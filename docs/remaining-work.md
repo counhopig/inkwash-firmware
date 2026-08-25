@@ -1,15 +1,14 @@
 # Firmware Remaining Work
 
 Updated: 2026-08-25  
-Flashed revision: `b38ff41` (`main`) - reflashed and reverified 2026-08-25
-after a run of code-only refactors (datetime/alarm_schedule calendar-math
-consolidation, a shared NVS blob-store helper, and item -2 below); boot was
-clean (no watchdog reset or panic) and item -2's dedup path was confirmed
-directly on the device. The 2026-08-22 pass below (items -1, 3, 6, and
-"Remaining engineering work" #1-2) predates this reflash and was only
-verified with `cargo check`/`cargo build --release`/`cargo test` on the
-host at the time - those items' hardware-verification status is unchanged
-by this reflash; do not read "fixed in code" as "verified on hardware" for
+Flashed revision: working tree at `1fc611d` (`main`) - reflashed and
+reverified 2026-08-25 twice this pass: first for item -2 (request-id
+dedup), then again for item -3 (RTC alignment), both confirmed directly on
+the device in the same session. The 2026-08-22 pass below (items -1, 3, 6,
+and "Remaining engineering work" #1-2) predates both reflashes and was
+only verified with `cargo check`/`cargo build --release`/`cargo test` on
+the host at the time - those items' hardware-verification status is
+unchanged; do not read "fixed in code" as "verified on hardware" for
 anything still marked that way below.
 
 ## Newly discovered from desktop/device logs
