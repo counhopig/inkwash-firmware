@@ -6,7 +6,7 @@ ESP32-S3 notebook. Firmware written in Rust (esp-idf), with a companion
 server and PC tool in sibling repos.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Target-Zectrix%20Note%204-black.svg)](docs/note4-hardware.md)
+[![Platform](https://img.shields.io/badge/Target-Zectrix%20Note%204-black.svg)](docs/development-guide.md)
 [![Lang](https://img.shields.io/badge/Rust-1.96%20(esp)-orange.svg)](rust-firmware/rust-toolchain.toml)
 
 ![Home](docs/screenshots/home.png)
@@ -61,7 +61,7 @@ flowchart LR
 This repo is **only for the black-and-white Zectrix Note 4**
 (ESP32-S3-WROOM-1 N16R8, 4.2″ 400×300 SSD2683 EPD). The Note 4 and the
 Note 4C have different displays and firmware — **do not flash one onto
-the other**. Full board details in [`docs/note4-hardware.md`](docs/note4-hardware.md).
+the other**. Full board details in [`docs/development-guide.md`](docs/development-guide.md) (§3 Board Reference).
 
 ## Quick start
 
@@ -116,7 +116,7 @@ espflash flash --port /dev/tty.usbmodem1101 \
 
 ```text
 inkwash-firmware/
-├── docs/                  # dev guide, hardware spec, protocol contracts
+├── docs/                  # development guide (incl. board reference + smoke-test checklist), protocol contracts
 ├── rust-firmware/         # the crate: 20+ modules, ~4.5k LOC + EPD FFI
 ├── scripts/               # build / flash / wifi-provision helpers
 ├── vendor/                # patched esp-idf-hal (read-only)
@@ -126,9 +126,10 @@ inkwash-firmware/
 ## Status
 
 Runs on real hardware. Calendar, alarms, todos, sync, USB/BLE config all
-implemented; some flows still need a final on-device confirmation (see
-[`docs/project-status.md`](docs/project-status.md)). Known workarounds
-(e.g. the ESP-IDF Wi-Fi reconnect crash) are documented in
+implemented; some flows still need a final on-device confirmation —
+progress and remaining work are tracked outside this repo, in the umbrella
+workspace's `docs/project-status.md` / `docs/remaining-work.md`. Known
+workarounds (e.g. the ESP-IDF Wi-Fi reconnect crash) are documented in
 [`rust-firmware/src/wifi.rs`](rust-firmware/src/wifi.rs).
 
 ## License

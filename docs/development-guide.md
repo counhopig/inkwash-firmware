@@ -4,25 +4,11 @@ This document records the hardware information, development environment, build a
 
 > This repository has only been verified on the ZECTRIX NOTE4 **black-and-white display version**. The display hardware, firmware, and waveforms of the NOTE4C and NOTE4 are incompatible — **never cross-flash them**.
 
-## 1. Project Scope and Current Status
+## 1. Project Scope
 
-Target device: **ZECTRIX NOTE4 black-and-white display version** (i.e., the hardware corresponding to `itopinion/zectrix-note4-epd-demo`).
+Target device: **ZECTRIX NOTE4 black-and-white display version** (i.e., the hardware corresponding to `itopinion/zectrix-note4-epd-demo`). The firmware is a usable offline-first calendar/alarm/todo device: Wi-Fi STA+NTP, audio (ES8311), RTC (PCF8563, including hardware alarm registers), NFC (GT23SC6699), battery management and ADC, deep sleep (GPIO17 RTC hold), USB/BLE control protocol, and HTTPS two-way sync are all implemented.
 
-### Verified on Real Hardware (These Behaviors Must Be Preserved)
-
-- ESP32-S3 revision v0.2, connected via USB Serial/JTAG.
-- 16 MB Flash; the boot image must use **DIO** mode.
-- After cold boot, the Rust firmware keeps the whole device powered (GPIO17 soft latch) and blinks the green LED heartbeat.
-- The three keys ENTER / UP / DOWN (short press + 1 s long press) have been verified on real hardware.
-- Button debouncing: 20 ms sampling, 4-sample confirmation (`rust-firmware/src/button.rs`).
-- The official SSD2683 EPD driver can perform 400×300 black-and-white full refresh and partial refresh; only refreshing the numeric region was verified on real hardware; long-press ghost clearing has also been verified.
-- The factory 16 MiB Flash has been fully backed up to `backups/note4-factory-20260815-213553.bin` (SHA-256 `dbe8b1504710d6b76dee0136505bc952013023db29fdcd1a3d3bfb4c6d9d182a`), which can be used to restore this device.
-
-### Current Implementation Status
-
-The firmware is now a usable calendar/alarm/todo device, no longer the button-counter demo from when this section was first written: Wi-Fi STA+NTP, audio (ES8311), RTC (PCF8563, including hardware alarm registers), NFC (GT23SC6699), battery management and ADC, deep sleep (GPIO17 RTC hold), USB/BLE control protocol, and HTTPS two-way sync are all implemented, with their basic paths verified on real hardware. See `rust-firmware/AGENTS.md` for the current module responsibility table (more up to date and complete than the early architecture diagram in section 4).
-
-Not yet done: file system, OTA, rollback. Not yet fully manually verified on real hardware: the full alarm ringing → ENTER dismiss flow, BLE pairing end-to-end connectivity — see the "Not Yet Done / Not Yet Verified" section of the root README for details.
+This document deliberately contains **no progress tracking** — what is verified on device and what remains is tracked in the umbrella workspace's `docs/project-status.md` and `docs/remaining-work.md` (one level above this repository); keep those files up to date instead of growing status sections here.
 
 ## 2. Safety Matters (Non-Negotiable)
 
@@ -34,27 +20,73 @@ Not yet done: file system, OTA, rollback. Not yet fully manually verified on rea
 6. **GPIO17 (PWR_ON) must be pulled high early in boot**, otherwise releasing the power key powers off the whole device; an RTC GPIO hold must also be designed for deep sleep.
 7. Close the monitor, serial terminals, and other IDEs occupying the serial port before flashing.
 
-## 3. Verified Hardware
+## 3. Verified Hardware (Board Reference)
 
-See [note4-hardware.md](note4-hardware.md) for the complete GPIO table. The current example directly uses the following signals:
+These notes are cross-referenced from the ZECTRIX NOTE4 spec page and the
+Slate firmware documentation, serving as this project's board-level baseline.
+The GPIO map describes the **full NOTE4 device hardware**, including every
+module's pins; the rows marked with **✓** are the ones the firmware currently
+uses explicitly.
 
-| GPIO | Purpose | Notes |
+### Core Specification
+
+| Item | Value |
+| --- | --- |
+| MCU | ESP32-S3-WROOM-1 N16R8 |
+| Flash | 16 MB; firmware boots in DIO mode |
+| PSRAM | 8 MB Octal |
+| Display | 4.2 inch black-white EPD, 400 × 300 |
+| Audio | ES8311 codec, speaker, MEMS mic |
+| Other | PCF8563 RTC, GT23SC6699 NFC |
+| USB | USB-C CDC/JTAG |
+
+### Complete GPIO Map
+
+| GPIO | Signal | Notes | Used by firmware |
+| --- | --- | --- | --- |
+| 0 | KEY_ENTER / BOOT | Active low, RTC-capable wake | ✓ ENTER key |
+| 1 | STDBY_H | Charge IC full status | ✓ `charge_done` |
+| 2 | CHRG_L | Charge IC charging status, active low | ✓ `charging` |
+| 3 | LED_G | Green LED, active low | ✓ status LED |
+| 4 | ADC_BAT | VBAT 1:2 divider | ✓ battery ADC |
+| 5 | RTC_INT | PCF8563 interrupt | — |
+| 6 | EPD_PWR_EN | EPD power rail | ✓ managed by official driver |
+| 7 | NFC_FD | NFC field detect | — |
+| 8 | EPD_BUSY | Active low: low means busy | ✓ |
+| 9 | EPD_NRES | EPD reset | ✓ managed by official driver |
+| 10 | EPD_NDC | EPD data/command | ✓ managed by official driver |
+| 11 | EPD_NCS | EPD chip select | ✓ SPI3 |
+| 12 | EPD_SCK | SPI clock | ✓ SPI3 |
+| 13 | EPD_SDA | SPI MOSI | ✓ SPI3 |
+| 14 | I2S_MCLK | ES8311 MCLK | — |
+| 15 | I2S_SCLK | ES8311 BCLK | — |
+| 16 | I2S_ASDOUT | Mic data in | — |
+| 17 | PWR_ON | Main power latch, high keeps power | ✓ pull high early in boot |
+| 18 | KEY_DET / PGDN | Down key and power-on feedback | ✓ DOWN key |
+| 19 | USB_DN | USB D- | — |
+| 20 | USB_DP | USB D+ | — |
+| 21 | NFC_PWR | NFC power | — |
+| 38 | I2S_LRCK | ES8311 LRCK | — |
+| 39 | KEY_PGUP | Up key, not RTC-capable wake | ✓ UP key |
+| 42 | PA_PWR_EN | Audio + I2C rail (AVDD) | ✓ pulled high before I2C0 init |
+| 43 | TXD0 | UART TX | — |
+| 44 | RXD0 | UART RX | — |
+| 45 | I2S_DSDIN | Speaker data out | — |
+| 46 | PA_CTRL | Speaker PA enable | — |
+| 47 | I2C_SDA | I2C data | ✓ I2C0 to PCF8563/ES8311 |
+| 48 | I2C_SCL | I2C clock | ✓ I2C0 to PCF8563/ES8311 |
+
+GPIO 26-37 are occupied by Octal PSRAM and must not be used as ordinary GPIOs.
+
+### Power Rails
+
+| Rail | Control | Notes |
 | --- | --- | --- |
-| 0 | ENTER / BOOT | Active-low press, RTC-capable wake |
-| 3 | Green LED | Lit when low |
-| 6 | EPD_PWR_EN | Managed by the official driver |
-| 8 | EPD_BUSY | Active-low busy |
-| 9 | EPD_NRES | Managed by the official driver |
-| 10 | EPD_NDC | Managed by the official driver |
-| 11 | EPD_NCS | SPI3 |
-| 12 | EPD_SCK | SPI3 |
-| 13 | EPD_SDA / MOSI | SPI3 |
-| 17 | PWR_ON main power latch | Pull high early in boot |
-| 18 | DOWN / KEY_DET | Active-low press |
-| 39 | UP | Active-low press, not RTC wake-capable |
-| 42 | PA_PWR_EN (AVDD) | Kept off in the current example |
+| Main power | GPIO17 | Must be held high before the user releases the power key |
+| EPD 3V3 | GPIO6 | Can be off while EPD keeps its visible image |
+| AVDD 3V3 | GPIO42 | Audio power and I2C pull-ups |
 
-GPIO 26-37 are occupied by Octal PSRAM and cannot be used as normal GPIOs.
+Deep sleep needs special care: GPIO17 must be held high through RTC GPIO hold, otherwise the main power latch releases and the device powers off (see §2 Safety Matters).
 
 ## 4. Software Architecture
 
@@ -239,6 +271,8 @@ zectrix_epd_power_off
 
 An e-paper display retains its last image after power-off; this is normal. Seeing the "old image" does not prove that the new firmware is not running — combine the serial log and the actual refresh flicker to judge.
 
+This repository uses the official ZECTRIX EPD component and its calibrated waveform data (SSD2683); keep that implementation as the known-good baseline when changing display code.
+
 ## 10. Current Implementation Highlights (Source Index)
 
 > This section only collects **low-level implementation details** that do not fit into the module table of `rust-firmware/AGENTS.md`
@@ -317,24 +351,7 @@ Confirm the user is a member of the `uucp` group (run `sudo usermod -aG uucp $US
 
 This is normal. An e-paper display holds its image when powered off; only a valid refresh waveform changes the content.
 
-## 12. Development Roadmap: Done vs Remaining
-
-Hardware smoke-test baseline, NVS, Wi-Fi/NTP, battery ADC/charging state, PCF8563 RTC, low power, audio (ES8311), NFC
-(GT23SC6699), watchdog, unified canvas/font layer, calendar/alarm/todo apps, USB/BLE control protocol, HTTPS two-way sync —
-all implemented; see `rust-firmware/AGENTS.md` for module responsibilities.
-
-Remaining:
-
-1. File system, content caching strategy.
-2. OTA, rollback.
-3. Real-device verification: the full alarm ringing → dismiss flow, BLE pairing end-to-end (especially since it must be redone
-   after switching to the Tauri/Vue version of `inkwash-desktop` — the old verification was done under an earlier Desktop
-   implementation), and the actual Wi-Fi reconnect-without-restart experience.
-   See the "Not Yet Done / Not Yet Verified" section of the root README and `docs/project-status.md` for details.
-
-For each new peripheral, run standalone tests first, then integrate it into the main application. Display, power, and sleep changes carry the highest risk; always keep a recoverable serial path and the factory backup.
-
-## 13. Pre-Commit Checks
+## 12. Pre-Commit Checks
 
 ```bash
 cargo +esp fmt --manifest-path rust-firmware/Cargo.toml -- --check
@@ -344,6 +361,115 @@ cargo +esp fmt --manifest-path rust-firmware/Cargo.toml -- --check
 Check on real hardware at least once: cold boot, power hold, initial full refresh, one press of each of the three keys, USB reconnection, and the serial log.
 
 Do not commit `sdkconfig`, build directories, factory backups, or logs containing device credentials. The current `.gitignore` already excludes `build/`, `managed_components/`, `dependencies.lock`, `sdkconfig`, `sdkconfig.old`, `backups/*.bin`, `rust-firmware/target/`, and `rust-firmware/.embuild/`.
+
+For each new peripheral, run standalone tests first, then integrate it into the main application. Display, power, and sleep changes carry the highest risk; always keep a recoverable serial path and the factory backup.
+
+## 13. Hardware Smoke-Test Checklist
+
+A repeatable checklist for exercising boot, sync, alarm, and BLE/USB
+recovery on a physical NOTE4 after flashing. This is the manual counterpart
+to `logic/`'s host-runnable tests: the `logic` crate locks down the *pure*
+scheduling, validation, and dedup rules on every commit without hardware;
+this checklist is for everything those tests cannot reach - real I2C
+timing, real Wi-Fi association, real flash wear, real button debounce, a
+real watchdog.
+
+Run this after any change touching `sync.rs`, `wifi.rs`, `alarms.rs`,
+`reminders.rs`, `ctx.rs`, `main.rs`, `ble_control.rs`, or `usb_console.rs`,
+and before recording "verified on hardware" in the umbrella workspace's
+`docs/remaining-work.md`. Record the flashed revision (`git describe`,
+logged once at boot as `GIT_REV`) alongside results.
+
+### Flash and boot
+
+- [ ] Build in release mode; flash via `scripts/build-rust.sh` /
+      `espflash flash --monitor` in DIO mode, 80 MHz, 16 MB flash. NOTE4
+      only - NOTE4C and QIO mode are forbidden (see §2 Safety Matters).
+- [ ] Boot log shows: power latch high, RTC read (or a clear reseed-from-VL
+      message), display full refresh, Wi-Fi stack init - with **no**
+      watchdog reset or panic anywhere in the sequence.
+- [ ] `GIT_REV` in the first boot log lines matches the commit under test
+      (not the stale ESP-IDF `App version` field).
+
+### Wi-Fi and sync
+
+- [ ] `set_wifi` (USB) against a real AP saves only after a successful
+      DHCP-timeout-free connect; a bad SSID/password is rejected without
+      corrupting the previously-saved credentials.
+- [ ] `sync_now` (USB, or the on-device menu) completes and applies
+      alarms/todos/inbox; confirm via `get_status` or the on-device list.
+- [ ] A **second** sync in the same boot session (USB `sync_now` again, or
+      wait for the next urgent-poll boundary) also completes - regression
+      guard for the old "second connect crashes" class of bug (see
+      `wifi.rs`'s `WifiManager` doc comment).
+- [ ] If testing the PMF workaround: connect to a PMF-required or
+      PMF-optional AP that previously failed with `assoc -> init` right
+      after `Wi-Fi connected`; confirm it now associates and reaches DHCP.
+- [ ] **Long soak** (leave running, do not skip this one): let the device
+      idle through several hours' worth of urgent-poll and full-sync
+      boundaries in one boot session (no reboot). Watch for a task-watchdog
+      abort; a clean multi-hour run with dozens of sync cycles and no reset
+      is the bar for calling any soak-related item fixed, not just "not
+      observed yet in 20 minutes."
+
+### Alarms
+
+- [ ] Arm a one-shot (`Once`) alarm a few minutes out; let it fire from
+      **deep sleep** (device asleep when the RTC alarm triggers, not
+      already awake) - this exact path (`main.rs`'s `alarm_fired_at_boot`)
+      has historically been the least-tested wake path.
+- [ ] ENTER dismisses within ~1s of a short press; sound stops immediately.
+- [ ] AF flag is acknowledged and the fired one-shot is removed from the
+      store (`Alarm dismissed` -> `No enabled alarms; hardware alarm
+      cleared`, or the next alarm re-armed if more are enabled).
+- [ ] Arm a **recurring** (`Weekly`/`Monthly`/`Daily`) alarm, let it fire and
+      dismiss it, and confirm the hardware alarm slot is **re-armed** for
+      the next occurrence (not left cleared).
+- [ ] While the alarm is ringing, send a USB command and confirm
+      `{"status":"busy"}` comes back within a few seconds (not silence).
+- [ ] Repeat the busy-reply check over **BLE** (open the pairing screen in
+      another test run, or verify via the BLE reply-during-ring path) -
+      confirms BLE is no longer silent during a blocking screen.
+
+### Reminders
+
+- [ ] A due, high-importance Todo triggers the full-screen reminder exactly
+      once per day, even across multiple boots on the same date.
+- [ ] An urgent (`Alert`, `High` priority) inbox item triggers the siren
+      reminder; dismiss with ENTER.
+- [ ] Both reminder types interrupt whichever screen is open (Calendar,
+      Settings, list/detail, BLE pairing) and return to a correctly redrawn
+      page afterward.
+
+### BLE and USB recovery
+
+- [ ] Open the BLE pairing screen, connect a client, send a command, get a
+      reply; leave the screen and confirm advertising stops (RAM reclaimed,
+      not left running).
+- [ ] Disconnect/reconnect BLE and unplug/replug USB repeatedly over a
+      longer session; confirm BLE teardown doesn't affect a later Wi-Fi
+      sync.
+- [ ] Opening the USB serial port with a naive client (default `pyserial`
+      `Serial(...)`, DTR/RTS not pre-cleared) resets the chip - expected,
+      not a regression; confirms the warning in [`control-protocol.md`](control-protocol.md)
+      is still accurate.
+
+### Capacity
+
+- [ ] Sync a maximal alarm list, Todo list, and Inbox (near NVS blob caps -
+      see `alarms::BLOB_BUF_LEN` / `todos::BLOB_BUF_LEN` /
+      `inbox::BLOB_BUF_LEN`); confirm pagination/truncation and no NVS
+      write failure, and check the e-paper for visible ghosting after
+      several full refreshes.
+
+### Recording results
+
+Append a dated entry to the umbrella workspace's `docs/remaining-work.md`
+(one level above this repository) naming exactly which checklist items
+passed, on what hardware, against what flashed revision - matching the
+existing entries' level of detail (specific log lines, timings, and repro
+counts, not just "works"). An item silently skipped is not the same as one
+verified; say which is which.
 
 ## 14. Restoring Factory Firmware
 
