@@ -14,7 +14,7 @@ fn main() {
     // The ESP-IDF app descriptor's `App version`/`Compile time` (visible in
     // the boot log) come from a `git describe` cached in esp-idf-sys's CMake
     // build directory at its first configure and are NOT recomputed on later
-    // `cargo build`s - see docs/remaining-work.md's stale-metadata item. This
+    // `cargo build`s - see ../docs/remaining-work.md's stale-metadata item. This
     // firmware-level GIT_REV is always current: printed once at boot instead
     // of trusting that field.
     let git_rev = std::process::Command::new("git")

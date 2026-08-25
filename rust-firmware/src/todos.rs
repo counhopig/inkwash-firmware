@@ -9,7 +9,7 @@ use crate::nvs_blob::{read_blob, write_blob, DirtySet};
 /// `Importance`/`TodoDue`/`Todo` live in `inkwash-logic` (re-exported here)
 /// so `sync_validate`'s host tests share the exact same wire shape instead
 /// of a hand-copied one that could drift - see "Remaining engineering work"
-/// #1 in `docs/remaining-work.md`.
+/// #1 in `../docs/remaining-work.md`.
 #[allow(unused_imports)] // TodoDue: part of Todo's public shape; no on-device code names it directly (due dates are server-authored, never constructed on-device).
 pub use inkwash_logic::todo::{Importance, Todo, TodoDue};
 

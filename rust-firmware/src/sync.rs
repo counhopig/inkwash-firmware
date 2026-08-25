@@ -24,7 +24,7 @@ use crate::wifi;
 
 /// `SyncResponse` and `validate_sync_response` (the sync merge rules) live
 /// in `inkwash-logic` so they can be unit-tested on the host - see
-/// "Remaining engineering work" #1 in `docs/remaining-work.md`. This crate
+/// "Remaining engineering work" #1 in `../docs/remaining-work.md`. This crate
 /// is the single source of truth; everything below just wires the result
 /// into HTTP + NVS.
 use inkwash_logic::sync_validate::{validate_sync_response, SyncResponse};
@@ -42,7 +42,7 @@ const RESPONSE_BUF_LEN: usize = 16384;
 /// (10s; see `sdkconfig.defaults`). Set well under that budget so a
 /// stalled/slow connection surfaces as a clean `Err` instead of leaving the
 /// main task blocked in a read long enough for the task watchdog to fire -
-/// see item -1 in `docs/remaining-work.md` for the live reboot this is meant
+/// see item -1 in `../docs/remaining-work.md` for the live reboot this is meant
 /// to prevent.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -218,7 +218,7 @@ pub fn fetch_and_apply(
     // `io::try_read_full` call. A single blocking read of up to 16KB, with
     // no `watchdog::feed()` until the *next* one (previously not until this
     // whole function returned), was the prime suspect for item -1 in
-    // `docs/remaining-work.md`: a live task-watchdog abort+reboot observed
+    // `../docs/remaining-work.md`: a live task-watchdog abort+reboot observed
     // mid-sync, right after "Certificate validated", with both cores idle
     // (main task genuinely blocked, not spinning) - exactly what a stalled
     // socket read plus a growing NVS write cost (worse after many sync

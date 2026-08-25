@@ -17,7 +17,7 @@ use crate::nvs_blob::{read_blob, write_blob};
 /// `InboxKind`/`Priority`/`InboxItem` live in `inkwash-logic` (re-exported
 /// here), alongside the pending-read merge/dedup rules `save`/`mark_read`/
 /// `ack_read` below call into instead of inlining - see "Remaining
-/// engineering work" #1 in `docs/remaining-work.md`.
+/// engineering work" #1 in `../docs/remaining-work.md`.
 pub use inkwash_logic::inbox_item::{InboxItem, InboxKind, Priority};
 
 const NAMESPACE: &str = "inkwash_inbox";

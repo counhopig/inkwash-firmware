@@ -8,7 +8,7 @@
 //! and `alarm_schedule`'s recurrence math both build on these instead of
 //! each carrying their own copy of the month-length table. That used to
 //! be two independent copies of the same leap-year arithmetic, and both
-//! were wrong the same way at once (`docs/remaining-work.md` item 0).
+//! were wrong the same way at once (`../docs/remaining-work.md` item 0).
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DateTime {
@@ -62,7 +62,7 @@ pub fn is_leap(year: i64) -> bool {
 /// Days per month for a given year (leap-aware). The single table every
 /// calendar computation in this crate reads from - see the module doc
 /// comment on why having more than one copy of this table is exactly what
-/// caused `docs/remaining-work.md` item 0.
+/// caused `../docs/remaining-work.md` item 0.
 fn month_lengths(year: i64) -> [i64; 12] {
     if is_leap(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -107,7 +107,7 @@ pub fn date_from_days(mut days: i64) -> (u16, u8, u8) {
 }
 
 /// Weekday (0=Sunday..6=Saturday) for an absolute day number. 1970-01-01
-/// was a Thursday (4) - see `docs/remaining-work.md` item 0: this constant
+/// was a Thursday (4) - see `../docs/remaining-work.md` item 0: this constant
 /// was `3` for a long time, which put every weekday-derived feature a day
 /// off.
 pub(crate) fn weekday_from_days(days: i64) -> u8 {
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn known_bug_report_date_is_saturday() {
-        // 2026-08-22: the date `docs/remaining-work.md` records as the
+        // 2026-08-22: the date `../docs/remaining-work.md` records as the
         // physical-hardware reproduction of the weekday bug ("device showed
         // Friday on a Saturday"). Locks in the fix for that exact report.
         let epoch = DateTime {

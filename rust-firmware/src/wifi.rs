@@ -133,7 +133,7 @@ impl WifiManager {
         // (`esp-idf-svc-0.52.1/src/wifi.rs`), which `set_configuration()`
         // just used above - it never reads `ClientConfiguration.pmf_cfg`,
         // so nothing settable on the Rust side changes it. Root-caused on
-        // hardware (2026-08-22, see item 6 in `docs/remaining-work.md`): a
+        // hardware (2026-08-22, see item 6 in `../docs/remaining-work.md`): a
         // WPA2/WPA3-mixed + PMF-required router accepted association but
         // then rejected the device (`assoc -> init` right after `Wi-Fi
         // connected`, before DHCP) because the driver advertised itself as

@@ -13,7 +13,7 @@
 //! through `DeviceContext` automatically gets the chance to reply `busy` to
 //! a queued BLE command instead of leaving BLE the one control channel with
 //! no reply at all during a ring/reminder - see item 3 in
-//! `docs/remaining-work.md`.
+//! `../docs/remaining-work.md`.
 //!
 //! The store fields are `&'a` (immutable) because their methods all take
 //! `&self` (the underlying NVS handles have internal mutability); only

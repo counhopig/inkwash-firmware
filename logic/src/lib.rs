@@ -9,7 +9,7 @@
 //! before this split, no part of the firmware crate's logic could be tested
 //! anywhere but on the physical device. This crate has no ESP-IDF
 //! dependency (just `serde`), so it builds and tests on any host. See
-//! "Remaining engineering work" #1 in `docs/remaining-work.md`.
+//! "Remaining engineering work" #1 in `../docs/remaining-work.md`.
 //!
 //! `rust-firmware` depends on this crate by path and re-exports each type
 //! from its usual module (`rtc::DateTime`, `alarms::{Repeat, StoredAlarm}`,
