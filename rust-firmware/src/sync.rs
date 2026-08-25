@@ -58,7 +58,6 @@ pub enum SyncOutcome {
     },
 }
 
-
 #[derive(Debug, Serialize)]
 struct DeviceSyncRequest {
     alarms: Vec<DeviceAlarmState>,
@@ -106,6 +105,79 @@ fn read_body_fully(response: &mut impl embedded_svc::io::Read, buf: &mut [u8]) -
     Ok(offset)
 }
 
+/// One complete HTTPS POST round-trip shared by `fetch_and_apply` and
+/// `poll_urgent` (which used to hand-roll identical copies of every step):
+/// builds the TLS/socket `HttpConfiguration` (cert bundle + `HTTP_TIMEOUT`),
+/// assembles the JSON headers (`accept`/`content-type`/`content-length`)
+/// plus any `extra_headers` and the optional Bearer auth header for a
+/// non-empty `token`, streams `body`, submits, then - after a watchdog feed -
+/// verifies the status is 200 (`err_label` names the caller in the failure
+/// message) and reads the whole body into `buf` through `read_body_fully`.
+/// That last step is load-bearing: the body MUST go through the
+/// watchdog-feeding read loop rather than one unbroken blocking read, the
+/// prime suspect of the live TWDT abort documented on `read_body_fully` and
+/// item -1 in `../docs/remaining-work.md`. Returns `(bytes_read, etag)` -
+/// the response's `etag` header if present, surfaced because
+/// `fetch_and_apply` needs it for conditional-request bookkeeping and the
+/// connection is gone once this helper returns.
+fn https_post(
+    url: &str,
+    token: &str,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+    buf: &mut [u8],
+    err_label: &str,
+) -> Result<(usize, Option<String>)> {
+    let config = HttpConfiguration {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        timeout: Some(HTTP_TIMEOUT),
+        ..Default::default()
+    };
+    let mut client = HttpClient::wrap(
+        EspHttpConnection::new(&config)
+            .map_err(|e| anyhow!("HTTP connection setup failed: {e}"))?,
+    );
+
+    let content_length = body.len().to_string();
+    let mut headers: Vec<(&str, &str)> = vec![
+        ("accept", "application/json"),
+        ("content-type", "application/json"),
+    ];
+    headers.extend_from_slice(extra_headers);
+    headers.push(("content-length", &content_length));
+    let auth_header;
+    if !token.is_empty() {
+        auth_header = format!("Bearer {token}");
+        headers.push(("authorization", &auth_header));
+    }
+
+    let mut request = client
+        .request(Method::Post, url, &headers)
+        .map_err(|e| anyhow!("POST {url} failed to start: {e}"))?;
+    let mut written = 0usize;
+    while written < body.len() {
+        let count = request
+            .write(&body[written..])
+            .map_err(|e| anyhow!("POST {url} body write failed: {e}"))?;
+        if count == 0 {
+            return Err(anyhow!("POST {url} body write made no progress"));
+        }
+        written += count;
+    }
+    let mut response = request
+        .submit()
+        .map_err(|e| anyhow!("POST {url} failed: {e}"))?;
+
+    watchdog::feed();
+    if response.status() != 200 {
+        return Err(anyhow!("{err_label}: HTTP {}", response.status()));
+    }
+
+    let etag = response.header("etag").map(|s| s.to_string());
+    let bytes_read = read_body_fully(&mut response, buf)?;
+    Ok((bytes_read, etag))
+}
+
 /// Fetches alarms and todos from `server_url`, applying conditional-request
 /// semantics. Uploads local mutable flags first and returns the merged
 /// server data's counts and new ETag. Any HTTP error, TLS error, or
@@ -123,16 +195,6 @@ pub fn fetch_and_apply(
     now: &DateTime,
 ) -> Result<SyncOutcome> {
     watchdog::feed();
-
-    let config = HttpConfiguration {
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        timeout: Some(HTTP_TIMEOUT),
-        ..Default::default()
-    };
-    let mut client = HttpClient::wrap(
-        EspHttpConnection::new(&config)
-            .map_err(|e| anyhow!("HTTP connection setup failed: {e}"))?,
-    );
 
     let local_alarms = alarm_store
         .load()
@@ -178,53 +240,18 @@ pub fn fetch_and_apply(
     };
     let request_body =
         serde_json::to_vec(&upload).map_err(|e| anyhow!("device sync JSON encode failed: {e}"))?;
-    let content_length = request_body.len().to_string();
-    let mut headers: Vec<(&str, &str)> = vec![
-        ("accept", "application/json"),
-        ("content-type", "application/json"),
-        ("content-length", &content_length),
-    ];
-    let auth_header;
-    if !token.is_empty() {
-        auth_header = format!("Bearer {token}");
-        headers.push(("authorization", &auth_header));
-    }
-    let mut request = client
-        .request(Method::Post, server_url, &headers)
-        .map_err(|e| anyhow!("POST {server_url} failed to start: {e}"))?;
-    let mut written = 0usize;
-    while written < request_body.len() {
-        let count = request
-            .write(&request_body[written..])
-            .map_err(|e| anyhow!("POST {server_url} body write failed: {e}"))?;
-        if count == 0 {
-            return Err(anyhow!("POST {server_url} body write made no progress"));
-        }
-        written += count;
-    }
-    let mut response = request
-        .submit()
-        .map_err(|e| anyhow!("POST {server_url} failed: {e}"))?;
-
-    let status = response.status();
-    watchdog::feed();
-    if status != 200 {
-        return Err(anyhow!("sync request failed: HTTP {status}"));
-    }
-
-    let new_etag = response.header("etag").map(|s| s.to_string());
-
-    // Read the body in a watchdog-feeding loop rather than one unbroken
-    // `io::try_read_full` call. A single blocking read of up to 16KB, with
-    // no `watchdog::feed()` until the *next* one (previously not until this
-    // whole function returned), was the prime suspect for item -1 in
-    // `../docs/remaining-work.md`: a live task-watchdog abort+reboot observed
-    // mid-sync, right after "Certificate validated", with both cores idle
-    // (main task genuinely blocked, not spinning) - exactly what a stalled
-    // socket read plus a growing NVS write cost (worse after many sync
-    // cycles' worth of flash wear) would produce against a 10s TWDT budget.
+    // The full HTTP round-trip (config, headers, body write, status check,
+    // watchdog-feeding body read) lives in `https_post` - see its doc
+    // comment for why the body read must keep feeding the task watchdog.
     let mut buf = [0u8; RESPONSE_BUF_LEN];
-    let bytes_read = read_body_fully(&mut response, &mut buf)?;
+    let (bytes_read, new_etag) = https_post(
+        server_url,
+        token,
+        &[],
+        &request_body,
+        &mut buf,
+        "sync request failed",
+    )?;
     let body = &buf[..bytes_read];
     watchdog::feed();
 
@@ -429,49 +456,15 @@ pub fn poll_urgent(counters: &PersistedCounters, wifi_mgr: &mut wifi::WifiManage
     wifi_mgr.connect(&creds)?;
 
     let result = (|| -> Result<bool> {
-        let config = HttpConfiguration {
-            crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-            timeout: Some(HTTP_TIMEOUT),
-            ..Default::default()
-        };
-        let mut client = HttpClient::wrap(
-            EspHttpConnection::new(&config)
-                .map_err(|e| anyhow!("HTTP connection setup failed: {e}"))?,
-        );
-        let mut headers: Vec<(&str, &str)> = vec![
-            ("accept", "application/json"),
-            ("content-type", "application/json"),
-            ("x-inkwash-poll", "1"),
-            ("content-length", "2"),
-        ];
-        let auth_header;
-        if !cfg.auth_token.is_empty() {
-            auth_header = format!("Bearer {}", cfg.auth_token);
-            headers.push(("authorization", &auth_header));
-        }
-        let mut request = client
-            .request(Method::Post, &cfg.server_url, &headers)
-            .map_err(|e| anyhow!("POST {} failed to start: {e}", cfg.server_url))?;
-        let mut written = 0usize;
-        let body = b"{}";
-        while written < body.len() {
-            let count = request
-                .write(&body[written..])
-                .map_err(|e| anyhow!("POST body write failed: {e}"))?;
-            if count == 0 {
-                return Err(anyhow!("POST body write made no progress"));
-            }
-            written += count;
-        }
-        let mut response = request
-            .submit()
-            .map_err(|e| anyhow!("POST {} failed: {e}", cfg.server_url))?;
-        watchdog::feed();
-        if response.status() != 200 {
-            return Err(anyhow!("urgent poll failed: HTTP {}", response.status()));
-        }
         let mut buf = [0u8; 256];
-        let bytes_read = read_body_fully(&mut response, &mut buf)?;
+        let (bytes_read, _) = https_post(
+            &cfg.server_url,
+            &cfg.auth_token,
+            &[("x-inkwash-poll", "1")],
+            b"{}",
+            &mut buf,
+            "urgent poll failed",
+        )?;
         let parsed: serde_json::Value = serde_json::from_slice(&buf[..bytes_read])
             .map_err(|e| anyhow!("urgent poll JSON decode failed: {e}"))?;
         Ok(parsed
