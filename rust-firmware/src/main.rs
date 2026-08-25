@@ -474,10 +474,7 @@ fn render_home_now(
         .wifi_creds()
         .map(|creds| creds.is_some())
         .unwrap_or(false);
-    let battery_percent = board
-        .battery_millivolts()
-        .ok()
-        .map(board::battery_percent_from_mv);
+    let battery_percent = board.battery_percent();
     let charge = board.charge_snapshot();
     board.display.render_home(
         clock,
@@ -500,20 +497,24 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
     }
     match board.battery_millivolts() {
         Ok(vbat_mv) => log::info!(
-            "Power state: power_present={} charging={} full={} vbat_mV={} ({}%)",
+            "Power state: power_present={} charging={} full={} fault={} no_battery={} vbat_mV={} ({}%)",
             charge.power_present,
             charge.charging,
             charge.full,
+            charge.fault,
+            charge.no_battery,
             vbat_mv,
             board::battery_percent_from_mv(vbat_mv)
         ),
         Err(err) => {
             log::warn!("Battery ADC read failed: {err}");
             log::info!(
-                "Power state: power_present={} charging={} full={} vbat_mV=<n/a>",
+                "Power state: power_present={} charging={} full={} fault={} no_battery={} vbat_mV=<n/a>",
                 charge.power_present,
                 charge.charging,
-                charge.full
+                charge.full,
+                charge.fault,
+                charge.no_battery
             );
         }
     }

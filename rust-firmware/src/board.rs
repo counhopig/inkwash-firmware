@@ -57,6 +57,11 @@ pub struct Note4Board {
     charge_status: ChargeStatus,
     charge_snapshot: ChargeSnapshot,
     adc: BoardAdc,
+    /// Percent from the last successful `battery_millivolts` read.
+    /// `battery_percent` returns this on a failed read instead of `None`
+    /// forcing every caller to invent its own fallback - see its doc
+    /// comment for why defaulting to "empty" is actively wrong.
+    last_battery_percent: Option<u8>,
     pub display: EpdDisplay,
     pub rtc: Pcf8563,
     /// `None` when the ES8311 failed to initialize; the rest of the board
@@ -78,20 +83,44 @@ pub struct ChargeSnapshot {
     pub charging: bool,
     /// Battery is full (STDBY_H high, debounced).
     pub full: bool,
+    /// Both status lines active at once - the charge IC reporting an
+    /// electrical fault. Mutually exclusive with `charging`/`full`/
+    /// `no_battery`: this takes priority over all three, matching the
+    /// official ZECTRIX demo's `ChargeStatus::State::kFault` (see the
+    /// `ChargeStatus` doc comment below - this field used to be computed
+    /// and silently discarded instead of reaching the UI).
+    pub fault: bool,
+    /// Both status lines have been seen active recently but neither has
+    /// settled into a stable state - the demo's `State::kNoBattery`,
+    /// meaning the board is likely running with no battery installed (the
+    /// lines bounce between states with nothing to hold them steady).
+    /// Mutually exclusive with `charging`/`full`, lower priority than
+    /// `fault`.
+    pub no_battery: bool,
 }
 
 /// Ported from the official ZECTRIX demo's `ChargeStatus` state machine
 /// (`components/zectrix_board/charge_status.cc`), simplified to the two
 /// status GPIOs plus debounce - the voltage-based precharge/CC/CV stage
-/// split is omitted since the UI only needs charge/full/power-present.
+/// split is omitted since the UI only needs charge/full/power-present, but
+/// `fault`/`no_battery` (see `ChargeSnapshot`) are kept: the demo treats
+/// both as real, user-visible states, not implementation detail.
 ///
 /// `tick` must be called once per `report_power_state` poll (~1 s); one
-/// tick is the debounce quantum, "stable" means active for ≥ 2 ticks.
+/// tick is the debounce quantum, "stable" means active for ≥ 2 ticks -
+/// coarser than the demo's 400 ms `kStableHighMs`, since this device's
+/// e-paper display has no need for sub-second charge-status feedback.
 struct ChargeStatus {
     /// Ticks since either status line was last active; `None` before the
     /// first activity. `<= 1` means power is present (matches the demo's
     /// ~1 s `kPowerPresentHoldMs`).
     power_ticks_since_seen: Option<u32>,
+    /// Ticks since the CHRG_L line was last seen active; used only for
+    /// `no_battery` detection (the demo's `last_detect_seen_ms_`).
+    detect_ticks_since_seen: Option<u32>,
+    /// Ticks since the STDBY_H line was last seen active; used only for
+    /// `no_battery` detection (the demo's `last_full_seen_ms_`).
+    full_ticks_since_seen: Option<u32>,
     charge_ticks: u32,
     full_ticks: u32,
     both_ticks: u32,
@@ -104,6 +133,8 @@ impl ChargeStatus {
     const fn new() -> Self {
         Self {
             power_ticks_since_seen: None,
+            detect_ticks_since_seen: None,
+            full_ticks_since_seen: None,
             charge_ticks: 0,
             full_ticks: 0,
             both_ticks: 0,
@@ -126,6 +157,17 @@ impl ChargeStatus {
         };
         let power_present = self.power_ticks_since_seen.is_some_and(|t| t <= 1);
 
+        self.detect_ticks_since_seen = if charging {
+            Some(0)
+        } else {
+            self.detect_ticks_since_seen.map(|t| t + 1)
+        };
+        self.full_ticks_since_seen = if charge_done {
+            Some(0)
+        } else {
+            self.full_ticks_since_seen.map(|t| t + 1)
+        };
+
         let charge_stable = self.charge_ticks >= 2;
         let full_stable = self.full_ticks >= 2;
         let both_stable = self.both_ticks >= 2;
@@ -137,10 +179,24 @@ impl ChargeStatus {
         };
         let fault = power_present && self.fault_ticks_since_seen.is_some_and(|t| t <= 1);
 
+        // Both lines have been seen recently but neither has settled -
+        // matches the demo's `alt_seen && !detect_stable && !full_stable`.
+        let alt_seen = power_present
+            && self.detect_ticks_since_seen.is_some_and(|t| t <= 1)
+            && self.full_ticks_since_seen.is_some_and(|t| t <= 1);
+        let no_battery = alt_seen && !fault && !charge_stable && !full_stable;
+
+        // Priority mirrors the demo's State enum exactly: fault outranks
+        // no_battery outranks full outranks charging.
+        let full = power_present && !fault && !no_battery && full_stable;
+        let charging = power_present && !fault && !no_battery && !full && charge_stable;
+
         ChargeSnapshot {
             power_present,
-            charging: power_present && charge_stable && !full_stable && !fault,
-            full: power_present && full_stable && !fault,
+            charging,
+            full,
+            fault,
+            no_battery,
         }
     }
 }
@@ -169,7 +225,15 @@ impl Note4Board {
         let key_enter = Button::new(pins.gpio0.into(), Pull::Up)?;
         let key_up = Button::new(pins.gpio39.into(), Pull::Up)?;
         let key_down = Button::new(pins.gpio18.into(), Pull::Up)?;
-        let charging = PinDriver::input(pins.gpio2, Pull::Up)?;
+        // Neither status line gets an internal pull: the official ZECTRIX
+        // demo's `ChargeStatus::Init` explicitly disables both pull-up and
+        // pull-down on both GPIOs (its only configuration of these two
+        // pins anywhere in that codebase), relying on the charge IC (or an
+        // external pull already on the PCB) to drive them - not on the
+        // ESP32's own weak internal pulls. `charging` used to add
+        // `Pull::Up` here with no comment explaining why; matched to the
+        // verified-working reference instead.
+        let charging = PinDriver::input(pins.gpio2, Pull::Floating)?;
         let charge_done = PinDriver::input(pins.gpio1, Pull::Floating)?;
         let display = EpdDisplay::new()?;
 
@@ -243,6 +307,7 @@ impl Note4Board {
             charge_status: ChargeStatus::new(),
             charge_snapshot: ChargeSnapshot::default(),
             adc,
+            last_battery_percent: None,
             display,
             rtc,
             audio,
@@ -262,6 +327,12 @@ impl Note4Board {
         if snapshot.full {
             log::debug!("charger: full (STDBY_H high, debounced)");
         }
+        if snapshot.fault {
+            log::warn!("charger: fault (CHRG_L and STDBY_H both active, debounced)");
+        }
+        if snapshot.no_battery {
+            log::warn!("charger: no battery detected (status lines alternating, debounced)");
+        }
         self.charge_snapshot = snapshot;
         snapshot
     }
@@ -273,15 +344,17 @@ impl Note4Board {
     }
 
     /// Drives the status LED (GPIO3) as a charging indicator: lit only
-    /// while a charger is connected **and** the battery is still charging,
-    /// dark once full or unplugged. `LED_G` is active-low (low = on,
-    /// matching the official demo's `SetPowerLed(on)` -> level 0); the
-    /// official firmware names this pin `ZECTRIX_POWER_LED` and keeps it
-    /// off except during self-test. A plugged-in-but-full state doesn't
-    /// keep a bright indicator burning all day - the battery icon on the
-    /// Home screen already shows the full state.
+    /// while a charger is connected **and** the battery is genuinely
+    /// charging, dark once full, unplugged, or in a fault/no-battery state
+    /// (those aren't "charging" either - a lit indicator would be actively
+    /// misleading). `LED_G` is active-low (low = on, matching the official
+    /// demo's `SetPowerLed(on)` -> level 0); the official firmware names
+    /// this pin `ZECTRIX_POWER_LED` and keeps it off except during
+    /// self-test. A plugged-in-but-full state doesn't keep a bright
+    /// indicator burning all day - the battery icon on the Home screen
+    /// already shows the full state.
     pub fn update_charging_led(&mut self, charge: ChargeSnapshot) -> Result<()> {
-        if charge.power_present && !charge.full {
+        if charge.power_present && !charge.full && !charge.fault && !charge.no_battery {
             self.led.set_low()?;
         } else {
             self.led.set_high()?;
@@ -295,6 +368,17 @@ impl Note4Board {
     /// then doubles the pin mV since the divider halves VBAT before the
     /// pin sees it. The DB_12 attenuation tops out around ~3.1 V on
     /// ESP32-S3, so the doubled result is clamped to `u16::MAX`.
+    ///
+    /// The channel driver is (re)built from `&self.adc` on every call
+    /// rather than stored as a `Note4Board` field: `AdcChannelDriver<'d>`
+    /// borrows the `AdcDriver` it's built from, and a field can't borrow a
+    /// sibling field of the same struct without unsafe self-referential
+    /// tricks. The official demo sidesteps this in C++ by owning the ADC
+    /// handle as a raw pointer instead; reconstructing per call is the
+    /// straightforward safe-Rust equivalent, not an oversight - see
+    /// `Note4Board::battery_percent` for where the actual per-call cost
+    /// (one more `esp_idf_svc` config call plus `BATTERY_ADC_SAMPLES`
+    /// reads) is bounded to callers that need a fresh value.
     pub fn battery_millivolts(&mut self) -> Result<u16> {
         let peripherals = unsafe { Peripherals::steal() };
         let mut channel = AdcChannelDriver::new(
@@ -309,6 +393,33 @@ impl Note4Board {
         let avg_mv = (sum / BATTERY_ADC_SAMPLES) as u16;
         let vbat_mv = (avg_mv as u32) * 2;
         Ok(vbat_mv.min(u16::MAX as u32) as u16)
+    }
+
+    /// Battery percent for display, tolerant of a transient ADC read
+    /// failure: on success, computes and remembers the percent; on
+    /// failure, returns whatever was last remembered instead of `None`.
+    /// Every render call site used to do `battery_millivolts().ok().map
+    /// (battery_percent_from_mv)` directly, which turns a single transient
+    /// I2C/ADC hiccup into the *emptiest* possible battery icon
+    /// (`unwrap_or(0)` at the render layer) regardless of the real charge
+    /// level - the worst available default for a false reading. `None` is
+    /// only possible here before the first successful read ever completes
+    /// (e.g. right at boot).
+    pub fn battery_percent(&mut self) -> Option<u8> {
+        match self.battery_millivolts() {
+            Ok(mv) => {
+                let percent = battery_percent_from_mv(mv);
+                self.last_battery_percent = Some(percent);
+                Some(percent)
+            }
+            Err(err) => {
+                log::warn!(
+                    "Battery ADC read failed, reusing last known percent ({:?}): {err}",
+                    self.last_battery_percent
+                );
+                self.last_battery_percent
+            }
+        }
     }
 }
 

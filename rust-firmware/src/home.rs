@@ -47,7 +47,15 @@ pub fn render(
     // hollow/outlined variant was tried and was visually indistinguishable
     // from the filled one once actually rendered.
     let percent = battery_percent.unwrap_or(0);
-    let battery_icon: &Icon = if charge.charging {
+    let battery_icon: &Icon = if charge.fault || charge.no_battery {
+        // Neither condition is a normal charge level - showing a
+        // percent-derived icon here would imply a reading that isn't
+        // meaningful. No dedicated fault/no-battery glyph exists at this
+        // icon size, so fall back to the outline (already the device's
+        // "pay attention" cue) rather than a falsely-confident percent
+        // tier; `charging_state` logs the specific condition.
+        &icons::BATTERY_OUTLINE
+    } else if charge.charging {
         if percent < 34 {
             &icons::CHARGING_LOW
         } else if percent < 67 {

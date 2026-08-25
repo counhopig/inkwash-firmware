@@ -13,6 +13,73 @@ anything still marked that way below.
 
 ## Newly discovered from desktop/device logs
 
+-4. ~~**P2 — Charge/battery display drops the official reference's fault and
+    no-battery detection, and shows the emptiest icon on any ADC hiccup.**~~
+    **Fixed, verified against the official reference and on physical
+    hardware** (2026-08-25). Found during a logic review, then confirmed by
+    reading the actual upstream source: ZECTRIX's public reference demo
+    (`itopinion/zectrix-note4-epd-demo`, `components/zectrix_board/
+    charge_status.{h,cc}` - linked from `wiki.zectrix.com/zh/software/
+    opensource`) exposes `Snapshot.fault` (both status lines active at
+    once - a real charger fault) and `Snapshot.no_battery` (lines
+    alternating without settling - no battery installed) as first-class
+    state. `board.rs::ChargeStatus`/`ChargeSnapshot` computed an
+    equivalent `fault` bool internally but never put it on the public
+    `ChargeSnapshot`, and had no `no_battery` detection at all - both
+    silently dropped in the port, so a real charger fault or a missing
+    battery would show a perfectly ordinary "on battery" icon with zero
+    indication anything was wrong.
+
+    Separately, `home.rs::render`'s `battery_percent.unwrap_or(0)` meant a
+    single transient ADC read failure (I2C hiccup, momentary error) showed
+    the emptiest possible battery icon regardless of the real charge level
+    - the worst available default for a false reading, and duplicated
+    across the two Home-render call sites (`main.rs::render_home_now`,
+    `screens.rs`'s `Page::Home` branch).
+
+    Also found: the reference's `ChargeStatus::Init` disables *both*
+    internal pull-up/pull-down on *both* status GPIOs (its only
+    configuration of those two pins anywhere in that codebase) - this
+    port's `charging` (GPIO2) line added `Pull::Up` with no comment
+    explaining why, inconsistent with both the reference and this port's
+    own `charge_done` (GPIO1, correctly `Pull::Floating`).
+
+    **Fixed:**
+    - `ChargeSnapshot` gained `fault`/`no_battery` fields; `ChargeStatus::
+      tick` now computes `no_battery` (the reference's `alt_seen &&
+      !detect_stable && !full_stable`, translated from the reference's
+      millisecond timestamps to this port's tick-based debounce) and wires
+      both into the same priority order as the reference's `State` enum:
+      fault outranks no_battery outranks full outranks charging. Both are
+      logged (`charging_state`) and gate the charging LED off
+      (`update_charging_led`) in addition to the existing full/unplugged
+      cases - a lit "charging" LED during a fault or with no battery
+      installed would be actively misleading.
+    - `home.rs::render` checks `fault || no_battery` first and falls back
+      to the outline icon (no dedicated fault/no-battery glyph exists at
+      this icon size) instead of a falsely-confident percent tier.
+    - Added `Note4Board::battery_percent()`, which remembers the last
+      successful reading and returns that instead of `None` on a failed
+      one; both Home-render call sites switched to it. `unwrap_or(0)`
+      still exists but is now only reachable before the very first
+      successful ADC read ever completes (effectively: boot-time ADC
+      failure, a real fault condition, not a false alarm from a later
+      transient hiccup).
+    - `charging` (GPIO2) changed from `Pull::Up` to `Pull::Floating`,
+      matching the reference exactly.
+
+    **Verified against physical hardware** (flashed, `--status`/`--sync`
+    over USB twice): `power_present=true charging=false full=false
+    fault=false no_battery=false vbat_mV=4120 (98%)`, consistent across
+    both reads, no watchdog reset or panic - confirms the pull-config
+    change didn't break real charge detection on this board. **Not
+    verified:** an actual fault or no-battery hardware condition (would
+    need physically shorting the status lines or removing the battery) -
+    the new code paths are exercised by normal charging/on-battery
+    operation but the fault/no_battery branches themselves are unverified
+    on real hardware, only reasoned from the ported algorithm matching the
+    reference's.
+
 -3. ~~**P1 — A backward RTC jump permanently disables NTP realignment.**~~
     **Fixed and verified on physical hardware** (2026-08-25). Found live on
     the user's own device: `--status` kept reporting `2026-08-22` days

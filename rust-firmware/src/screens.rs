@@ -343,11 +343,7 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
                         .wifi_creds()
                         .map(|creds| creds.is_some())
                         .unwrap_or(false);
-                    let battery_percent = ctx
-                        .board
-                        .battery_millivolts()
-                        .ok()
-                        .map(crate::board::battery_percent_from_mv);
+                    let battery_percent = ctx.board.battery_percent();
                     let charge = ctx.board.charge_snapshot();
                     ctx.board.display.render_home(
                         now,
