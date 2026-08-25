@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 
+use crate::nvs_blob;
+
 const NAMESPACE: &str = "inkwash";
 const KEY_WIFI_SSID: &str = "wifi_ssid";
 const KEY_WIFI_PASS: &str = "wifi_pass";
@@ -24,6 +26,11 @@ const WIFI_CRED_MAX_LEN: usize = 64;
 /// Server URLs typically fit in ~256 chars, tokens often 128-256 chars, and
 /// ETags vary but are rarely over 128 chars.
 const SERVER_CONFIG_MAX_LEN: usize = 256;
+
+/// Read-buffer size for every numeric/date scalar (stored as its decimal
+/// string): a `u64` needs at most 20 digits and the `YYYYMMDD` reminder
+/// marker 8, so one shared size covers them all.
+const NUM_STR_MAX_LEN: usize = 20;
 
 #[derive(Clone, Debug)]
 pub struct WifiCreds {
@@ -56,56 +63,52 @@ impl PersistedCounters {
         Ok(Self { nvs })
     }
 
+    /// Parses a decimal-string scalar into `T`; `label` only feeds the error
+    /// message (mirroring each former hand-written getter's wording).
+    fn read_num<T: std::str::FromStr>(&self, key: &str, label: &str) -> Result<Option<T>>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match nvs_blob::read_scalar::<NUM_STR_MAX_LEN>(&self.nvs, key)? {
+            Some(value) => value
+                .parse::<T>()
+                .map(Some)
+                .map_err(|e| anyhow!("invalid stored {label} '{value}': {e}")),
+            None => Ok(None),
+        }
+    }
+
+    /// Stores a numeric scalar as its decimal string.
+    fn write_num<T: ToString>(&self, key: &str, value: T) -> Result<()> {
+        nvs_blob::write_scalar(&self.nvs, key, &value.to_string())
+    }
+
     /// Reads the Wi-Fi credentials stored in NVS, if any.
     pub fn wifi_creds(&self) -> Result<Option<WifiCreds>> {
-        let mut ssid_buf = [0u8; WIFI_CRED_MAX_LEN];
-        let ssid = match self
-            .nvs
-            .get_str(KEY_WIFI_SSID, &mut ssid_buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_WIFI_SSID}) failed: {e}"))?
-        {
-            Some(s) => s.to_owned(),
-            None => return Ok(None),
+        let Some(ssid) = nvs_blob::read_scalar::<WIFI_CRED_MAX_LEN>(&self.nvs, KEY_WIFI_SSID)?
+        else {
+            return Ok(None);
         };
-        let mut pass_buf = [0u8; WIFI_CRED_MAX_LEN];
-        let password = self
-            .nvs
-            .get_str(KEY_WIFI_PASS, &mut pass_buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_WIFI_PASS}) failed: {e}"))?
-            .unwrap_or("")
-            .to_owned();
+        let password = nvs_blob::read_scalar::<WIFI_CRED_MAX_LEN>(&self.nvs, KEY_WIFI_PASS)?
+            .unwrap_or_default();
         Ok(Some(WifiCreds { ssid, password }))
     }
 
     /// Stores the Wi-Fi credentials in NVS for later connections.
     pub fn save_wifi_creds(&self, creds: &WifiCreds) -> Result<()> {
-        self.nvs
-            .set_str(KEY_WIFI_SSID, &creds.ssid)
-            .map_err(|e| anyhow!("NVS set_str({KEY_WIFI_SSID}) failed: {e}"))?;
-        self.nvs
-            .set_str(KEY_WIFI_PASS, &creds.password)
-            .map_err(|e| anyhow!("NVS set_str({KEY_WIFI_PASS}) failed: {e}"))?;
-        Ok(())
+        nvs_blob::write_scalar(&self.nvs, KEY_WIFI_SSID, &creds.ssid)?;
+        nvs_blob::write_scalar(&self.nvs, KEY_WIFI_PASS, &creds.password)
     }
 
     /// Reads the server configuration (URL and auth token) from NVS, if any.
     pub fn device_config(&self) -> Result<Option<DeviceConfig>> {
-        let mut url_buf = [0u8; SERVER_CONFIG_MAX_LEN];
-        let server_url = match self
-            .nvs
-            .get_str(KEY_SERVER_URL, &mut url_buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_SERVER_URL}) failed: {e}"))?
-        {
-            Some(s) => s.to_owned(),
-            None => return Ok(None),
+        let Some(server_url) =
+            nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_SERVER_URL)?
+        else {
+            return Ok(None);
         };
-        let mut token_buf = [0u8; SERVER_CONFIG_MAX_LEN];
-        let auth_token = self
-            .nvs
-            .get_str(KEY_AUTH_TOKEN, &mut token_buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_AUTH_TOKEN}) failed: {e}"))?
-            .unwrap_or("")
-            .to_owned();
+        let auth_token = nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_AUTH_TOKEN)?
+            .unwrap_or_default();
         Ok(Some(DeviceConfig {
             server_url,
             auth_token,
@@ -114,33 +117,18 @@ impl PersistedCounters {
 
     /// Stores the server configuration (URL and auth token) in NVS.
     pub fn save_device_config(&self, cfg: &DeviceConfig) -> Result<()> {
-        self.nvs
-            .set_str(KEY_SERVER_URL, &cfg.server_url)
-            .map_err(|e| anyhow!("NVS set_str({KEY_SERVER_URL}) failed: {e}"))?;
-        self.nvs
-            .set_str(KEY_AUTH_TOKEN, &cfg.auth_token)
-            .map_err(|e| anyhow!("NVS set_str({KEY_AUTH_TOKEN}) failed: {e}"))?;
-        Ok(())
+        nvs_blob::write_scalar(&self.nvs, KEY_SERVER_URL, &cfg.server_url)?;
+        nvs_blob::write_scalar(&self.nvs, KEY_AUTH_TOKEN, &cfg.auth_token)
     }
 
     /// Reads the last-seen sync ETag from NVS for conditional requests, if any.
     pub fn sync_etag(&self) -> Result<Option<String>> {
-        let mut etag_buf = [0u8; SERVER_CONFIG_MAX_LEN];
-        match self
-            .nvs
-            .get_str(KEY_SYNC_ETAG, &mut etag_buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_SYNC_ETAG}) failed: {e}"))?
-        {
-            Some(s) => Ok(Some(s.to_owned())),
-            None => Ok(None),
-        }
+        nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_SYNC_ETAG)
     }
 
     /// Stores the sync ETag in NVS for future conditional requests.
     pub fn save_sync_etag(&self, etag: &str) -> Result<()> {
-        self.nvs
-            .set_str(KEY_SYNC_ETAG, etag)
-            .map_err(|e| anyhow!("NVS set_str({KEY_SYNC_ETAG}) failed: {e}"))
+        nvs_blob::write_scalar(&self.nvs, KEY_SYNC_ETAG, etag)
     }
 
     /// Invalidates conditional-sync state after changing server identity.
@@ -155,15 +143,9 @@ impl PersistedCounters {
     /// configured server every this many minutes while running on Home (see
     /// `main.rs`'s periodic sync check). Defaults to 60 (1 hour).
     pub fn sync_interval_minutes(&self) -> Result<u16> {
-        let mut buf = [0u8; 8];
-        let value = self
-            .nvs
-            .get_str(KEY_SYNC_INTERVAL_MIN, &mut buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_SYNC_INTERVAL_MIN}) failed: {e}"))?
-            .unwrap_or("60");
-        value
-            .parse::<u16>()
-            .map_err(|e| anyhow!("invalid stored sync interval '{value}': {e}"))
+        Ok(self
+            .read_num::<u16>(KEY_SYNC_INTERVAL_MIN, "sync interval")?
+            .unwrap_or(60))
     }
 
     /// Sets the automatic-sync interval in minutes.
@@ -171,63 +153,32 @@ impl PersistedCounters {
         if !(1..=1440).contains(&minutes) {
             return Err(anyhow!("sync interval must be between 1 and 1440 minutes"));
         }
-        self.nvs
-            .set_str(KEY_SYNC_INTERVAL_MIN, &minutes.to_string())
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS set_str({KEY_SYNC_INTERVAL_MIN}) failed: {e}"))
+        self.write_num(KEY_SYNC_INTERVAL_MIN, minutes)
     }
 
     /// Unix seconds of the last successful sync, if any. `main.rs` uses this
     /// with `sync_interval_minutes` to decide when to trigger the next
     /// automatic sync.
     pub fn last_sync_epoch(&self) -> Result<Option<u64>> {
-        let mut buf = [0u8; 20];
-        match self
-            .nvs
-            .get_str(KEY_LAST_SYNC_EPOCH, &mut buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_LAST_SYNC_EPOCH}) failed: {e}"))?
-        {
-            Some(value) => value
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|e| anyhow!("invalid stored last-sync epoch '{value}': {e}")),
-            None => Ok(None),
-        }
+        self.read_num::<u64>(KEY_LAST_SYNC_EPOCH, "last-sync epoch")
     }
 
     /// Records the time of a successful sync so the periodic checker knows
     /// how long it has been since the last one.
     pub fn set_last_sync_epoch(&self, epoch: u64) -> Result<()> {
-        self.nvs
-            .set_str(KEY_LAST_SYNC_EPOCH, &epoch.to_string())
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS set_str({KEY_LAST_SYNC_EPOCH}) failed: {e}"))
+        self.write_num(KEY_LAST_SYNC_EPOCH, epoch)
     }
 
     /// Unix seconds of the last successful periodic NTP RTC alignment, if
     /// any. `main.rs` uses this to resync the PCF8563 roughly once a day,
     /// keeping the wall-clock boundaries the cron sync aligns to accurate.
     pub fn rtc_align_epoch(&self) -> Result<Option<u64>> {
-        let mut buf = [0u8; 20];
-        match self
-            .nvs
-            .get_str(KEY_RTC_ALIGN_EPOCH, &mut buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_RTC_ALIGN_EPOCH}) failed: {e}"))?
-        {
-            Some(value) => value
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|e| anyhow!("invalid stored rtc-align epoch '{value}': {e}")),
-            None => Ok(None),
-        }
+        self.read_num::<u64>(KEY_RTC_ALIGN_EPOCH, "rtc-align epoch")
     }
 
     /// Records when the RTC was last aligned via NTP.
     pub fn set_rtc_align_epoch(&self, epoch: u64) -> Result<()> {
-        self.nvs
-            .set_str(KEY_RTC_ALIGN_EPOCH, &epoch.to_string())
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS set_str({KEY_RTC_ALIGN_EPOCH}) failed: {e}"))
+        self.write_num(KEY_RTC_ALIGN_EPOCH, epoch)
     }
 
     /// Drops the last-alignment marker. Call whenever the RTC clock is set
@@ -245,15 +196,9 @@ impl PersistedCounters {
     }
 
     pub fn timezone_offset_minutes(&self) -> Result<i16> {
-        let mut buf = [0u8; 8];
-        let value = self
-            .nvs
-            .get_str(KEY_TIMEZONE_OFFSET, &mut buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_TIMEZONE_OFFSET}) failed: {e}"))?
-            .unwrap_or("0");
-        value
-            .parse::<i16>()
-            .map_err(|e| anyhow!("invalid stored timezone offset '{value}': {e}"))
+        Ok(self
+            .read_num::<i16>(KEY_TIMEZONE_OFFSET, "timezone offset")?
+            .unwrap_or(0))
     }
 
     pub fn save_timezone_offset_minutes(&self, offset: i16) -> Result<()> {
@@ -262,31 +207,18 @@ impl PersistedCounters {
                 "timezone offset must be between -720 and 840 minutes"
             ));
         }
-        self.nvs
-            .set_str(KEY_TIMEZONE_OFFSET, &offset.to_string())
-            .map_err(|e| anyhow!("NVS set_str({KEY_TIMEZONE_OFFSET}) failed: {e}"))
+        self.write_num(KEY_TIMEZONE_OFFSET, offset)
     }
 
     /// The last calendar date (as `YYYYMMDD`) on which the due-todo
     /// reminder fired, if ever. `main.rs` compares it against today so a
     /// due `High` todo rings once per day, not every poll.
     pub fn todo_reminded_date(&self) -> Result<Option<String>> {
-        let mut buf = [0u8; 16];
-        match self
-            .nvs
-            .get_str(KEY_TODO_REMINDED_DATE, &mut buf)
-            .map_err(|e| anyhow!("NVS get_str({KEY_TODO_REMINDED_DATE}) failed: {e}"))?
-        {
-            Some(s) => Ok(Some(s.to_owned())),
-            None => Ok(None),
-        }
+        nvs_blob::read_scalar::<NUM_STR_MAX_LEN>(&self.nvs, KEY_TODO_REMINDED_DATE)
     }
 
     /// Records that the due-todo reminder fired on `date` (`YYYYMMDD`).
     pub fn set_todo_reminded_date(&self, date: &str) -> Result<()> {
-        self.nvs
-            .set_str(KEY_TODO_REMINDED_DATE, date)
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS set_str({KEY_TODO_REMINDED_DATE}) failed: {e}"))
+        nvs_blob::write_scalar(&self.nvs, KEY_TODO_REMINDED_DATE, date)
     }
 }

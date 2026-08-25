@@ -49,6 +49,33 @@ pub fn write_blob<const N: usize, T: Serialize + ?Sized>(
         .map_err(|e| anyhow!("NVS set_blob({key}) failed: {e}"))
 }
 
+/// Reads a single *scalar* string value stored under one NVS `key`, in
+/// contrast to the list-oriented blob pair above. This is the variant used
+/// by `storage.rs::PersistedCounters` for its simple per-field keys (Wi-Fi
+/// credentials, server URL/token, ETag, numeric settings recorded as their
+/// decimal string, ...): each field is one plain NVS string item rather than
+/// a JSON blob, so it stays individually inspectable with `idf.py`/parttool
+/// and costs no serde round-trip. `Ok(None)` if the key has never been
+/// written; the `N`-byte stack buffer plays the same role as in
+/// `read_blob` - a value longer than `N` fails the underlying `get_str`
+/// instead of silently truncating. Thin wrapper over the ESP-only NVS FFI,
+/// hence not host-unit-testable (the sibling `logic` crate deliberately has
+/// zero ESP-IDF deps).
+pub fn read_scalar<const N: usize>(nvs: &EspDefaultNvs, key: &str) -> Result<Option<String>> {
+    let mut buf = [0u8; N];
+    Ok(nvs
+        .get_str(key, &mut buf)
+        .map_err(|e| anyhow!("NVS get_str({key}) failed: {e}"))?
+        .map(str::to_owned))
+}
+
+/// Writes a single *scalar* string value under one NVS `key` - the write
+/// half of [`read_scalar`] (same per-field contract; see above).
+pub fn write_scalar(nvs: &EspDefaultNvs, key: &str, value: &str) -> Result<()> {
+    nvs.set_str(key, value)
+        .map_err(|e| anyhow!("NVS set_str({key}) failed: {e}"))
+}
+
 /// Comfortably covers the worst case of all 256 `u8` ids dirty at once
 /// (`"[255,254,...,0]"` serializes to well under 1024 bytes).
 const DIRTY_SET_BUF_LEN: usize = 1024;
