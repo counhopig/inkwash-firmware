@@ -4,10 +4,21 @@
 //! screen, and PCF8563 programming stay in that file - only the pure
 //! date/schedule arithmetic and the `StoredAlarm`/`Repeat` data shapes live
 //! here.
+//!
+//! Day-number/calendar-date conversion itself is not reimplemented here -
+//! it's `datetime::days_since_epoch`/`datetime::date_from_days`, re-exported
+//! below so existing call sites are unaffected.
 
 use serde::{Deserialize, Serialize};
 
-use crate::datetime::{is_leap, DateTime};
+use crate::datetime::DateTime;
+use crate::datetime::weekday_from_days;
+
+// Re-exported so `rust-firmware/src/alarms.rs`'s existing
+// `alarms::{days_since_epoch, date_from_days}` call sites keep working
+// unchanged - `datetime` is the single canonical implementation now (see
+// its module doc comment).
+pub use crate::datetime::{date_from_days, days_since_epoch};
 
 /// Recurrence schedule, wire-compatible with the server's
 /// `models::Repeat`. Externally tagged by serde: `"Daily"`, `{"Weekly":
@@ -53,61 +64,6 @@ pub struct StoredAlarm {
     pub repeat: Repeat,
     pub enabled: bool,
     pub label: String,
-}
-
-/// Absolute day number (proleptic Gregorian, epoch 1970-01-01) - only used
-/// to order alarms against each other, matching the calendar math already
-/// in `DateTime::from_unix`.
-pub fn days_since_epoch(year: u16, month: u8, day: u8) -> i64 {
-    let mut days: i64 = 0;
-    for y in 1970..year as i64 {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    let month_days = if is_leap(year as i64) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    for m in month_days.iter().take(month as usize - 1) {
-        days += *m as i64;
-    }
-    days + day as i64 - 1
-}
-
-/// Days per month for a given year (leap-aware).
-fn month_lengths(year: i64) -> [i64; 12] {
-    if is_leap(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    }
-}
-
-/// Calendar date (year, month, day) for an absolute day number relative to
-/// 1970-01-01. Inverse of `days_since_epoch`.
-pub fn date_from_days(mut days: i64) -> (u16, u8, u8) {
-    let mut year = 1970i64;
-    loop {
-        let dim = if is_leap(year) { 366 } else { 365 };
-        if days < dim {
-            break;
-        }
-        days -= dim;
-        year += 1;
-    }
-    for (idx, dim) in month_lengths(year).iter().enumerate() {
-        if days < *dim {
-            return (year as u16, (idx + 1) as u8, (days + 1) as u8);
-        }
-        days -= *dim;
-    }
-    unreachable!("date_from_days ran past a year's day count")
-}
-
-/// Weekday (0=Sunday..6=Saturday) for an absolute day number. 1970-01-01
-/// was a Thursday (4).
-fn weekday_from_days(days: i64) -> u8 {
-    ((days + 4).rem_euclid(7)) as u8
 }
 
 /// The next calendar date (year, month, day, weekday) that `repeat` covers,

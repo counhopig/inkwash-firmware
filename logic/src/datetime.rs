@@ -2,6 +2,13 @@
 //! (which re-exports `DateTime`/`is_leap` from here so nothing else has to
 //! change). Kept separate from that file's PCF8563 I2C code specifically so
 //! it has no hardware dependency and can be unit-tested on the host.
+//!
+//! `days_since_epoch`/`date_from_days` are the single canonical
+//! day-number/calendar-date conversion for the whole crate - `DateTime`
+//! and `alarm_schedule`'s recurrence math both build on these instead of
+//! each carrying their own copy of the month-length table. That used to
+//! be two independent copies of the same leap-year arithmetic, and both
+//! were wrong the same way at once (`docs/remaining-work.md` item 0).
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DateTime {
@@ -19,41 +26,14 @@ pub struct DateTime {
 impl DateTime {
     pub fn from_unix(epoch: u64) -> Self {
         let secs = (epoch % 86400) as u32;
-        let mut days = (epoch / 86400) as i64;
-        let mut year: i64 = 1970;
-        loop {
-            let leap = is_leap(year);
-            let dy = if leap { 366 } else { 365 };
-            if days < dy {
-                break;
-            }
-            days -= dy;
-            year += 1;
-        }
-        let leap = is_leap(year);
-        let month_days = if leap {
-            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-        let mut month = 1;
-        for &dm in &month_days {
-            if days < dm {
-                break;
-            }
-            days -= dm;
-            month += 1;
-        }
-        let day = days as u8 + 1;
+        let days = (epoch / 86400) as i64;
+        let (year, month, day) = date_from_days(days);
         let hour = (secs / 3600) as u8;
         let minute = ((secs % 3600) / 60) as u8;
         let second = (secs % 60) as u8;
-        // 1970-01-01 was a Thursday (0=Sunday..6=Saturday convention - see
-        // `docs/remaining-work.md` item 0: this constant was `3` for a long
-        // time, which put every weekday-derived feature a day off).
-        let weekday = ((epoch / 86400 + 4) % 7) as u8;
+        let weekday = weekday_from_days(days);
         Self {
-            year: year as u16,
+            year,
             month,
             day,
             weekday,
@@ -65,21 +45,7 @@ impl DateTime {
     }
 
     pub fn to_unix(self) -> u64 {
-        let mut days = 0u64;
-        for year in 1970..self.year as i64 {
-            days += if is_leap(year) { 366 } else { 365 };
-        }
-        let month_days = if is_leap(self.year as i64) {
-            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-        days += month_days
-            .iter()
-            .take(self.month.saturating_sub(1) as usize)
-            .map(|days| *days as u64)
-            .sum::<u64>();
-        days += self.day.saturating_sub(1) as u64;
+        let days = days_since_epoch(self.year, self.month, self.day) as u64;
         days * 86_400 + self.hour as u64 * 3_600 + self.minute as u64 * 60 + self.second as u64
     }
 
@@ -91,6 +57,61 @@ impl DateTime {
 
 pub fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Days per month for a given year (leap-aware). The single table every
+/// calendar computation in this crate reads from - see the module doc
+/// comment on why having more than one copy of this table is exactly what
+/// caused `docs/remaining-work.md` item 0.
+fn month_lengths(year: i64) -> [i64; 12] {
+    if is_leap(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    }
+}
+
+/// Absolute day number (proleptic Gregorian, epoch 1970-01-01) for a
+/// calendar date. Inverse of `date_from_days`.
+pub fn days_since_epoch(year: u16, month: u8, day: u8) -> i64 {
+    let mut days: i64 = 0;
+    for y in 1970..year as i64 {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    days += month_lengths(year as i64)
+        .iter()
+        .take(month.saturating_sub(1) as usize)
+        .sum::<i64>();
+    days + day.saturating_sub(1) as i64
+}
+
+/// Calendar date (year, month, day) for an absolute day number relative to
+/// 1970-01-01. Inverse of `days_since_epoch`.
+pub fn date_from_days(mut days: i64) -> (u16, u8, u8) {
+    let mut year = 1970i64;
+    loop {
+        let dim = if is_leap(year) { 366 } else { 365 };
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        year += 1;
+    }
+    for (idx, dim) in month_lengths(year).iter().enumerate() {
+        if days < *dim {
+            return (year as u16, (idx + 1) as u8, (days + 1) as u8);
+        }
+        days -= *dim;
+    }
+    unreachable!("date_from_days ran past a year's day count")
+}
+
+/// Weekday (0=Sunday..6=Saturday) for an absolute day number. 1970-01-01
+/// was a Thursday (4) - see `docs/remaining-work.md` item 0: this constant
+/// was `3` for a long time, which put every weekday-derived feature a day
+/// off.
+pub(crate) fn weekday_from_days(days: i64) -> u8 {
+    ((days + 4).rem_euclid(7)) as u8
 }
 
 #[cfg(test)]
