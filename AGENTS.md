@@ -89,7 +89,24 @@ Firmware releases are built **locally** — a full ESP-IDF toolchain is impracti
 - Release check: `gh release view v0.3.0 --repo counhopig/inkwash-firmware --json isDraft,assets` (expect `isDraft: false` and the `inkwash-note4` firmware asset).
 
 ## NOTES
-- `rust-firmware/.cargo/config.toml` contains machine-specific paths (`IDF_PATH=~/esp/esp-idf`, `LIBCLANG_PATH` pointing at this machine's espup esp-clang) — must be edited manually when switching machines or toolchain versions.
-- **rust-analyzer availability depends on two machine-specific pieces** (both take effect via the repo-root `.vscode/settings.json`): ① the `esp-ra` toolchain (`rustup toolchain link esp-ra ~/esp/esp-ra`): `bin/cargo` is a wrapper (`--version` reports 1.96.0, everything else is forwarded to the esp cargo), `rustc`/`rustdoc` are symlinks pointing at the esp toolchain — must be rebuilt after an espup reinstall; ② `.vscode/settings.json` injects `RUSTUP_TOOLCHAIN=esp-ra` + IDF env (IDF_PATH, tools, venv python at `~/esp/esp-idf` and `~/.espressif/python_env/idf5.5_py3.9_env/bin`). Root cause: rust-analyzer 0.3.3016 classifies the esp cargo's `1.95.0-nightly` as <1.95.0, falls back to the removed `--lockfile-path` argument, which makes `cargo metadata` degrade to `--no-deps` (spurious unresolved imports in the editor); the wrapper guides it to the `-Zlockfile-path` branch (supported by the esp cargo). Once upstream rustup ships rustc ≥1.96.0-nightly, the whole hack can be removed.
+- `rust-firmware/.cargo/config.toml` keeps no machine-specific paths: `IDF_PATH`
+  and `LIBCLANG_PATH` are resolved dynamically by `scripts/build-rust.sh` /
+  `build-rust.ps1` (honoring `$IDF_PATH`/`$LIBCLANG_PATH` when set, then probing
+  the conventional install locations; newest match wins). A bare `cargo build`
+  still requires a sourced ESP-IDF environment — always use the scripts.
+- **rust-analyzer availability depends on two per-machine pieces**: ① the
+  `esp-ra` toolchain (`rustup toolchain link esp-ra ~/esp/esp-ra`): `bin/cargo`
+  is a wrapper (`--version` reports 1.96.0, everything else is forwarded to the
+  esp cargo), `rustc`/`rustdoc` are symlinks pointing at the esp toolchain —
+  must be rebuilt after an espup reinstall; ② the ESP-IDF environment must come
+  from the parent process — launch the editor from a shell where
+  `source ~/esp/esp-idf/export.sh` has run (or set `IDF_PATH` globally); the
+  tracked `.vscode/settings.json` injects only `RUSTUP_TOOLCHAIN=esp-ra` and no
+  absolute paths. Root cause: rust-analyzer 0.3.3016 classifies the esp cargo's
+  `1.95.0-nightly` as <1.95.0, falls back to the removed `--lockfile-path`
+  argument, which makes `cargo metadata` degrade to `--no-deps` (spurious
+  unresolved imports in the editor); the wrapper guides it to the
+  `-Zlockfile-path` branch (supported by the esp cargo). Once upstream rustup
+  ships rustc ≥1.96.0-nightly, the whole hack can be removed.
 - The device supports periodic auto-sync (default 60 minutes, configurable to 1/5/10/30/60 in the settings menu); failures are retried on the next cycle; `esp_wifi_stop()` and `esp_restart()` remain red lines, see red line #3.
 - Not yet verified on device: the full alarm-ringing flow and BLE end-to-end pairing — changes to related code cannot be vouched for by "it compiles".

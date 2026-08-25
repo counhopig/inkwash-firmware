@@ -1,0 +1,16 @@
+// Machine-independent rust-analyzer setup for the Xtensa esp toolchain.
+//
+// One-time per-machine prerequisites (see docs/development-guide.md):
+//   1. `espup install`, then `rustup toolchain link esp-ra ~/esp/esp-ra`
+//      (re-link after every espup reinstall).
+//   2. Launch VS Code from a shell with the ESP-IDF environment sourced
+//      (`source ~/esp/esp-idf/export.sh`), or set IDF_PATH globally, so
+//      cargo can run esp-idf-sys's build script during cargo check.
+//
+// No absolute paths belong in this file: build-time paths are discovered
+// dynamically by scripts/build-rust.sh / build-rust.ps1.
+{
+    "rust-analyzer.server.extraEnv": {
+        "RUSTUP_TOOLCHAIN": "esp-ra"
+    },
+}

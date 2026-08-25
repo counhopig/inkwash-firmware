@@ -32,5 +32,7 @@ __pycache__/
 .omo/
 .claude/
 
-# vscode
-.vscode/
+# vscode - editor config is ignored, except the machine-independent
+# rust-analyzer settings (no absolute paths; see the file's header comment)
+.vscode/*
+!.vscode/settings.json
