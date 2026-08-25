@@ -43,7 +43,7 @@ No codegraph tooling; rust-analyzer has been available since 2026-08-18 (`esp-ra
 
 ## CONVENTIONS
 - Docs are written in Chinese; commits use conventional format and are described in English (`feat:`/`fix:`/`docs:` etc., lowercase start).
-- **No tests, no CI**: `harness = false`; pre-commit checks = fmt + clippy with zero warnings + release build + manual on-device verification (development-guide §12–§13).
+- **The `rust-firmware` bin crate has no tests, no CI** (`harness = false`); pre-commit checks = fmt + clippy with zero warnings + release build + manual on-device verification (development-guide §12–§13). The host-testable logic lives in the sibling `logic/` crate (`inkwash-logic`, path dependency, zero ESP-IDF deps): `cd logic && cargo test` is the only automated test suite (currently ~50 tests; add new pure date/schedule/validation logic there, not in `rust-firmware/src`).
 - Toolchain pinned to the `esp` channel (`rust-toolchain.toml`); formatting must use `cargo +esp fmt`, stable/nightly are disallowed.
 - Size-first: release `opt-level="s"`, dev `"z"`; `build-std=["std","panic_abort"]`.
 - `cargo run` = flash + monitor (runner=espflash); a bare `cargo build` always fails in a shell that has not sourced the ESP-IDF environment — always use `scripts/build-rust.sh`.
