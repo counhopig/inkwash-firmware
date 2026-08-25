@@ -78,6 +78,49 @@ pub struct StoredAlarm {
     pub label: String,
 }
 
+/// A calendar date: year, month, day and its computed weekday
+/// (0=Sunday..6=Saturday). Returned by `next_matching_day`; callers that
+/// need an occurrence's time-of-day pair it with their own hour/minute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CalDate {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub weekday: u8,
+}
+
+/// The next calendar date at or after `from` whose schedule matches
+/// `repeat`, found by scanning day-by-day (the shared implementation behind
+/// `next_occurrence_date` and `minutes_until`'s Weekly/Monthly branches -
+/// before this function existed each caller carried its own copy of this
+/// scan, and a duplicated date-math bug in one copy is exactly the class of
+/// error that produced `../docs/remaining-work.md` items 0 and -3).
+///
+/// The scan runs for `max_days` consecutive days starting at `from`
+/// (inclusive). `None` means no matching day within the window; non-empty
+/// schedules always match within ~62 days, so with the default `370` the
+/// fallback is unreachable in practice for a validated schedule. Whether a
+/// match on the very first day is acceptable is the caller's decision: a
+/// caller whose occurrence time for today has already passed should start
+/// `from` at tomorrow rather than post-filtering the result.
+pub fn next_matching_day(repeat: &Repeat, from: CalDate, max_days: u32) -> Option<CalDate> {
+    let from_days = days_since_epoch(from.year, from.month, from.day);
+    for offset in 0..max_days {
+        let days = from_days + offset as i64;
+        let (year, month, day) = date_from_days(days);
+        let weekday = weekday_from_days(days);
+        if repeat.fires_on(year, month, day, weekday) {
+            return Some(CalDate {
+                year,
+                month,
+                day,
+                weekday,
+            });
+        }
+    }
+    None
+}
+
 /// The next calendar date (year, month, day, weekday) that `repeat` covers,
 /// at or after `now`'s date. Non-empty schedules always match within ~62
 /// days, so the scan is bounded and the fallback is unreachable in practice.
@@ -87,20 +130,21 @@ pub fn next_occurrence_date(
     minute: u8,
     now: &DateTime,
 ) -> (u16, u8, u8, u8) {
-    let now_days = days_since_epoch(now.year, now.month, now.day);
     let occurrence_minutes = hour as i64 * 60 + minute as i64;
     let now_minutes = now.hour as i64 * 60 + now.minute as i64;
-    for offset in 0..370 {
-        let days = now_days + offset;
-        let (year, month, day) = date_from_days(days);
-        let weekday = weekday_from_days(days);
-        if repeat.fires_on(year, month, day, weekday)
-            && !(offset == 0 && occurrence_minutes <= now_minutes)
-        {
-            return (year, month, day, weekday);
-        }
+    let from_days = days_since_epoch(now.year, now.month, now.day)
+        + if occurrence_minutes > now_minutes { 0 } else { 1 };
+    let (year, month, day) = date_from_days(from_days);
+    let from = CalDate {
+        year,
+        month,
+        day,
+        weekday: weekday_from_days(from_days),
+    };
+    match next_matching_day(repeat, from, 370) {
+        Some(d) => (d.year, d.month, d.day, d.weekday),
+        None => (now.year, now.month, now.day, now.weekday),
     }
-    (now.year, now.month, now.day, now.weekday)
 }
 
 /// Whole days from `now` until the given calendar date (0 = today,
@@ -126,22 +170,21 @@ fn minutes_until(alarm: &StoredAlarm, now: &DateTime) -> i64 {
             delta
         }
         Repeat::Weekly { .. } | Repeat::Monthly { .. } => {
-            let now_days = days_since_epoch(now.year, now.month, now.day);
-            for offset in 0..370 {
-                let days = now_days + offset;
-                let (year, month, day) = date_from_days(days);
-                let weekday = weekday_from_days(days);
-                if !alarm.repeat.fires_on(year, month, day, weekday) {
-                    continue;
-                }
-                if offset == 0 && alarm_minutes <= now_minutes {
-                    // Today's occurrence already passed; keep scanning for
-                    // the next matching date.
-                    continue;
-                }
-                return offset * 24 * 60 + (alarm_minutes - now_minutes);
-            }
-            i64::MAX
+            let from_days = days_since_epoch(now.year, now.month, now.day)
+                + if alarm_minutes > now_minutes { 0 } else { 1 };
+            let (year, month, day) = date_from_days(from_days);
+            let from = CalDate {
+                year,
+                month,
+                day,
+                weekday: weekday_from_days(from_days),
+            };
+            let Some(next) = next_matching_day(&alarm.repeat, from, 370) else {
+                return i64::MAX;
+            };
+            let next_days = days_since_epoch(next.year, next.month, next.day);
+            let offset = next_days - days_since_epoch(now.year, now.month, now.day);
+            offset * 24 * 60 + (alarm_minutes - now_minutes)
         }
         Repeat::Once { year, month, day } => {
             let now_days = days_since_epoch(now.year, now.month, now.day);
@@ -205,6 +248,130 @@ mod tests {
             enabled,
             label: String::new(),
         }
+    }
+
+    #[test]
+    fn next_matching_day_daily_matches_the_start_date_itself() {
+        let from = CalDate {
+            year: 2026,
+            month: 8,
+            day: 22,
+            weekday: 6,
+        };
+        assert_eq!(
+            next_matching_day(&Repeat::Daily, from, 370),
+            Some(from),
+            "Daily covers every day, so the scan must hit `from` itself"
+        );
+    }
+
+    #[test]
+    fn next_matching_day_weekly_skips_non_matching_weekdays() {
+        // 2026-08-31 is a Monday; the next Tuesday (weekday 2) is 2026-09-01.
+        let from = CalDate {
+            year: 2026,
+            month: 8,
+            day: 31,
+            weekday: 1,
+        };
+        let repeat = Repeat::Weekly { days: vec![2] };
+        let next = next_matching_day(&repeat, from, 370).expect("a Tuesday exists");
+        assert_eq!((next.year, next.month, next.day), (2026, 9, 1));
+        assert_eq!(next.weekday, 2);
+    }
+
+    #[test]
+    fn next_matching_day_monthly_wraps_across_year_boundary() {
+        // Only the 5th; from December 10th the next hit is January 5th of
+        // next year.
+        let from = CalDate {
+            year: 2026,
+            month: 12,
+            day: 10,
+            weekday: 4,
+        };
+        let repeat = Repeat::Monthly { days: vec![5] };
+        let next = next_matching_day(&repeat, from, 370).expect("a 5th exists");
+        assert_eq!((next.year, next.month, next.day), (2027, 1, 5));
+    }
+
+    #[test]
+    fn next_matching_day_monthly_never_clamps_to_a_nonexistent_day() {
+        // Day 29 in a non-leap February doesn't exist; the scan must skip
+        // the whole month and land on the next real 29th (March), never a
+        // clamped 28th.
+        let from = CalDate {
+            year: 2026,
+            month: 2,
+            day: 1,
+            weekday: 0,
+        };
+        let repeat = Repeat::Monthly { days: vec![29] };
+        let next = next_matching_day(&repeat, from, 370).expect("a 29th exists");
+        assert_eq!((next.year, next.month, next.day), (2026, 3, 29));
+    }
+
+    #[test]
+    fn next_matching_day_once_matches_only_its_exact_date() {
+        let from = CalDate {
+            year: 2026,
+            month: 8,
+            day: 22,
+            weekday: 6,
+        };
+        let today = Repeat::Once {
+            year: 2026,
+            month: 8,
+            day: 22,
+        };
+        assert_eq!(
+            next_matching_day(&today, from, 370),
+            Some(from),
+            "a One-shot on the start date matches the start date itself"
+        );
+        let tomorrow = Repeat::Once {
+            year: 2026,
+            month: 8,
+            day: 23,
+        };
+        let next = next_matching_day(&tomorrow, from, 370).expect("tomorrow is within the window");
+        assert_eq!((next.year, next.month, next.day), (2026, 8, 23));
+        let yesterday = Repeat::Once {
+            year: 2026,
+            month: 8,
+            day: 21,
+        };
+        assert_eq!(
+            next_matching_day(&yesterday, from, 370),
+            None,
+            "a One-shot behind the start date must not be found"
+        );
+    }
+
+    #[test]
+    fn next_matching_day_respects_a_short_max_days_window() {
+        let from = CalDate {
+            year: 2026,
+            month: 8,
+            day: 22,
+            weekday: 6,
+        };
+        let repeat = Repeat::Weekly { days: vec![2] }; // next Tuesday: Aug 25
+        assert_eq!(
+            next_matching_day(&repeat, from, 3),
+            None,
+            "3 days from Saturday reaches only Sun/Mon - no Tuesday"
+        );
+        assert_eq!(
+            next_matching_day(&repeat, from, 4),
+            Some(CalDate {
+                year: 2026,
+                month: 8,
+                day: 25,
+                weekday: 2,
+            }),
+            "4 days from Saturday reaches Tuesday exactly"
+        );
     }
 
     #[test]
