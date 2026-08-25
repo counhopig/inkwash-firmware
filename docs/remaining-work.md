@@ -1,21 +1,26 @@
 # Firmware Remaining Work
 
-Updated: 2026-08-22  
-Flashed revision: `ac995ca` (`main`) - unchanged this pass: the 2026-08-22
-code-only pass below (items -1, 3, 6, and "Remaining engineering work" #1-2)
-was verified with `cargo check`/`cargo build --release` (both clean, no
-warnings) and, for the new `logic` crate, `cargo test` on the host, but
-**not flashed to physical hardware** - no device was available. Every claim
-below is marked accordingly; do not read "fixed in code" as "verified on
-hardware."
+Updated: 2026-08-25  
+Flashed revision: `b38ff41` (`main`) - reflashed and reverified 2026-08-25
+after a run of code-only refactors (datetime/alarm_schedule calendar-math
+consolidation, a shared NVS blob-store helper, and item -2 below); boot was
+clean (no watchdog reset or panic) and item -2's dedup path was confirmed
+directly on the device. The 2026-08-22 pass below (items -1, 3, 6, and
+"Remaining engineering work" #1-2) predates this reflash and was only
+verified with `cargo check`/`cargo build --release`/`cargo test` on the
+host at the time - those items' hardware-verification status is unchanged
+by this reflash; do not read "fixed in code" as "verified on hardware" for
+anything still marked that way below.
 
 ## Newly discovered from desktop/device logs
 
--2. **P1 — A resent command is fully re-executed, not just re-acknowledged.**
-    Found 2026-08-25 from a real USB session log (`inkwash-desktop`, flashed
-    revision `c8c83dc` - older than this doc's `ac995ca` reference, but the
-    bug reproduces unchanged against current `main` too; grepped for any
-    existing dedup logic and found none). Sequence: user sent `set_wifi`
+-2. ~~**P1 — A resent command is fully re-executed, not just
+    re-acknowledged.**~~ **Fixed and verified on physical hardware**
+    (2026-08-25). Found the same day from a real USB session log
+    (`inkwash-desktop`, flashed revision `c8c83dc` - older than this doc's
+    `ac995ca` reference, but the bug reproduced unchanged against current
+    `main` too; grepped for any existing dedup logic and found none).
+    Sequence: user sent `set_wifi`
     (`req-2`); Wi-Fi association took ~28s (repeated `Haven't to connect to
     a suitable AP now!` retries); once it finally succeeded, the log shows
     `USB control: Wi-Fi credentials saved for 'Ccloude_2.4G'` **9 more
@@ -40,26 +45,39 @@ hardware."
     of duplicate resends that all get *fully executed* once the device
     catches up, not just re-acknowledged.
 
-    **Fixed in code, 2026-08-25 (not yet hardware-verified):**
-    `DeviceContext` now carries `last_command: Option<(String, Command,
-    Reply)>` - the last id-tagged command actually dispatched, and the
-    reply it produced. `control::dispatch` takes the correlation `id` as a
-    parameter and checks it (plus a full `Command` equality check, not just
-    `id`) before doing any work; a match replays the cached `Reply` instead
-    of re-executing. The key is `(id, Command)` together rather than `id`
-    alone deliberately: the desktop's request-id counter restarts at 1 on
-    every process launch, so `id` collisions *across sessions* are the
-    normal case, not a rare edge case - keying on content too means a
+    **Fixed:** `DeviceContext` now carries `last_command: Option<(String,
+    Command, Reply)>` - the last id-tagged command actually dispatched, and
+    the reply it produced. `control::dispatch` takes the correlation `id`
+    as a parameter and checks it (plus a full `Command` equality check, not
+    just `id`) before doing any work; a match replays the cached `Reply`
+    instead of re-executing. The key is `(id, Command)` together rather
+    than `id` alone deliberately: the desktop's request-id counter restarts
+    at 1 on every process launch, so `id` collisions *across sessions* are
+    the normal case, not a rare edge case - keying on content too means a
     same-numbered command from an unrelated session can never replay a
     stale reply for the wrong command. `Busy` replies never populate the
     cache (they don't go through `dispatch` at all), so a duplicate that
     arrives while a blocking screen is up is still correctly retried later,
-    not permanently told "busy". Verified with `cargo build` against the
-    real `xtensa-esp32s3-espidf` target (clean, no warnings) and the
-    `logic` crate's full host test suite (40/40) - **needs a hardware pass
-    repeating the same `set_wifi` → `sync_now` sequence against a slow-to-
-    associate AP to confirm only one `Wi-Fi credentials saved`/`Sync
-    applied` line appears per command.**
+    not permanently told "busy".
+
+    **Verified on physical hardware** (2026-08-25, flashed `b38ff41`):
+    booted clean, no watchdog reset or panic, prior Wi-Fi/server config
+    survived the reflash. `--sync` over USB completed with exactly one
+    `Sync applied`/`USB control sync completed` line, no duplicates, under
+    normal (non-delayed) conditions. Directly exercised the dedup path
+    itself rather than waiting for a real slow AP association to trigger a
+    natural resend: sent `{"cmd":"get_status","id":"dup-test"}` twice
+    back-to-back over the raw USB serial line with no wait in between (the
+    same shape a client's 2s-retry-on-timeout would produce). Device log:
+    the first copy executed and replied normally; the second logged
+    `control: Duplicate command id=dup-test; replaying cached reply without
+    re-executing` and returned the byte-identical cached reply instead of
+    re-running `GetStatus` - confirming the `(id, Command)` cache hit and
+    replay path both work as designed. `set_wifi`/`sync_now` were not
+    re-tested against a genuinely slow-to-associate AP (the original
+    trigger condition), so the *end-to-end* desktop-driven repro from the
+    bug report is still open as a lower-priority follow-up, but the
+    mechanism the fix relies on is now hardware-confirmed directly.
 
 -1. **P0/P1 — Task watchdog abort + reboot during background sync.**
     Found by accident 2026-08-22 during an otherwise-unrelated alarm test:
@@ -300,6 +318,32 @@ issues above.
   identical "single press mutes, doesn't exit; long hold does" symptom,
   which is what motivated the `is_raw_pressed` fix over trying to tune the
   shared debounce constants.
+
+### 2026-08-25 hardware pass (item -2 above, request-id dedup)
+
+- Built `--release` and flashed `b38ff41` via `espflash flash` (no
+  `--monitor`, to avoid blocking an automated session) plus a follow-up
+  `--status` over USB to confirm boot. `GIT_REV` read back as
+  `v0.3.0-31-gb38ff41`; boot log showed no watchdog reset or panic, and the
+  device's previously-saved Wi-Fi/server config survived the reflash
+  unchanged (NVS partition untouched by a plain app-partition flash).
+- `--sync` completed with exactly one `Sync applied: 0 alarms, 0 todos, 3
+  inbox` / `USB control sync completed` line - no duplicate execution under
+  normal (non-delayed) conditions.
+- Directly exercised the dedup path with a hand-crafted duplicate: opened
+  the raw USB serial line (pyserial) and wrote
+  `{"cmd":"get_status","id":"dup-test"}` twice back-to-back with no wait in
+  between - the same shape a client's 2s-retry-on-timeout would produce
+  while the device is still working on the first copy. Device log: the
+  first copy executed and replied normally; the second logged `control:
+  Duplicate command id=dup-test; replaying cached reply without
+  re-executing` and returned the byte-identical cached reply. Confirms the
+  `(id, Command)` cache hit and replay path both work on real hardware, not
+  just in the `logic`/`protocol` host test suites.
+- Not covered: a genuinely slow Wi-Fi association naturally triggering the
+  desktop's real 2s retry loop (the original bug report's exact trigger)
+  wasn't reproduced this pass - see item -2's note on this being a
+  lower-priority follow-up.
 
 ## Required physical-device verification
 
