@@ -14,6 +14,7 @@ mod home;
 mod icons;
 mod inbox;
 mod nfc;
+mod nvs_blob;
 mod power;
 mod reminders;
 mod rtc;

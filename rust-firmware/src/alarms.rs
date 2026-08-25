@@ -13,6 +13,7 @@ use crate::ble_control::BleControl;
 use crate::board::Note4Board;
 use crate::button::POLL_INTERVAL_MS;
 use crate::canvas::Canvas;
+use crate::nvs_blob::{read_blob, write_blob, DirtySet};
 use crate::rtc::{AlarmRegs, DateTime, Pcf8563};
 use crate::usb_console::{reject_pending_command, UsbConsole};
 use crate::{ui, watchdog};
@@ -56,31 +57,11 @@ impl AlarmStore {
 
     /// Empty list if nothing has been saved yet.
     pub fn load(&self) -> Result<Vec<StoredAlarm>> {
-        let mut buf = [0u8; BLOB_BUF_LEN];
-        let bytes = self
-            .nvs
-            .get_blob(KEY_ALARMS, &mut buf)
-            .map_err(|e| anyhow!("NVS get_blob({KEY_ALARMS}) failed: {e}"))?;
-        match bytes {
-            Some(bytes) => {
-                serde_json::from_slice(bytes).map_err(|e| anyhow!("alarms JSON decode failed: {e}"))
-            }
-            None => Ok(Vec::new()),
-        }
+        Ok(read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_ALARMS)?.unwrap_or_default())
     }
 
     pub fn save(&self, alarms: &[StoredAlarm]) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(alarms).map_err(|e| anyhow!("alarms JSON encode failed: {e}"))?;
-        if bytes.len() > BLOB_BUF_LEN {
-            return Err(anyhow!(
-                "alarms blob too large: {} bytes (max {BLOB_BUF_LEN})",
-                bytes.len()
-            ));
-        }
-        self.nvs
-            .set_blob(KEY_ALARMS, &bytes)
-            .map_err(|e| anyhow!("NVS set_blob({KEY_ALARMS}) failed: {e}"))
+        write_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_ALARMS, alarms)
     }
 
     // --- Two-way sync dirty tracking -------------------------------------
@@ -89,40 +70,23 @@ impl AlarmStore {
     // `enabled` flag changed *locally* are uploaded, so a Server/Desktop
     // edit isn't clobbered by the device's stale copy on the next sync.
 
+    fn dirty(&self) -> DirtySet<'_> {
+        DirtySet::new(&self.nvs, KEY_DIRTY)
+    }
+
     /// Marks `id` as locally changed (enabled flag) and pending upload.
     pub fn mark_dirty(&self, id: u8) -> Result<()> {
-        let mut dirty = self.dirty_ids()?;
-        if !dirty.contains(&id) {
-            dirty.push(id);
-        }
-        let bytes =
-            serde_json::to_vec(&dirty).map_err(|e| anyhow!("dirty JSON encode failed: {e}"))?;
-        self.nvs
-            .set_blob(KEY_DIRTY, &bytes)
-            .map_err(|e| anyhow!("NVS set_blob({KEY_DIRTY}) failed: {e}"))
+        self.dirty().mark(id)
     }
 
     /// `local_id`s changed locally since the last successful sync.
     pub fn dirty_ids(&self) -> Result<Vec<u8>> {
-        let mut buf = [0u8; BLOB_BUF_LEN];
-        let bytes = self
-            .nvs
-            .get_blob(KEY_DIRTY, &mut buf)
-            .map_err(|e| anyhow!("NVS get_blob({KEY_DIRTY}) failed: {e}"))?;
-        match bytes {
-            Some(bytes) => {
-                serde_json::from_slice(bytes).map_err(|e| anyhow!("dirty JSON decode failed: {e}"))
-            }
-            None => Ok(Vec::new()),
-        }
+        self.dirty().ids()
     }
 
     /// Drops the dirty set after a successful sync.
     pub fn clear_dirty(&self) -> Result<()> {
-        self.nvs
-            .remove(KEY_DIRTY)
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS remove({KEY_DIRTY}) failed: {e}"))
+        self.dirty().clear()
     }
 }
 

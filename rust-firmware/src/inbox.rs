@@ -11,7 +11,8 @@
 
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
-use serde::{Deserialize, Serialize};
+
+use crate::nvs_blob::{read_blob, write_blob};
 
 /// `InboxKind`/`Priority`/`InboxItem` live in `inkwash-logic` (re-exported
 /// here), alongside the pending-read merge/dedup rules `save`/`mark_read`/
@@ -51,32 +52,12 @@ impl InboxStore {
         Ok(Self { nvs })
     }
 
-    fn read_blob<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
-        let mut buf = [0u8; BLOB_BUF_LEN];
-        let bytes = self
-            .nvs
-            .get_blob(key, &mut buf)
-            .map_err(|e| anyhow!("NVS get_blob({key}) failed: {e}"))?;
-        match bytes {
-            Some(bytes) => serde_json::from_slice(bytes)
-                .map(Some)
-                .map_err(|e| anyhow!("{key} JSON decode failed: {e}")),
-            None => Ok(None),
-        }
+    fn read_blob<T: for<'de> serde::Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
+        read_blob::<BLOB_BUF_LEN, _>(&self.nvs, key)
     }
 
-    fn write_blob<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(value).map_err(|e| anyhow!("{key} JSON encode failed: {e}"))?;
-        if bytes.len() > BLOB_BUF_LEN {
-            return Err(anyhow!(
-                "{key} blob too large: {} bytes (max {BLOB_BUF_LEN})",
-                bytes.len()
-            ));
-        }
-        self.nvs
-            .set_blob(key, &bytes)
-            .map_err(|e| anyhow!("NVS set_blob({key}) failed: {e}"))
+    fn write_blob<T: serde::Serialize + ?Sized>(&self, key: &str, value: &T) -> Result<()> {
+        write_blob::<BLOB_BUF_LEN, _>(&self.nvs, key, value)
     }
 
     /// The authoritative inbox list, empty if never synced.

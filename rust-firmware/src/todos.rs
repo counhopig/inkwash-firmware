@@ -4,6 +4,8 @@
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 
+use crate::nvs_blob::{read_blob, write_blob, DirtySet};
+
 /// `Importance`/`TodoDue`/`Todo` live in `inkwash-logic` (re-exported here)
 /// so `sync_validate`'s host tests share the exact same wire shape instead
 /// of a hand-copied one that could drift - see "Remaining engineering work"
@@ -34,31 +36,11 @@ impl TodoStore {
 
     /// Empty list if nothing has been saved yet.
     pub fn load(&self) -> Result<Vec<Todo>> {
-        let mut buf = [0u8; BLOB_BUF_LEN];
-        let bytes = self
-            .nvs
-            .get_blob(KEY_TODOS, &mut buf)
-            .map_err(|e| anyhow!("NVS get_blob({KEY_TODOS}) failed: {e}"))?;
-        match bytes {
-            Some(bytes) => {
-                serde_json::from_slice(bytes).map_err(|e| anyhow!("todos JSON decode failed: {e}"))
-            }
-            None => Ok(Vec::new()),
-        }
+        Ok(read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_TODOS)?.unwrap_or_default())
     }
 
     pub fn save(&self, todos: &[Todo]) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(todos).map_err(|e| anyhow!("todos JSON encode failed: {e}"))?;
-        if bytes.len() > BLOB_BUF_LEN {
-            return Err(anyhow!(
-                "todos blob too large: {} bytes (max {BLOB_BUF_LEN})",
-                bytes.len()
-            ));
-        }
-        self.nvs
-            .set_blob(KEY_TODOS, &bytes)
-            .map_err(|e| anyhow!("NVS set_blob({KEY_TODOS}) failed: {e}"))
+        write_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_TODOS, todos)
     }
 
     // --- Two-way sync dirty tracking -------------------------------------
@@ -68,40 +50,23 @@ impl TodoStore {
     // Server/Desktop side is not clobbered by the device's stale copy on
     // the next sync. The set is cleared only after a successful sync.
 
+    fn dirty(&self) -> DirtySet<'_> {
+        DirtySet::new(&self.nvs, KEY_DIRTY)
+    }
+
     /// Marks `id` as locally changed (done flag and/or importance) and
     /// pending upload.
     pub fn mark_dirty(&self, id: u8) -> Result<()> {
-        let mut dirty = self.dirty_ids()?;
-        if !dirty.contains(&id) {
-            dirty.push(id);
-        }
-        let bytes =
-            serde_json::to_vec(&dirty).map_err(|e| anyhow!("dirty JSON encode failed: {e}"))?;
-        self.nvs
-            .set_blob(KEY_DIRTY, &bytes)
-            .map_err(|e| anyhow!("NVS set_blob({KEY_DIRTY}) failed: {e}"))
+        self.dirty().mark(id)
     }
 
     /// `local_id`s changed locally since the last successful sync.
     pub fn dirty_ids(&self) -> Result<Vec<u8>> {
-        let mut buf = [0u8; BLOB_BUF_LEN];
-        let bytes = self
-            .nvs
-            .get_blob(KEY_DIRTY, &mut buf)
-            .map_err(|e| anyhow!("NVS get_blob({KEY_DIRTY}) failed: {e}"))?;
-        match bytes {
-            Some(bytes) => {
-                serde_json::from_slice(bytes).map_err(|e| anyhow!("dirty JSON decode failed: {e}"))
-            }
-            None => Ok(Vec::new()),
-        }
+        self.dirty().ids()
     }
 
     /// Drops the dirty set after a successful sync.
     pub fn clear_dirty(&self) -> Result<()> {
-        self.nvs
-            .remove(KEY_DIRTY)
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS remove({KEY_DIRTY}) failed: {e}"))
+        self.dirty().clear()
     }
 }
