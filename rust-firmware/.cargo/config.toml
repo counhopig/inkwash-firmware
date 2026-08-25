@@ -13,8 +13,8 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.5.5"
 ESP_IDF_TOOLS_INSTALL_DIR = "fromenv"
-IDF_PATH = "${HOME}/esp/esp-idf"
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
-# LIBCLANG_PATH is machine-specific (espup installs esp-clang under the
-# per-user rustup toolchain dir) and is resolved dynamically by
-# scripts/build-rust.sh / build-rust.ps1 instead of being hardcoded here.
+# LIBCLANG_PATH and IDF_PATH are machine-specific (espup installs esp-clang
+# under the per-user rustup toolchain dir; ESP-IDF's location varies per
+# install) and are resolved dynamically by scripts/build-rust.sh /
+# build-rust.ps1 instead of being hardcoded here.

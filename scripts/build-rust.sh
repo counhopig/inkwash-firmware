@@ -3,13 +3,26 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [ -f "$HOME/esp/esp-idf/export.sh" ]; then
-    # shellcheck disable=SC1091
-    . "$HOME/esp/esp-idf/export.sh"
-else
-    echo "ESP-IDF not found at ~/esp/esp-idf. Install it first (see README)." >&2
+# Locate ESP-IDF without hardcoding an install path: honor $IDF_PATH when
+# set, else probe the conventional install locations in order.
+if [ -z "${IDF_PATH:-}" ]; then
+    for candidate in "$HOME/esp/esp-idf" "$HOME"/esp/esp-idf-* \
+        "$HOME"/.espressif/frameworks/esp-idf-*; do
+        if [ -f "$candidate/export.sh" ]; then
+            IDF_PATH="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "${IDF_PATH:-}" ] || [ ! -f "$IDF_PATH/export.sh" ]; then
+    echo "Could not locate ESP-IDF. Set \$IDF_PATH or install it under ~/esp (see README)." >&2
     exit 1
 fi
+export IDF_PATH
+
+# shellcheck disable=SC1091
+. "$IDF_PATH/export.sh"
 
 # esp-idf-sys's bindgen step needs espup's esp-clang, which clang-sys does not
 # find on its own. Locate it under the active `esp` rustup toolchain instead

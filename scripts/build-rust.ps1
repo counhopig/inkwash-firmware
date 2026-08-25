@@ -3,18 +3,56 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$idfExport = "C:\Espressif\frameworks\esp-idf-v5.5.5-2\export.ps1"
-$idfPython = "C:\Espressif\python_env\idf5.5_py3.11_env\Scripts"
-$idfGit = "C:\Espressif\tools\idf-git\2.44.0\cmd"
 $projectDir = Join-Path $PSScriptRoot "..\rust-firmware"
 
-if (-not (Test-Path -LiteralPath $idfExport)) {
-    throw "ESP-IDF export script not found: $idfExport"
+# Locate ESP-IDF without hardcoding an install path: honor $env:IDF_PATH
+# when set, else probe the conventional install locations and pick the
+# newest match. (Mirrors scripts/build-rust.sh; Windows side remains
+# unverified on a real toolchain - see docs.)
+$idfRoot = $null
+if ($env:IDF_PATH) {
+    $idfRoot = $env:IDF_PATH
+} else {
+    $candidates = @()
+    foreach ($pattern in @(
+        (Join-Path $env:USERPROFILE "esp\esp-idf"),
+        (Join-Path $env:USERPROFILE "esp\esp-idf-*"),
+        (Join-Path $env:USERPROFILE ".espressif\frameworks\esp-idf-*"),
+        "C:\Espressif\frameworks\esp-idf*"
+    )) {
+        $candidates += @(Get-Item -Path $pattern -Directory -ErrorAction SilentlyContinue)
+    }
+    $idfRoot = $candidates |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
 }
 
-$env:Path = "$idfPython;$idfGit;$env:Path"
-$env:IDF_TOOLS_PATH = "C:\Espressif"
-. $idfExport
+if (-not $idfRoot -or -not (Test-Path (Join-Path $idfRoot "export.ps1"))) {
+    throw "Could not locate ESP-IDF. Set `$env:IDF_PATH or install it conventionally (see README)."
+}
+$env:IDF_PATH = $idfRoot
+
+# Tools dir follows the installer layout: C:\Espressif (offline installer)
+# or ~\.espressif (idf.py online installer).
+if (-not $env:IDF_TOOLS_PATH) {
+    if (Test-Path "C:\Espressif") { $env:IDF_TOOLS_PATH = "C:\Espressif" }
+    else { $env:IDF_TOOLS_PATH = Join-Path $env:USERPROFILE ".espressif" }
+}
+
+# Prepend the tools' python env and bundled git (export.ps1 needs both);
+# each is optional - fall back to whatever is on PATH.
+$prepend = @()
+$pythonEnv = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH "python_env") -Directory -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending | Select-Object -First 1
+if ($pythonEnv) { $prepend += (Join-Path $pythonEnv.FullName "Scripts") }
+$gitCmd = Get-ChildItem -Path (Join-Path $env:IDF_TOOLS_PATH "tools\idf-git\*\cmd") -Directory -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending | Select-Object -First 1
+if ($gitCmd) { $prepend += $gitCmd.FullName }
+if ($prepend.Count -gt 0) {
+    $env:Path = (($prepend -join ";") + ";" + $env:Path)
+}
+
+. (Join-Path $idfRoot "export.ps1")
 
 if (-not $env:LIBCLANG_PATH) {
     # esp-idf-sys's bindgen step needs espup's esp-clang, which clang-sys does
