@@ -230,6 +230,20 @@ impl PersistedCounters {
             .map_err(|e| anyhow!("NVS set_str({KEY_RTC_ALIGN_EPOCH}) failed: {e}"))
     }
 
+    /// Drops the last-alignment marker. Call whenever the RTC clock is set
+    /// from a source other than a confirmed-successful NTP sync (the
+    /// boot-time VL reseed in `main.rs`, from a stale build-time constant) -
+    /// leaving a stale marker in place can leave it *later* than the
+    /// now-reseeded clock, which would otherwise block every future
+    /// alignment attempt indefinitely (see `sync.rs::maybe_align_rtc`'s doc
+    /// comment).
+    pub fn clear_rtc_align_epoch(&self) -> Result<()> {
+        self.nvs
+            .remove(KEY_RTC_ALIGN_EPOCH)
+            .map(|_| ())
+            .map_err(|e| anyhow!("NVS remove({KEY_RTC_ALIGN_EPOCH}) failed: {e}"))
+    }
+
     pub fn timezone_offset_minutes(&self) -> Result<i16> {
         let mut buf = [0u8; 8];
         let value = self

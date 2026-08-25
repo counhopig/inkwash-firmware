@@ -142,6 +142,17 @@ fn main() -> Result<()> {
                     log::warn!("PCF8563 reseed failed: {err}");
                 } else {
                     dt = seeded;
+                    // The clock just jumped to an approximate build-time
+                    // value, not a confirmed-correct one - drop any stale
+                    // "last aligned" marker from before this reseed so
+                    // `sync::maybe_align_rtc` doesn't see a marker that's
+                    // now later than the reseeded clock and (before this
+                    // fix, permanently) skip every future NTP alignment
+                    // attempt. See its doc comment for the hardware case
+                    // this was found from.
+                    if let Err(err) = counters.clear_rtc_align_epoch() {
+                        log::warn!("Failed to clear stale RTC alignment marker: {err}");
+                    }
                 }
             }
             Some(dt)

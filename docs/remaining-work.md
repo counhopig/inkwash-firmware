@@ -14,6 +14,47 @@ anything still marked that way below.
 
 ## Newly discovered from desktop/device logs
 
+-3. ~~**P1 — A backward RTC jump permanently disables NTP realignment.**~~
+    **Fixed and verified on physical hardware** (2026-08-25). Found live on
+    the user's own device: `--status` kept reporting `2026-08-22` days
+    after the actual date. Root-caused with a temporary diagnostic log in
+    `maybe_align_rtc`: the stored `rtc_align_epoch` marker read
+    `2026-08-24T06:00:00Z` while the RTC's current clock read
+    `2026-08-22T13:22:26Z` - the "last successfully aligned" timestamp was
+    *40+ hours ahead* of the clock it's supposed to be tracking.
+
+    **Root cause:** at some point this device's PCF8563 lost backup power
+    (`voltage_low`), and `main.rs`'s boot-time reseed path set the clock
+    from `BUILD_EPOCH_SECS` (a stale, already-days-old firmware build's
+    embedded compile time) without touching `rtc_align_epoch`, which still
+    held the timestamp from a *previous, genuinely successful* NTP
+    alignment that predated the power loss. `sync::maybe_align_rtc` computed
+    staleness as `now.to_unix().saturating_sub(last) >= 24h` - once `last`
+    ended up later than `now`, `saturating_sub` clamped the negative delta
+    to 0, which reads as "just aligned". This is a stable trap: with no
+    error surfaced anywhere, the device silently never becomes eligible for
+    NTP realignment again, no matter how many days pass or how many
+    otherwise-successful syncs run.
+
+    **Fixed:** `maybe_align_rtc` now compares with `abs_diff` instead of
+    `saturating_sub`, so a clock that jumped *backward* by 24h+ is exactly
+    as strong a signal to resync as one that's 24h+ stale forward - both
+    now correctly trigger realignment. Belt-and-suspenders: the boot-time
+    VL reseed in `main.rs` now also calls the new
+    `PersistedCounters::clear_rtc_align_epoch()` right after reseeding the
+    clock, so a stale marker from before a power-loss event can never
+    survive into the reseeded era in the first place, regardless of what
+    the numeric delta happens to be.
+
+    **Verified on physical hardware**, on the exact device this was found
+    on: flashed the fix, ran `--sync` twice. First attempt: `align_due`
+    correctly flipped to `true` and NTP was attempted (previously it never
+    was), but timed out (`esp_idf_svc::sntp: ... timed out waiting for NTP
+    sync`) - a transient network hiccup, not a regression. Second attempt:
+    `NTP sync OK; RTC set to 2026-08-25 12:53:40` - the device's real
+    current date/time. `--status` afterward confirmed `PCF8563: 2026-08-25
+    12:53:53 vl=false`.
+
 -2. ~~**P1 — A resent command is fully re-executed, not just
     re-acknowledged.**~~ **Fixed and verified on physical hardware**
     (2026-08-25). Found the same day from a real USB session log

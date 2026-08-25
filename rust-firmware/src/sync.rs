@@ -376,7 +376,19 @@ pub fn sync_now(
 /// the next sync; the alignment timestamp is only recorded on success.
 fn maybe_align_rtc(counters: &PersistedCounters, rtc: &mut Pcf8563, now: &DateTime) {
     let align_due = match counters.rtc_align_epoch() {
-        Ok(Some(last)) => now.to_unix().saturating_sub(last) >= 24 * 3600,
+        // `abs_diff`, not `saturating_sub(...) >= 24h`: if the RTC clock
+        // itself ever jumps backward - the boot-time VL reseed in main.rs
+        // sets the clock from a stale BUILD_EPOCH_SECS without touching
+        // this marker - `last` can end up *later* than `now`. A
+        // `saturating_sub` of a negative delta clamps to 0, which reads as
+        // "just aligned", permanently blocking any future resync attempt
+        // with no error and no way to self-correct. Confirmed on hardware
+        // 2026-08-25: `now` read ~2026-08-22 while the stored marker read
+        // ~2026-08-24, and the device had been silently stuck on the wrong
+        // date ever since. A clock running backward is exactly as strong a
+        // signal that the stored marker is untrustworthy as one running
+        // forward by the same amount.
+        Ok(Some(last)) => now.to_unix().abs_diff(last) >= 24 * 3600,
         Ok(None) => true,
         Err(err) => {
             log::warn!("Failed to read RTC alignment time: {err}");
