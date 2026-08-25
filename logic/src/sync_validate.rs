@@ -31,16 +31,35 @@ pub struct SyncResponse {
     pub inbox_truncated: bool,
 }
 
+/// The dedup-then-validate loop shared by all three sync stores (alarms,
+/// todos, inbox), so a fix to one store's loop can't silently miss the other
+/// two. Rejects the first duplicate id (error names it as `{kind}`) and runs
+/// every item through `validate`, which the caller wraps with per-item
+/// context (e.g. "alarm 7 has invalid repeat: ..."). Items whose only rule
+/// is uniqueness pass `|_| Ok(())`.
+pub fn dedup_validate<T>(
+    items: &[T],
+    kind: &str,
+    id_of: impl Fn(&T) -> u64,
+    validate: impl Fn(&T) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for item in items {
+        let id = id_of(item);
+        if !ids.insert(id) {
+            return Err(format!("duplicate {kind} id {id}"));
+        }
+        validate(item)?;
+    }
+    Ok(())
+}
+
 /// Rejects malformed or internally inconsistent server state before any NVS
 /// blob is replaced. Wire DTOs deliberately use plain integers for protocol
 /// compatibility; the firmware must establish their invariants at this
 /// boundary instead of letting invalid dates become array indices or RTC BCD.
 pub fn validate_sync_response(response: &SyncResponse) -> Result<(), String> {
-    let mut alarm_ids = HashSet::new();
-    for alarm in &response.alarms {
-        if !alarm_ids.insert(alarm.id) {
-            return Err(format!("duplicate alarm id {}", alarm.id));
-        }
+    dedup_validate(&response.alarms, "alarm", |a| a.id as u64, |alarm| {
         if alarm.hour > 23 || alarm.minute > 59 {
             return Err(format!(
                 "alarm {} has invalid time {:02}:{:02}",
@@ -48,14 +67,10 @@ pub fn validate_sync_response(response: &SyncResponse) -> Result<(), String> {
             ));
         }
         validate_repeat(&alarm.repeat)
-            .map_err(|err| format!("alarm {} has invalid repeat: {err}", alarm.id))?;
-    }
+            .map_err(|err| format!("alarm {} has invalid repeat: {err}", alarm.id))
+    })?;
 
-    let mut todo_ids = HashSet::new();
-    for todo in &response.todos {
-        if !todo_ids.insert(todo.id) {
-            return Err(format!("duplicate todo id {}", todo.id));
-        }
+    dedup_validate(&response.todos, "todo", |t| t.id as u64, |todo| {
         if let Some(due) = todo.due_date {
             validate_date(due.year, due.month, due.day)
                 .map_err(|err| format!("todo {} has invalid due date: {err}", todo.id))?;
@@ -67,14 +82,10 @@ pub fn validate_sync_response(response: &SyncResponse) -> Result<(), String> {
             validate_repeat(repeat)
                 .map_err(|err| format!("todo {} has invalid repeat: {err}", todo.id))?;
         }
-    }
+        Ok(())
+    })?;
 
-    let mut inbox_ids = HashSet::new();
-    for item in &response.inbox {
-        if !inbox_ids.insert(item.id) {
-            return Err(format!("duplicate inbox id {}", item.id));
-        }
-    }
+    dedup_validate(&response.inbox, "inbox", |item| item.id, |_| Ok(()))?;
 
     // Preflight the two fixed-size stores before writing either one. Without
     // this, an oversized todo response could replace alarms and then fail,
@@ -239,5 +250,107 @@ mod tests {
         assert!(validate_date(1999, 1, 1).is_err()); // year out of range
         assert!(validate_date(2100, 1, 1).is_err()); // year out of range
         assert!(validate_date(2026, 4, 31).is_err()); // April has 30 days
+    }
+
+    #[test]
+    fn dedup_validate_alarm_items_rejects_duplicates_then_validates() {
+        let alarms = vec![
+            alarm(1, 9, 0, Repeat::Daily),
+            alarm(2, 10, 0, Repeat::Daily),
+            alarm(1, 11, 0, Repeat::Daily),
+        ];
+        let err = dedup_validate(&alarms, "alarm", |a| a.id as u64, |_| Ok(())).unwrap_err();
+        assert_eq!(err, "duplicate alarm id 1");
+        // Validation still runs on every item, including after a dup-free prefix.
+        let err = dedup_validate(
+            &[alarm(1, 24, 0, Repeat::Daily)],
+            "alarm",
+            |a| a.id as u64,
+            |a| {
+                if a.hour > 23 {
+                    Err(format!("alarm {} has invalid time", a.id))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, "alarm 1 has invalid time");
+    }
+
+    #[test]
+    fn dedup_validate_todo_items_applies_the_once_repeat_rule() {
+        let todos = vec![
+            Todo {
+                id: 5,
+                text: "a".into(),
+                done: false,
+                importance: Default::default(),
+                due_date: None,
+                repeat: Some(Repeat::Daily),
+            },
+            Todo {
+                id: 5,
+                text: "b".into(),
+                done: false,
+                importance: Default::default(),
+                due_date: None,
+                repeat: None,
+            },
+        ];
+        let err = dedup_validate(&todos, "todo", |t| t.id as u64, |_| Ok(())).unwrap_err();
+        assert_eq!(err, "duplicate todo id 5");
+        // Per-item validation is reached for items that pass dedup.
+        let err = dedup_validate(
+            &[Todo {
+                id: 7,
+                text: "x".into(),
+                done: false,
+                importance: Default::default(),
+                due_date: None,
+                repeat: Some(Repeat::Once {
+                    year: 2026,
+                    month: 8,
+                    day: 22,
+                }),
+            }],
+            "todo",
+            |t| t.id as u64,
+            |t| {
+                if matches!(t.repeat, Some(Repeat::Once { .. })) {
+                    Err(format!("todo {} uses unsupported Once repeat", t.id))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, "todo 7 uses unsupported Once repeat");
+    }
+
+    #[test]
+    fn dedup_validate_inbox_items_only_checks_uniqueness() {
+        let items = vec![
+            InboxItem {
+                id: 100,
+                kind: crate::inbox_item::InboxKind::Alert,
+                priority: Default::default(),
+                title: "a".into(),
+                body: String::new(),
+                when: None,
+                read: false,
+            },
+            InboxItem {
+                id: 100,
+                kind: crate::inbox_item::InboxKind::Alert,
+                priority: Default::default(),
+                title: "b".into(),
+                body: String::new(),
+                when: None,
+                read: false,
+            },
+        ];
+        let err = dedup_validate(&items, "inbox", |i| i.id, |_| Ok(())).unwrap_err();
+        assert_eq!(err, "duplicate inbox id 100");
     }
 }
