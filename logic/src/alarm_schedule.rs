@@ -40,6 +40,18 @@ pub enum Repeat {
 }
 
 impl Repeat {
+    /// Stable discriminator string - the server uses this as its SQLite
+    /// `repeat_kind` column value, so it must not change without a
+    /// migration on that side.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Repeat::Daily => "daily",
+            Repeat::Weekly { .. } => "weekly",
+            Repeat::Monthly { .. } => "monthly",
+            Repeat::Once { .. } => "once",
+        }
+    }
+
     /// Whether this schedule covers the given calendar date. `weekday`
     /// is 0=Sunday..6=Saturday.
     pub fn fires_on(&self, year: u16, month: u8, day: u8, weekday: u8) -> bool {

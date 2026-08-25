@@ -14,6 +14,18 @@ pub enum InboxKind {
     Info,
 }
 
+impl From<&str> for InboxKind {
+    /// Used by the server to decode its SQLite `kind` column; unrecognized
+    /// values default to `Info` rather than failing the read.
+    fn from(s: &str) -> Self {
+        match s {
+            "alert" => InboxKind::Alert,
+            "event" => InboxKind::Event,
+            _ => InboxKind::Info,
+        }
+    }
+}
+
 /// Inbox notification priority, wire-compatible with the server's `Priority`
 /// (`"normal"`/`"high"`). `High` alerts trigger an urgent full-screen
 /// reminder with an insistent tone; the sync client long-polls for them so
@@ -24,6 +36,17 @@ pub enum Priority {
     #[default]
     Normal,
     High,
+}
+
+impl From<&str> for Priority {
+    /// Used by the server to decode its SQLite `priority` column;
+    /// unrecognized values default to `Normal` rather than failing the read.
+    fn from(s: &str) -> Self {
+        match s {
+            "high" => Priority::High,
+            _ => Priority::Normal,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

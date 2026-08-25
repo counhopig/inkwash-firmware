@@ -18,6 +18,19 @@ pub enum Importance {
     High,
 }
 
+impl Importance {
+    /// Stable discriminator string - the server uses this as its SQLite
+    /// column value, so it must not change without a migration on that
+    /// side.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Importance::Low => "low",
+            Importance::Medium => "medium",
+            Importance::High => "high",
+        }
+    }
+}
+
 /// Full due date (year/month/day). The calendar page draws a marker on that
 /// date, and a `High` todo due today triggers a one-shot reminder through
 /// `reminders.rs`. The `year` field defaults to 0 so records synced before it
