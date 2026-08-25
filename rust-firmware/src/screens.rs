@@ -1252,7 +1252,7 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 let _ = ctx.poll_usb_control(now);
                 if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command())
                 {
-                    let reply = crate::control::dispatch(ctx, cmd, now);
+                    let reply = crate::control::dispatch(ctx, id.as_deref(), cmd, now);
                     if let Some(ble) = ctx.ble_control.as_ref() {
                         ble.write_reply(&reply, id.as_deref());
                     }

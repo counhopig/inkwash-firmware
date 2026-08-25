@@ -88,6 +88,13 @@ pub struct DeviceContext<'a> {
     pub ble_control: &'a mut Option<BleControl>,
     pub sync_scheduler: SyncScheduler,
     pub alarm_scheduler: AlarmScheduler,
+    /// The last id-tagged command `control::dispatch` actually executed
+    /// (USB or BLE, whichever came last), and the reply it produced.
+    /// Resent duplicates of that exact `(id, Command)` replay the cached
+    /// reply instead of re-executing - see `control::dispatch`'s doc
+    /// comment for why this exists and why the key includes `Command`,
+    /// not just `id`.
+    pub last_command: Option<(String, Command, Reply)>,
 }
 
 impl DeviceContext<'_> {
@@ -100,7 +107,7 @@ impl DeviceContext<'_> {
         };
         let changes_visible_state = !matches!(cmd, Command::GetStatus);
         let fresh_now = self.board.rtc.read_time().ok();
-        let reply = control::dispatch(self, cmd, fresh_now.as_ref().or(now));
+        let reply = control::dispatch(self, id.as_deref(), cmd, fresh_now.as_ref().or(now));
         crate::usb_console::write_reply(&reply, id.as_deref());
         changes_visible_state && matches!(reply, Reply::Ok)
     }

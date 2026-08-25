@@ -11,6 +11,56 @@ hardware."
 
 ## Newly discovered from desktop/device logs
 
+-2. **P1 — A resent command is fully re-executed, not just re-acknowledged.**
+    Found 2026-08-25 from a real USB session log (`inkwash-desktop`, flashed
+    revision `c8c83dc` - older than this doc's `ac995ca` reference, but the
+    bug reproduces unchanged against current `main` too; grepped for any
+    existing dedup logic and found none). Sequence: user sent `set_wifi`
+    (`req-2`); Wi-Fi association took ~28s (repeated `Haven't to connect to
+    a suitable AP now!` retries); once it finally succeeded, the log shows
+    `USB control: Wi-Fi credentials saved for 'Ccloude_2.4G'` **9 more
+    times** over the next ~23s, each preceded by a full disconnect/
+    reconnect/DHCP cycle and each followed by `reply id 'req-2' does not
+    match in-flight request 'req-3'; ignoring` (the desktop had already
+    moved on to `sync_now`, `req-3`, by the time these extra replies
+    arrived). `sync_now` itself then also fully ran twice (`Sync applied:
+    ...` logged twice, ~33s apart) for the same reason.
+
+    **Root cause:** `inkwash-desktop`'s `send_and_wait` (`commands/
+    device.rs`) resends a command under the same `request_id` every 2s
+    while waiting for a reply, on the stated assumption "All protocol
+    commands are idempotent, so a resent command is safe." That's true of
+    the *end state* but not of the *cost* - `usb_console::UsbConsole::
+    poll_command` queues every resent copy as an independent command with
+    no awareness that an identical `(id, Command)` was already dispatched,
+    and `DeviceContext::poll_usb_control`/the BLE dispatch sites
+    unconditionally ran every one of them through `control::dispatch`. Any
+    command slower than the 2s retry interval - Wi-Fi association is the
+    common case, but this applies to `sync_now` too - accumulates a backlog
+    of duplicate resends that all get *fully executed* once the device
+    catches up, not just re-acknowledged.
+
+    **Fixed in code, 2026-08-25 (not yet hardware-verified):**
+    `DeviceContext` now carries `last_command: Option<(String, Command,
+    Reply)>` - the last id-tagged command actually dispatched, and the
+    reply it produced. `control::dispatch` takes the correlation `id` as a
+    parameter and checks it (plus a full `Command` equality check, not just
+    `id`) before doing any work; a match replays the cached `Reply` instead
+    of re-executing. The key is `(id, Command)` together rather than `id`
+    alone deliberately: the desktop's request-id counter restarts at 1 on
+    every process launch, so `id` collisions *across sessions* are the
+    normal case, not a rare edge case - keying on content too means a
+    same-numbered command from an unrelated session can never replay a
+    stale reply for the wrong command. `Busy` replies never populate the
+    cache (they don't go through `dispatch` at all), so a duplicate that
+    arrives while a blocking screen is up is still correctly retried later,
+    not permanently told "busy". Verified with `cargo build` against the
+    real `xtensa-esp32s3-espidf` target (clean, no warnings) and the
+    `logic` crate's full host test suite (40/40) - **needs a hardware pass
+    repeating the same `set_wifi` → `sync_now` sequence against a slow-to-
+    associate AP to confirm only one `Wi-Fi credentials saved`/`Sync
+    applied` line appears per command.**
+
 -1. **P0/P1 — Task watchdog abort + reboot during background sync.**
     Found by accident 2026-08-22 during an otherwise-unrelated alarm test:
     after ~2.5 hours and dozens of successful sync cycles in one boot

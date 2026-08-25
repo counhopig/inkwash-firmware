@@ -132,6 +132,16 @@ especially once the `busy` reply exists - a reminder screen can make several
 replies arrive close together. Set `id` and match on it rather than assuming
 replies arrive in the order requests were sent.
 
+**Resending is safe and cheap when `id` is set.** If a client resends the
+same command (same `id`, same body) because it hasn't seen a reply yet - USB
+boot reset, a slow operation, a lost byte - the device recognizes the exact
+`(id, command)` pair it already executed and replays the cached reply
+instead of re-running the command. Without a matching `id` on both the
+original and the resend, the device has no way to tell a resend apart from
+a genuinely new, identically-shaped command, and will execute it again -
+this matters for anything with a real side effect (`set_wifi`, `sync_now`),
+not just for saving battery.
+
 ### Replies
 
 Replies are sent as JSON objects, one per line. Each reply has a `status` field

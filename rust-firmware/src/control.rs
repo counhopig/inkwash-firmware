@@ -17,7 +17,7 @@ use crate::storage::{DeviceConfig, WifiCreds};
 use crate::sync;
 
 /// Incoming command from a USB/BLE client.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     /// Configure Wi-Fi credentials. Will attempt to connect to verify before
@@ -45,7 +45,7 @@ pub enum Command {
 }
 
 /// Reply sent back to a USB/BLE client.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
     /// Command succeeded.
@@ -112,7 +112,43 @@ pub fn render_reply(reply: &Reply, id: Option<&str>) -> String {
 /// both USB (Phase 4) and BLE (Phase 5) control channels will call into,
 /// so it must remain transport-agnostic. It accesses the board (for
 /// RTC and Wi-Fi state), the stores (for syncing), and the time.
-pub fn dispatch(ctx: &mut DeviceContext, cmd: Command, now: Option<&DateTime>) -> Reply {
+///
+/// `id` (the client's correlation id, if any) is checked against
+/// `ctx.last_command` before doing any work: a client resends a command
+/// verbatim - same `id` - whenever it hasn't seen a reply yet (USB boot
+/// reset, a `Busy` reply, or just a slow op like `SetWifi`/`SyncNow` taking
+/// longer than the client's retry interval), and the transports queue every
+/// resent copy as an independent command with no dedup of their own (see
+/// `usb_console::UsbConsole::poll_command`). Without this check, a command
+/// that takes a while to complete gets replayed - fully re-executed, not
+/// just re-acknowledged - once for every resend still queued by the time
+/// the device catches up. Confirmed on hardware 2026-08-25: a single
+/// `set_wifi` ran 10 times (9 extra Wi-Fi disconnect/reconnect/save cycles)
+/// and `sync_now` ran twice, both because the device was busy long enough
+/// for the desktop's 2s retry to queue several duplicates - see
+/// `docs/remaining-work.md`. The cache key is `(id, Command)` together, not
+/// `id` alone: the desktop's request-id counter restarts at 1 every process
+/// launch, so `id` collisions *across sessions* are the common case, not an
+/// edge case - keying on content too means a same-numbered command from an
+/// unrelated session can never replay a stale reply for the wrong command.
+pub fn dispatch(ctx: &mut DeviceContext, id: Option<&str>, cmd: Command, now: Option<&DateTime>) -> Reply {
+    if let Some(id) = id {
+        if let Some((last_id, last_cmd, last_reply)) = &ctx.last_command {
+            if last_id == id && *last_cmd == cmd {
+                log::info!("Duplicate command id={id}; replaying cached reply without re-executing");
+                return last_reply.clone();
+            }
+        }
+    }
+    let cmd_for_cache = cmd.clone();
+    let reply = dispatch_inner(ctx, cmd, now);
+    if let Some(id) = id {
+        ctx.last_command = Some((id.to_string(), cmd_for_cache, reply.clone()));
+    }
+    reply
+}
+
+fn dispatch_inner(ctx: &mut DeviceContext, cmd: Command, now: Option<&DateTime>) -> Reply {
     match cmd {
         Command::SetWifi { ssid, password } => {
             let creds = WifiCreds { ssid, password };

@@ -296,6 +296,7 @@ fn main() -> Result<()> {
         ble_control: &mut ble_control,
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
         alarm_scheduler: AlarmScheduler::new(clock.as_ref(), alarm_fired_at_boot),
+        last_command: None,
     };
 
     let mut status_tick = 0u32;
@@ -364,7 +365,7 @@ fn main() -> Result<()> {
         // shape `ble_pairing_screen` uses.
         if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command()) {
             let needs_full_redraw = matches!(cmd, control::Command::SyncNow);
-            let reply = control::dispatch(&mut ctx, cmd, clock.as_ref());
+            let reply = control::dispatch(&mut ctx, id.as_deref(), cmd, clock.as_ref());
             if needs_full_redraw && matches!(reply, control::Reply::Ok) {
                 dirty.push(FULL_SCREEN_RECT);
             }
