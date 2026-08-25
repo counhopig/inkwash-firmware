@@ -1,15 +1,15 @@
 # Firmware Remaining Work
 
 Updated: 2026-08-25  
-Flashed revision: working tree at `1fc611d` (`main`) - reflashed and
-reverified 2026-08-25 twice this pass: first for item -2 (request-id
-dedup), then again for item -3 (RTC alignment), both confirmed directly on
-the device in the same session. The 2026-08-22 pass below (items -1, 3, 6,
-and "Remaining engineering work" #1-2) predates both reflashes and was
-only verified with `cargo check`/`cargo build --release`/`cargo test` on
-the host at the time - those items' hardware-verification status is
-unchanged; do not read "fixed in code" as "verified on hardware" for
-anything still marked that way below.
+Flashed revision: working tree at `32fea38` (`main`) - reflashed and
+reverified 2026-08-25 three times this pass: item -2 (request-id dedup),
+item -3 (RTC alignment), and item -4 (charge/battery display), each
+confirmed directly on the device in the same session. The 2026-08-22 pass
+below (items -1, 3, 6, and "Remaining engineering work" #1-2) predates all
+three reflashes and was only verified with `cargo check`/`cargo build
+--release`/`cargo test` on the host at the time - those items'
+hardware-verification status is unchanged; do not read "fixed in code" as
+"verified on hardware" for anything still marked that way below.
 
 ## Newly discovered from desktop/device logs
 
