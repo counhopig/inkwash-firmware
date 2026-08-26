@@ -190,25 +190,27 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_todo_and_inbox_ids() {
-        let mut todo_dup = SyncResponse::default();
-        todo_dup.todos = vec![
-            Todo {
-                id: 5,
-                text: "a".into(),
-                done: false,
-                importance: Default::default(),
-                due_date: None,
-                repeat: None,
-            },
-            Todo {
-                id: 5,
-                text: "b".into(),
-                done: false,
-                importance: Default::default(),
-                due_date: None,
-                repeat: None,
-            },
-        ];
+        let todo_dup = SyncResponse {
+            todos: vec![
+                Todo {
+                    id: 5,
+                    text: "a".into(),
+                    done: false,
+                    importance: Default::default(),
+                    due_date: None,
+                    repeat: None,
+                },
+                Todo {
+                    id: 5,
+                    text: "b".into(),
+                    done: false,
+                    importance: Default::default(),
+                    due_date: None,
+                    repeat: None,
+                },
+            ],
+            ..Default::default()
+        };
         assert!(validate_sync_response(&todo_dup).is_err());
     }
 
