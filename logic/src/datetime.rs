@@ -182,7 +182,11 @@ mod tests {
             ..Default::default()
         }
         .to_unix();
-        assert_eq!(DateTime::from_unix(epoch).weekday, 6, "2026-08-22 is a Saturday");
+        assert_eq!(
+            DateTime::from_unix(epoch).weekday,
+            6,
+            "2026-08-22 is a Saturday"
+        );
     }
 
     #[test]

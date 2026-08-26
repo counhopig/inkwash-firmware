@@ -11,8 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::datetime::DateTime;
 use crate::datetime::weekday_from_days;
+use crate::datetime::DateTime;
 
 // Re-exported so `rust-firmware/src/alarms.rs`'s existing
 // `alarms::{days_since_epoch, date_from_days}` call sites keep working
@@ -133,7 +133,11 @@ pub fn next_occurrence_date(
     let occurrence_minutes = hour as i64 * 60 + minute as i64;
     let now_minutes = now.hour as i64 * 60 + now.minute as i64;
     let from_days = days_since_epoch(now.year, now.month, now.day)
-        + if occurrence_minutes > now_minutes { 0 } else { 1 };
+        + if occurrence_minutes > now_minutes {
+            0
+        } else {
+            1
+        };
     let (year, month, day) = date_from_days(from_days);
     let from = CalDate {
         year,
@@ -513,7 +517,7 @@ mod tests {
         let alarms = vec![
             alarm(0, 23, 0, Repeat::Daily, true),  // 13h away
             alarm(1, 10, 30, Repeat::Daily, true), // 30m away - soonest
-            alarm(2, 10, 5, Repeat::Daily, false),  // sooner but disabled
+            alarm(2, 10, 5, Repeat::Daily, false), // sooner but disabled
         ];
         let due = next_due(&alarms, &now).expect("an enabled alarm exists");
         assert_eq!(due.id, 1);

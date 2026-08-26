@@ -59,31 +59,41 @@ pub fn dedup_validate<T>(
 /// compatibility; the firmware must establish their invariants at this
 /// boundary instead of letting invalid dates become array indices or RTC BCD.
 pub fn validate_sync_response(response: &SyncResponse) -> Result<(), String> {
-    dedup_validate(&response.alarms, "alarm", |a| a.id as u64, |alarm| {
-        if alarm.hour > 23 || alarm.minute > 59 {
-            return Err(format!(
-                "alarm {} has invalid time {:02}:{:02}",
-                alarm.id, alarm.hour, alarm.minute
-            ));
-        }
-        validate_repeat(&alarm.repeat)
-            .map_err(|err| format!("alarm {} has invalid repeat: {err}", alarm.id))
-    })?;
-
-    dedup_validate(&response.todos, "todo", |t| t.id as u64, |todo| {
-        if let Some(due) = todo.due_date {
-            validate_date(due.year, due.month, due.day)
-                .map_err(|err| format!("todo {} has invalid due date: {err}", todo.id))?;
-        }
-        if let Some(repeat) = &todo.repeat {
-            if matches!(repeat, alarm_schedule::Repeat::Once { .. }) {
-                return Err(format!("todo {} uses unsupported Once repeat", todo.id));
+    dedup_validate(
+        &response.alarms,
+        "alarm",
+        |a| a.id as u64,
+        |alarm| {
+            if alarm.hour > 23 || alarm.minute > 59 {
+                return Err(format!(
+                    "alarm {} has invalid time {:02}:{:02}",
+                    alarm.id, alarm.hour, alarm.minute
+                ));
             }
-            validate_repeat(repeat)
-                .map_err(|err| format!("todo {} has invalid repeat: {err}", todo.id))?;
-        }
-        Ok(())
-    })?;
+            validate_repeat(&alarm.repeat)
+                .map_err(|err| format!("alarm {} has invalid repeat: {err}", alarm.id))
+        },
+    )?;
+
+    dedup_validate(
+        &response.todos,
+        "todo",
+        |t| t.id as u64,
+        |todo| {
+            if let Some(due) = todo.due_date {
+                validate_date(due.year, due.month, due.day)
+                    .map_err(|err| format!("todo {} has invalid due date: {err}", todo.id))?;
+            }
+            if let Some(repeat) = &todo.repeat {
+                if matches!(repeat, alarm_schedule::Repeat::Once { .. }) {
+                    return Err(format!("todo {} uses unsupported Once repeat", todo.id));
+                }
+                validate_repeat(repeat)
+                    .map_err(|err| format!("todo {} has invalid repeat: {err}", todo.id))?;
+            }
+            Ok(())
+        },
+    )?;
 
     dedup_validate(&response.inbox, "inbox", |item| item.id, |_| Ok(()))?;
 

@@ -153,7 +153,10 @@ mod tests {
         let now = dt(2026, 8, 22, 6); // Saturday
         let mut recurring = todo(1, Importance::High, false, None);
         recurring.repeat = Some(Repeat::Weekly { days: vec![6] });
-        assert_eq!(due_high_importance_todos(&[recurring.clone()], &now).len(), 1);
+        assert_eq!(
+            due_high_importance_todos(&[recurring.clone()], &now).len(),
+            1
+        );
         recurring.repeat = Some(Repeat::Weekly { days: vec![1] }); // Monday only
         assert!(due_high_importance_todos(&[recurring], &now).is_empty());
     }
@@ -164,7 +167,7 @@ mod tests {
         let new_items = vec![
             item(1, false), // still unread - kept
             item(2, true),  // server applied the ack - dropped
-            // 3 no longer present at all - dropped
+                            // 3 no longer present at all - dropped
         ];
         let mut result = merge_pending_read(&pending, &new_items);
         result.sort();
