@@ -3,7 +3,15 @@
 All notable changes to **inkwash-firmware** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.5.0] - 2026-08-27
+
+### Changed
+- **Version aligned to 0.5.0** across the four Inkwash repositories.
+
+### Added
+- **CI workflow for `inkwash-logic`** (host tests, rustfmt, clippy) on
+  push/PR - the firmware crate itself still needs the ESP-IDF toolchain,
+  so only the host-testable logic layer runs in CI.
 
 ## [0.4.0] - 2026-08-21
 
