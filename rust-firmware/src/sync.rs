@@ -38,13 +38,15 @@ const RESPONSE_BUF_LEN: usize = 16384;
 /// Explicit socket timeout for every HTTP client used in this module.
 /// `Configuration::timeout` defaults to `None`, which leaves the native
 /// `esp_http_client`'s own default in effect rather than a value under our
-/// control - not guaranteed to be shorter than `CONFIG_ESP_TASK_WDT_TIMEOUT_S`
-/// (10s; see `sdkconfig.defaults`). Set well under that budget so a
-/// stalled/slow connection surfaces as a clean `Err` instead of leaving the
-/// main task blocked in a read long enough for the task watchdog to fire -
-/// see item -1 in `../docs/remaining-work.md` for the live reboot this is meant
-/// to prevent.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+/// control. It bounds each blocked read inside `request.submit()` below -
+/// a call that also contains the TLS handshake, so the whole thing runs
+/// without a single `watchdog::feed()` for up to handshake + this value.
+/// Both live TWDT aborts (item -1) died in exactly that window: handshake
+/// ~1-4.7s plus a stalled submit 5-8.7s blew the 10s watchdog budget even
+/// with the old 8s timeout. 5s keeps handshake + submit + error teardown
+/// under `CONFIG_ESP_TASK_WDT_TIMEOUT_S` (20s) on a flaky link while still
+/// being generous for a real server over the public internet.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of a bidirectional sync after the merged server state is applied.
 #[derive(Clone, Debug)]
@@ -156,6 +158,7 @@ fn https_post(
         .map_err(|e| anyhow!("POST {url} failed to start: {e}"))?;
     let mut written = 0usize;
     while written < body.len() {
+        watchdog::feed();
         let count = request
             .write(&body[written..])
             .map_err(|e| anyhow!("POST {url} body write failed: {e}"))?;
@@ -164,11 +167,14 @@ fn https_post(
         }
         written += count;
     }
-    let mut response = request
-        .submit()
-        .map_err(|e| anyhow!("POST {url} failed: {e}"))?;
-
+    let submit = request.submit();
+    // Feed on the error path too: a timed-out/stalled submit returns here
+    // without ever reaching the `feed()` below, and the handshake+submit
+    // window just elapsed was entirely un-feedable - the exact shape of
+    // both item -1 TWDT aborts. Any post-error teardown in the caller
+    // (NVS write, disconnect, redraw) now runs with a fresh budget.
     watchdog::feed();
+    let mut response = submit.map_err(|e| anyhow!("POST {url} failed: {e}"))?;
     if response.status() != 200 {
         return Err(anyhow!("{err_label}: HTTP {}", response.status()));
     }

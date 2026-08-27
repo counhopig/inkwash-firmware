@@ -30,10 +30,13 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
 
 # Task watchdog: catch a genuine hang (stuck peripheral, a future infinite
-# loop) and reboot instead of leaving the device stuck. 10s gives headroom
-# over the longest observed single blocking call (Wi-Fi scan, ~2.5s) while
-# still catching anything that's actually stuck. See src/watchdog.rs.
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# loop) and reboot instead of leaving the device stuck. The longest
+# un-feedable window is the HTTPS round-trip in sync.rs::https_post: TLS
+# handshake (observed up to ~4.7s on a flaky link) plus the 5s
+# HTTP_TIMEOUT submit, ~10s worst case - the two live TWDT aborts in item
+# -1 died in that window. 20s keeps 2x headroom over it while still
+# rebooting anything genuinely stuck. See src/watchdog.rs.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=20
 CONFIG_ESP_TASK_WDT_PANIC=y
 
 # BLE/NimBLE configuration for Phase 5 (on-demand BLE control channel).
