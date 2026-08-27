@@ -238,13 +238,23 @@ Exit the monitor with `Ctrl+C`. If flashing fails, exit the monitor first, then 
 
 ### Success Criteria
 
-1. After boot, the device stays powered when the power key is released.
-2. The green LED blinks periodically (the `led_tick` outside `button.rs` toggles every ~0.5 s in the main loop).
-3. The screen displays `Hello world` after an obvious full-refresh process.
-4. The screen shows the three counters for ENTER / UP / DOWN.
-5. Each press of the corresponding key prints the key name to the serial log and increments the on-screen counter once (partial refresh).
+These are the minimal post-flash checks for the current Inkwash firmware;
+the full on-device checklist (Wi-Fi sync, alarm ringing, reminders, BLE/USB
+recovery, capacity) is §13.
 
-In the current example, each key press refreshes only the changed numeric region using the official partial-refresh API; full refresh is only performed at boot and for long-press ghost clearing.
+1. After boot, the device stays powered when the power key is released.
+2. The serial log shows `Inkwash NOTE4 Rust bring-up starting (git <rev>)`
+   (plus the PCF8563 `read_time` line), then the main loop's periodic
+   power/clock reports.
+3. The screen renders the Home screen after an obvious full-refresh
+   process: the clock, the NEXT ALARM / OPEN TODOS cards, and the battery
+   indicator — no `Hello world`, no counters.
+4. The firmware answers the USB control protocol:
+   `inkwash-desktop --status <port>` returns a `Status { ... }` reply (it
+   also echoes the recent boot log lines).
+5. A long press of UP/DOWN opens the navigation drawer (HOME /
+   CALENDAR / INBOX / ALARMS / TODOS / SETTINGS) and the pages render;
+   short presses on Home are a deliberate no-op.
 
 ## 9. Display Data Conventions
 
