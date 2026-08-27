@@ -8,8 +8,6 @@ This document records the hardware information, development environment, build a
 
 Target device: **ZECTRIX NOTE4 black-and-white display version** (i.e., the hardware corresponding to `itopinion/zectrix-note4-epd-demo`). The firmware is a usable offline-first calendar/alarm/todo device: Wi-Fi STA+NTP, audio (ES8311), RTC (PCF8563, including hardware alarm registers), NFC (GT23SC6699), battery management and ADC, deep sleep (GPIO17 RTC hold), USB/BLE control protocol, and HTTPS two-way sync are all implemented.
 
-This document deliberately contains **no progress tracking** — what is verified on device and what remains is tracked in the umbrella workspace's `docs/project-status.md` and `docs/remaining-work.md` (one level above this repository); keep those files up to date instead of growing status sections here.
-
 ## 2. Safety Matters (Non-Negotiable)
 
 1. **Confirm the device is the NOTE4 black-and-white display version.** The NOTE4C's display hardware and firmware differ; do not cross-flash.
@@ -375,10 +373,9 @@ timing, real Wi-Fi association, real flash wear, real button debounce, a
 real watchdog.
 
 Run this after any change touching `sync.rs`, `wifi.rs`, `alarms.rs`,
-`reminders.rs`, `ctx.rs`, `main.rs`, `ble_control.rs`, or `usb_console.rs`,
-and before recording "verified on hardware" in the umbrella workspace's
-`docs/remaining-work.md`. Record the flashed revision (`git describe`,
-logged once at boot as `GIT_REV`) alongside results.
+`reminders.rs`, `ctx.rs`, `main.rs`, `ble_control.rs`, or `usb_console.rs`.
+Record the flashed revision (`git describe`, logged once at boot as
+`GIT_REV`) alongside results.
 
 ### Flash and boot
 
@@ -461,15 +458,6 @@ logged once at boot as `GIT_REV`) alongside results.
       `inbox::BLOB_BUF_LEN`); confirm pagination/truncation and no NVS
       write failure, and check the e-paper for visible ghosting after
       several full refreshes.
-
-### Recording results
-
-Append a dated entry to the umbrella workspace's `docs/remaining-work.md`
-(one level above this repository) naming exactly which checklist items
-passed, on what hardware, against what flashed revision - matching the
-existing entries' level of detail (specific log lines, timings, and repro
-counts, not just "works"). An item silently skipped is not the same as one
-verified; say which is which.
 
 ## 14. Restoring Factory Firmware
 

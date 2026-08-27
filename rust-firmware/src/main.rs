@@ -291,7 +291,7 @@ fn main() -> Result<()> {
     // a `&mut` to this slot rather than the `BleControl` itself, so every
     // blocking screen that goes through it (reminders, alarm ring) can still
     // reach BLE to reply `busy` to a queued command - see `ctx.rs`'s doc
-    // comment and item 3 in `../docs/remaining-work.md`.
+    // comment.
     let mut ble_control: Option<ble_control::BleControl> = None;
 
     // Bundle the long-lived state into one context, then run the main loop

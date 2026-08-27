@@ -5,8 +5,7 @@ use crate::board::SharedI2c;
 
 /// `DateTime` and `is_leap` are pure calendar/epoch math with no I2C or
 /// other hardware dependency, so they live in `inkwash-logic` where they can
-/// be unit-tested on the host (see "Remaining engineering work" #1 in
-/// `../docs/remaining-work.md`) - this crate is the single source of truth,
+/// be unit-tested on the host - this crate is the single source of truth,
 /// re-exported here so every existing `crate::rtc::DateTime` /
 /// `crate::rtc::is_leap` call site keeps working unchanged.
 pub use inkwash_logic::datetime::{is_leap, DateTime};

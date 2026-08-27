@@ -33,8 +33,7 @@ const MAX_RING_SECS: u64 = 300;
 /// so they can be unit-tested on the host - this crate is the single source
 /// of truth, re-exported here so every existing `alarms::Repeat` /
 /// `alarms::StoredAlarm` / `alarms::next_due` (etc.) call site keeps working
-/// unchanged. See "Remaining engineering work" #1 in
-/// `../docs/remaining-work.md`.
+/// unchanged.
 pub use inkwash_logic::alarm_schedule::{
     date_from_days, days_since_epoch, days_until, is_expired_once, next_due, next_id,
     next_occurrence_date, Repeat, StoredAlarm,

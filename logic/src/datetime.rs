@@ -8,7 +8,7 @@
 //! and `alarm_schedule`'s recurrence math both build on these instead of
 //! each carrying their own copy of the month-length table. That used to
 //! be two independent copies of the same leap-year arithmetic, and both
-//! were wrong the same way at once (`../docs/remaining-work.md` item 0).
+//! were wrong the same way at once.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DateTime {
@@ -61,8 +61,7 @@ pub fn is_leap(year: i64) -> bool {
 
 /// Days per month for a given year (leap-aware). The single table every
 /// calendar computation in this crate reads from - see the module doc
-/// comment on why having more than one copy of this table is exactly what
-/// caused `../docs/remaining-work.md` item 0.
+/// comment on why having more than one copy of this table is dangerous.
 fn month_lengths(year: i64) -> [i64; 12] {
     if is_leap(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -107,9 +106,8 @@ pub fn date_from_days(mut days: i64) -> (u16, u8, u8) {
 }
 
 /// Weekday (0=Sunday..6=Saturday) for an absolute day number. 1970-01-01
-/// was a Thursday (4) - see `../docs/remaining-work.md` item 0: this constant
-/// was `3` for a long time, which put every weekday-derived feature a day
-/// off.
+/// was a Thursday (4) - this constant was `3` for a long time, which put every
+/// weekday-derived feature a day off.
 pub(crate) fn weekday_from_days(days: i64) -> u8 {
     ((days + 4).rem_euclid(7)) as u8
 }
@@ -119,9 +117,8 @@ mod tests {
     use super::*;
 
     /// Independent ground truth for weekday, deliberately *not* sharing any
-    /// code with `DateTime::from_unix` - the item-0 bug (weekday off by one
-    /// everywhere) would have passed a test that reused the same `+3`/`+4`
-    /// formula under test. Zeller's congruence (Gregorian form); returns
+    /// code with `DateTime::from_unix` - a weekday-off-by-one bug would have passed a test
+    /// that reused the same `+3`/`+4` formula under test. Zeller's congruence (Gregorian form); returns
     /// 0=Sunday..6=Saturday to match this codebase's convention.
     fn zeller_weekday(year: i64, month: i64, day: i64) -> u8 {
         let (y, m) = if month < 3 {
@@ -172,9 +169,9 @@ mod tests {
 
     #[test]
     fn known_bug_report_date_is_saturday() {
-        // 2026-08-22: the date `../docs/remaining-work.md` records as the
-        // physical-hardware reproduction of the weekday bug ("device showed
-        // Friday on a Saturday"). Locks in the fix for that exact report.
+        // 2026-08-22: physical-hardware reproduction of the weekday bug
+        // ("device showed Friday on a Saturday"). Locks in the fix for that
+        // exact report.
         let epoch = DateTime {
             year: 2026,
             month: 8,

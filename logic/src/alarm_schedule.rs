@@ -94,7 +94,7 @@ pub struct CalDate {
 /// `next_occurrence_date` and `minutes_until`'s Weekly/Monthly branches -
 /// before this function existed each caller carried its own copy of this
 /// scan, and a duplicated date-math bug in one copy is exactly the class of
-/// error that produced `../docs/remaining-work.md` items 0 and -3).
+/// error this refactor prevents.
 ///
 /// The scan runs for `max_days` consecutive days starting at `from`
 /// (inclusive). `None` means no matching day within the window; non-empty

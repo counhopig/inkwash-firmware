@@ -8,7 +8,7 @@ Self-developed firmware repository for the ZECTRIX NOTE4 black-and-white display
 ## STRUCTURE
 ```
 inkwash/
-├── docs/            # All documentation: development guide (must read; includes board reference + hardware smoke-test checklist) and two cross-repo protocol contracts. Progress/status docs live in the umbrella workspace's ../docs/, not here
+├── docs/            # All documentation: development guide (must read; includes board reference + hardware smoke-test checklist) and two cross-repo protocol contracts.
 ├── rust-firmware/   # The only product code: inkwash-note4 crate (21 flat src modules ~4.3k LOC + C++ EPD component)
 ├── scripts/         # Build/flash/provisioning scripts (.sh=Linux, .ps1=Windows twin, +1 Python provisioning)
 ├── vendor/          # vendored esp-idf-hal 0.46.2 + sdmmc patch (third-party, read-only, see UNIQUE STYLES)
@@ -26,7 +26,6 @@ No root Cargo.toml, no workspace, no CI, no LICENSE. `.omo/` and `.claude/` are 
 | USB/BLE command protocol | `docs/control-protocol.md` | Contract with inkwash-desktop |
 | HTTP sync protocol | `docs/sync-api.md` | Contract with inkwash-server |
 | Wi-Fi connection history and scan culprit investigation | `rust-firmware/src/wifi.rs` (`WifiManager` doc comments) | Complete reasoning chain and root cause of the second-connection crash (resolved); code-level summary in `rust-firmware/AGENTS.md` |
-| On-device verification status / cross-repo progress | `../docs/project-status.md`, `../docs/remaining-work.md` (umbrella workspace, outside this repo) | Contains a "not yet verified on device" checklist and remaining-work tracking for all four repos |
 
 ## CODE MAP
 No codegraph tooling; rust-analyzer has been available since 2026-08-18 (`esp-ra` toolchain + IDF env injection, see NOTES) — the following is static analysis; reference centrality is not measured.

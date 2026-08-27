@@ -23,8 +23,7 @@ use crate::watchdog;
 use crate::wifi;
 
 /// `SyncResponse` and `validate_sync_response` (the sync merge rules) live
-/// in `inkwash-logic` so they can be unit-tested on the host - see
-/// "Remaining engineering work" #1 in `../docs/remaining-work.md`. This crate
+/// in `inkwash-logic` so they can be unit-tested on the host. This crate
 /// is the single source of truth; everything below just wires the result
 /// into HTTP + NVS.
 use inkwash_logic::sync_validate::{validate_sync_response, SyncResponse};
@@ -41,7 +40,7 @@ const RESPONSE_BUF_LEN: usize = 16384;
 /// control. It bounds each blocked read inside `request.submit()` below -
 /// a call that also contains the TLS handshake, so the whole thing runs
 /// without a single `watchdog::feed()` for up to handshake + this value.
-/// Both live TWDT aborts (item -1) died in exactly that window: handshake
+/// Both live TWDT aborts died in exactly that window: handshake
 /// ~1-4.7s plus a stalled submit 5-8.7s blew the 10s watchdog budget even
 /// with the old 8s timeout. 5s keeps handshake + submit + error teardown
 /// under `CONFIG_ESP_TASK_WDT_TIMEOUT_S` (20s) on a flaky link while still
@@ -117,8 +116,8 @@ fn read_body_fully(response: &mut impl embedded_svc::io::Read, buf: &mut [u8]) -
 /// message) and reads the whole body into `buf` through `read_body_fully`.
 /// That last step is load-bearing: the body MUST go through the
 /// watchdog-feeding read loop rather than one unbroken blocking read, the
-/// prime suspect of the live TWDT abort documented on `read_body_fully` and
-/// item -1 in `../docs/remaining-work.md`. Returns `(bytes_read, etag)` -
+/// prime suspect of the live TWDT abort documented on `read_body_fully`.
+/// Returns `(bytes_read, etag)` -
 /// the response's `etag` header if present, surfaced because
 /// `fetch_and_apply` needs it for conditional-request bookkeeping and the
 /// connection is gone once this helper returns.
@@ -171,7 +170,7 @@ fn https_post(
     // Feed on the error path too: a timed-out/stalled submit returns here
     // without ever reaching the `feed()` below, and the handshake+submit
     // window just elapsed was entirely un-feedable - the exact shape of
-    // both item -1 TWDT aborts. Any post-error teardown in the caller
+    // both TWDT aborts. Any post-error teardown in the caller
     // (NVS write, disconnect, redraw) now runs with a fresh budget.
     watchdog::feed();
     let mut response = submit.map_err(|e| anyhow!("POST {url} failed: {e}"))?;

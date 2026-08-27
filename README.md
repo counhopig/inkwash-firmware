@@ -126,10 +126,8 @@ inkwash-firmware/
 ## Status
 
 Runs on real hardware. Calendar, alarms, todos, sync, USB/BLE config all
-implemented; some flows still need a final on-device confirmation —
-progress and remaining work are tracked outside this repo, in the umbrella
-workspace's `docs/project-status.md` / `docs/remaining-work.md`. Known
-workarounds (e.g. the ESP-IDF Wi-Fi reconnect crash) are documented in
+implemented. Known workarounds (e.g. the ESP-IDF Wi-Fi reconnect crash)
+are documented in
 [`rust-firmware/src/wifi.rs`](rust-firmware/src/wifi.rs).
 
 ## License

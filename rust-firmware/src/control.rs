@@ -125,8 +125,8 @@ pub fn render_reply(reply: &Reply, id: Option<&str>) -> String {
 /// the device catches up. Confirmed on hardware 2026-08-25: a single
 /// `set_wifi` ran 10 times (9 extra Wi-Fi disconnect/reconnect/save cycles)
 /// and `sync_now` ran twice, both because the device was busy long enough
-/// for the desktop's 2s retry to queue several duplicates - see
-/// `../docs/remaining-work.md`. The cache key is `(id, Command)` together, not
+/// for the desktop's 2s retry to queue several duplicates. The cache key is
+/// `(id, Command)` together, not
 /// `id` alone: the desktop's request-id counter restarts at 1 every process
 /// launch, so `id` collisions *across sessions* are the common case, not an
 /// edge case - keying on content too means a same-numbered command from an
