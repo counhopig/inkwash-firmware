@@ -217,10 +217,21 @@ continue to ring/display as scheduled.
 
 ## Timing and Scheduling
 
-The firmware itself does not dictate a sync schedule. Syncing is initiated
-manually by the user selecting "SYNC NOW" from the on-device menu. Future
-versions may add automatic background syncing (e.g., every 30 minutes when
-Wi-Fi is available), but this is not yet implemented.
+Sync cadence is driven by the device itself on wall-clock boundaries (the
+main loop's `SyncScheduler`, `rust-firmware/src/main.rs`):
+
+- A **lightweight urgent poll** (`X-Inkwash-Poll: 1`) fires at each
+  `:00`/`:30` boundary — every 30 s — to check for high-priority messages
+  without pulling the full payload.
+- A **full sync** fires at each `interval` boundary (the top of the hour
+  for a 1 h interval, the `:05` marks for 5 min, and so on): the device
+  uploads its locally-changed flags and applies the server's authoritative
+  lists.
+- Boundaries are computed from the RTC's wall clock, not a boot-relative
+  timer, so they never drift; the PCF8563 is resynced over NTP once a day
+  to keep them aligned. A failed sync is retried on the next boundary.
+- A manual `sync_now` from the on-device menu (or over USB/BLE) still
+  triggers an immediate full sync.
 
 ## Security
 

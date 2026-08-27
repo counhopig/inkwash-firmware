@@ -117,10 +117,12 @@ espflash flash --port /dev/tty.usbmodem1101 \
 ```text
 inkwash-firmware/
 ├── docs/                  # development guide (incl. board reference + smoke-test checklist), protocol contracts
-├── rust-firmware/         # the crate: 20+ modules, ~4.5k LOC + EPD FFI
+├── logic/                 # inkwash-logic: host-testable pure scheduling/validation logic (CI-tested)
+├── rust-firmware/         # the crate: 28 modules, ~7.3k LOC + EPD FFI
 ├── scripts/               # build / flash / wifi-provision helpers
+├── tools/                 # e-paper UI preview renderer, CJK font generator
 ├── vendor/                # patched esp-idf-hal (read-only)
-└── licenses/              # font / upstream licenses
+└── LICENSE                # Apache-2.0 (font/upstream licenses - see the footer)
 ```
 
 ## Status
@@ -128,12 +130,15 @@ inkwash-firmware/
 Runs on real hardware. Calendar, alarms, todos, sync, USB/BLE config all
 implemented. Known workarounds (e.g. the ESP-IDF Wi-Fi reconnect crash)
 are documented in
-[`rust-firmware/src/wifi.rs`](rust-firmware/src/wifi.rs).
+[`rust-firmware/src/wifi.rs`](rust-firmware/src/wifi.rs). The
+host-testable `logic/` crate is checked in CI (`cargo test` + rustfmt +
+clippy on every push/PR); the firmware crate itself needs the ESP-IDF
+toolchain and is verified on device (see `docs/development-guide.md`).
 
 ## License
 
 [Apache-2.0](LICENSE). Includes the TRMNL16 proportional font (SIL Open
 Font License 1.1), the Noto Sans SC CJK font (SIL Open Font License 1.1 —
 see `rust-firmware/assets/FONT_LICENSE.txt`), and code ported from the
-official `itopinion/zectrix-note4-epd-demo` (MIT) — see `licenses/` and
-the `font8x16.rs` header for details.
+official `itopinion/zectrix-note4-epd-demo` (MIT) — see the
+`font8x16.rs` header for details.

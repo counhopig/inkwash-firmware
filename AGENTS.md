@@ -1,20 +1,23 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-08-16 · **Updated:** 2026-08-20 · **Commit:** f41555b · **Branch:** main
+**Generated:** 2026-08-16 · **Updated:** 2026-08-27 · **Commit:** 84eadad · **Branch:** main
 
 ## OVERVIEW
-Self-developed firmware repository for the ZECTRIX NOTE4 black-and-white display edition (ESP32-S3-WROOM-1 N16R8, 4.2" 400×300 SSD2683 EPD). A single Rust crate (`rust-firmware/`) built with ESP-IDF 5.5.5 and the `esp` Xtensa toolchain, implementing calendar/offline alarms/todos + HTTPS sync + USB/BLE configuration channels. One of a three-repository system (`../inkwash-desktop` PC tool, `../inkwash-server` backend, each an independent repository). Design principle: the device does not author content — the configuration channel only delivers Wi-Fi credentials/server address + token, content is pulled as structured JSON, and alarms ring offline.
+Self-developed firmware repository for the ZECTRIX NOTE4 black-and-white display edition (ESP32-S3-WROOM-1 N16R8, 4.2" 400×300 SSD2683 EPD). A single Rust crate (`rust-firmware/`) built with ESP-IDF 5.5.5 and the `esp` Xtensa toolchain, implementing calendar/offline alarms/todos + HTTPS sync + USB/BLE configuration channels. One of a four-repository system (`../inkwash-desktop` PC tool, `../inkwash-server` backend, `../inkwash-mcp` MCP server, each an independent repository). Design principle: the device does not author content — the configuration channel only delivers Wi-Fi credentials/server address + token, content is pulled as structured JSON, and alarms ring offline.
 
 ## STRUCTURE
 ```
-inkwash/
+inkwash-firmware/
 ├── docs/            # All documentation: development guide (must read; includes board reference + hardware smoke-test checklist) and two cross-repo protocol contracts.
-├── rust-firmware/   # The only product code: inkwash-note4 crate (21 flat src modules ~4.3k LOC + C++ EPD component)
-├── scripts/         # Build/flash/provisioning scripts (.sh=Linux, .ps1=Windows twin, +1 Python provisioning)
+├── logic/           # inkwash-logic: host-testable pure logic (the only automated test suite, CI-tested)
+├── rust-firmware/   # inkwash-note4 crate (28 flat src modules ~7.3k LOC + C++ EPD component)
+├── scripts/         # Build/flash/provisioning scripts (.sh=Linux, .ps1=Windows twin)
+├── tools/           # e-paper UI preview renderer + CJK font generator
 ├── vendor/          # vendored esp-idf-hal 0.46.2 + sdmmc patch (third-party, read-only, see UNIQUE STYLES)
-└── backups/         # factory 16MB flash backup (gitignored, device-unique and contains credentials — never commit)
+├── CHANGELOG.md     # release history
+└── LICENSE          # Apache-2.0 (font/upstream licenses — see the README footer)
 ```
-No root Cargo.toml, no workspace, no CI, no LICENSE. `.omo/` and `.claude/` are tool directories, not project content.
+No root Cargo.toml, no workspace; the firmware crate itself has no CI (needs the ESP-IDF toolchain) — `logic/` is CI-tested via `.github/workflows/ci.yml`. `.omo/` and `.claude/` are tool directories, not project content.
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
@@ -32,17 +35,17 @@ No codegraph tooling; rust-analyzer has been available since 2026-08-18 (`esp-ra
 
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `main()` | fn | `rust-firmware/src/main.rs:85` | Single entry point: boot + 20ms polling main loop, wires up all 20 `mod` modules |
+| `main()` | fn | `rust-firmware/src/main.rs` | Single entry point: boot + 20ms polling main loop, wires up all 28 `mod` modules |
 | `Note4Board::take()` | fn | `src/board.rs` | Central hardware assembly: RTC/EPD/buttons/LED/audio/NFC/ADC, shared I2C0 |
 | `WifiManager` | struct | `src/wifi.rs` | Wi-Fi singleton — carrier of the most critical constraint in the repo (see ANTI-PATTERNS #3) |
 | `control::dispatch` | fn | `src/control.rs` | Shared USB/BLE command dispatch, called only from the main loop context |
-| `sync::sync_now` | fn | `src/sync.rs` | HTTPS sync (ETag/304) + Wi-Fi restart-avoidance logic |
+| `sync::sync_now` | fn | `src/sync.rs` | HTTPS sync (bidirectional POST, dirty-set upload, urgent poll; ETag kept for legacy GET) |
 | `AlarmStore` / `TodoStore` | struct | `src/alarms.rs` / `src/todos.rs` | NVS persistence; the alarm store picks the soonest one and writes it to the PCF8563's single hardware register |
-| Two shared singletons | — | `main.rs:97-105, 214` | One NVS partition handle + one WifiManager, each created once per process |
+| Two shared singletons | — | `main.rs` (boot sequence) | One NVS partition handle + one WifiManager, each created once per process |
 
 ## CONVENTIONS
 - Docs are written in Chinese; commits use conventional format and are described in English (`feat:`/`fix:`/`docs:` etc., lowercase start).
-- **The `rust-firmware` bin crate has no tests, no CI** (`harness = false`); pre-commit checks = fmt + clippy with zero warnings + release build + manual on-device verification (development-guide §12–§13). The host-testable logic lives in the sibling `logic/` crate (`inkwash-logic`, path dependency, zero ESP-IDF deps): `cd logic && cargo test` is the only automated test suite (currently ~50 tests; add new pure date/schedule/validation logic there, not in `rust-firmware/src`).
+- **The `rust-firmware` bin crate has no tests** (`harness = false`); pre-commit checks = fmt + clippy with zero warnings + release build + manual on-device verification (development-guide §12–§13). The host-testable logic lives in the sibling `logic/` crate (`inkwash-logic`, path dependency, zero ESP-IDF deps) — CI-tested on push/PR via `.github/workflows/ci.yml` (`cargo test --locked` + rustfmt + clippy), and locally with `cd logic && cargo test` (currently 49 tests; add new pure date/schedule/validation logic there, not in `rust-firmware/src`).
 - Toolchain pinned to the `esp` channel (`rust-toolchain.toml`); formatting must use `cargo +esp fmt`, stable/nightly are disallowed.
 - Size-first: release `opt-level="s"`, dev `"z"`; `build-std=["std","panic_abort"]`.
 - `cargo run` = flash + monitor (runner=espflash); a bare `cargo build` always fails in a shell that has not sourced the ESP-IDF environment — always use `scripts/build-rust.sh`.

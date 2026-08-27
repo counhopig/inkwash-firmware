@@ -91,7 +91,7 @@ Deep sleep needs special care: GPIO17 must be held high through RTC GPIO hold, o
 The application core is written in Rust, built on top of ESP-IDF (5.5.5):
 
 ```text
-Rust application (main.rs, 20 flat mod modules — see rust-firmware/AGENTS.md)
+Rust application (main.rs, 28 flat mod modules — see rust-firmware/AGENTS.md)
   |
   +-- Board ownership, buttons, RTC, audio, NFC, ADC (board.rs / esp-idf-hal)
   |
@@ -104,7 +104,7 @@ Rust application (main.rs, 20 flat mod modules — see rust-firmware/AGENTS.md)
                          +-- ESP-IDF GPIO/SPI drivers + SSD2683 waveform
 ```
 
-See the MODULE MAP in [`rust-firmware/AGENTS.md`](../rust-firmware/AGENTS.md) for the complete module responsibility table (21 src files, including application-layer modules such as UI/alarm/todo/sync/USB/BLE) — the rest of this section only keeps the build details of the EPD FFI component itself and does not duplicate the full module list.
+See the MODULE MAP in [`rust-firmware/AGENTS.md`](../rust-firmware/AGENTS.md) for the complete module responsibility table (28 src files, including application-layer modules such as UI/alarm/todo/sync/USB/BLE) — the rest of this section only keeps the build details of the EPD FFI component itself and does not duplicate the full module list.
 
 | File | Role |
 | --- | --- |
@@ -355,6 +355,11 @@ This is normal. An e-paper display holds its image when powered off; only a vali
 cargo +esp fmt --manifest-path rust-firmware/Cargo.toml -- --check
 ./scripts/build-rust.sh --release
 ```
+
+The host-testable `logic/` crate is checked by CI on every push/PR
+(`cargo test --locked` + rustfmt + clippy) and locally with
+`cd logic && cargo test`; the firmware crate itself needs the ESP-IDF
+toolchain and is verified on device.
 
 Check on real hardware at least once: cold boot, power hold, initial full refresh, one press of each of the three keys, USB reconnection, and the serial log.
 
