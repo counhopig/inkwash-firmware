@@ -73,7 +73,9 @@ cargo +esp fmt --manifest-path rust-firmware/Cargo.toml -- --check   # pre-commi
 espflash flash --port /dev/tty.usbmodem1101 --chip esp32s3 --flash-size 16mb \
   --flash-mode dio --flash-freq 80mhz --partition-table rust-firmware/partitions.csv \
   rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4  # flash (macOS port name; Linux is /dev/ttyACM0)
-espflash monitor --port /dev/tty.usbmodem1101     # serial logs (the only "testing" means)
+espflash monitor --port /dev/tty.usbmodem1101     # serial logs (needs a real TTY)
+inkwash-desktop --status /dev/tty.usbmodem1101    # verify the running firmware over the USB control protocol (get_status; echoes boot log lines)
+espflash board-info --port /dev/tty.usbmodem1101  # confirm the chip is reachable when the node exists but tools report the device missing
 ```
 
 ## RELEASES

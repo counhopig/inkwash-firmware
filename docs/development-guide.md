@@ -339,7 +339,44 @@ broadcasts, e.g., `XiaoMi_ED4E` vs the router's actual `Xiaomi_ED4E`) — the SS
 
 ### Cannot open the serial port
 
-Confirm the user is a member of the `uucp` group (run `sudo usermod -aG uucp $USER` and log in again), close other monitors / serial tools, re-plug the USB cable, and check the device node with `ls /dev/ttyACM*`. If necessary, hold ENTER/BOOT and trigger a reset to enter download mode.
+On Linux, confirm the user is a member of the `uucp` group (run `sudo
+usermod -aG uucp $USER` and log in again), close other monitors / serial
+tools, and check the device node with `ls /dev/ttyACM*` (macOS:
+`/dev/tty.usbmodem*`). If necessary, hold ENTER/BOOT and trigger a reset
+to enter download mode.
+
+espflash failing with `Device error, e.g. paper out` or `No such file or
+directory (os error 2)` usually means the device is not actually on the
+bus. **Check the physical USB connection first** (cable, hub, port) and
+re-seat it — in practice a disappearing node has been a loose/unplugged
+cable, not a tooling problem. The node briefly vanishing and
+re-enumerating during a re-plug is normal; wait a few seconds and retry
+before suspecting the software. (Opening the USB-Serial/JTAG port does
+reset the board, but that alone does not make the node disappear.)
+
+To confirm the chip is reachable and flashable at all:
+
+```bash
+espflash board-info --port /dev/tty.usbmodem1101
+```
+
+A successful `board-info` (chip id, flash size, security info) means the
+device is alive. If the node exists but every tool reports the device
+missing, the USB link is down — re-seat the cable.
+
+Verifying the running firmware: `espflash monitor` needs a real TTY
+(`Failed to initialize input reader` outside an interactive shell) and a
+plain `cat` on the node may read nothing, so a silent serial log is not
+proof of a dead device. The authoritative check is the USB control
+protocol:
+
+```bash
+inkwash-desktop --status /dev/tty.usbmodem1101
+```
+
+A `Status { ... }` reply proves the freshly-flashed firmware booted and
+is polling commands; the CLI also echoes the recent boot log lines
+alongside the reply.
 
 ### Powers off shortly after power-on
 
