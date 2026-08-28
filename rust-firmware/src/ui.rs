@@ -72,9 +72,9 @@ pub fn header(canvas: &mut Canvas, title: &str) {
 pub fn footer(_canvas: &mut Canvas, _hint: &str) {}
 
 pub fn show_message(board: &mut Note4Board, title: &str, lines: &[&str], pause: Duration) {
-    let canvas = board.display.canvas_mut();
+    let mut canvas = board.display.canvas_mut();
     canvas.clear();
-    header(canvas, title);
+    header(&mut canvas, title);
     // Centered horizontally: these are one-off status toasts (sync
     // result, sleep notice, BLE error), not scannable/left-reading
     // content, so they read better as a centered caption than pinned to
@@ -85,6 +85,7 @@ pub fn show_message(board: &mut Note4Board, title: &str, lines: &[&str], pause: 
         canvas.draw_text_prop((400usize.saturating_sub(width)) / 2, y, 2, line);
         y += 38;
     }
+    drop(canvas);
     board.display.refresh_partial_best_effort(Rect {
         x: 0,
         y: 0,
@@ -164,9 +165,10 @@ pub fn pick_from_list(
     loop {
         let _ = ctx.poll_background(now);
         if needs_redraw {
-            let canvas = ctx.board.display.canvas_mut();
-            draw_rows(canvas, title, items, selected);
-            footer(canvas, hint);
+            let mut canvas = ctx.board.display.canvas_mut();
+            draw_rows(&mut canvas, title, items, selected);
+            footer(&mut canvas, hint);
+            drop(canvas);
             if first_draw {
                 ctx.board.display.refresh_full_best_effort();
                 first_draw = false;
@@ -217,9 +219,9 @@ pub fn pick_number(
     loop {
         let _ = ctx.poll_background(now);
         if needs_redraw {
-            let canvas = ctx.board.display.canvas_mut();
+            let mut canvas = ctx.board.display.canvas_mut();
             canvas.clear();
-            header(canvas, title);
+            header(&mut canvas, title);
             let label = format!("{value:02}");
             let number_width = Canvas::text_prop_width(&label, 5);
             let box_width = number_width + 64;
@@ -249,7 +251,8 @@ pub fn pick_number(
             let value_x = box_x + 7 + (box_width - 7 - number_width) / 2;
             let value_y = BOX_TOP + (BOX_H.saturating_sub(80)) / 2;
             canvas.draw_text_prop(value_x, value_y, 5, &label);
-            footer(canvas, "UP/DOWN CHANGE   ENTER OK   HOLD ENTER BACK");
+            footer(&mut canvas, "UP/DOWN CHANGE   ENTER OK   HOLD ENTER BACK");
+            drop(canvas);
             if first_draw {
                 ctx.board.display.refresh_full_best_effort();
                 first_draw = false;

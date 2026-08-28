@@ -7,6 +7,7 @@ mod canvas;
 mod control;
 mod ctx;
 mod display;
+mod epd_task;
 mod font5x7;
 mod font8x16;
 mod font_cjk;
@@ -21,14 +22,16 @@ mod rtc;
 mod screens;
 mod storage;
 mod sync;
+mod sync_task;
 mod todos;
 mod ui;
 mod usb_console;
+mod wake;
 mod watchdog;
 mod wifi;
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alarms::AlarmStore;
 use anyhow::Result;
@@ -36,19 +39,39 @@ use board::Note4Board;
 use button::{ButtonEvent, POLL_INTERVAL_MS};
 use canvas::Rect;
 use ctx::{AlarmScheduler, DeviceContext, SyncScheduler};
+use epd_task::EpdCompletion;
 use inbox::InboxStore;
 use rtc::DateTime;
 use storage::PersistedCounters;
 use todos::TodoStore;
 
-/// Poll cycles between two consecutive `power status` log lines.
-/// 50 × 20 ms = 1 s.
-const STATUS_REPORT_INTERVAL_POLLS: u32 = 50;
-
-/// Poll cycles between two consecutive PCF8563 re-reads.
-/// 60 × 20 ms = 1.2 s, fast enough that the on-screen seconds tick at least
-/// once per refresh.
-const CLOCK_POLL_INTERVAL_POLLS: u32 = 60;
+/// Idle-mode poll period: 1 s. Exceeds `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`
+/// (200 ticks = 200 ms at FREERTOS_HZ=1000), so each idle sleep is ~0.8 s of
+/// real light sleep per second.
+const IDLE_POLL_INTERVAL_MS: u64 = 1000;
+/// Quiet time before Home drops from the 20 ms cadence to the idle cadence.
+const IDLE_ENTER_AFTER: Duration = Duration::from_millis(2000);
+/// Active-mode PCF8563 re-read period (was 60 × 20 ms).
+const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(1200);
+/// Idle-mode PCF8563 re-read period. The visible clock shows HH:MM only
+/// (home.rs), so a 10 s staleness window costs nothing on screen; minute
+/// changes still trigger the clock-region refresh, up to 10 s late. Sync
+/// scheduling, alarm re-arming, and due-todo reminders ride the same read -
+/// 10 s boundary-detection granularity is fine for the :00/:30-aligned
+/// scheduler (the power plan accepts this).
+const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Quiet time before the deep-sleep tier (power plan P4-1): after this
+/// long without *user* activity (clock-region refreshes do not count),
+/// the device enters deep sleep instead of idling in light sleep.
+const DEEP_SLEEP_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Fallback maintenance wake when no future alarm needs a month-boundary
+/// wake: 10 minutes. Each wake boots, re-renders and refreshes just the
+/// clock region (P4-2), and realigns the sync scheduler, so the on-screen
+/// time stays within ~10 min of reality and syncs stay alive through deep
+/// sleep. Cost: ~1.6 s active per 10 min boot -> ~0.13 mA average, still
+/// µA-class idle. (The old 1 h fallback left the frozen e-paper clock up
+/// to an hour stale - the official firmware wakes far more often.)
+const MAINTENANCE_WAKE_FALLBACK: Duration = Duration::from_secs(10 * 60);
 
 /// Bounding rect for the large home clock and its date/status metadata.
 const CLOCK_RECT: Rect = Rect {
@@ -97,7 +120,10 @@ fn main() -> Result<()> {
     if let Err(err) = watchdog::subscribe() {
         log::warn!("Task watchdog subscribe failed: {err}");
     }
-    power::log_wakeup_cause();
+    // True when this boot is a deep-sleep wake (any non-undefined wake
+    // cause), as opposed to a power-on reset / fresh flash. Used by the
+    // P4-2 boot path to skip the full-screen refresh on wake.
+    let woke_from_deep_sleep = power::log_wakeup_cause();
     let mut board = Note4Board::take()?;
     log::info!("Power latch is high; rendering home screen");
 
@@ -113,6 +139,9 @@ fn main() -> Result<()> {
     let counters = PersistedCounters::open(nvs_partition.clone())?;
     let alarm_store = AlarmStore::open(nvs_partition.clone())?;
     let todo_store = TodoStore::open(nvs_partition.clone())?;
+    // The sync task gets its own clone and opens its own store handles on
+    // the same partition (`EspNvs` is Send but not Sync - see sync_task.rs).
+    let sync_partition = nvs_partition.clone();
     let inbox_store = InboxStore::open(nvs_partition)?;
     let mut usb_console = usb_console::UsbConsole::start();
 
@@ -202,16 +231,28 @@ fn main() -> Result<()> {
         }
     }
 
-    render_home_now(
+    // Home's data fingerprint at the last actual render; the sync
+    // completion path compares against it to skip unchanged redraws
+    // (power plan O-8).
+    let mut last_home_fp = Some(render_home_now(
         &mut board,
         &counters,
         &alarm_store,
         &todo_store,
         &inbox_store,
         clock.as_ref(),
-    );
-    board.display.refresh_full()?;
-    log::info!("Initial display refresh completed");
+    ));
+    // Power plan P4-2: on a deep-sleep wake the e-paper already shows the
+    // pre-sleep frame, so skip the full refresh (the slowest part of boot)
+    // and update only the clock region. Alarm-wakes already repainted the
+    // ring screen with their own full refresh, so they keep the full path.
+    if woke_from_deep_sleep && !alarm_fired_at_boot {
+        board.display.refresh_partial_best_effort(CLOCK_RECT);
+        log::info!("Deep-sleep wake: clock region refreshed");
+    } else {
+        board.display.refresh_full()?;
+        log::info!("Initial display refresh queued to EPD task");
+    }
 
     if board.audio.is_none() {
         log::warn!("ES8311 not available");
@@ -255,14 +296,14 @@ fn main() -> Result<()> {
                         Ok(()) => match board.rtc.read_time() {
                             Ok(dt) => {
                                 clock = Some(dt);
-                                render_home_now(
+                                last_home_fp = Some(render_home_now(
                                     &mut board,
                                     &counters,
                                     &alarm_store,
                                     &todo_store,
                                     &inbox_store,
                                     clock.as_ref(),
-                                );
+                                ));
                                 board.display.refresh_partial_best_effort(CLOCK_RECT);
                                 log::info!("Clock region refreshed after NTP sync");
                             }
@@ -285,6 +326,26 @@ fn main() -> Result<()> {
         }
     };
 
+    // Arm automatic light sleep now that the board is up and the
+    // boot-time Wi-Fi/NTP sync is done (Wi-Fi disconnected): with
+    // CONFIG_PM_ENABLE + tickless idle, the idle task enters light sleep
+    // once the main loop drops to its idle cadence (see the loop below).
+    // Sleep only happens when both cores are idle, so boot-time Wi-Fi work
+    // was never at risk regardless of where this call lands. A config
+    // failure must not boot-loop the device: degrade to always-awake
+    // polling rather than aborting.
+    if let Err(err) = power::configure_light_sleep() {
+        log::warn!("Light sleep not armed (device stays fully awake): {err}");
+    }
+
+    // Move the process's one WifiManager into the dedicated sync task
+    // (power plan P3): every Wi-Fi operation from here on - scheduled
+    // syncs, the Sync Now menu, USB/BLE SetWifi/SyncNow - runs off the
+    // main loop, so a slow HTTPS round-trip never blocks buttons, USB, or
+    // the display. The main loop talks to it through the command/reply
+    // channels in `DeviceContext`.
+    let sync_task = sync_task::SyncTask::spawn(sync_partition, wifi_mgr)?;
+
     // Owned here (not inside `DeviceContext`) because its lifetime differs
     // from the rest of the bundled state: populated only while the BLE
     // pairing screen is open, torn down on leaving it. `DeviceContext` holds
@@ -299,7 +360,7 @@ fn main() -> Result<()> {
     let mut ctx = DeviceContext {
         board: &mut board,
         counters: &counters,
-        wifi_mgr: &mut wifi_mgr,
+        sync: &sync_task,
         alarm_store: &alarm_store,
         todo_store: &todo_store,
         inbox_store: &inbox_store,
@@ -307,32 +368,61 @@ fn main() -> Result<()> {
         ble_control: &mut ble_control,
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
         alarm_scheduler: AlarmScheduler::new(clock.as_ref(), alarm_fired_at_boot),
+        pending_wifi_op: None,
         last_command: None,
     };
 
-    let mut status_tick = 0u32;
-    let mut clock_tick = 0u32;
+    // Two-level polling cadence (power plan P1-4): while the user
+    // interacts - a key is raw-low, a command arrived, a refresh is
+    // pending - the loop runs at POLL_INTERVAL_MS so the poll-based
+    // debounce/long-press timing stays exactly as before. Once the device
+    // has been quiet for IDLE_ENTER_AFTER, the loop drops to the idle
+    // cadence: the 1 s sleep exceeds CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP
+    // (200 ticks), so automatic light sleep engages for ~0.8 s of every
+    // idle second. Keys wake light sleep directly (GPIO wakeup, power.rs);
+    // a raw-low key flips the loop back to the 20 ms cadence so the
+    // debounce keeps its 4-sample timing, and the RTC alarm line
+    // (`board.rtc_int`) runs the alarm path immediately after an ext1 wake.
+    //
     // Cron-style wall-clock alignment: sync decisions fire when the
     // boundary index *advances*, not when a boot-relative timer elapses -
     // so "every 30s" means at :00/:30 of each minute and "every 1h" means
     // at the top of the hour. Initialized to the boot-time boundary so the
     // first aligned boundary after boot fires (and a never-synced device
     // syncs on its first urgent-poll boundary).
+    let mut idle = false;
+    let mut last_activity = Instant::now();
+    let mut status_last = Instant::now();
+    let mut clock_last = Instant::now();
+    // When the device entered the idle tier; drives the deep-sleep tier
+    // (P4). Reset by *user* activity only - clock-region refreshes keep
+    // the light-sleep cadence but must not postpone deep sleep.
+    let mut deep_sleep_since: Option<Instant> = None;
     loop {
         watchdog::feed();
         let mut dirty: Vec<Rect> = Vec::new();
+        let now = Instant::now();
 
-        status_tick += 1;
-        if status_tick >= STATUS_REPORT_INTERVAL_POLLS {
-            status_tick = 0;
+        // Power status once per second, unchanged cadence (it gates the
+        // charge-status debounce tick).
+        if now.duration_since(status_last) >= Duration::from_secs(1) {
+            status_last = now;
             if let Err(err) = report_power_state(ctx.board) {
                 log::warn!("Power status probe failed: {err}");
             }
         }
 
-        clock_tick += 1;
-        if clock_tick >= CLOCK_POLL_INTERVAL_POLLS {
-            clock_tick = 0;
+        // PCF8563 re-read: 1.2 s active, 10 s idle (see
+        // IDLE_CLOCK_POLL_INTERVAL). Minute changes drive the clock-region
+        // refresh; sync scheduling, alarm re-arming, and due-todo
+        // reminders ride the same read.
+        let clock_interval = if idle {
+            IDLE_CLOCK_POLL_INTERVAL
+        } else {
+            CLOCK_POLL_INTERVAL
+        };
+        if now.duration_since(clock_last) >= clock_interval {
+            clock_last = now;
             match ctx.board.rtc.read_time() {
                 Ok(dt) => {
                     let changed = clock
@@ -349,14 +439,15 @@ fn main() -> Result<()> {
                         clock = Some(dt);
                         dirty.push(CLOCK_RECT);
                     }
-                    // Cron-style sync decisions ride the fresh clock read
-                    // (every 1.2 s): boundaries only fire once each, aligned
-                    // to wall clock. Both checks are cheap NVS reads unless a
+                    // Cron-style sync decisions ride the fresh clock read:
+                    // boundaries only fire once each, aligned to wall
+                    // clock. Both checks are cheap NVS reads unless a
                     // boundary actually advanced, so this never adds Wi-Fi
                     // traffic beyond the intended cadence. The due-todo
-                    // reminder shares the urgent-poll cadence (once per 30 s
-                    // boundary, gated once/day anyway). Ordinary menu loops
-                    // service this same scheduler through DeviceContext.
+                    // reminder shares the urgent-poll cadence (once per
+                    // 30 s boundary, gated once/day anyway). Ordinary menu
+                    // loops service this same scheduler through
+                    // DeviceContext.
                     if ctx.poll_runtime(&dt) {
                         dirty.push(FULL_SCREEN_RECT);
                     }
@@ -365,8 +456,26 @@ fn main() -> Result<()> {
             }
         }
 
+        // RTC alarm fast path: GPIO5 is not a light-sleep wake source (its
+        // level floats low during light sleep - see `power::WAKE_PINS`),
+        // so alarm firing is detected by polling the PCF8563 AF flag every
+        // iteration instead of waiting up to 10 s for the gated RTC read.
+        // The flag read is a 2-byte I2C transaction (~50 us), negligible
+        // even at the 20 ms active cadence.
+        if ctx.board.rtc.alarm_flag().unwrap_or(false) {
+            match ctx.board.rtc.read_time() {
+                Ok(dt) => {
+                    if ctx.poll_runtime(&dt) {
+                        dirty.push(FULL_SCREEN_RECT);
+                    }
+                }
+                Err(err) => log::warn!("PCF8563 read_time failed (alarm fast path): {err}"),
+            }
+        }
+
         // Poll USB console for incoming commands, dispatch them, and send replies.
-        if ctx.poll_usb_control(clock.as_ref()) {
+        let (usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
+        if usb_changed {
             dirty.push(FULL_SCREEN_RECT);
         }
 
@@ -374,18 +483,77 @@ fn main() -> Result<()> {
         // `poll_command` returns an owned `(id, Command)`, ending the borrow
         // of `ctx.ble_control` before `dispatch` needs `&mut ctx` - the same
         // shape `ble_pairing_screen` uses.
+        let mut ble_changed = false;
         if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command()) {
             let needs_full_redraw = matches!(cmd, control::Command::SyncNow);
-            let reply = control::dispatch(&mut ctx, id.as_deref(), cmd, clock.as_ref());
+            let reply = control::dispatch(
+                &mut ctx,
+                control::Channel::Ble,
+                id.as_deref(),
+                cmd,
+                clock.as_ref(),
+            );
             if needs_full_redraw && matches!(reply, control::Reply::Ok) {
                 dirty.push(FULL_SCREEN_RECT);
+                ble_changed = true;
             }
             if let Some(ble) = ctx.ble_control.as_ref() {
                 ble.write_reply(&reply, id.as_deref());
             }
         }
 
+        // EPD completion events (power plan O-6): the app state machine
+        // observes every refresh's outcome - success, failure, and
+        // partial->full recovery - instead of the result living only
+        // inside the EPD task.
+        while let Some(completion) = ctx.board.display.poll_completion() {
+            match completion {
+                EpdCompletion {
+                    ok: true,
+                    recovered: false,
+                    kind,
+                } => {
+                    log::info!("EPD refresh completed: {kind:?}");
+                }
+                EpdCompletion {
+                    ok: true,
+                    recovered: true,
+                    kind,
+                } => {
+                    log::warn!("EPD partial refresh failed; recovered via full refresh ({kind:?})");
+                }
+                EpdCompletion {
+                    ok: false, kind, ..
+                } => {
+                    log::error!("EPD refresh failed: {kind:?}");
+                }
+            }
+        }
+
+        // Receipts from the sync task (scheduled syncs, deferred
+        // USB/BLE SyncNow/SetWifi replies): applies the RTC re-arm, NTP
+        // alignment, and transport replies. A successful sync redraws the
+        // full screen only when it actually changed what Home shows
+        // (power plan O-8) - an unchanged sync leaves the panel alone.
+        if let Some(event) = ctx.poll_wifi_ops() {
+            if matches!(event, sync_task::WifiOpEvent::SyncDone(Ok(_)))
+                && Some(home_data_fingerprint(
+                    ctx.counters,
+                    ctx.alarm_store,
+                    ctx.todo_store,
+                    ctx.inbox_store,
+                    clock.as_ref(),
+                )) != last_home_fp
+            {
+                dirty.push(FULL_SCREEN_RECT);
+            }
+        }
+
+        // Home has no single-key action: ENTER is root (no-op), long UP or
+        // DOWN opens the navigation drawer. Any event counts as activity.
+        let mut key_changed = false;
         if let Some(event) = ctx.board.key_enter.poll() {
+            key_changed = true;
             match event {
                 ButtonEvent::Pressed => {
                     // Home has no primary action. Settings is reached only
@@ -399,6 +567,7 @@ fn main() -> Result<()> {
             }
         }
         if let Some(event) = ctx.board.key_up.poll() {
+            key_changed = true;
             match event {
                 ButtonEvent::Pressed => {
                     // Home has no vertical selection.
@@ -413,6 +582,7 @@ fn main() -> Result<()> {
         }
 
         if let Some(event) = ctx.board.key_down.poll() {
+            key_changed = true;
             match event {
                 ButtonEvent::Pressed => {
                     // Home has no vertical selection.
@@ -427,14 +597,14 @@ fn main() -> Result<()> {
         }
 
         if !dirty.is_empty() {
-            render_home_now(
+            last_home_fp = Some(render_home_now(
                 ctx.board,
                 ctx.counters,
                 ctx.alarm_store,
                 ctx.todo_store,
                 ctx.inbox_store,
                 clock.as_ref(),
-            );
+            ));
             if dirty
                 .iter()
                 .any(|rect| rect.width == 400 && rect.height == 300)
@@ -447,10 +617,75 @@ fn main() -> Result<()> {
                     ctx.board.display.refresh_partial_best_effort(*rect);
                 }
             }
-            log::info!("Partial display refresh completed");
+            log::info!("Partial display refresh queued to EPD task");
         }
 
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
+        // Idle/active selection: input, a dispatched command, or a display
+        // refresh counts as activity; a raw-low key forces the 20 ms
+        // cadence so the polled debounce keeps its 4-sample timing after a
+        // GPIO wake (the wake resumes the loop mid-idle-sleep).
+        let any_key_pressed = ctx.board.key_enter.is_raw_pressed()
+            || ctx.board.key_up.is_raw_pressed()
+            || ctx.board.key_down.is_raw_pressed();
+        // Any USB frame counts as user activity (the power plan's idle
+        // definition is "no button, no USB frame", not just visible
+        // changes): GetStatus polls from the desktop tool must not let the
+        // device drift into deep sleep mid-session.
+        let user_activity = usb_activity || ble_changed || key_changed || any_key_pressed;
+        let interacted = user_activity || !dirty.is_empty();
+        if interacted || any_key_pressed {
+            last_activity = now;
+            idle = false;
+            if user_activity {
+                deep_sleep_since = None;
+            }
+        } else if now.duration_since(last_activity) >= IDLE_ENTER_AFTER {
+            idle = true;
+            deep_sleep_since.get_or_insert(now);
+        }
+
+        // Deep-sleep tier (power plan P4-1): after DEEP_SLEEP_AFTER of
+        // idle light sleep with no user activity and no Wi-Fi op in
+        // flight, drop to deep sleep. Wake sources: ENTER (GPIO0), DOWN
+        // (GPIO18), the RTC alarm line (GPIO5), and the maintenance timer.
+        // UP is not an RTC GPIO and cannot wake deep sleep - documented
+        // in development-guide.md.
+        if idle
+            && ctx.pending_wifi_op.is_none()
+            && deep_sleep_since.is_some_and(|since| now.duration_since(since) >= DEEP_SLEEP_AFTER)
+        {
+            // Power plan O-11: the wake interval is the *minimum* of the
+            // next month-boundary alarm maintenance wake and the 10-minute
+            // fallback - a far-future one-shot alarm must not stretch the
+            // sleep so long that the on-screen time goes stale (P4-10).
+            let maintenance = clock
+                .as_ref()
+                .and_then(|dt| {
+                    ctx.alarm_store
+                        .load()
+                        .ok()
+                        .and_then(|alarms| alarms::maintenance_wakeup_delay(&alarms, dt))
+                })
+                .map(|delay| delay.min(MAINTENANCE_WAKE_FALLBACK))
+                .or(Some(MAINTENANCE_WAKE_FALLBACK));
+            log::info!("Idle past deep-sleep threshold; entering deep sleep");
+            crate::power::enter_deep_sleep_with_wakeups(maintenance);
+        }
+
+        if idle {
+            // One-shot wake interrupts armed for the light-sleep window: a
+            // key press or an asserted RTC alarm line returns the wait
+            // immediately, so the loop polls the buttons / probes the
+            // alarm line within milliseconds of the event (see `wake.rs`
+            // for why a plain sleep cannot - the GPIO wakeup resumes the
+            // CPU but not the blocked task).
+            ctx.board.wake.arm();
+            if ctx.board.wake.wait(IDLE_POLL_INTERVAL_MS as u32) {
+                log::info!("Idle wait woken early (key pressed)");
+            }
+        } else {
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
+        }
     }
 }
 
@@ -466,7 +701,7 @@ fn render_home_now(
     todo_store: &TodoStore,
     inbox_store: &InboxStore,
     clock: Option<&DateTime>,
-) {
+) -> u64 {
     let next_alarm = clock.and_then(|dt| screens::next_alarm_label(alarm_store, dt));
     let todo_summary = screens::todo_summary(todo_store, clock);
     let unread_inbox = inbox_store.unread_count().unwrap_or(0);
@@ -488,6 +723,47 @@ fn render_home_now(
         battery_percent,
         charge,
     );
+    home_data_fingerprint(counters, alarm_store, todo_store, inbox_store, clock)
+}
+
+/// Fingerprint of Home's data-backed content: the alarm list, todo list,
+/// unread-inbox count, Wi-Fi-configured flag, and the calendar date. A
+/// sync (or any remote state change) that leaves all of these identical
+/// produces no visible difference on Home, so the full-screen redraw it
+/// would trigger is skipped (power plan O-8). Hour/minute are deliberately
+/// excluded - clock drift is the clock-region refresh's job, and including
+/// the minute would make every sync look "changed" (a sync takes longer
+/// than a minute boundary).
+fn home_data_fingerprint(
+    counters: &PersistedCounters,
+    alarm_store: &AlarmStore,
+    todo_store: &TodoStore,
+    inbox_store: &InboxStore,
+    clock: Option<&DateTime>,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    if let Some(dt) = clock {
+        (dt.year, dt.month, dt.day).hash(&mut hasher);
+    }
+    counters
+        .wifi_creds()
+        .map(|creds| creds.is_some())
+        .unwrap_or(false)
+        .hash(&mut hasher);
+    if let Ok(alarms) = alarm_store.load() {
+        serde_json::to_vec(&alarms)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    if let Ok(todos) = todo_store.load() {
+        serde_json::to_vec(&todos)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    inbox_store.unread_count().unwrap_or(0).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn report_power_state(board: &mut Note4Board) -> Result<()> {

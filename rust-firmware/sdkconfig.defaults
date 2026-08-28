@@ -22,6 +22,18 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Power management: automatic light sleep whenever both cores are idle
+# past the threshold. IDLE_TIME_BEFORE_SLEEP is in ticks: 200 ms at
+# FREERTOS_HZ=1000. The Home main loop drops to a 1 s idle cadence
+# (src/main.rs), so each idle sleep exceeds the threshold and spends
+# ~0.8 s of every second in real light sleep. Keys and the RTC alarm
+# line wake it (src/power.rs `configure_light_sleep`). Note the plan's
+# `CONFIG_FREERTOS_IDLE_TIME_BEFORE_ENTERING_LIGHT_SLEEP` is the pre-5.x
+# name; IDF 5.5 calls it `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=200
 CONFIG_NVS_ENABLED=y
 CONFIG_ADC_ONESHOT_ENABLED=y
 CONFIG_I2C=y
@@ -31,12 +43,15 @@ CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
 
 # Task watchdog: catch a genuine hang (stuck peripheral, a future infinite
 # loop) and reboot instead of leaving the device stuck. The longest
-# un-feedable window is the HTTPS round-trip in sync.rs::https_post: TLS
-# handshake (observed up to ~4.7s on a flaky link) plus the 5s
-# HTTP_TIMEOUT submit, ~10s worst case - the two live TWDT aborts in item
-# -1 died in that window. 20s keeps 2x headroom over it while still
-# rebooting anything genuinely stuck. See src/watchdog.rs.
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=20
+# un-feedable window used to be the HTTPS round-trip in sync.rs running on
+# the main task (handshake ~4.7s + 5s HTTP_TIMEOUT, ~10s worst case - two
+# live TWDT aborts died in that window, hence the old 20s). The power
+# plan's P3 moved the whole sync path onto its own subscribed task, and P2
+# moved EPD refreshes off the main loop too; the main task's blocking
+# windows are now short I2C/NVS ops, so 10s still gives 2x+ headroom over
+# any real stall while catching a genuinely stuck loop sooner. See
+# src/watchdog.rs.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_PANIC=y
 
 # BLE/NimBLE configuration for Phase 5 (on-demand BLE control channel).

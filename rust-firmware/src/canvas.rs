@@ -8,7 +8,7 @@ pub const HEIGHT: usize = 300;
 const BYTES_PER_ROW: usize = WIDTH / 8;
 const FRAME_SIZE: usize = BYTES_PER_ROW * HEIGHT;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: u16,
     pub y: u16,
@@ -33,27 +33,6 @@ impl Canvas {
 
     pub fn clear(&mut self) {
         self.frame.fill(0xFF);
-    }
-
-    fn pixel_is_white(&self, x: usize, y: usize) -> bool {
-        let index = y * BYTES_PER_ROW + x / 8;
-        let mask = 1 << (7 - (x & 7));
-        self.frame[index] & mask != 0
-    }
-
-    /// Packs the pixels inside `rect` into the row-padded 1bpp format the
-    /// EPD partial-refresh API expects.
-    pub fn pack_rect(&self, rect: Rect) -> Vec<u8> {
-        let row_bytes = (rect.width as usize).div_ceil(8);
-        let mut packed = vec![0u8; row_bytes * rect.height as usize];
-        for (row, y) in (rect.y..rect.y + rect.height).enumerate() {
-            for (column, x) in (rect.x..rect.x + rect.width).enumerate() {
-                if self.pixel_is_white(x as usize, y as usize) {
-                    packed[row * row_bytes + column / 8] |= 1 << (7 - (column & 7));
-                }
-            }
-        }
-        packed
     }
 
     pub fn set_pixel(&mut self, x: usize, y: usize, black: bool) {
@@ -223,5 +202,24 @@ impl Canvas {
             cursor += (width as usize + 1) * scale;
         }
         cursor - x
+    }
+}
+
+/// Packs the pixels inside `rect` from a full-frame snapshot `frame`
+/// (e.g. a `RenderCommand` snapshot captured at request time) into `out`
+/// (a reusable scratch buffer), replacing its contents with the
+/// row-padded 1bpp format the EPD partial-refresh API expects.
+pub fn pack_rect_from_frame(frame: &[u8], rect: Rect, out: &mut Vec<u8>) {
+    let row_bytes = (rect.width as usize).div_ceil(8);
+    out.clear();
+    out.resize(row_bytes * rect.height as usize, 0);
+    for (row, y) in (rect.y..rect.y + rect.height).enumerate() {
+        for (column, x) in (rect.x..rect.x + rect.width).enumerate() {
+            let index = y as usize * BYTES_PER_ROW + (x as usize) / 8;
+            let mask = 1 << (7 - ((x as usize) & 7));
+            if frame[index] & mask != 0 {
+                out[row * row_bytes + column / 8] |= 1 << (7 - (column & 7));
+            }
+        }
     }
 }

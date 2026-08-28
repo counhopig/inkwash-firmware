@@ -84,12 +84,6 @@ impl WifiManager {
         self.used
     }
 
-    /// Whether the STA link is currently up (connected + netif running).
-    /// Reports `false` if the driver is not started or the query fails.
-    pub fn is_connected(&self) -> bool {
-        self.wifi.is_connected().unwrap_or(false)
-    }
-
     /// Connects to `creds`, waiting for the STA link and a DHCP lease
     /// (netif up) before returning. Leaves the driver connected - call
     /// `disconnect` when done, mirroring the previous per-call
@@ -281,9 +275,11 @@ pub fn restart_for_fresh_wifi_session() -> ! {
     crate::power::restart_via_deep_sleep(Duration::from_millis(100))
 }
 
-/// Starts the SNTP client, waits for the first sync and pushes the obtained
-/// time into the PCF8563 RTC.
-pub fn ntp_sync_and_set_rtc(rtc: &mut Pcf8563, timezone_offset_minutes: i16) -> Result<()> {
+/// Starts the SNTP client, waits for the first sync and returns the
+/// obtained UTC epoch seconds without touching the RTC - used by the sync
+/// task (which never accesses the I2C bus) for the daily alignment, whose
+/// RTC write is applied by the main loop.
+pub fn ntp_sync_epoch() -> Result<u64> {
     let sntp = EspSntp::new(&SntpConf {
         servers: ["pool.ntp.org", "ntp.aliyun.com"],
         ..Default::default()
@@ -301,8 +297,13 @@ pub fn ntp_sync_and_set_rtc(rtc: &mut Pcf8563, timezone_offset_minutes: i16) -> 
         }
         thread::sleep(Duration::from_millis(500));
     }
+    Ok(EspSystemTime {}.now().as_secs())
+}
 
-    let epoch_secs = EspSystemTime {}.now().as_secs();
+/// Starts the SNTP client, waits for the first sync and pushes the obtained
+/// time into the PCF8563 RTC.
+pub fn ntp_sync_and_set_rtc(rtc: &mut Pcf8563, timezone_offset_minutes: i16) -> Result<()> {
+    let epoch_secs = ntp_sync_epoch()?;
     let dt = DateTime::from_unix(epoch_secs).shifted_minutes(timezone_offset_minutes as i32);
     rtc.write_time(&dt)
         .context("failed to write NTP time to PCF8563")?;

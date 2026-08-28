@@ -77,9 +77,9 @@ fn show_due_todos(
     usb: &mut UsbConsole,
     mut ble: Option<&mut BleControl>,
 ) {
-    let canvas = board.display.canvas_mut();
+    let mut canvas = board.display.canvas_mut();
     canvas.clear();
-    ui::header(canvas, "TODOS DUE");
+    ui::header(&mut canvas, "TODOS DUE");
     for (index, todo) in due.iter().take(7).enumerate() {
         let text = screens::truncate_prop(&todo.text, 300);
         canvas.draw_text_prop(16, 48 + index * 24, 1, &format!("!! {text}"));
@@ -88,6 +88,7 @@ fn show_due_todos(
         canvas.draw_text_prop(16, 268, 1, "MORE...");
     }
     canvas.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
+    drop(canvas);
     board.display.refresh_full_best_effort();
 
     if let Some(audio) = board.audio.as_mut() {
@@ -151,9 +152,9 @@ fn show_urgent(
     usb: &mut UsbConsole,
     mut ble: Option<&mut BleControl>,
 ) {
-    let canvas = board.display.canvas_mut();
+    let mut canvas = board.display.canvas_mut();
     canvas.clear();
-    ui::header(canvas, "URGENT");
+    ui::header(&mut canvas, "URGENT");
     for (index, title) in titles.iter().take(4).enumerate() {
         canvas.draw_text_prop(16, 48 + index * 24, 1, &format!("!! {title}"));
     }
@@ -161,6 +162,7 @@ fn show_urgent(
         canvas.draw_text_prop(16, 268, 1, "MORE IN INBOX...");
     }
     canvas.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
+    drop(canvas);
     board.display.refresh_full_best_effort();
 
     if let Some(audio) = board.audio.as_mut() {

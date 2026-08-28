@@ -14,7 +14,16 @@ use serde::{Deserialize, Serialize};
 use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
 use crate::storage::{DeviceConfig, WifiCreds};
-use crate::sync;
+use crate::sync_task::OpSource;
+
+/// Which transport a command arrived on. Long operations (SyncNow,
+/// SetWifi) defer their reply; the deferred reply must be written back to
+/// the same channel the command came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Usb,
+    Ble,
+}
 
 /// Incoming command from a USB/BLE client.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -55,6 +64,14 @@ pub enum Reply {
     /// inbox) was actively ringing. It was not executed; the client should
     /// retry after the user dismisses the reminder or it times out.
     Busy,
+
+    /// A long-running command (SyncNow, SetWifi) was accepted and is being
+    /// executed asynchronously on the sync task. The real result is
+    /// delivered as a deferred reply with the same `id` when the operation
+    /// completes; the client should keep waiting rather than resending
+    /// (a resend replays this interim reply until the real result replaces
+    /// it - see `control-protocol.md`'s `pending` reply).
+    Pending,
 
     /// Device status snapshot.
     Status {
@@ -131,57 +148,67 @@ pub fn render_reply(reply: &Reply, id: Option<&str>) -> String {
 /// launch, so `id` collisions *across sessions* are the common case, not an
 /// edge case - keying on content too means a same-numbered command from an
 /// unrelated session can never replay a stale reply for the wrong command.
-pub fn dispatch(ctx: &mut DeviceContext, id: Option<&str>, cmd: Command, now: Option<&DateTime>) -> Reply {
+pub fn dispatch(
+    ctx: &mut DeviceContext,
+    channel: Channel,
+    id: Option<&str>,
+    cmd: Command,
+    now: Option<&DateTime>,
+) -> Reply {
     if let Some(id) = id {
         if let Some((last_id, last_cmd, last_reply)) = &ctx.last_command {
             if last_id == id && *last_cmd == cmd {
-                log::info!("Duplicate command id={id}; replaying cached reply without re-executing");
+                log::info!(
+                    "Duplicate command id={id}; replaying cached reply without re-executing"
+                );
                 return last_reply.clone();
             }
         }
     }
     let cmd_for_cache = cmd.clone();
-    let reply = dispatch_inner(ctx, cmd, now);
+    let reply = dispatch_inner(ctx, channel, cmd, now, id);
     if let Some(id) = id {
         ctx.last_command = Some((id.to_string(), cmd_for_cache, reply.clone()));
     }
     reply
 }
 
-fn dispatch_inner(ctx: &mut DeviceContext, cmd: Command, now: Option<&DateTime>) -> Reply {
+fn dispatch_inner(
+    ctx: &mut DeviceContext,
+    channel: Channel,
+    cmd: Command,
+    now: Option<&DateTime>,
+    id: Option<&str>,
+) -> Reply {
     match cmd {
-        Command::SetWifi { ssid, password } => {
-            let creds = WifiCreds { ssid, password };
-
-            // Attempt to connect and verify the credentials work before saving.
-            // Only credentials we know are valid end up in NVS; if the
-            // connection fails, return an error without persisting. Multiple
-            // connects per boot are safe now that `wifi::WifiManager::connect`
-            // no longer scans before connecting (see its doc comment).
-            match ctx.wifi_mgr.connect(&creds) {
-                Ok(()) => {
-                    // Connection succeeded; disconnect (we're not keeping a
-                    // persistent connection) and save to NVS.
-                    ctx.wifi_mgr.disconnect();
-                    match ctx.counters.save_wifi_creds(&creds) {
-                        Ok(()) => {
-                            log::info!("USB control: Wi-Fi credentials saved for '{}'", creds.ssid);
-                            Reply::Ok
-                        }
-                        Err(err) => {
-                            log::warn!("USB control: Wi-Fi credentials verified but NVS save failed: {err}");
-                            Reply::Error {
-                                message: format!("Failed to save credentials: {err}"),
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::warn!("USB control: Wi-Fi connection verification failed: {err}");
-                    Reply::Error {
-                        message: format!("Connection verification failed: {err}"),
-                    }
-                }
+        Command::SetWifi {
+            ref ssid,
+            ref password,
+        } => {
+            // Verification + NVS save run on the sync task (it owns the
+            // Wi-Fi driver); the reply is deferred and delivered via
+            // `DeviceContext::poll_wifi_ops`. `Pending` tells the client
+            // the command was accepted and the real result is coming; a
+            // second op already in flight replies `Busy` instead - not
+            // executed, safe to retry (power plan O-10).
+            let creds = WifiCreds {
+                ssid: ssid.clone(),
+                password: password.clone(),
+            };
+            let source = match channel {
+                Channel::Usb => OpSource::Usb {
+                    id: id.map(str::to_owned),
+                },
+                Channel::Ble => OpSource::Ble {
+                    id: id.map(str::to_owned),
+                },
+            };
+            match ctx.start_set_wifi(creds, source, cmd.clone()) {
+                Ok(true) => Reply::Pending,
+                Ok(false) => Reply::Busy,
+                Err(err) => Reply::Error {
+                    message: format!("Failed to start Wi-Fi verification: {err}"),
+                },
             }
         }
 
@@ -213,42 +240,29 @@ fn dispatch_inner(ctx: &mut DeviceContext, cmd: Command, now: Option<&DateTime>)
         }
 
         Command::SyncNow => {
-            // `sync::sync_now` connects Wi-Fi (main.rs drops the boot-time
-            // connection once NTP sync is done, so one usually isn't
-            // already up by the time this command arrives), then does the
-            // fetch/apply/etag-save cycle - shared with the on-device
-            // "SYNC NOW" menu screen so the two paths can't drift.
+            // The sync runs on the sync task (it owns Wi-Fi); the reply is
+            // deferred and delivered via `DeviceContext::poll_wifi_ops`.
+            // `Pending` means accepted - the real result follows as a
+            // deferred reply with the same id (power plan O-10).
             let Some(now_dt) = now else {
                 return Reply::Error {
                     message: "System time not available".to_string(),
                 };
             };
-            match sync::sync_now(
-                ctx.counters,
-                ctx.wifi_mgr,
-                ctx.alarm_store,
-                ctx.todo_store,
-                ctx.inbox_store,
-                &mut ctx.board.rtc,
-                now_dt,
-            ) {
-                Ok(sync::SyncOutcome::Applied {
-                    alarm_count,
-                    todo_count,
-                    inbox_count,
-                    ..
-                }) => {
-                    log::info!(
-                        "USB control sync completed: {alarm_count} alarms, {todo_count} todos, {inbox_count} inbox"
-                    );
-                    Reply::Ok
-                }
-                Err(err) => {
-                    log::warn!("USB control sync failed: {err}");
-                    Reply::Error {
-                        message: format!("Sync failed: {err}"),
-                    }
-                }
+            let source = match channel {
+                Channel::Usb => OpSource::Usb {
+                    id: id.map(str::to_owned),
+                },
+                Channel::Ble => OpSource::Ble {
+                    id: id.map(str::to_owned),
+                },
+            };
+            match ctx.start_sync(source, *now_dt, cmd.clone()) {
+                Ok(true) => Reply::Pending,
+                Ok(false) => Reply::Busy,
+                Err(err) => Reply::Error {
+                    message: format!("Failed to start sync: {err}"),
+                },
             }
         }
 
@@ -265,10 +279,12 @@ fn dispatch_inner(ctx: &mut DeviceContext, cmd: Command, now: Option<&DateTime>)
                 .map(|opt| opt.is_some())
                 .unwrap_or(false);
 
-            // Report live Wi-Fi connection state plus what is actually
-            // stored in NVS. Secrets (Wi-Fi password, server auth token) are
-            // never sent back to the client - only whether one is set.
-            let wifi_connected = ctx.wifi_mgr.is_connected();
+            // Report Wi-Fi connection state (last-known, from the sync
+            // task - the main loop never touches the driver) plus what is
+            // actually stored in NVS. Secrets (Wi-Fi password, server auth
+            // token) are never sent back to the client - only whether one
+            // is set.
+            let wifi_connected = ctx.sync.is_connected();
             let (wifi_ssid, wifi_has_password) = ctx
                 .counters
                 .wifi_creds()

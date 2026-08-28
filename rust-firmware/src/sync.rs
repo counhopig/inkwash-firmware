@@ -14,9 +14,9 @@ use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConne
 use serde::Serialize;
 use std::time::Duration;
 
-use crate::alarms::{self, AlarmStore};
+use crate::alarms::AlarmStore;
 use crate::inbox::InboxStore;
-use crate::rtc::{DateTime, Pcf8563};
+use crate::rtc::DateTime;
 use crate::storage::PersistedCounters;
 use crate::todos::{Importance, TodoStore};
 use crate::watchdog;
@@ -188,7 +188,6 @@ fn https_post(
 /// server data's counts and new ETag. Any HTTP error, TLS error, or
 /// JSON parse error returns `Err(...)` with a descriptive message rather
 /// than panicking.
-#[allow(clippy::too_many_arguments)]
 pub fn fetch_and_apply(
     server_url: &str,
     token: &str,
@@ -196,8 +195,7 @@ pub fn fetch_and_apply(
     alarm_store: &AlarmStore,
     todo_store: &TodoStore,
     inbox_store: &InboxStore,
-    rtc: &mut Pcf8563,
-    now: &DateTime,
+    _now: &DateTime,
 ) -> Result<SyncOutcome> {
     watchdog::feed();
 
@@ -281,11 +279,13 @@ pub fn fetch_and_apply(
     // The merged server state now reflects everything we uploaded, so the
     // pending local changes are spent. Cleared only here, after a
     // successful round-trip - a failed sync keeps them for the retry.
-    // The hardware alarm is part of the committed device state, not an
-    // optional side effect. Do not acknowledge local mutations when the RTC
-    // could not be brought in line with the newly stored alarm list.
-    alarms::program_hardware_alarm(rtc, &parsed.alarms, now)
-        .map_err(|e| anyhow!("failed to reprogram hardware alarm after sync: {e}"))?;
+    //
+    // The PCF8563 hardware alarm is NOT reprogrammed here: the sync task
+    // never touches the I2C bus. The main loop re-points the alarm slot at
+    // the new nearest alarm when it applies the sync receipt (see
+    // `ctx::DeviceContext::apply_sync_result`); the `poll_alarm`
+    // date-boundary re-arm is the safety net if that application is ever
+    // delayed.
     alarm_store
         .clear_dirty()
         .map_err(|e| anyhow!("failed to clear alarm dirty set: {e}"))?;
@@ -311,102 +311,125 @@ pub fn fetch_and_apply(
     })
 }
 
-/// Full "Sync Now" flow, shared by the on-device menu (`screens.rs`) and
-/// the USB/BLE `SyncNow` command (`control.rs`): connects Wi-Fi using the
-/// stored credentials (via the process's one shared `WifiManager` - see
-/// its doc comment for why a fresh `EspWifi` per call crashes), loads
-/// server config + cached ETag, calls `fetch_and_apply`, persists any new
-/// ETag, then disconnects Wi-Fi again - mirroring `main.rs`'s boot-time
-/// "connect only for as long as needed" pattern. `fetch_and_apply` itself
-/// has no idea whether Wi-Fi is up; both call sites used to assume it
-/// already was (main.rs disconnects after the initial NTP sync, so by the
-/// time a user actually presses "Sync Now" minutes or hours later, there
-/// is no active STA connection) - confirmed as a real bug via an
-/// end-to-end hardware test (`ESP_ERR_HTTP_CONNECT` / "Host is
-/// unreachable"), not just a hypothetical.
+/// Result of a full sync, plus the RTC-relevant side effects the main loop
+/// must apply itself: the sync task runs on its own thread and never
+/// touches the I2C bus (see the power plan's P3-3 - the shared-`Pcf8563`
+/// route was rejected because `SharedI2c` is `Rc<RefCell<...>>`, which is
+/// not `Send`; converting it to `Arc<Mutex<...>>` would ripple through the
+/// audio/NFC drivers for no functional gain over the receipt).
+pub struct SyncResult {
+    pub outcome: Result<SyncOutcome>,
+    /// NTP epoch seconds for the daily RTC alignment, when the alignment
+    /// gate is due and Wi-Fi was up long enough for SNTP. The main loop
+    /// writes this into the PCF8563.
+    pub ntp_epoch: Option<u64>,
+}
+
+/// Full "Sync Now" flow, executed on the sync task (see `sync_task.rs`):
+/// connects Wi-Fi using the stored credentials (via the process's one
+/// shared `WifiManager` - see its doc comment for why a fresh `EspWifi`
+/// per call crashes), loads server config + cached ETag, calls
+/// `fetch_and_apply`, persists any new ETag, then disconnects Wi-Fi again -
+/// mirroring `main.rs`'s boot-time "connect only for as long as needed"
+/// pattern. The RTC hardware alarm and NTP alignment are deferred to the
+/// main loop via [`SyncResult`].
 pub fn sync_now(
     counters: &PersistedCounters,
     wifi_mgr: &mut wifi::WifiManager,
     alarm_store: &AlarmStore,
     todo_store: &TodoStore,
     inbox_store: &InboxStore,
-    rtc: &mut Pcf8563,
     now: &DateTime,
-) -> Result<SyncOutcome> {
-    let creds = counters
-        .wifi_creds()
-        .map_err(|e| anyhow!("failed to load Wi-Fi credentials: {e}"))?
-        .ok_or_else(|| {
-            anyhow!("Wi-Fi not configured; use SetWifi or the on-device wizard first")
-        })?;
-    let cfg = counters
-        .device_config()
-        .map_err(|e| anyhow!("failed to load server config: {e}"))?
-        .ok_or_else(|| anyhow!("Server not configured; use SetServer first"))?;
-    let etag = counters.sync_etag().ok().flatten();
+) -> SyncResult {
+    let (outcome, ntp_epoch) = match (|| -> Result<(SyncOutcome, Option<u64>)> {
+        let creds = counters
+            .wifi_creds()
+            .map_err(|e| anyhow!("failed to load Wi-Fi credentials: {e}"))?
+            .ok_or_else(|| {
+                anyhow!("Wi-Fi not configured; use SetWifi or the on-device wizard first")
+            })?;
+        let cfg = counters
+            .device_config()
+            .map_err(|e| anyhow!("failed to load server config: {e}"))?
+            .ok_or_else(|| anyhow!("Server not configured; use SetServer first"))?;
+        let etag = counters.sync_etag().ok().flatten();
 
-    // A second in-process Wi-Fi connect used to crash; the codebase once
-    // worked around it by deep-sleep restarting for a fresh session (see
-    // `wifi::WifiManager`'s doc comment for the full history). The manual
-    // `esp_wifi_scan_start()` that `connect()` ran before every connection
-    // turned out to be the trigger - credentials here always come from the
-    // desktop's `SetWifi` command, so that scan was never needed and has
-    // been removed. Multiple connects per boot now work; no restart needed.
-    if wifi_mgr.used() {
-        log::warn!("Wi-Fi already used this boot session; attempting a second connect (scan-free)");
-    }
-
-    wifi_mgr
-        .connect(&creds)
-        .map_err(|e| anyhow!("Wi-Fi connect failed: {e}"))?;
-
-    let outcome = fetch_and_apply(
-        &cfg.server_url,
-        &cfg.auth_token,
-        etag.as_deref(),
-        alarm_store,
-        todo_store,
-        inbox_store,
-        rtc,
-        now,
-    );
-
-    // Daily NTP RTC alignment rides the live connection (SNTP needs Wi-Fi
-    // up); skipped on failed syncs so a dead network retries next time.
-    if outcome.is_ok() {
-        maybe_align_rtc(counters, rtc, now);
-    }
-
-    // Disconnect regardless of outcome - nothing else needs Wi-Fi to stay
-    // connected after this.
-    wifi_mgr.disconnect();
-
-    if let Ok(SyncOutcome::Applied {
-        etag: Some(ref new_etag),
-        ..
-    }) = outcome
-    {
-        if let Err(err) = counters.save_sync_etag(new_etag) {
-            log::warn!("Failed to save sync ETag: {err}");
+        // A second in-process Wi-Fi connect used to crash; the codebase once
+        // worked around it by deep-sleep restarting for a fresh session (see
+        // `wifi::WifiManager`'s doc comment for the full history). The
+        // manual `esp_wifi_scan_start()` that `connect()` ran before every
+        // connection turned out to be the trigger - credentials here always
+        // come from the desktop's `SetWifi` command, so that scan was never
+        // needed and has been removed. Multiple connects per boot now work;
+        // no restart needed.
+        if wifi_mgr.used() {
+            log::warn!(
+                "Wi-Fi already used this boot session; attempting a second connect (scan-free)"
+            );
         }
-    }
-    // Record when this sync ran, so the periodic auto-sync checker
-    // (`main.rs`) knows how long it has been since the last one.
-    if outcome.is_ok() {
-        if let Err(err) = counters.set_last_sync_epoch(now.to_unix()) {
-            log::warn!("Failed to record last-sync time: {err}");
-        }
-    }
 
-    outcome
+        wifi_mgr
+            .connect(&creds)
+            .map_err(|e| anyhow!("Wi-Fi connect failed: {e}"))?;
+
+        let outcome = fetch_and_apply(
+            &cfg.server_url,
+            &cfg.auth_token,
+            etag.as_deref(),
+            alarm_store,
+            todo_store,
+            inbox_store,
+            now,
+        );
+
+        // Daily NTP alignment rides the live connection (SNTP needs Wi-Fi
+        // up); skipped on failed syncs so a dead network retries next time.
+        let ntp_epoch = if outcome.is_ok() {
+            maybe_ntp_epoch(counters, now)
+        } else {
+            None
+        };
+
+        // Disconnect regardless of outcome - nothing else needs Wi-Fi to
+        // stay connected after this.
+        wifi_mgr.disconnect();
+
+        if let Ok(SyncOutcome::Applied {
+            etag: Some(new_etag),
+            ..
+        }) = &outcome
+        {
+            if let Err(err) = counters.save_sync_etag(new_etag) {
+                log::warn!("Failed to save sync ETag: {err}");
+            }
+        }
+        // Record when this sync ran, so the periodic auto-sync checker
+        // (`main.rs`) knows how long it has been since the last one.
+        if outcome.is_ok() {
+            if let Err(err) = counters.set_last_sync_epoch(now.to_unix()) {
+                log::warn!("Failed to record last-sync time: {err}");
+            }
+        }
+
+        // Unwrap at the end: connect/fetch failures early-return via `?`,
+        // but the disconnect above and the ETag/last-sync bookkeeping must
+        // run first, exactly like the original synchronous flow.
+        Ok((outcome?, ntp_epoch))
+    })() {
+        Ok((outcome, ntp_epoch)) => (Ok(outcome), ntp_epoch),
+        Err(err) => (Err(err), None),
+    };
+    SyncResult { outcome, ntp_epoch }
 }
 
-/// Resyncs the PCF8563 over NTP once per day. Must be called while Wi-Fi
-/// is still connected (SNTP cannot start on a dead link) - `sync_now`
-/// calls it before its final disconnect, so the daily check piggybacks on
-/// whichever sync path happened to run. A failed NTP round-trip retries on
-/// the next sync; the alignment timestamp is only recorded on success.
-fn maybe_align_rtc(counters: &PersistedCounters, rtc: &mut Pcf8563, now: &DateTime) {
+/// Captures the NTP epoch for the daily RTC alignment when the alignment
+/// gate is due. Must be called while Wi-Fi is still connected (SNTP cannot
+/// start on a dead link) - `sync_now` calls it before its final
+/// disconnect, so the daily check piggybacks on whichever sync path
+/// happened to run. The main loop applies the returned epoch to the
+/// PCF8563 and records the alignment timestamp (the sync task never
+/// touches the I2C bus); a failed NTP round-trip retries on the next sync.
+fn maybe_ntp_epoch(counters: &PersistedCounters, now: &DateTime) -> Option<u64> {
     let align_due = match counters.rtc_align_epoch() {
         // `abs_diff`, not `saturating_sub(...) >= 24h`: if the RTC clock
         // itself ever jumps backward - the boot-time VL reseed in main.rs
@@ -428,16 +451,14 @@ fn maybe_align_rtc(counters: &PersistedCounters, rtc: &mut Pcf8563, now: &DateTi
         }
     };
     if !align_due {
-        return;
+        return None;
     }
-    let timezone_offset = counters.timezone_offset_minutes().unwrap_or(0);
-    match wifi::ntp_sync_and_set_rtc(rtc, timezone_offset) {
-        Ok(()) => {
-            if let Err(err) = counters.set_rtc_align_epoch(now.to_unix()) {
-                log::warn!("Failed to record RTC alignment time: {err}");
-            }
+    match wifi::ntp_sync_epoch() {
+        Ok(epoch) => Some(epoch),
+        Err(err) => {
+            log::warn!("Periodic RTC alignment failed: {err}");
+            None
         }
-        Err(err) => log::warn!("Periodic RTC alignment failed: {err}"),
     }
 }
 

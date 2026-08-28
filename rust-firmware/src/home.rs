@@ -1,6 +1,6 @@
 //! Home-screen layout, kept free of any EPD/FFI dependency so the exact
 //! same pixels can be rendered on a PC (see `tools/preview`) and on the
-//! device. `display::EpdDisplay::render_home` calls `render` here, then
+//! device. `display::EpdClient::render_home` calls `render` here, then
 //! pushes the resulting framebuffer to the panel.
 
 use crate::board::ChargeSnapshot;

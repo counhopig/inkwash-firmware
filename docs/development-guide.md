@@ -47,7 +47,7 @@ uses explicitly.
 | 2 | CHRG_L | Charge IC charging status, active low | ✓ `charging` |
 | 3 | LED_G | Green LED, active low | ✓ status LED |
 | 4 | ADC_BAT | VBAT 1:2 divider | ✓ battery ADC |
-| 5 | RTC_INT | PCF8563 interrupt | — |
+| 5 | RTC_INT | PCF8563 interrupt | ✓ deep-sleep ext1 wake + `alarm_flag` poll |
 | 6 | EPD_PWR_EN | EPD power rail | ✓ managed by official driver |
 | 7 | NFC_FD | NFC field detect | — |
 | 8 | EPD_BUSY | Active low: low means busy | ✓ |
@@ -84,7 +84,23 @@ GPIO 26-37 are occupied by Octal PSRAM and must not be used as ordinary GPIOs.
 | EPD 3V3 | GPIO6 | Can be off while EPD keeps its visible image |
 | AVDD 3V3 | GPIO42 | Audio power and I2C pull-ups |
 
-Deep sleep needs special care: GPIO17 must be held high through RTC GPIO hold, otherwise the main power latch releases and the device powers off (see §2 Safety Matters).
+### Deep-Sleep Tier (Automatic)
+
+The firmware has two sleep tiers (power plan P4): light sleep engages automatically whenever the main loop is idle (both cores idle past `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`), and after **5 minutes** without user activity the device drops to deep sleep for µA-level idle power. Deep-sleep wake sources:
+
+| Source | Pin | Notes |
+| --- | --- | --- |
+| ENTER button | GPIO0 | RTC-capable |
+| DOWN button | GPIO18 | RTC-capable; included in the ext1 wake mask (`wake_cause()` reports `WakeCause::Down`) |
+| RTC alarm line | GPIO5 | `RTC_INT`, open-drain active low - alarms ring from deep sleep |
+| Maintenance timer | - | Wakes for the next month-boundary alarm re-arm, or after the 10-minute fallback (whichever is sooner) so the on-screen clock and sync scheduler stay current |
+
+**Deep-sleep limitations (by hardware):**
+- **UP (GPIO39) cannot wake deep sleep.** GPIO39 is not an RTC-capable pin, so it is the one nav key excluded from the ext1 wake mask (`power.rs:89` masks GPIO0|GPIO5|GPIO18). ENTER and DOWN both wake deep sleep; UP is light-sleep-only. Users must press ENTER or DOWN to resume from deep sleep.
+- **USB cannot wake deep sleep.** USB-Serial-JTAG has no light- or deep-sleep wake path on ESP32-S3 (IDF-6395); a USB command sent while asleep waits for the next periodic wake (≤1 s in light sleep) or, from deep sleep, for the host to reopen the serial port - opening/closing the port resets the chip (see §13), so the desktop tool always starts from a fresh, awake boot. The tool's command timeout (35/45 s) covers the reset + boot.
+- The maintenance timer wake boots into the normal loop; the aligned sync scheduler then fires at the next :00/:30 boundary, so scheduled syncs survive deep sleep.
+
+See `rust-firmware/src/power.rs` (`enter_deep_sleep_with_wakeups`) and `rust-firmware/src/main.rs` (the deep-sleep tier in the main loop).
 
 ## 4. Software Architecture
 

@@ -1,42 +1,63 @@
-use anyhow::{bail, Result};
-use esp_idf_svc::sys::zectrix_epd::{
-    zectrix_epd_config_t, zectrix_epd_del, zectrix_epd_get_default_config, zectrix_epd_handle_t,
-    zectrix_epd_new, zectrix_epd_power_off, zectrix_epd_power_on, zectrix_epd_rect_t,
-    zectrix_epd_refresh_full_1bpp, zectrix_epd_refresh_partial_1bpp,
-};
+//! Client side of the EPD subsystem (power plan P2): the shared 1bpp
+//! canvas and the request slot into the dedicated EPD task, which owns
+//! the FFI driver. Every refresh is asynchronous - drawing into the canvas
+//! is never blocked by a panel update, and the main loop never waits on a
+//! refresh.
+//!
+//! The canvas lives on the app thread only. A refresh request snapshots
+//! the whole frame under the canvas lock at request time (power plan
+//! O-4), so the EPD task never reads the canvas and a pending refresh is
+//! immune to later drawing. Requests go through a single latest-wins slot
+//! (power plan O-5), and partial-vs-full promotion is decided here (power
+//! plan O-7), keeping the refresh policy in one place.
+
+use anyhow::Result;
+use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 
 use crate::board::ChargeSnapshot;
 use crate::canvas::Canvas;
+use crate::epd_task::{self, EpdCompletion, EpdHandle};
 use crate::home;
 use crate::rtc::DateTime;
 
 pub use crate::canvas::Rect;
 
-pub struct EpdDisplay {
-    handle: zectrix_epd_handle_t,
-    canvas: Canvas,
+/// Consecutive partial refreshes before the scheduler promotes the next
+/// one to a full refresh (power plan O-7, matching the reference demo's
+/// ghosting guard: 8 UI partials then a full refresh).
+const PARTIALS_BEFORE_FULL: u32 = 8;
+
+/// Main-thread handle to the EPD subsystem: a lockable view of the frame
+/// buffer plus the request slot into [`crate::epd_task`].
+pub struct EpdClient {
+    canvas: Mutex<Canvas>,
+    handle: EpdHandle,
+    /// Partial refreshes executed since the last full refresh; drives the
+    /// full-refresh promotion (power plan O-7).
+    partials_since_full: u32,
 }
 
-impl EpdDisplay {
+impl EpdClient {
+    /// Initializes the EPD driver (hardware faults propagate) and spawns
+    /// the refresh task.
     pub fn new() -> Result<Self> {
-        let mut config = unsafe { std::mem::zeroed::<zectrix_epd_config_t>() };
-        unsafe { zectrix_epd_get_default_config(&mut config) };
-
-        let mut handle: zectrix_epd_handle_t = std::ptr::null_mut();
-        check_epd("initialize official Zectrix EPD driver", unsafe {
-            zectrix_epd_new(&config, &mut handle)
-        })?;
-
+        let canvas = Mutex::new(Canvas::new());
+        let handle = epd_task::spawn()?;
         Ok(Self {
+            canvas,
             handle,
-            canvas: Canvas::new(),
+            partials_since_full: 0,
         })
     }
 
     /// Direct canvas access for screens that don't fit the fixed
     /// `render_home` layout, e.g. the navigation drawer and `screens.rs`.
-    pub fn canvas_mut(&mut self) -> &mut Canvas {
-        &mut self.canvas
+    /// The returned guard is the frame buffer; the refresh request issued
+    /// after drawing snapshots it, so what was just drawn is what the
+    /// panel shows.
+    pub fn canvas_mut(&mut self) -> MutexGuard<'_, Canvas> {
+        self.canvas.lock()
     }
 
     /// The idle/background screen: clock, Wi-Fi/battery status, next-alarm
@@ -59,8 +80,9 @@ impl EpdDisplay {
         battery_percent: Option<u8>,
         charge: ChargeSnapshot,
     ) {
+        let mut canvas = self.canvas.lock();
         home::render(
-            &mut self.canvas,
+            &mut canvas,
             clock,
             next_alarm_time,
             next_alarm_date,
@@ -74,19 +96,14 @@ impl EpdDisplay {
         );
     }
 
+    /// Queues a full-screen refresh of the current canvas contents; the
+    /// frame is snapshotted now, so the panel shows exactly this frame.
+    /// Resets the partial-refresh promotion counter.
     pub fn refresh_full(&mut self) -> Result<()> {
-        check_epd("power on EPD", unsafe { zectrix_epd_power_on(self.handle) })?;
-        let refresh = check_epd("refresh EPD", unsafe {
-            zectrix_epd_refresh_full_1bpp(
-                self.handle,
-                self.canvas.frame().as_ptr(),
-                self.canvas.frame().len(),
-            )
-        });
-        let power_off = check_epd("power off EPD", unsafe {
-            zectrix_epd_power_off(self.handle)
-        });
-        refresh.and(power_off)
+        let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
+        self.handle.request_full(frame);
+        self.partials_since_full = 0;
+        Ok(())
     }
 
     /// Always refreshes only `rect`, never promotes to a full refresh.
@@ -94,60 +111,44 @@ impl EpdDisplay {
     /// only when its displayed minute changes; boot and alarm-ring still use
     /// `refresh_full` explicitly. Callers re-render the whole canvas
     /// before refreshing, so the partial rect always shows fresh pixels.
+    /// The scheduler merges consecutive partials into one pending request
+    /// and promotes to a full refresh after [`PARTIALS_BEFORE_FULL`] of
+    /// them (power plan O-7); `refresh_full` is for the deliberate full
+    /// refreshes (boot, alarm ring).
     pub fn refresh_partial(&mut self, rect: Rect) -> Result<()> {
-        check_epd("power on EPD", unsafe { zectrix_epd_power_on(self.handle) })?;
-        let pixels = self.canvas.pack_rect(rect);
-        let c_rect = zectrix_epd_rect_t {
-            x: rect.x as i32,
-            y: rect.y as i32,
-            width: rect.width as i32,
-            height: rect.height as i32,
-        };
-        let refresh = check_epd("refresh EPD partial", unsafe {
-            zectrix_epd_refresh_partial_1bpp(self.handle, &c_rect, pixels.as_ptr(), pixels.len())
-        });
-        let power_off = check_epd("power off EPD", unsafe {
-            zectrix_epd_power_off(self.handle)
-        });
-        refresh.and(power_off)
+        if self.partials_since_full >= PARTIALS_BEFORE_FULL {
+            self.partials_since_full = 0;
+            log::info!("{PARTIALS_BEFORE_FULL} consecutive partial refreshes; promoting to full");
+            return self.refresh_full();
+        }
+        let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
+        self.handle.request_partial(rect, frame);
+        self.partials_since_full += 1;
+        Ok(())
     }
 
     /// UI screens are best-effort callers: a display fault must not silently
     /// disappear, but it also must not stop buttons, alarms, or the watchdog.
+    /// The refresh itself (and any failure recovery) happens in the EPD
+    /// task.
     pub fn refresh_full_best_effort(&mut self) {
         if let Err(err) = self.refresh_full() {
-            log::error!("EPD full refresh failed: {err}");
+            log::error!("EPD full refresh request failed: {err}");
         }
     }
 
-    /// Logs a partial-refresh failure and attempts one full refresh using the
-    /// already-rendered canvas. This is the common recovery path for a panel
-    /// that lost partial-update state without turning every UI loop into an
-    /// error-propagation tree.
+    /// Logs a request-send failure. The panel-level recovery for a failed
+    /// partial refresh (one full refresh from the same snapshot) lives in
+    /// the EPD task, where the FFI result is known.
     pub fn refresh_partial_best_effort(&mut self, rect: Rect) {
         if let Err(err) = self.refresh_partial(rect) {
-            log::warn!("EPD partial refresh failed; trying full refresh: {err}");
-            if let Err(full_err) = self.refresh_full() {
-                log::error!("EPD recovery full refresh failed: {full_err}");
-            }
+            log::error!("EPD partial refresh request failed: {err}");
         }
     }
-}
 
-impl Drop for EpdDisplay {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                zectrix_epd_del(self.handle);
-            }
-            self.handle = std::ptr::null_mut();
-        }
+    /// Non-blocking drain of completed refreshes (power plan O-6): the app
+    /// state machine observes each refresh's success/failure/recovery here.
+    pub fn poll_completion(&mut self) -> Option<EpdCompletion> {
+        self.handle.poll_completion()
     }
-}
-
-fn check_epd(operation: &str, result: i32) -> Result<()> {
-    if result != 0 {
-        bail!("{operation} failed with ESP-IDF error 0x{result:04x}");
-    }
-    Ok(())
 }

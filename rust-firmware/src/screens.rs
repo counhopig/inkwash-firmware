@@ -10,6 +10,7 @@ use crate::display::Rect;
 use crate::inbox::{InboxItem, InboxStore};
 use crate::rtc::{is_leap, DateTime};
 use crate::sync;
+use crate::sync_task::OpSource;
 use crate::todos::{Importance, TodoStore};
 use crate::ui::{
     draw_rows, footer, header, pick_from_list, pick_number, poll_nav, show_message, tick, Nav,
@@ -252,8 +253,9 @@ fn pick_navigation(
     loop {
         let _ = ctx.poll_background(now);
         if needs_redraw {
-            let canvas = ctx.board.display.canvas_mut();
-            draw_navigation_bar(canvas, selected);
+            let mut canvas = ctx.board.display.canvas_mut();
+            draw_navigation_bar(&mut canvas, selected);
+            drop(canvas);
             ctx.board.display.refresh_partial_best_effort(NAV_BAR_RECT);
             needs_redraw = false;
         }
@@ -360,9 +362,9 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
                 }
                 Page::Calendar => {
                     let now = live_now.as_ref();
-                    let canvas = ctx.board.display.canvas_mut();
+                    let mut canvas = ctx.board.display.canvas_mut();
                     canvas.clear();
-                    header(canvas, "CALENDAR");
+                    header(&mut canvas, "CALENDAR");
                     if let Some(dt) = now {
                         let todos = ctx.todo_store.load().unwrap_or_default();
                         // Day markers for the visible month: whether a todo
@@ -393,12 +395,20 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
                             }
                         }
                         cal_selected_day = cal_selected_day.min(days_in_month).max(1);
-                        draw_month_grid(canvas, dt.year, dt.month, now, cal_selected_day, &marks);
+                        draw_month_grid(
+                            &mut canvas,
+                            dt.year,
+                            dt.month,
+                            now,
+                            cal_selected_day,
+                            &marks,
+                        );
                     }
                     footer(
-                        canvas,
+                        &mut canvas,
                         "UP/DOWN MOVE   ENTER WEEK VIEW   HOLD UP/DOWN SWITCH PAGE",
                     );
+                    drop(canvas);
                 }
                 Page::Alarms => render_alarm_page(ctx.board, ctx.alarm_store, alarm_selected),
                 Page::Todos => {
@@ -743,9 +753,9 @@ fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option
         )
     };
 
-    let canvas = ctx.board.display.canvas_mut();
+    let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
-    header(canvas, &title);
+    header(&mut canvas, &title);
 
     // Seven compact day cards keep the dense week scannable without the
     // spreadsheet-like full-height grid. The opened day gets the same
@@ -835,6 +845,7 @@ fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option
             }
         }
     }
+    drop(canvas);
 
     ctx.board.display.refresh_full_best_effort();
     loop {
@@ -920,9 +931,9 @@ fn render_alarm_page(board: &mut Note4Board, store: &AlarmStore, selected: usize
         .map(format_alarm_row)
         .collect();
     items.push("+ ADD ALARM".to_string());
-    let canvas = board.display.canvas_mut();
-    draw_rows(canvas, "ALARMS", &items, selected);
-    footer(canvas, "UP/DOWN MOVE   ENTER OK   HOLD UP/DOWN PAGE");
+    let mut canvas = board.display.canvas_mut();
+    draw_rows(&mut canvas, "ALARMS", &items, selected);
+    footer(&mut canvas, "UP/DOWN MOVE   ENTER OK   HOLD UP/DOWN PAGE");
 }
 
 fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: usize) {
@@ -966,9 +977,9 @@ fn render_todo_page(
         .iter()
         .map(|t| format_todo_row(t, now))
         .collect();
-    let canvas = board.display.canvas_mut();
-    draw_rows(canvas, "TODOS", &items, selected);
-    footer(canvas, "ENTER DONE   HOLD ENTER IMPORTANCE");
+    let mut canvas = board.display.canvas_mut();
+    draw_rows(&mut canvas, "TODOS", &items, selected);
+    footer(&mut canvas, "ENTER DONE   HOLD ENTER IMPORTANCE");
 }
 
 /// Whether `todo` (repeating or one-off) is due on `now`'s date.
@@ -1060,13 +1071,13 @@ fn render_inbox_page(board: &mut Note4Board, store: &InboxStore, selected: usize
         .iter()
         .map(format_inbox_row)
         .collect();
-    let canvas = board.display.canvas_mut();
+    let mut canvas = board.display.canvas_mut();
     if items.is_empty() {
-        draw_rows(canvas, "INBOX", &["NO MESSAGES".to_string()], selected);
+        draw_rows(&mut canvas, "INBOX", &["NO MESSAGES".to_string()], selected);
     } else {
-        draw_rows(canvas, "INBOX", &items, selected);
+        draw_rows(&mut canvas, "INBOX", &items, selected);
     }
-    footer(canvas, "ENTER OPEN   HOLD UP/DOWN PAGE");
+    footer(&mut canvas, "ENTER OPEN   HOLD UP/DOWN PAGE");
 }
 
 /// Opens an inbox item's detail (title + body) and marks it read locally.
@@ -1079,9 +1090,9 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
         log::warn!("Failed to mark inbox item read: {err}");
     }
 
-    let canvas = ctx.board.display.canvas_mut();
+    let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
-    header(canvas, "INBOX");
+    header(&mut canvas, "INBOX");
     // Title: scale 2 when it fits, otherwise wrap to up to two scale-1
     // lines (CJK cells are full-width, so a char-count cap overflowed
     // badly). The hairline rule below always clears the title's ink.
@@ -1113,7 +1124,8 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
         canvas.draw_text_prop(16, y, 1, &line);
         y += 18;
     }
-    footer(canvas, "ENTER / HOLD ENTER CLOSE");
+    footer(&mut canvas, "ENTER / HOLD ENTER CLOSE");
+    drop(canvas);
     ctx.board.display.refresh_full_best_effort();
     loop {
         if ctx.poll_background(now) {
@@ -1172,22 +1184,87 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
         return;
     };
 
-    match sync::sync_now(
-        ctx.counters,
-        ctx.wifi_mgr,
-        ctx.alarm_store,
-        ctx.todo_store,
-        ctx.inbox_store,
-        &mut ctx.board.rtc,
-        now_dt,
+    if ctx.pending_wifi_op.is_some() {
+        show_message(
+            ctx.board,
+            "SYNC BUSY",
+            &["SYNC ALREADY IN PROGRESS"],
+            std::time::Duration::from_secs(2),
+        );
+        return;
+    }
+
+    // Render the syncing status once; the wait loop below polls keys and
+    // USB so the screen never freezes while the sync task works.
+    {
+        let mut canvas = ctx.board.display.canvas_mut();
+        canvas.clear();
+        header(&mut canvas, "SYNC NOW");
+        let label = "SYNCING...";
+        let label_width = Canvas::text_prop_width(label, 2);
+        canvas.draw_text_prop((400usize.saturating_sub(label_width)) / 2, 110, 2, label);
+        footer(&mut canvas, "HOLD ENTER BACK");
+        drop(canvas);
+        ctx.board.display.refresh_full_best_effort();
+    }
+
+    let result = match ctx.start_sync(
+        OpSource::Internal,
+        *now_dt,
+        crate::control::Command::SyncNow,
     ) {
-        Ok(sync::SyncOutcome::Applied {
+        Ok(true) => {
+            let mut result = None;
+            while result.is_none() {
+                let _ = ctx.poll_usb_control(now);
+                if matches!(poll_nav(ctx.board), Nav::Enter | Nav::Cancel) {
+                    // User backed out; the sync continues on the sync task
+                    // and its receipt is applied by the main loop.
+                    break;
+                }
+                if let Some(crate::sync_task::WifiOpEvent::SyncDone(outcome)) = ctx.poll_wifi_ops()
+                {
+                    result = Some(outcome);
+                }
+                tick();
+            }
+            result
+        }
+        Ok(false) => {
+            show_message(
+                ctx.board,
+                "SYNC BUSY",
+                &["SYNC ALREADY IN PROGRESS"],
+                std::time::Duration::from_secs(2),
+            );
+            None
+        }
+        Err(err) => {
+            log::warn!("Failed to dispatch sync: {err}");
+            let err_msg = err.to_string();
+            let truncated = if err_msg.chars().count() > 40 {
+                format!("{}...", err_msg.chars().take(37).collect::<String>())
+            } else {
+                err_msg
+            };
+            show_message(
+                ctx.board,
+                "SYNC FAILED",
+                &[&truncated],
+                std::time::Duration::from_secs(2),
+            );
+            None
+        }
+    };
+
+    match result {
+        Some(Ok(sync::SyncOutcome::Applied {
             alarm_count,
             todo_count,
             inbox_count,
             inbox_truncated,
             ..
-        }) => {
+        })) => {
             let msg = if inbox_truncated {
                 format!("A:{alarm_count} T:{todo_count} IN:{inbox_count}+")
             } else {
@@ -1200,7 +1277,7 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 std::time::Duration::from_secs(2),
             );
         }
-        Err(err) => {
+        Some(Err(err)) => {
             let err_msg = err.to_string();
             // Truncate long error messages for display - by chars, not
             // bytes, so this can't panic mid-UTF-8-codepoint.
@@ -1217,6 +1294,7 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
             );
             log::warn!("Sync failed: {err}");
         }
+        None => {}
     }
 }
 
@@ -1226,16 +1304,29 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
         Ok(ble) => {
             *ctx.ble_control = Some(ble);
             log::info!("BLE pairing screen: started advertising");
+            // The S3 BT controller registers no IDF skip-light-sleep
+            // callback (unlike Wi-Fi), so an idle moment in this screen's
+            // loop could drop the radio into light sleep and break the
+            // BLE connection. Hold an explicit pm lock for the whole
+            // pairing session; it releases when this screen exits.
+            let _light_sleep_block = match crate::power::LightSleepBlock::acquire("ble_pairing") {
+                Ok(block) => Some(block),
+                Err(err) => {
+                    log::warn!("Failed to block light sleep for BLE pairing: {err}");
+                    None
+                }
+            };
 
             // Display the pairing screen with instructions.
-            let canvas = ctx.board.display.canvas_mut();
+            let mut canvas = ctx.board.display.canvas_mut();
             canvas.clear();
-            header(canvas, "BLE PAIRING");
+            header(&mut canvas, "BLE PAIRING");
             canvas.draw_text_prop(8, 40, 1, "CONNECTING...");
             canvas.draw_text_prop(8, 60, 1, "Service UUID:");
             canvas.draw_text_prop(8, 72, 1, "d2c25e50-");
             canvas.draw_text_prop(8, 84, 1, "5e22-48d8...");
-            footer(canvas, "HOLD ENTER BACK");
+            footer(&mut canvas, "HOLD ENTER BACK");
+            drop(canvas);
             ctx.board.display.refresh_full_best_effort();
 
             // This screen owns the main thread while pairing is active, so it
@@ -1246,9 +1337,19 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
             let mut last_alarm_poll = std::time::Instant::now();
             loop {
                 let _ = ctx.poll_usb_control(now);
+                // Deferred replies for long Wi-Fi ops (SyncNow/SetWifi)
+                // dispatched over BLE while pairing: delivered when the
+                // sync task finishes.
+                let _ = ctx.poll_wifi_ops();
                 if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command())
                 {
-                    let reply = crate::control::dispatch(ctx, id.as_deref(), cmd, now);
+                    let reply = crate::control::dispatch(
+                        ctx,
+                        crate::control::Channel::Ble,
+                        id.as_deref(),
+                        cmd,
+                        now,
+                    );
                     if let Some(ble) = ctx.ble_control.as_ref() {
                         ble.write_reply(&reply, id.as_deref());
                     }

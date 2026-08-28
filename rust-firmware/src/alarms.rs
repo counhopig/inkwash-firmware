@@ -119,14 +119,15 @@ fn ring_until_dismissed(
     usb: &mut UsbConsole,
     mut ble: Option<&mut BleControl>,
 ) -> Result<()> {
-    let canvas = board.display.canvas_mut();
+    let mut canvas = board.display.canvas_mut();
     canvas.clear();
-    ui::header(canvas, "ALARM");
+    ui::header(&mut canvas, "ALARM");
     let alarm_w = Canvas::text_prop_width("ALARM", 4);
     canvas.draw_text_prop(200usize.saturating_sub(alarm_w / 2), 92, 4, "ALARM");
     let hint = "ENTER = DISMISS";
     let hint_w = Canvas::text_prop_width(hint, 1);
     canvas.draw_text_prop(200usize.saturating_sub(hint_w / 2), 184, 1, hint);
+    drop(canvas);
     board.display.refresh_full_best_effort();
 
     let start = EspSystemTime {}.now();

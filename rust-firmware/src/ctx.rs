@@ -20,7 +20,10 @@
 //! lets a function read a store and mutate the board in the same scope
 //! without fighting the borrow checker.
 
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
+
+use anyhow::Result;
 
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
@@ -28,10 +31,11 @@ use crate::board::Note4Board;
 use crate::control::{self, Command, Reply};
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
-use crate::storage::PersistedCounters;
+use crate::storage::{PersistedCounters, WifiCreds};
+use crate::sync::{self, SyncOutcome};
+use crate::sync_task::{OpSource, PendingWifiOp, SyncTask, WifiOpEvent};
 use crate::todos::TodoStore;
 use crate::usb_console::UsbConsole;
-use crate::wifi::WifiManager;
 
 /// Wall-clock sync cursors shared by Home and every blocking UI loop.
 /// Keeping them here prevents each screen from inventing its own timer and
@@ -41,6 +45,14 @@ pub struct SyncScheduler {
     last_full_boundary: u64,
     never_synced: bool,
     last_ui_poll: Instant,
+    /// True once a successful full sync has fetched the server state while
+    /// the urgent flag was set. The server keeps answering `urgent: true`
+    /// until the message is read, so without this flag the device would
+    /// run a *full* sync at every 30 s boundary while any unread urgent
+    /// message exists (power plan O-9). Cleared when a poll reports no
+    /// urgent content; a failed urgent-triggered sync leaves it false so
+    /// the next boundary retries.
+    urgent_synced: bool,
 }
 
 /// State needed to safely re-arm the PCF8563's single alarm slot without
@@ -70,6 +82,7 @@ impl SyncScheduler {
             last_full_boundary: inkwash_logic::scheduler::boundary_index(unix, interval * 60),
             never_synced: counters.last_sync_epoch().unwrap_or(None).is_none(),
             last_ui_poll: Instant::now(),
+            urgent_synced: false,
         }
     }
 }
@@ -79,7 +92,9 @@ impl SyncScheduler {
 pub struct DeviceContext<'a> {
     pub board: &'a mut Note4Board,
     pub counters: &'a PersistedCounters,
-    pub wifi_mgr: &'a mut WifiManager,
+    /// Handle to the sync task, which owns the process's one `WifiManager`
+    /// (replaces the old direct `wifi_mgr` field - see `sync_task.rs`).
+    pub sync: &'a SyncTask,
     pub alarm_store: &'a AlarmStore,
     pub todo_store: &'a TodoStore,
     pub inbox_store: &'a InboxStore,
@@ -87,6 +102,10 @@ pub struct DeviceContext<'a> {
     pub ble_control: &'a mut Option<BleControl>,
     pub sync_scheduler: SyncScheduler,
     pub alarm_scheduler: AlarmScheduler,
+    /// One long-running Wi-Fi operation at a time (the sync task
+    /// serializes them anyway); `None` when idle. The receipt is polled by
+    /// [`DeviceContext::poll_wifi_ops`].
+    pub pending_wifi_op: Option<PendingWifiOp>,
     /// The last id-tagged command `control::dispatch` actually executed
     /// (USB or BLE, whichever came last), and the reply it produced.
     /// Resent duplicates of that exact `(id, Command)` replay the cached
@@ -97,25 +116,35 @@ pub struct DeviceContext<'a> {
 }
 
 impl DeviceContext<'_> {
-    /// Services one queued USB command from any UI loop. Returns true when a
-    /// successful command may have changed visible device state and the
-    /// current screen should redraw from its stores/RTC.
-    pub fn poll_usb_control(&mut self, now: Option<&DateTime>) -> bool {
+    /// Services one queued USB command from any UI loop. Returns
+    /// `(visible_change, activity)`: `visible_change` is true when a
+    /// successful command may have changed visible device state (the
+    /// current screen should redraw), and `activity` is true when *any*
+    /// command frame was received - used by the main loop's idle/deep-sleep
+    /// tracking, where the power plan counts "no USB frames" (not just
+    /// state-changing ones) as idle.
+    pub fn poll_usb_control(&mut self, now: Option<&DateTime>) -> (bool, bool) {
         let Some((id, cmd)) = self.usb_console.poll_command() else {
-            return false;
+            return (false, false);
         };
         let changes_visible_state = !matches!(cmd, Command::GetStatus);
         let fresh_now = self.board.rtc.read_time().ok();
-        let reply = control::dispatch(self, id.as_deref(), cmd, fresh_now.as_ref().or(now));
+        let reply = control::dispatch(
+            self,
+            control::Channel::Usb,
+            id.as_deref(),
+            cmd,
+            fresh_now.as_ref().or(now),
+        );
         crate::usb_console::write_reply(&reply, id.as_deref());
-        changes_visible_state && matches!(reply, Reply::Ok)
+        (changes_visible_state && matches!(reply, Reply::Ok), true)
     }
 
     /// Services USB plus wall-clock scheduled sync while an ordinary screen
     /// owns the main thread. BLE pairing deliberately calls
     /// `poll_usb_control` directly because BLE and Wi-Fi share the radio.
     pub fn poll_background(&mut self, now: Option<&DateTime>) -> bool {
-        let usb_changed = self.poll_usb_control(now);
+        let (usb_changed, _) = self.poll_usb_control(now);
         let runtime_changed =
             if self.sync_scheduler.last_ui_poll.elapsed() >= Duration::from_secs(1) {
                 self.sync_scheduler.last_ui_poll = Instant::now();
@@ -129,7 +158,12 @@ impl DeviceContext<'_> {
             } else {
                 false
             };
-        usb_changed || runtime_changed
+        // Receipts for Wi-Fi operations dispatched while this screen owns
+        // the thread (scheduler syncs, deferred SetWifi/SyncNow replies):
+        // applied here so the RTC re-arm / NTP alignment stay timely even
+        // when the main loop is blocked behind a long-lived screen.
+        let sync_changed = self.poll_wifi_ops().is_some();
+        usb_changed || sync_changed || runtime_changed
     }
 
     /// Services all RTC-driven work shared by Home and ordinary screens.
@@ -216,9 +250,12 @@ impl DeviceContext<'_> {
         }
     }
 
-    /// Runs an urgent/full sync when its wall-clock boundary advances.
-    /// Returns true only when a full sync applied state that callers should
-    /// redraw. Failed attempts are retried at the next boundary.
+    /// Runs an urgent/full sync when its wall-clock boundary advances. The
+    /// work itself happens on the sync task; this only advances the
+    /// boundary cursors and dispatches the command (returning `false`, the
+    /// completion side effects - redraw, RTC re-arm - are applied by
+    /// [`DeviceContext::poll_wifi_ops`]). Failed attempts are retried at
+    /// the next boundary.
     pub fn poll_scheduled_sync(&mut self, now: &DateTime) -> bool {
         let server_configured = self
             .counters
@@ -250,46 +287,251 @@ impl DeviceContext<'_> {
             return false;
         }
 
-        if urgent_due {
-            self.sync_scheduler.last_urgent_boundary =
-                inkwash_logic::scheduler::boundary_index(unix, 30);
-            match crate::sync::poll_urgent(self.counters, self.wifi_mgr) {
-                Ok(true) => {
-                    log::info!("Urgent message available; syncing");
-                    return self.run_full_sync(now);
-                }
-                Ok(false) => {}
-                Err(err) => log::warn!("Urgent poll failed: {err}"),
-            }
+        // One op at a time; cursors were advanced when the previous one
+        // dispatched, so the next boundary still fires on time.
+        if self.pending_wifi_op.is_some() {
+            return false;
         }
 
         if full_due || (self.sync_scheduler.never_synced && urgent_due) {
             self.sync_scheduler.last_full_boundary =
                 inkwash_logic::scheduler::boundary_index(unix, interval * 60);
-            log::info!("Aligned sync due (interval {interval} min); syncing");
-            return self.run_full_sync(now);
+            self.sync_scheduler.last_urgent_boundary =
+                inkwash_logic::scheduler::boundary_index(unix, 30);
+            log::info!("Aligned sync due (interval {interval} min); dispatching");
+            if let Err(err) = self.start_sync(OpSource::Internal, *now, Command::SyncNow) {
+                log::warn!("Failed to dispatch scheduled sync: {err}");
+            }
+            return false;
+        }
+
+        if urgent_due {
+            self.sync_scheduler.last_urgent_boundary =
+                inkwash_logic::scheduler::boundary_index(unix, 30);
+            log::info!("Urgent poll boundary; dispatching");
+            match self.sync.poll_urgent() {
+                Ok(reply) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
+                }
+                Err(err) => log::warn!("Failed to dispatch urgent poll: {err}"),
+            }
         }
         false
     }
 
-    fn run_full_sync(&mut self, now: &DateTime) -> bool {
-        match crate::sync::sync_now(
-            self.counters,
-            self.wifi_mgr,
-            self.alarm_store,
-            self.todo_store,
-            self.inbox_store,
-            &mut self.board.rtc,
-            now,
-        ) {
-            Ok(_) => {
-                self.sync_scheduler.never_synced = false;
-                log::info!("Full sync completed");
-                true
+    /// Dispatches a full sync to the sync task and records the pending
+    /// receipt. Returns `Ok(true)` when dispatched, `Ok(false)` when
+    /// another Wi-Fi operation is already in flight (the caller replies
+    /// busy / skips). `cmd` is kept for the dedup-cache update on
+    /// completion.
+    pub fn start_sync(&mut self, source: OpSource, now: DateTime, cmd: Command) -> Result<bool> {
+        if self.pending_wifi_op.is_some() {
+            return Ok(false);
+        }
+        let reply = self.sync.sync_now(now)?;
+        self.pending_wifi_op = Some(PendingWifiOp::Sync { reply, source, cmd });
+        Ok(true)
+    }
+
+    /// Dispatches a Wi-Fi verification + save to the sync task.
+    pub fn start_set_wifi(
+        &mut self,
+        creds: WifiCreds,
+        source: OpSource,
+        cmd: Command,
+    ) -> Result<bool> {
+        if self.pending_wifi_op.is_some() {
+            return Ok(false);
+        }
+        let reply = self.sync.set_wifi(creds)?;
+        self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply, source, cmd });
+        Ok(true)
+    }
+
+    /// Polls the pending Wi-Fi operation's receipt (non-blocking). Called
+    /// every main-loop iteration and by blocking screens via
+    /// [`DeviceContext::poll_background`]; applies completion side effects
+    /// (RTC re-arm, NTP alignment, deferred transport replies) and returns
+    /// the completed operation's event for the caller.
+    pub fn poll_wifi_ops(&mut self) -> Option<WifiOpEvent> {
+        let op = self.pending_wifi_op.take()?;
+        let event = match op {
+            PendingWifiOp::Sync { reply, source, cmd } => match reply.try_recv() {
+                Ok(result) => {
+                    let event = WifiOpEvent::SyncDone(
+                        result.outcome.as_ref().map_err(|e| e.to_string()).cloned(),
+                    );
+                    self.apply_sync_result(result, source, cmd);
+                    Some(event)
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::Sync { reply, source, cmd });
+                    return None;
+                }
+                Err(_) => None,
+            },
+            PendingWifiOp::SetWifi { reply, source, cmd } => match reply.try_recv() {
+                Ok(result) => {
+                    let event = WifiOpEvent::SetWifiDone;
+                    self.apply_set_wifi_result(result, source, cmd);
+                    Some(event)
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply, source, cmd });
+                    return None;
+                }
+                Err(_) => None,
+            },
+            PendingWifiOp::UrgentPoll { reply } => match reply.try_recv() {
+                Ok(Ok(true)) => {
+                    // Power plan O-9: the server keeps answering
+                    // `urgent: true` until the message is read, and a
+                    // successful full sync already fetched it - so further
+                    // polls with the flag still set must not re-run the
+                    // full sync at every 30 s boundary. Cleared when a
+                    // poll reports no urgent content.
+                    if self.sync_scheduler.urgent_synced {
+                        log::info!("Urgent flag still set and already synced; skipping full sync");
+                        None
+                    } else {
+                        log::info!("Urgent message available; dispatching full sync");
+                        match self.board.rtc.read_time() {
+                            Ok(now) => {
+                                if let Err(err) =
+                                    self.start_sync(OpSource::Internal, now, Command::SyncNow)
+                                {
+                                    log::warn!("Failed to dispatch sync after urgent poll: {err}");
+                                }
+                            }
+                            Err(err) => log::warn!("RTC read failed after urgent poll: {err}"),
+                        }
+                        None
+                    }
+                }
+                Ok(Ok(false)) => {
+                    self.sync_scheduler.urgent_synced = false;
+                    None
+                }
+                Ok(Err(err)) => {
+                    log::warn!("Urgent poll failed: {err}");
+                    None
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
+                    return None;
+                }
+                Err(_) => None,
+            },
+        };
+        event
+    }
+
+    /// Applies a completed sync: re-points the PCF8563 alarm slot at the
+    /// newly-synced alarm list, applies the daily NTP alignment, clears the
+    /// fresh-device fast path, and delivers the deferred transport reply
+    /// (updating the dedup cache so a resend replays the real result).
+    fn apply_sync_result(&mut self, result: sync::SyncResult, source: OpSource, cmd: Command) {
+        let sync::SyncResult { outcome, ntp_epoch } = result;
+        if outcome.is_ok() {
+            // The sync task saved the merged alarm list to NVS; re-point
+            // the PCF8563's single alarm slot at the new nearest alarm.
+            match self.board.rtc.read_time() {
+                Ok(now) => {
+                    match self.alarm_store.load().and_then(|list| {
+                        crate::alarms::program_hardware_alarm(&mut self.board.rtc, &list, &now)
+                    }) {
+                        Ok(()) => {}
+                        Err(err) => {
+                            log::warn!("Failed to re-arm hardware alarm after sync: {err}")
+                        }
+                    }
+                }
+                Err(err) => log::warn!("RTC read failed after sync (alarm not re-armed): {err}"),
+            }
+            // Daily NTP alignment: the sync task captured the NTP time
+            // while Wi-Fi was up; apply it here (the task never touches
+            // the I2C bus).
+            if let Some(epoch) = ntp_epoch {
+                let tz = self.counters.timezone_offset_minutes().unwrap_or(0);
+                let dt = DateTime::from_unix(epoch).shifted_minutes(tz as i32);
+                match self.board.rtc.write_time(&dt) {
+                    Ok(()) => {
+                        log::info!("NTP alignment applied to RTC");
+                        if let Err(err) = self.counters.set_rtc_align_epoch(epoch) {
+                            log::warn!("Failed to record RTC alignment time: {err}");
+                        }
+                    }
+                    Err(err) => log::warn!("Failed to write NTP time to RTC: {err}"),
+                }
+            }
+            self.sync_scheduler.never_synced = false;
+            // A successful full sync fetched the current server state; if
+            // the urgent flag is still set, that message is already here
+            // and the 30 s urgent polls must not re-run the full sync
+            // until the flag clears (power plan O-9).
+            self.sync_scheduler.urgent_synced = true;
+            log::info!("Full sync completed");
+        }
+        self.deliver_deferred_reply(source, cmd, reply_for_outcome(&outcome));
+    }
+
+    fn apply_set_wifi_result(&mut self, result: Result<()>, source: OpSource, cmd: Command) {
+        let reply = match &result {
+            Ok(()) => {
+                log::info!("Wi-Fi credentials verified and saved");
+                Reply::Ok
             }
             Err(err) => {
-                log::warn!("Full sync failed: {err}");
-                false
+                log::warn!("Wi-Fi connection verification failed: {err}");
+                Reply::Error {
+                    message: format!("Connection verification failed: {err}"),
+                }
+            }
+        };
+        self.deliver_deferred_reply(source, cmd, reply);
+    }
+
+    /// Writes a deferred reply to its transport and updates the dedup
+    /// cache so a resent duplicate replays the real result instead of the
+    /// interim `Busy`.
+    fn deliver_deferred_reply(&mut self, source: OpSource, command: Command, reply: Reply) {
+        match source {
+            OpSource::Usb { id } => {
+                crate::usb_console::write_reply(&reply, id.as_deref());
+                if let Some(id) = id {
+                    self.last_command = Some((id, command, reply));
+                }
+            }
+            OpSource::Ble { id } => {
+                if let Some(ble) = self.ble_control.as_ref() {
+                    ble.write_reply(&reply, id.as_deref());
+                }
+                if let Some(id) = id {
+                    self.last_command = Some((id, command, reply));
+                }
+            }
+            OpSource::Internal => {}
+        }
+    }
+}
+
+fn reply_for_outcome(outcome: &Result<SyncOutcome>) -> Reply {
+    match outcome {
+        Ok(SyncOutcome::Applied {
+            alarm_count,
+            todo_count,
+            inbox_count,
+            ..
+        }) => {
+            log::info!(
+                "Sync completed: {alarm_count} alarms, {todo_count} todos, {inbox_count} inbox"
+            );
+            Reply::Ok
+        }
+        Err(err) => {
+            log::warn!("Sync failed: {err}");
+            Reply::Error {
+                message: format!("Sync failed: {err}"),
             }
         }
     }

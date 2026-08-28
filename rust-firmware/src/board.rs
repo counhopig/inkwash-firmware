@@ -15,7 +15,7 @@ use esp_idf_svc::hal::units::Hertz;
 
 use crate::audio::{self, Es8311};
 use crate::button::Button;
-use crate::display::EpdDisplay;
+use crate::display::EpdClient;
 use crate::nfc::{self, NfcTag};
 use crate::power;
 use crate::rtc::{Pcf8563, PCF8563_ADDR};
@@ -62,8 +62,13 @@ pub struct Note4Board {
     /// forcing every caller to invent its own fallback - see its doc
     /// comment for why defaulting to "empty" is actively wrong.
     last_battery_percent: Option<u8>,
-    pub display: EpdDisplay,
+    pub display: EpdClient,
     pub rtc: Pcf8563,
+    /// One-shot wake interrupts for the idle loop (see `wake.rs`): the
+    /// three nav keys resume the main loop's idle wait the moment they
+    /// assert, instead of waiting out the 1 s poll. (The RTC alarm line is
+    /// not wired here - see `power::WAKE_PINS` for why.)
+    pub wake: crate::wake::Waker,
     /// `None` when the ES8311 failed to initialize; the rest of the board
     /// (display/buttons/RTC/Wi-Fi) still works without it.
     pub audio: Option<Es8311>,
@@ -225,6 +230,13 @@ impl Note4Board {
         let key_enter = Button::new(pins.gpio0.into(), Pull::Up)?;
         let key_up = Button::new(pins.gpio39.into(), Pull::Up)?;
         let key_down = Button::new(pins.gpio18.into(), Pull::Up)?;
+        // One-shot wake interrupts for the idle loop: a key press resumes
+        // the main loop's 1 s idle wait immediately (see `wake.rs` for why
+        // the sleep wake sources alone cannot do that).
+        let wake = crate::wake::Waker::new(&crate::power::WAKE_PINS);
+        wake.subscribe(crate::power::GPIO_NUM_0)?;
+        wake.subscribe(crate::power::GPIO_NUM_39)?;
+        wake.subscribe(crate::power::GPIO_NUM_18)?;
         // Neither status line gets an internal pull: the official ZECTRIX
         // demo's `ChargeStatus::Init` explicitly disables both pull-up and
         // pull-down on both GPIOs (its only configuration of these two
@@ -235,7 +247,7 @@ impl Note4Board {
         // verified-working reference instead.
         let charging = PinDriver::input(pins.gpio2, Pull::Floating)?;
         let charge_done = PinDriver::input(pins.gpio1, Pull::Floating)?;
-        let display = EpdDisplay::new()?;
+        let display = EpdClient::new()?;
 
         let adc: BoardAdc = AdcDriver::new(peripherals.adc1)?;
         // GPIO4 is reserved as the analog battery pin and intentionally
@@ -310,6 +322,7 @@ impl Note4Board {
             last_battery_percent: None,
             display,
             rtc,
+            wake,
             audio,
             nfc,
         })
