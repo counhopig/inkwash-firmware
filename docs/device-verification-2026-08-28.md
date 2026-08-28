@@ -115,7 +115,43 @@
 
 ---
 
-## 4. 复现需要的环境备注
+## 4. 崩溃根因（已定位，已修复，待真机复核）
+
+> 本节是后续排查的增量记录，补记「问题 A 的候选根因」里当时未坐实、
+> 后来在真机上抓到确凿证据的那条。
+
+**决定性日志：** 烧入 `26ce17e` 后抓到：
+
+```
+assert failed: xTaskGenericNotifyWait tasks.c:5814 (uxIndexToWait < 1)
+Backtrace: 0x4038495d:... Rebooting...
+rst:0xc (RTC_SW_CPU_RST)
+```
+
+**根因链条（确凿）：**
+
+1. `0f8e568` 的 `wake.rs` 唤醒 ISR 用 `eNoAction` + value `0`，`xTaskGenericNotifyWait`
+   的 `!= 0` 返回值在部分 IDF 构建下读不到有效通知 → 主任务进入 idle/light sleep
+   后**不再轮询按键/RTC**，表现为按键、屏幕刷新、USB 响应一起消失（问题 A 的真相）。
+2. `26ce17e` 试图修复时，把 `` 0xffffffff `` 误传成 `xTaskGenericNotifyWait` 的
+   **第一参数（`uxIndexToWaitOn` 通知索引，必须为 0）**，触发 `uxIndexToWait < 1`
+   断言 → **panic 重启循环**。e-paper 保留崩溃前最后一帧（18:44），外观即"彻底卡死"。
+3. `ec4c679` 已把参数位置改回：索引固定 `0`，`ulBitsToClearOnEntry = 0xffffffff`；
+   ISR 侧保留 `eSetValueWithOverwrite` + value `1`。本地 release 为
+   `v0.5.0-7-gec4c679`。
+
+**待复核（尚未真机坐实）：**
+- `ec4c679` 烧入后，**ENTER / DOWN 唤醒、时钟刷新是否恢复** —— 尚无连续日志证据。
+- 深睡维护唤醒后**时钟区长期不刷新**这条独立显示路径，两个 wake 修复都**未触及**，
+  仍需在「进入深睡 / 维护唤醒 / EPD 完成」三类日志上坐实。
+
+**验证方法（务必遵守）：** 一次**连续**日志会话（不反复开关端口），重点看启动行
+的 git hash、有无 `uxIndexToWait < 1` 断言，以及「进入深睡 / maintenance= / EPD
+refresh completed/failed」三类日志。
+
+---
+
+## 5. 复现需要的环境备注
 
 - 烧录必须 `--before usb-reset`；`--before default-reset` 连不上。
 - 观察运行日志用**单次长会话**（开一次串口、设备睡掉枚举消失后自动重连），
