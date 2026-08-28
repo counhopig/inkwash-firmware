@@ -151,7 +151,48 @@ refresh completed/failed」三类日志。
 
 ---
 
-## 5. 复现需要的环境备注
+## 5. EPD 唤醒通道缺陷（时钟冻结的真正根因，已修复）
+
+> 上一节把「时钟不刷新」归因于 wake 通知缺陷，但**那只是崩溃/误判，不是时钟
+> 冻结的最终根因**。后续静态审查定位到 `0f8e568`（P2 EPD 任务化）引入的另一个
+> 独立缺陷，它单独就能造成「时钟永久冻结」，与 wake.rs 无关。
+
+**确凿根因（`epd_task.rs::spawn`，已修复为 `e0578c4`）：**
+
+```rust
+// 修复前：两个互不相通的 sync_channel(1)
+let slot = Arc::new(RefreshSlot {
+    pending: Mutex::new(None),
+    notify_tx: sync_channel(1).0,          // channel A 的 sender，receiver 被丢弃
+});
+...
+.spawn(move || run(driver, task_slot, sync_channel(1).1, completions_tx))
+    //                                          ^^^^^^^^^^^^^^^^^ channel B 的 receiver，
+    //                                          sender 从未保存、无人发送
+```
+
+- `submit_partial`/`submit_full` 里 `notify_tx.try_send(())` 发到 channel A，但其
+  receiver 已被 drop → `try_send` **总是失败**（被 `let _ =` 吞掉）。
+- `run()` 里 `notify_rx.recv()` 等 channel B，其 sender 不存在 → **永久阻塞**。
+- 结果：EPD task 启动后最多消费一次「已 pending 的命令」，之后永远卡在 `recv()`，
+  **不再 drain**——所有后续刷新（时钟分钟变化、深睡唤醒的时钟区局刷）全部丢失，
+  屏幕时钟因此永久停在上次成功刷新的那一帧（18:44）。
+
+**修复（`e0578c4`）：** 只建一个 channel，把成对的 sender/receiver 分别交给
+`RefreshSlot.notify_tx` 和 `run()` 的 `notify_rx`。
+
+**与深睡唤醒 partial 首刷的关系（无需额外改代码）：** 深睡 = 整机重启，`zectrix_epd_new`
+后 `shadow_valid=false`，深睡唤醒路径发的第一个 `refresh_partial(CLOCK_RECT)` 会因
+`zectrix_epd_refresh_partial_1bpp` 的 `shadow_valid` 检查返回 `ESP_ERR_INVALID_STATE`，
+但 `epd_task::execute` 的 partial-失败分支会**用同一张含新时间的整帧快照**走 full
+recovery 重新建立 shadow 并刷屏。此链路在 channel 修复后即自洽。
+
+**待真机复核：** `e0578c4` 烧入后，需确认 EPD 刷新日志（`EPD refresh completed` /
+`EPD partial refresh failed; recovered via full refresh`）持续出现、时钟随分钟更新。
+
+---
+
+## 6. 复现需要的环境备注
 
 - 烧录必须 `--before usb-reset`；`--before default-reset` 连不上。
 - 观察运行日志用**单次长会话**（开一次串口、设备睡掉枚举消失后自动重连），
