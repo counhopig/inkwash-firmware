@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-08-16 · **Updated:** 2026-08-27 · **Commit:** 84eadad · **Branch:** main
+**Generated:** 2026-08-16 · **Updated:** 2026-08-28 · **Commit:** 82df098 · **Branch:** main
 
 ## OVERVIEW
 Self-developed firmware repository for the ZECTRIX NOTE4 black-and-white display edition (ESP32-S3-WROOM-1 N16R8, 4.2" 400×300 SSD2683 EPD). A single Rust crate (`rust-firmware/`) built with ESP-IDF 5.5.5 and the `esp` Xtensa toolchain, implementing calendar/offline alarms/todos + HTTPS sync + USB/BLE configuration channels. One of a four-repository system (`../inkwash-desktop` PC tool, `../inkwash-server` backend, `../inkwash-mcp` MCP server, each an independent repository). Design principle: the device does not author content — the configuration channel only delivers Wi-Fi credentials/server address + token, content is pulled as structured JSON, and alarms ring offline.
