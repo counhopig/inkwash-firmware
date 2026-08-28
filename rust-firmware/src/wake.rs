@@ -110,12 +110,13 @@ impl Waker {
     /// `ulBitsToClearOnEntry = 0xffffffff` clears any stale notification
     /// from a previous awake window before blocking, so a press that fired
     /// while the loop was still in its active cadence cannot be replayed
-    /// as a spurious wake on the very next idle wait.
+    /// as a spurious wake on the very next idle wait. The first argument
+    /// is the notification *index* (`uxIndexToWaitOn`), which must stay 0.
     pub fn wait(&self, timeout_ticks: u32) -> bool {
         unsafe {
             xTaskGenericNotifyWait(
-                0xffffffff,
                 0,
+                0xffffffff,
                 0,
                 core::ptr::null_mut(),
                 timeout_ticks as TickType_t,
