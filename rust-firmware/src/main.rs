@@ -667,7 +667,10 @@ fn main() -> Result<()> {
                 })
                 .map(|delay| delay.min(MAINTENANCE_WAKE_FALLBACK))
                 .or(Some(MAINTENANCE_WAKE_FALLBACK));
-            log::info!("Idle past deep-sleep threshold; entering deep sleep");
+            log::info!(
+                "Idle past deep-sleep threshold; entering deep sleep (maintenance={:?})",
+                maintenance
+            );
             crate::power::enter_deep_sleep_with_wakeups(maintenance);
         }
 

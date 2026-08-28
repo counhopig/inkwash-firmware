@@ -19,7 +19,7 @@ use core::ffi::c_void;
 
 use anyhow::Result;
 use esp_idf_svc::sys::{
-    eNotifyAction_eNoAction, gpio_int_type_t_GPIO_INTR_LOW_LEVEL, gpio_intr_disable,
+    eNotifyAction_eSetValueWithOverwrite, gpio_int_type_t_GPIO_INTR_LOW_LEVEL, gpio_intr_disable,
     gpio_intr_enable, gpio_isr_handler_add, gpio_set_intr_type, xTaskGenericNotifyFromISR,
     xTaskGenericNotifyWait, xTaskGetCurrentTaskHandle, BaseType_t, TaskHandle_t, TickType_t,
 };
@@ -39,11 +39,17 @@ unsafe extern "C" fn wake_isr(ctx: *mut c_void) {
     unsafe {
         gpio_intr_disable(ctx.gpio);
         let mut higher_prio_woken: BaseType_t = 0;
+        // Set a non-zero notification value with overwrite. The old
+        // `eNoAction` + value 0 left the notification value at 0, which on
+        // some IDF builds made `xTaskGenericNotifyWait(..., != 0)` return
+        // false even after a wake - the idle loop then fell straight
+        // through without polling the buttons, and a held-low key kept
+        // re-entering sleep until the pin stormed or the loop wedged.
         xTaskGenericNotifyFromISR(
             ctx.task,
             0,
-            0,
-            eNotifyAction_eNoAction,
+            1,
+            eNotifyAction_eSetValueWithOverwrite,
             core::ptr::null_mut(),
             &mut higher_prio_woken,
         );
@@ -100,9 +106,20 @@ impl Waker {
     /// Blocks until a wake notification or `timeout_ticks`, consuming the
     /// notification state either way. Returns true when a notification was
     /// pending (a key was pressed or the RTC alarm line asserted).
+    ///
+    /// `ulBitsToClearOnEntry = 0xffffffff` clears any stale notification
+    /// from a previous awake window before blocking, so a press that fired
+    /// while the loop was still in its active cadence cannot be replayed
+    /// as a spurious wake on the very next idle wait.
     pub fn wait(&self, timeout_ticks: u32) -> bool {
         unsafe {
-            xTaskGenericNotifyWait(0, 0, 0, core::ptr::null_mut(), timeout_ticks as TickType_t) != 0
+            xTaskGenericNotifyWait(
+                0xffffffff,
+                0,
+                0,
+                core::ptr::null_mut(),
+                timeout_ticks as TickType_t,
+            ) != 0
         }
     }
 }
