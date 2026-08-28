@@ -7,25 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
-- **Power/response overhaul** - the `power-and-response` plan (EPD refresh,
-  Wi-Fi/HTTPS sync, and sleep tiering):
-  - **Light sleep** (`P1`): `CONFIG_PM_ENABLE` + tickless idle with a 200-tick
+- **Power/response overhaul** (EPD refresh, Wi-Fi/HTTPS sync, and sleep
+  tiering):
+  - **Light sleep**: `CONFIG_PM_ENABLE` + tickless idle with a 200-tick
     admission threshold; a two-level poll cadence (20 ms active / 1 s idle)
     with a 10 s idle RTC re-read; digital-GPIO wake for the three nav keys;
     and a `LightSleepBlock` no-light-sleep lock while BLE pairing is open.
-  - **EPD refresh task** (`P2`): the `zectrix_epd` FFI driver now lives in
+  - **EPD refresh task**: the `zectrix_epd` FFI driver now lives in
     `epd_task.rs`, which owns it exclusively. Refresh requests carry an
     immutable full-frame snapshot through a bounded single-slot latest-wins
     path; completion events (`ok` / `recovered`) report success, failure, and
     partial->full recovery back to the app; and `display.rs` centralizes the
     "8 partials then a full refresh" promotion policy.
-  - **Sync task** (`P3`): `sync_task.rs` owns the process's single
+  - **Sync task**: `sync_task.rs` owns the process's single
     `WifiManager` and runs every Wi-Fi operation (SyncNow/SetWifi/UrgentPoll)
     off the main loop over command/reply channels, with independent NVS
     handles per thread. Deferred replies use a new `pending` status, `busy`
     keeps "not executed, safe to retry", and a home-content fingerprint plus
     an urgent dedup flag skip unchanged redraws / repeated full syncs.
-  - **Deep sleep tier** (`P4`): 5-minute idle drops to deep sleep with ext1
+  - **Deep sleep tier**: 5-minute idle drops to deep sleep with ext1
     wake on GPIO0/5/18 (ENTER/RTC_INT/DOWN); a maintenance-timer wake takes
     the minimum of the next month-boundary alarm and a 10-minute fallback;
     a deep-sleep wake skips the boot full refresh.
@@ -37,7 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and EPD blocking windows live on their own watched tasks.
 
 ### Known limitations
-- Input stays poll-based (`P5` is not yet done): there is no dedicated button
+- Input stays poll-based: there is no dedicated button
   task or bounded event queue, and `wake.rs` only wakes the main loop rather
   than emitting semantic key events.
 - Not yet verified on device: idle power / response latency measurements, the

@@ -49,7 +49,7 @@ pub struct SyncScheduler {
     /// the urgent flag was set. The server keeps answering `urgent: true`
     /// until the message is read, so without this flag the device would
     /// run a *full* sync at every 30 s boundary while any unread urgent
-    /// message exists (power plan O-9). Cleared when a poll reports no
+    /// message exists. Cleared when a poll reports no
     /// urgent content; a failed urgent-triggered sync leaves it false so
     /// the next boundary retries.
     urgent_synced: bool,
@@ -121,7 +121,7 @@ impl DeviceContext<'_> {
     /// successful command may have changed visible device state (the
     /// current screen should redraw), and `activity` is true when *any*
     /// command frame was received - used by the main loop's idle/deep-sleep
-    /// tracking, where the power plan counts "no USB frames" (not just
+    /// tracking, where idle counts "no USB frames" (not just
     /// state-changing ones) as idle.
     pub fn poll_usb_control(&mut self, now: Option<&DateTime>) -> (bool, bool) {
         let Some((id, cmd)) = self.usb_console.poll_command() else {
@@ -384,7 +384,7 @@ impl DeviceContext<'_> {
             },
             PendingWifiOp::UrgentPoll { reply } => match reply.try_recv() {
                 Ok(Ok(true)) => {
-                    // Power plan O-9: the server keeps answering
+                    // The server keeps answering
                     // `urgent: true` until the message is read, and a
                     // successful full sync already fetched it - so further
                     // polls with the flag still set must not re-run the
@@ -468,7 +468,7 @@ impl DeviceContext<'_> {
             // A successful full sync fetched the current server state; if
             // the urgent flag is still set, that message is already here
             // and the 30 s urgent polls must not re-run the full sync
-            // until the flag clears (power plan O-9).
+            // until the flag clears.
             self.sync_scheduler.urgent_synced = true;
             log::info!("Full sync completed");
         }

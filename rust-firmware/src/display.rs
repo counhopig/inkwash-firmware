@@ -1,15 +1,15 @@
-//! Client side of the EPD subsystem (power plan P2): the shared 1bpp
+//! Client side of the EPD subsystem: the shared 1bpp
 //! canvas and the request slot into the dedicated EPD task, which owns
 //! the FFI driver. Every refresh is asynchronous - drawing into the canvas
 //! is never blocked by a panel update, and the main loop never waits on a
 //! refresh.
 //!
 //! The canvas lives on the app thread only. A refresh request snapshots
-//! the whole frame under the canvas lock at request time (power plan
-//! O-4), so the EPD task never reads the canvas and a pending refresh is
-//! immune to later drawing. Requests go through a single latest-wins slot
-//! (power plan O-5), and partial-vs-full promotion is decided here (power
-//! plan O-7), keeping the refresh policy in one place.
+//! the whole frame under the canvas lock at request time, so the EPD task
+//! never reads the canvas and a pending refresh is
+//! immune to later drawing. Requests go through a single latest-wins slot,
+//! and partial-vs-full promotion is decided here,
+//! keeping the refresh policy in one place.
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -24,7 +24,7 @@ use crate::rtc::DateTime;
 pub use crate::canvas::Rect;
 
 /// Consecutive partial refreshes before the scheduler promotes the next
-/// one to a full refresh (power plan O-7, matching the reference demo's
+/// one to a full refresh (matching the reference demo's
 /// ghosting guard: 8 UI partials then a full refresh).
 const PARTIALS_BEFORE_FULL: u32 = 8;
 
@@ -34,7 +34,7 @@ pub struct EpdClient {
     canvas: Mutex<Canvas>,
     handle: EpdHandle,
     /// Partial refreshes executed since the last full refresh; drives the
-    /// full-refresh promotion (power plan O-7).
+    /// full-refresh promotion.
     partials_since_full: u32,
 }
 
@@ -113,7 +113,7 @@ impl EpdClient {
     /// before refreshing, so the partial rect always shows fresh pixels.
     /// The scheduler merges consecutive partials into one pending request
     /// and promotes to a full refresh after [`PARTIALS_BEFORE_FULL`] of
-    /// them (power plan O-7); `refresh_full` is for the deliberate full
+    /// them; `refresh_full` is for the deliberate full
     /// refreshes (boot, alarm ring).
     pub fn refresh_partial(&mut self, rect: Rect) -> Result<()> {
         if self.partials_since_full >= PARTIALS_BEFORE_FULL {
@@ -146,7 +146,7 @@ impl EpdClient {
         }
     }
 
-    /// Non-blocking drain of completed refreshes (power plan O-6): the app
+    /// Non-blocking drain of completed refreshes: the app
     /// state machine observes each refresh's success/failure/recovery here.
     pub fn poll_completion(&mut self) -> Option<EpdCompletion> {
         self.handle.poll_completion()

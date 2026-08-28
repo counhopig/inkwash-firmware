@@ -1,10 +1,10 @@
-//! Dedicated EPD refresh task (power plan P2).
+//! Dedicated EPD refresh task.
 //!
 //! Owns the synchronous `zectrix_epd` FFI driver and serializes every
 //! panel refresh on one thread, so the main loop never blocks on a
 //! refresh.
 //!
-//! Request model (power plan O-4/O-5): every refresh command carries an
+//! Request model: every refresh command carries an
 //! **immutable pixel snapshot** of the whole frame, copied under the
 //! canvas lock at request time. The task never touches the shared canvas,
 //! so a pending request always paints exactly the picture its requester
@@ -17,7 +17,7 @@
 //! the newest frame. Memory is bounded (at most one 15 KB frame snapshot
 //! pending).
 //!
-//! Completion (power plan O-6): the task reports every refresh back to the
+//! Completion: the task reports every refresh back to the
 //! app through a completion channel - success, failure, and partial->full
 //! recovery are all observable, so the app state machine can treat a frame
 //! as displayed only once its completion arrives.
@@ -46,13 +46,13 @@ pub enum RefreshKind {
 /// One refresh request: an immutable full-frame pixel snapshot plus the
 /// region to paint from it. The snapshot is captured at request time under
 /// the canvas lock, so the panel shows exactly the frame the requester
-/// drew regardless of what the canvas holds later (power plan O-4).
+/// drew regardless of what the canvas holds later.
 pub struct RenderCommand {
     pub kind: RefreshKind,
     pub frame: Box<[u8]>,
 }
 
-/// Completion report for one executed refresh (power plan O-6).
+/// Completion report for one executed refresh.
 #[derive(Debug, Clone, Copy)]
 pub struct EpdCompletion {
     pub kind: RefreshKind,
@@ -122,7 +122,7 @@ pub struct EpdHandle {
 
 impl EpdHandle {
     /// Queues a partial refresh of `rect`, merging into any pending
-    /// request (latest-wins, power plan O-5).
+    /// request (latest-wins).
     pub fn request_partial(&self, rect: Rect, frame: Box<[u8]>) {
         self.slot.submit_partial(rect, frame);
     }
@@ -133,7 +133,7 @@ impl EpdHandle {
         self.slot.submit_full(frame);
     }
 
-    /// Non-blocking drain of completed refreshes (power plan O-6).
+    /// Non-blocking drain of completed refreshes.
     pub fn poll_completion(&self) -> Option<EpdCompletion> {
         self.completions.try_recv().ok()
     }

@@ -190,7 +190,7 @@ fn dispatch_inner(
             // `DeviceContext::poll_wifi_ops`. `Pending` tells the client
             // the command was accepted and the real result is coming; a
             // second op already in flight replies `Busy` instead - not
-            // executed, safe to retry (power plan O-10).
+            // executed, safe to retry.
             let creds = WifiCreds {
                 ssid: ssid.clone(),
                 password: password.clone(),
@@ -243,7 +243,7 @@ fn dispatch_inner(
             // The sync runs on the sync task (it owns Wi-Fi); the reply is
             // deferred and delivered via `DeviceContext::poll_wifi_ops`.
             // `Pending` means accepted - the real result follows as a
-            // deferred reply with the same id (power plan O-10).
+            // deferred reply with the same id.
             let Some(now_dt) = now else {
                 return Reply::Error {
                     message: "System time not available".to_string(),

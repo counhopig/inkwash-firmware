@@ -86,7 +86,7 @@ GPIO 26-37 are occupied by Octal PSRAM and must not be used as ordinary GPIOs.
 
 ### Deep-Sleep Tier (Automatic)
 
-The firmware has two sleep tiers (power plan P4): light sleep engages automatically whenever the main loop is idle (both cores idle past `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`), and after **5 minutes** without user activity the device drops to deep sleep for µA-level idle power. Deep-sleep wake sources:
+The firmware has two sleep tiers: light sleep engages automatically whenever the main loop is idle (both cores idle past `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`), and after **5 minutes** without user activity the device drops to deep sleep for µA-level idle power. Deep-sleep wake sources:
 
 | Source | Pin | Notes |
 | --- | --- | --- |

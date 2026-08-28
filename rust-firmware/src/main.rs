@@ -58,15 +58,15 @@ const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 /// changes still trigger the clock-region refresh, up to 10 s late. Sync
 /// scheduling, alarm re-arming, and due-todo reminders ride the same read -
 /// 10 s boundary-detection granularity is fine for the :00/:30-aligned
-/// scheduler (the power plan accepts this).
+/// scheduler.
 const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Quiet time before the deep-sleep tier (power plan P4-1): after this
+/// Quiet time before the deep-sleep tier: after this
 /// long without *user* activity (clock-region refreshes do not count),
 /// the device enters deep sleep instead of idling in light sleep.
 const DEEP_SLEEP_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Fallback maintenance wake when no future alarm needs a month-boundary
 /// wake: 10 minutes. Each wake boots, re-renders and refreshes just the
-/// clock region (P4-2), and realigns the sync scheduler, so the on-screen
+/// clock region, and realigns the sync scheduler, so the on-screen
 /// time stays within ~10 min of reality and syncs stay alive through deep
 /// sleep. Cost: ~1.6 s active per 10 min boot -> ~0.13 mA average, still
 /// µA-class idle. (The old 1 h fallback left the frozen e-paper clock up
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
     }
     // True when this boot is a deep-sleep wake (any non-undefined wake
     // cause), as opposed to a power-on reset / fresh flash. Used by the
-    // P4-2 boot path to skip the full-screen refresh on wake.
+    // deep-sleep wake path to skip the full-screen refresh on wake.
     let woke_from_deep_sleep = power::log_wakeup_cause();
     let mut board = Note4Board::take()?;
     log::info!("Power latch is high; rendering home screen");
@@ -232,8 +232,7 @@ fn main() -> Result<()> {
     }
 
     // Home's data fingerprint at the last actual render; the sync
-    // completion path compares against it to skip unchanged redraws
-    // (power plan O-8).
+    // completion path compares against it to skip unchanged redraws.
     let mut last_home_fp = Some(render_home_now(
         &mut board,
         &counters,
@@ -242,7 +241,7 @@ fn main() -> Result<()> {
         &inbox_store,
         clock.as_ref(),
     ));
-    // Power plan P4-2: on a deep-sleep wake the e-paper already shows the
+    // On a deep-sleep wake the e-paper already shows the
     // pre-sleep frame, so skip the full refresh (the slowest part of boot)
     // and update only the clock region. Alarm-wakes already repainted the
     // ring screen with their own full refresh, so they keep the full path.
@@ -338,8 +337,8 @@ fn main() -> Result<()> {
         log::warn!("Light sleep not armed (device stays fully awake): {err}");
     }
 
-    // Move the process's one WifiManager into the dedicated sync task
-    // (power plan P3): every Wi-Fi operation from here on - scheduled
+    // Move the process's one WifiManager into the dedicated sync task:
+    // every Wi-Fi operation from here on - scheduled
     // syncs, the Sync Now menu, USB/BLE SetWifi/SyncNow - runs off the
     // main loop, so a slow HTTPS round-trip never blocks buttons, USB, or
     // the display. The main loop talks to it through the command/reply
@@ -372,7 +371,7 @@ fn main() -> Result<()> {
         last_command: None,
     };
 
-    // Two-level polling cadence (power plan P1-4): while the user
+    // Two-level polling cadence: while the user
     // interacts - a key is raw-low, a command arrived, a refresh is
     // pending - the loop runs at POLL_INTERVAL_MS so the poll-based
     // debounce/long-press timing stays exactly as before. Once the device
@@ -394,8 +393,8 @@ fn main() -> Result<()> {
     let mut last_activity = Instant::now();
     let mut status_last = Instant::now();
     let mut clock_last = Instant::now();
-    // When the device entered the idle tier; drives the deep-sleep tier
-    // (P4). Reset by *user* activity only - clock-region refreshes keep
+    // When the device entered the idle tier; drives the deep-sleep tier.
+    // Reset by *user* activity only - clock-region refreshes keep
     // the light-sleep cadence but must not postpone deep sleep.
     let mut deep_sleep_since: Option<Instant> = None;
     loop {
@@ -502,7 +501,7 @@ fn main() -> Result<()> {
             }
         }
 
-        // EPD completion events (power plan O-6): the app state machine
+        // EPD completion events: the app state machine
         // observes every refresh's outcome - success, failure, and
         // partial->full recovery - instead of the result living only
         // inside the EPD task.
@@ -534,7 +533,7 @@ fn main() -> Result<()> {
         // USB/BLE SyncNow/SetWifi replies): applies the RTC re-arm, NTP
         // alignment, and transport replies. A successful sync redraws the
         // full screen only when it actually changed what Home shows
-        // (power plan O-8) - an unchanged sync leaves the panel alone.
+        // - an unchanged sync leaves the panel alone.
         if let Some(event) = ctx.poll_wifi_ops() {
             if matches!(event, sync_task::WifiOpEvent::SyncDone(Ok(_)))
                 && Some(home_data_fingerprint(
@@ -627,8 +626,8 @@ fn main() -> Result<()> {
         let any_key_pressed = ctx.board.key_enter.is_raw_pressed()
             || ctx.board.key_up.is_raw_pressed()
             || ctx.board.key_down.is_raw_pressed();
-        // Any USB frame counts as user activity (the power plan's idle
-        // definition is "no button, no USB frame", not just visible
+        // Any USB frame counts as user activity (idle is "no button, no
+        // USB frame", not just visible
         // changes): GetStatus polls from the desktop tool must not let the
         // device drift into deep sleep mid-session.
         let user_activity = usb_activity || ble_changed || key_changed || any_key_pressed;
@@ -644,7 +643,7 @@ fn main() -> Result<()> {
             deep_sleep_since.get_or_insert(now);
         }
 
-        // Deep-sleep tier (power plan P4-1): after DEEP_SLEEP_AFTER of
+        // Deep-sleep tier: after DEEP_SLEEP_AFTER of
         // idle light sleep with no user activity and no Wi-Fi op in
         // flight, drop to deep sleep. Wake sources: ENTER (GPIO0), DOWN
         // (GPIO18), the RTC alarm line (GPIO5), and the maintenance timer.
@@ -654,10 +653,10 @@ fn main() -> Result<()> {
             && ctx.pending_wifi_op.is_none()
             && deep_sleep_since.is_some_and(|since| now.duration_since(since) >= DEEP_SLEEP_AFTER)
         {
-            // Power plan O-11: the wake interval is the *minimum* of the
+            // The wake interval is the *minimum* of the
             // next month-boundary alarm maintenance wake and the 10-minute
             // fallback - a far-future one-shot alarm must not stretch the
-            // sleep so long that the on-screen time goes stale (P4-10).
+            // sleep so long that the on-screen time goes stale.
             let maintenance = clock
                 .as_ref()
                 .and_then(|dt| {
@@ -730,7 +729,7 @@ fn render_home_now(
 /// unread-inbox count, Wi-Fi-configured flag, and the calendar date. A
 /// sync (or any remote state change) that leaves all of these identical
 /// produces no visible difference on Home, so the full-screen redraw it
-/// would trigger is skipped (power plan O-8). Hour/minute are deliberately
+/// would trigger is skipped. Hour/minute are deliberately
 /// excluded - clock drift is the clock-region refresh's job, and including
 /// the minute would make every sync look "changed" (a sync takes longer
 /// than a minute boundary).

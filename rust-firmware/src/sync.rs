@@ -313,7 +313,7 @@ pub fn fetch_and_apply(
 
 /// Result of a full sync, plus the RTC-relevant side effects the main loop
 /// must apply itself: the sync task runs on its own thread and never
-/// touches the I2C bus (see the power plan's P3-3 - the shared-`Pcf8563`
+/// touches the I2C bus (the shared-`Pcf8563`
 /// route was rejected because `SharedI2c` is `Rc<RefCell<...>>`, which is
 /// not `Send`; converting it to `Arc<Mutex<...>>` would ripple through the
 /// audio/NFC drivers for no functional gain over the receipt).

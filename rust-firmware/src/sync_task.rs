@@ -1,4 +1,4 @@
-//! Dedicated sync task (power plan P3): owns the process's single
+//! Dedicated sync task: owns the process's single
 //! `WifiManager` and executes every Wi-Fi operation off the main loop, so
 //! an HTTPS sync (up to ~10 s on a flaky link) never blocks buttons, USB,
 //! BLE, or the display. The main loop, menus, and control channels send

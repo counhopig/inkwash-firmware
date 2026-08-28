@@ -1,4 +1,4 @@
-//! One-shot interrupt wake for the idle loop (power plan P1).
+//! One-shot interrupt wake for the idle loop.
 //!
 //! The Home loop's idle cadence is a 1 s wait that doubles as the light
 //! sleep window (see `power::configure_light_sleep`). A plain

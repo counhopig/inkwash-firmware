@@ -220,13 +220,13 @@ pub fn configure_light_sleep() -> Result<()> {
 /// controller, active while the BLE pairing screen is open - stays
 /// uninterrupted across idle windows.
 ///
-/// The other admission conditions from the power plan (sync in flight,
+/// The other admission conditions (sync in flight,
 /// EPD refresh in flight) need no runtime guard while those operations
 /// run on the main thread: a running core holds its RTOS pm lock, and an
 /// active Wi-Fi radio registers its own skip-light-sleep callback, so
 /// automatic light sleep cannot engage mid-operation. This guard only
-/// matters once a condition can outlive the main thread (the P2/P3 task
-/// moves, or BLE).
+/// matters once a condition can outlive the main thread (the EPD/sync
+/// tasks, or BLE).
 pub struct LightSleepBlock {
     handle: esp_pm_lock_handle_t,
     reason: &'static str,
