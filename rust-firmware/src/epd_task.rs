@@ -150,16 +150,26 @@ const EPD_TASK_STACK: usize = 12 * 1024;
 /// silently killing a background task.
 pub fn spawn() -> Result<EpdHandle> {
     let driver = EpdDriver(init_driver()?);
+    // One notify channel: the sender wakes the task through `RefreshSlot`,
+    // the receiver is the run-loop's wake source. The previous code created
+    // two independent `sync_channel(1)`s - one whose sender was kept and one
+    // whose receiver was handed to `run` - so `submit_*` notified a channel
+    // with a dropped receiver (`try_send` always failed) and `run` blocked
+    // forever on a channel nobody sent to. The task executed at most the
+    // commands already pending at startup, then never drained again: every
+    // later refresh (clock minute changes, deep-sleep wake region) was lost,
+    // which froze the on-screen clock.
+    let (notify_tx, notify_rx) = sync_channel(1);
     let slot = Arc::new(RefreshSlot {
         pending: Mutex::new(None),
-        notify_tx: sync_channel(1).0,
+        notify_tx,
     });
     let (completions_tx, completions_rx) = channel();
     let task_slot = Arc::clone(&slot);
     std::thread::Builder::new()
         .name("epd".to_string())
         .stack_size(EPD_TASK_STACK)
-        .spawn(move || run(driver, task_slot, sync_channel(1).1, completions_tx))?;
+        .spawn(move || run(driver, task_slot, notify_rx, completions_tx))?;
     Ok(EpdHandle {
         slot,
         completions: completions_rx,
