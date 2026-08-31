@@ -44,7 +44,7 @@ pub struct TodoDue {
     pub day: u8,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Todo {
     pub id: u8,
     pub text: String,

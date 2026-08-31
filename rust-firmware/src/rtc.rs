@@ -8,6 +8,7 @@ use crate::board::SharedI2c;
 /// be unit-tested on the host - this crate is the single source of truth,
 /// re-exported here so every existing `crate::rtc::DateTime` /
 /// `crate::rtc::is_leap` call site keeps working unchanged.
+pub use inkwash_logic::alarm_regs::AlarmRegs;
 pub use inkwash_logic::datetime::{is_leap, DateTime};
 
 pub const PCF8563_ADDR: u8 = 0x51;
@@ -100,7 +101,7 @@ impl Pcf8563 {
         self.write_regs(0x09, &[0x80, 0x80, 0x80, 0x80])?;
         let mut ctrl2 = [0u8; 1];
         self.read_regs(0x01, &mut ctrl2)?;
-        self.write_regs(0x01, &[ctrl2[0] & !0x08])?;
+        self.write_regs(0x01, &[ctrl2[0] & !(0x08 | 0x02)])?;
         Ok(())
     }
 
@@ -140,15 +141,4 @@ impl Pcf8563 {
         self.write_regs(0x01, &[ctrl2[0] & !0x08])?;
         Ok(())
     }
-}
-
-/// PCF8563 alarm compare fields. `None` sets that field's AE bit, which
-/// means "ignored in the match" - e.g. `day: None, weekday: None` with
-/// `minute`/`hour` set fires every day at that time; `day: Some(d)` fires
-/// once on that day-of-month instead.
-pub struct AlarmRegs {
-    pub minute: u8,
-    pub hour: u8,
-    pub day: Option<u8>,
-    pub weekday: Option<u8>,
 }

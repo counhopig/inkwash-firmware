@@ -1,16 +1,11 @@
 use anyhow::Result;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Input, PinDriver, Pull};
 
+pub use inkwash_logic::button_event::ButtonEvent;
+
 pub const POLL_INTERVAL_MS: u32 = 20;
 const DEBOUNCE_SAMPLES: u32 = 4;
 const LONG_PRESS_POLLS: u32 = 50;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ButtonEvent {
-    Pressed,
-    Released,
-    LongPressed,
-}
 
 pub struct Button {
     pin: PinDriver<'static, Input>,

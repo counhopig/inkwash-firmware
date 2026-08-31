@@ -9,85 +9,18 @@
 //! See `docs/control-protocol.md` for the complete specification.
 
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
 use crate::storage::{DeviceConfig, WifiCreds};
 use crate::sync_task::OpSource;
 
-/// Which transport a command arrived on. Long operations (SyncNow,
-/// SetWifi) defer their reply; the deferred reply must be written back to
-/// the same channel the command came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Channel {
-    Usb,
-    Ble,
-}
-
-/// Incoming command from a USB/BLE client.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-pub enum Command {
-    /// Configure Wi-Fi credentials. Will attempt to connect to verify before
-    /// saving to NVS - only credentials we know work end up persisted.
-    SetWifi { ssid: String, password: String },
-
-    /// Configure the server URL and authentication token for syncing alarms
-    /// and todos. Saves immediately without verification (URLs are hard to
-    /// validate without attempting a network request).
-    SetServer { url: String, token: String },
-
-    /// Trigger an immediate sync with the configured server. Requires a
-    /// live Wi-Fi connection and a valid system time; returns an error
-    /// if either is unavailable.
-    SyncNow,
-
-    /// Query the device's current configuration and connectivity state.
-    GetStatus,
-
-    /// Remove every locally stored alarm and disarm the RTC alarm slot.
-    ClearAlarms,
-
-    /// Set local time as a fixed UTC offset in minutes (UTC-12 through UTC+14).
-    SetTimezone { offset_minutes: i16 },
-}
-
-/// Reply sent back to a USB/BLE client.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Reply {
-    /// Command succeeded.
-    Ok,
-
-    /// A command arrived while a full-screen reminder (due-todo or urgent
-    /// inbox) was actively ringing. It was not executed; the client should
-    /// retry after the user dismisses the reminder or it times out.
-    Busy,
-
-    /// A long-running command (SyncNow, SetWifi) was accepted and is being
-    /// executed asynchronously on the sync task. The real result is
-    /// delivered as a deferred reply with the same `id` when the operation
-    /// completes; the client should keep waiting rather than resending
-    /// (a resend replays this interim reply until the real result replaces
-    /// it - see `control-protocol.md`'s `pending` reply).
-    Pending,
-
-    /// Device status snapshot.
-    Status {
-        wifi_configured: bool,
-        server_configured: bool,
-        wifi_connected: bool,
-        wifi_ssid: Option<String>,
-        wifi_has_password: bool,
-        server_url: Option<String>,
-        server_has_token: bool,
-        timezone_offset_minutes: i16,
-    },
-
-    /// Command failed.
-    Error { message: String },
-}
+/// Pure wire-protocol shapes (`Channel`, `Command`, `Reply`) now live in
+/// `inkwash-logic` so the host-testable application state machine shares
+/// the single source of truth; re-exported here so every existing
+/// `control::Command` / `control::Reply` / `control::Channel` call site
+/// keeps working unchanged.
+pub use inkwash_logic::protocol::{Channel, Command, Reply};
 
 /// Parses a command from a JSON string, along with the client's optional
 /// correlation `id` (any string; absent if the client didn't send one - see

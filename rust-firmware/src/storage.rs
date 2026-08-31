@@ -32,17 +32,11 @@ const SERVER_CONFIG_MAX_LEN: usize = 256;
 /// marker 8, so one shared size covers them all.
 const NUM_STR_MAX_LEN: usize = 20;
 
-#[derive(Clone, Debug)]
-pub struct WifiCreds {
-    pub ssid: String,
-    pub password: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct DeviceConfig {
-    pub server_url: String,
-    pub auth_token: String,
-}
+/// Pure config data shapes (`WifiCreds`, `DeviceConfig`) live in
+/// `inkwash-logic` so the host-testable application state machine shares
+/// the single source of truth; re-exported here so every existing
+/// `storage::WifiCreds` / `storage::DeviceConfig` call site keeps working.
+pub use inkwash_logic::device_config::{DeviceConfig, WifiCreds};
 
 pub struct PersistedCounters {
     nvs: EspDefaultNvs,

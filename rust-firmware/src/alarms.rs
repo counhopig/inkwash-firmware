@@ -98,11 +98,17 @@ pub fn handle_fired_alarm(
     ble: Option<&mut BleControl>,
     now: Option<&DateTime>,
 ) -> Result<()> {
+    let mut list = alarm_store.load()?;
+    if !list.iter().any(|alarm| alarm.enabled) {
+        log::warn!("Ignoring RTC alarm signal because no alarms are enabled");
+        board.rtc.clear_alarm()?;
+        return Ok(());
+    }
+
     ring_until_dismissed(board, usb, ble)?;
     board.rtc.ack_alarm()?;
 
     if let Some(now) = now {
-        let mut list = alarm_store.load()?;
         let before = list.len();
         list.retain(|alarm| !is_expired_once(alarm, now));
         if list.len() != before {

@@ -17,10 +17,16 @@
 //! logic itself; the firmware modules add the hardware-facing parts (NVS
 //! storage, I2C, display, buttons) around it.
 
+pub mod alarm_regs;
 pub mod alarm_schedule;
+pub mod app;
+pub mod button_event;
 pub mod datetime;
+pub mod device_config;
 pub mod inbox_item;
+pub mod protocol;
 pub mod reminder_dedup;
 pub mod scheduler;
 pub mod sync_validate;
 pub mod todo;
+pub mod wake_cause;

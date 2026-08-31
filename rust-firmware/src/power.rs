@@ -12,6 +12,11 @@ use esp_idf_svc::sys::{
     gpio_int_type_t_GPIO_INTR_LOW_LEVEL, gpio_wakeup_disable, gpio_wakeup_enable,
 };
 
+/// Pure `WakeCause` vocabulary lives in `inkwash-logic` (re-exported here)
+/// so the host-testable application state machine shares the single source
+/// of truth.
+pub use inkwash_logic::wake_cause::WakeCause;
+
 const GPIO_NUM_17: i32 = 17;
 pub const GPIO_NUM_0: i32 = 0;
 /// PCF8563 `RTC_INT`, open-drain active low; asserted when the RTC alarm
@@ -41,18 +46,6 @@ pub const GPIO_NUM_39: i32 = 39;
 /// loop's RTC `alarm_flag` poll (<= 1 s, see `main.rs`); deep sleep keeps
 /// the ext1 GPIO5 wake, where the RTC-IO path arms its own pull.
 pub const WAKE_PINS: [i32; 3] = [GPIO_NUM_0, GPIO_NUM_18, GPIO_NUM_39];
-
-/// Who woke the chip up, disambiguated from `esp_sleep_get_wakeup_cause`'s
-/// EXT1 case via `esp_sleep_get_ext1_wakeup_status`'s per-pin bitmask -
-/// ENTER, DOWN, and the RTC alarm all share the same ext1 wake source, so
-/// the cause alone doesn't tell them apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WakeCause {
-    Enter,
-    RtcAlarm,
-    Down,
-    Other,
-}
 
 /// Releases the GPIO17 RTC hold left over from a previous deep-sleep session.
 /// Must be called before any `PinDriver::output(gpio17)` is constructed; the

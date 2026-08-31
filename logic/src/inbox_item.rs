@@ -49,7 +49,7 @@ impl From<&str> for Priority {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxItem {
     /// Device-visible stable id (server `seq`, monotonic).
     pub id: u64,

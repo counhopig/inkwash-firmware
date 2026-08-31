@@ -11,8 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::datetime::weekday_from_days;
-use crate::datetime::DateTime;
+use crate::alarm_regs::AlarmRegs;
+use crate::datetime::{weekday_from_days, DateTime};
 
 // Re-exported so `rust-firmware/src/alarms.rs`'s existing
 // `alarms::{days_since_epoch, date_from_days}` call sites keep working
@@ -68,7 +68,7 @@ impl Repeat {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredAlarm {
     pub id: u8,
     pub hour: u8,
@@ -219,11 +219,79 @@ pub fn is_expired_once(alarm: &StoredAlarm, now: &DateTime) -> bool {
 }
 
 /// Picks the chronologically nearest enabled alarm relative to `now`.
+///
+/// An expired one-shot (`minutes_until == i64::MAX`, i.e. a `Once` alarm
+/// whose date has passed) is excluded: it must not be returned, or it would
+/// be re-armed into the PCF8563 and re-fire on the already-passed
+/// day-of-month. The caller drops expired one-shots after firing; this
+/// makes `next_due` correct even when a stale one lingers in the store.
 pub fn next_due<'a>(alarms: &'a [StoredAlarm], now: &DateTime) -> Option<&'a StoredAlarm> {
     alarms
         .iter()
-        .filter(|a| a.enabled)
+        .filter(|a| a.enabled && minutes_until(a, now) != i64::MAX)
         .min_by_key(|a| minutes_until(a, now))
+}
+
+/// Computes the PCF8563 compare fields for a single alarm as it should be
+/// armed *right now* (the hardware slot holds one alarm at a time, so a
+/// caller programs only `next_due`'s result). Repeat rules are translated to
+/// the register's day/weekday fields - the same mapping `alarms.rs`'s
+/// `program_hardware_alarm` uses, factored here so the host-testable state
+/// machine and the firmware share one recurrence implementation rather than
+/// a second, drift-prone copy.
+///
+/// Returns `None` when the slot must stay *closed* for this alarm because
+/// it cannot be safely armed at this instant:
+/// - a `Once` alarm whose target date is in a different calendar month
+///   (the PCF8563 has no month/year register, so arming its day-of-month
+///   would false-fire on the current month's/earlier month's matching
+///   day). The caller leaves the slot closed and a maintenance wake
+///   re-evaluates when the target month arrives.
+///
+/// For `Weekly` the armed day is the *next* covered weekday (each ring is
+/// re-programmed by the ack-and-rearm flow, so it can't keep firing on
+/// later weeks that don't contain a nearer alarm); for `Monthly` it is the
+/// target day-of-month.
+pub fn alarm_regs_for(alarm: &StoredAlarm, now: &DateTime) -> Option<AlarmRegs> {
+    match &alarm.repeat {
+        Repeat::Daily => Some(AlarmRegs {
+            minute: alarm.minute,
+            hour: alarm.hour,
+            day: None,
+            weekday: None,
+        }),
+        Repeat::Weekly { .. } => {
+            let (_, _, _, dow) = next_occurrence_date(&alarm.repeat, alarm.hour, alarm.minute, now);
+            Some(AlarmRegs {
+                minute: alarm.minute,
+                hour: alarm.hour,
+                day: None,
+                weekday: Some(dow),
+            })
+        }
+        Repeat::Monthly { .. } => {
+            let (_, _, day_of_month, _) =
+                next_occurrence_date(&alarm.repeat, alarm.hour, alarm.minute, now);
+            Some(AlarmRegs {
+                minute: alarm.minute,
+                hour: alarm.hour,
+                day: Some(day_of_month),
+                weekday: None,
+            })
+        }
+        Repeat::Once { year, month, day } => {
+            if now.year == *year && now.month == *month {
+                Some(AlarmRegs {
+                    minute: alarm.minute,
+                    hour: alarm.hour,
+                    day: Some(*day),
+                    weekday: None,
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,5 +596,143 @@ mod tests {
         let now = dt(2026, 8, 22, 10, 0);
         let alarms = vec![alarm(0, 10, 30, Repeat::Daily, false)];
         assert!(next_due(&alarms, &now).is_none());
+    }
+
+    #[test]
+    fn next_due_none_when_only_expired_once() {
+        // 2026-08-22 12:00; the once alarm's date already passed, so
+        // `minutes_until` is i64::MAX and it must be excluded.
+        let now = dt(2026, 8, 22, 12, 0);
+        let alarms = vec![alarm(
+            0,
+            9,
+            0,
+            Repeat::Once {
+                year: 2026,
+                month: 8,
+                day: 22,
+            },
+            true,
+        )];
+        assert!(next_due(&alarms, &now).is_none());
+    }
+
+    #[test]
+    fn next_due_ignores_expired_once_when_a_valid_alarm_exists() {
+        let now = dt(2026, 8, 22, 12, 0);
+        let alarms = vec![
+            alarm(
+                0,
+                9,
+                0,
+                Repeat::Once {
+                    year: 2026,
+                    month: 8,
+                    day: 22,
+                },
+                true,
+            ),
+            alarm(1, 13, 0, Repeat::Daily, true),
+        ];
+        let due = next_due(&alarms, &now).expect("a valid alarm exists");
+        assert_eq!(due.id, 1);
+    }
+
+    // ---- repeat-aware RTC programming (shared `alarm_regs_for`) ---------
+
+    #[test]
+    fn alarm_regs_for_daily_leaves_day_and_weekday_unset() {
+        let now = dt(2026, 8, 22, 10, 0);
+        let regs = alarm_regs_for(&alarm(0, 7, 15, Repeat::Daily, true), &now)
+            .expect("daily is always armable");
+        assert_eq!(
+            regs,
+            AlarmRegs {
+                minute: 15,
+                hour: 7,
+                day: None,
+                weekday: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alarm_regs_for_weekly_arms_next_covered_weekday() {
+        // 2026-08-22 is a Saturday (weekday 6). A weekly alarm on
+        // Sunday(0)/Monday(1) must arm the next covered weekday after today.
+        let now = dt(2026, 8, 22, 10, 0);
+        let mon = alarm(0, 8, 0, Repeat::Weekly { days: vec![1] }, true);
+        let regs = alarm_regs_for(&mon, &now).expect("weekly is armable");
+        // Next Monday after Sat 22 Aug 2026 is Mon 24 Aug (weekday 1).
+        assert_eq!(
+            regs,
+            AlarmRegs {
+                minute: 0,
+                hour: 8,
+                day: None,
+                weekday: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn alarm_regs_for_monthly_arms_target_day_of_month() {
+        let now = dt(2026, 8, 22, 10, 0);
+        let monthly = alarm(0, 8, 0, Repeat::Monthly { days: vec![15] }, true);
+        let regs = alarm_regs_for(&monthly, &now).expect("monthly armable");
+        assert_eq!(
+            regs,
+            AlarmRegs {
+                minute: 0,
+                hour: 8,
+                day: Some(15),
+                weekday: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alarm_regs_for_once_in_target_month_arms_day() {
+        let now = dt(2026, 8, 22, 10, 0);
+        let once = alarm(
+            0,
+            8,
+            0,
+            Repeat::Once {
+                year: 2026,
+                month: 8,
+                day: 25,
+            },
+            true,
+        );
+        let regs = alarm_regs_for(&once, &now).expect("in target month -> armable");
+        assert_eq!(
+            regs,
+            AlarmRegs {
+                minute: 0,
+                hour: 8,
+                day: Some(25),
+                weekday: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alarm_regs_for_once_outside_target_month_returns_none() {
+        // Now is August; target is September. The slot has no month/year
+        // register, so arming the day would false-fire in August.
+        let now = dt(2026, 8, 22, 10, 0);
+        let once = alarm(
+            0,
+            8,
+            0,
+            Repeat::Once {
+                year: 2026,
+                month: 9,
+                day: 5,
+            },
+            true,
+        );
+        assert_eq!(alarm_regs_for(&once, &now), None);
     }
 }
