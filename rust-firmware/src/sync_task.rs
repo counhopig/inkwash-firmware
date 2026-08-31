@@ -12,8 +12,9 @@
 //! `ctx::DeviceContext::apply_sync_result`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -155,9 +156,13 @@ fn run(
     // This task runs the HTTPS+TLS round-trips, so it must be TWDT-watched
     // too: the feeds inside sync.rs only take effect for subscribed tasks,
     // and an un-watched hang would leave a pending op stuck forever.
-    if let Err(err) = crate::watchdog::subscribe() {
-        log::warn!("Sync task watchdog subscribe failed: {err}");
-    }
+    let watchdog_subscribed = match crate::watchdog::subscribe() {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("Sync task watchdog subscribe failed: {err}");
+            false
+        }
+    };
     // Independent NVS handles on the shared partition (see module doc).
     let (counters, alarm_store, todo_store, inbox_store) = match open_stores(partition) {
         Ok(stores) => stores,
@@ -167,7 +172,17 @@ fn run(
         }
     };
 
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        let cmd = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(cmd) => cmd,
+            Err(RecvTimeoutError::Timeout) => {
+                if watchdog_subscribed {
+                    crate::watchdog::feed();
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match cmd {
             SyncCommand::SyncNow { now, reply } => {
                 connected.store(true, Ordering::Relaxed);
