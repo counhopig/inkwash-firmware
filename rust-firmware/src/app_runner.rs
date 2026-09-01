@@ -14,19 +14,20 @@
 //!   `EffectRunner` helper, producing `EffectCompleted` / `EffectFailed`
 //!   events that are fed back into the state machine.
 //!
-//! Coexistence with `ctx::DeviceContext`: the runner borrows the same
-//! drivers, stores, and audio/display/EPD subsystems `DeviceContext` already
-//! exposes. While step 2 is being wired in, `DeviceContext` still owns
-//! scheduling decisions (sync cadence, alarm re-arm); the runner owns
-//! state-machine transitions for the flows the architecture marks as "first
-//! to migrate" (boot/home/RTC alarm/sleep). Both share the same underlying
-//! hardware through the existing module boundaries.
+//! Per-category error mapping (P1 #4): each `Effect` variant maps its
+//! `anyhow::Error` to the matching `EffectError` variant so the state
+//! machine schedules the correct retry path. FailurePolicy::AbortBatch
+//! is honoured (P1 #5): the first failure stops the rest of the batch
+//! without rolling back successful writes. EffectIds are assigned in
+//! declared order inside each batch (P1 #5): the same `Effect` always
+//! carries the same id within one batch, so completion/failure events
+//! correlate precisely.
 
 use anyhow::Result;
 
 use inkwash_logic::app::{
     self, AppState, Effect, EffectBatchId, EffectCompletion, EffectError, EffectFailure, EffectId,
-    EffectOutput, Event, OperationId, RenderGeneration, RenderRequest,
+    EffectOutput, Event, FailurePolicy, OperationId, RenderGeneration, RenderRequest,
 };
 use inkwash_logic::protocol::ControlReply;
 
@@ -36,24 +37,15 @@ use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
 
 /// Owns the application's `AppState` and drives every event through the
-/// pure transition function. The runner is constructed once at boot, given
-/// the facts that make up a `BootSnapshot`, and accepts further events via
-/// [`AppRunner::dispatch`].
+/// pure transition function.
 pub struct AppRunner {
     state: AppState,
     /// Most recent RTC read - threaded into `Effect::Render` so the home
-    /// screen does not need a fresh I2C transaction for each refresh. The
-    /// legacy main loop reads the RTC on the same 1.2 s / 10 s cadence, so
-    /// the runner simply observes the timestamp the main loop hands it
-    /// rather than owning its own RTC reads.
+    /// screen does not need a fresh I2C transaction for each refresh.
     last_clock: Option<DateTime>,
 }
 
-#[allow(dead_code)]
 impl AppRunner {
-    /// Build a runner with an empty `AppState`. Boot facts are pushed in
-    /// via [`AppRunner::dispatch`] once the caller has collected them - the
-    /// runner does not own I2C reads.
     pub fn new() -> Self {
         Self {
             state: AppState::default(),
@@ -61,9 +53,7 @@ impl AppRunner {
         }
     }
 
-    /// Build a runner from a pre-populated `AppState` (used when boot
-    /// facts have already been merged into the state directly by the legacy
-    /// boot path).
+    #[allow(dead_code)]
     pub fn from_state(state: AppState) -> Self {
         Self {
             state,
@@ -71,10 +61,12 @@ impl AppRunner {
         }
     }
 
+    #[allow(dead_code)]
     pub fn state(&self) -> &AppState {
         &self.state
     }
 
+    #[allow(dead_code)]
     pub fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
     }
@@ -84,14 +76,7 @@ impl AppRunner {
     }
 
     /// Dispatch a single event through the state machine and run every
-    /// returned effect batch against the existing drivers. Synchronous
-    /// completions are fed back into the state machine in the same call;
-    /// asynchronous effects (renders, sync, BLE pairing, sleep) are
-    /// returned to the caller as [`AsyncKick`]s. The caller is expected to
-    /// keep the corresponding subsystem handle alive and, when the
-    /// eventual completion arrives, build an [`EffectCompletion`] /
-    /// [`EffectFailure`] and feed it via [`AppRunner::on_effect_completed`]
-    /// or [`AppRunner::on_effect_failed`].
+    /// returned effect batch against the existing drivers.
     pub fn dispatch(
         &mut self,
         event: Event,
@@ -115,22 +100,17 @@ impl AppRunner {
             ctx,
             last_clock: self.last_clock,
         };
-        // Drive every effects in this batch. For each we either:
-        // - synchronous outcome -> feed the matching completion into the
-        //   state machine, which may return further batches. We invoke
-        //   `run_batch` recursively; recursion depth is bounded by the
-        //   chain length the state machine produces (one or two in
-        //   practice).
-        // - asynchronous outcome -> hand the effect back to the caller as
-        //   an `AsyncKick` so the matching subsystem (EPD task, sync
-        //   task, BLE pairing screen, ...) can drive it to completion.
-        // - failure -> feed an `EffectFailed` into the state machine and
-        //   recurse on whatever it returns.
-        for effect in batch.effects {
+        // EffectId allocation: stable, position-based within the batch so
+        // completion/failure events correlate precisely (P1 #5). The
+        // `batch.failure_policy` decides whether to keep going after a
+        // failure: `AbortBatch` stops the rest of the batch on the first
+        // failure; `Continue` runs every effect regardless.
+        for (idx, effect) in batch.effects.iter().cloned().enumerate() {
+            let effect_id = EffectId(idx as u64 + 1);
             let outcome = runner.run(&effect);
-            // End the runner's borrow before re-borrowing `self` /
-            // `ctx` for the recursive `run_batch` call below. We
-            // shadow the variable (rather than `drop(runner)`) because
+            // End the runner's borrow before re-borrowing `self` / `ctx`
+            // for the recursive `run_batch` call below. We shadow the
+            // variable (rather than `drop(runner)`) because
             // `EffectRunner` has no `Drop` impl - clippy flags
             // `std::mem::drop` on non-`Drop` types as a no-op.
             let _ = runner;
@@ -138,7 +118,7 @@ impl AppRunner {
                 Ok(EffectOutcome::Completed(output)) => {
                     let completion = EffectCompletion {
                         batch_id: batch.id,
-                        effect_id: EffectId(0),
+                        effect_id,
                         operation_id: batch.operation_id,
                         render_generation: batch.render_generation,
                         output,
@@ -150,21 +130,25 @@ impl AppRunner {
                 }
                 Ok(EffectOutcome::Async) => kicks.push(AsyncKick {
                     batch_id: batch.id,
+                    effect_id,
                     operation_id: batch.operation_id,
                     render_generation: batch.render_generation,
                     effect,
                 }),
-                Err(err) => {
+                Err((category, msg)) => {
                     let failure = EffectFailure {
                         batch_id: batch.id,
-                        effect_id: EffectId(0),
+                        effect_id,
                         operation_id: batch.operation_id,
                         render_generation: batch.render_generation,
-                        error: map_err(&err),
+                        error: err_for_category(category, &msg),
                     };
                     let chained = app::update(&mut self.state, Event::EffectFailed(failure));
                     for next in chained {
                         kicks.extend(self.run_batch(next, ctx)?);
+                    }
+                    if batch.failure_policy == FailurePolicy::AbortBatch {
+                        break;
                     }
                 }
             }
@@ -176,6 +160,9 @@ impl AppRunner {
         }
         Ok(kicks)
     }
+
+    /// Feed an externally-observed completion back into the state machine.
+    #[allow(dead_code)]
     pub fn on_effect_completed(
         &mut self,
         completion: EffectCompletion,
@@ -189,6 +176,7 @@ impl AppRunner {
         Ok(kicks)
     }
 
+    #[allow(dead_code)]
     pub fn on_effect_failed(
         &mut self,
         failure: EffectFailure,
@@ -209,19 +197,25 @@ impl Default for AppRunner {
     }
 }
 
-/// A side-effect request the dispatch could not complete synchronously:
-/// either an `Effect::Render` (waiting for the EPD task), or a sync/ble/
-/// sleep that is dispatched onto another task. The caller is expected to
-/// keep the corresponding subsystem handle alive and, when the eventual
-/// completion arrives, build an [`EffectCompletion`] /
-/// [`EffectFailure`] and feed it back to `AppRunner`.
-#[derive(Clone)]
+/// A side-effect request the dispatch could not complete synchronously.
 #[allow(dead_code)]
 pub struct AsyncKick {
     pub batch_id: EffectBatchId,
+    pub effect_id: EffectId,
     pub operation_id: OperationId,
     pub render_generation: Option<RenderGeneration>,
     pub effect: Effect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectCategory {
+    Ack,
+    Persist,
+    Rtc,
+    Render,
+    Sync,
+    Tone,
+    Sleep,
 }
 
 enum EffectOutcome {
@@ -236,83 +230,95 @@ struct EffectRunner<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
-    fn run(&mut self, effect: &Effect) -> Result<EffectOutcome> {
+    fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
         match effect {
             // ---- synchronous effects ---------------------------------------
-            Effect::PersistAlarms(list) => {
-                AlarmStore::save(self.ctx.alarm_store, list)?;
-                Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+            Effect::PersistAlarms(list) => match AlarmStore::save(self.ctx.alarm_store, list) {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                     inkwash_logic::app::PersistTarget::Alarms,
-                )))
-            }
+                ))),
+                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+            },
             Effect::PersistTodos(list) => {
-                crate::todos::TodoStore::save(self.ctx.todo_store, list)?;
-                Ok(EffectOutcome::Completed(EffectOutput::Persisted(
-                    inkwash_logic::app::PersistTarget::Todos,
-                )))
+                match crate::todos::TodoStore::save(self.ctx.todo_store, list) {
+                    Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                        inkwash_logic::app::PersistTarget::Todos,
+                    ))),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+                }
             }
             Effect::PersistInbox(list) => {
-                crate::inbox::InboxStore::save(self.ctx.inbox_store, list)?;
-                Ok(EffectOutcome::Completed(EffectOutput::Persisted(
-                    inkwash_logic::app::PersistTarget::Inbox,
-                )))
+                match crate::inbox::InboxStore::save(self.ctx.inbox_store, list) {
+                    Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                        inkwash_logic::app::PersistTarget::Inbox,
+                    ))),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+                }
             }
-            Effect::PersistConfig(cfg) => {
-                self.ctx.counters.save_device_config(cfg)?;
-                Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+            Effect::PersistConfig(cfg) => match self.ctx.counters.save_device_config(cfg) {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                     inkwash_logic::app::PersistTarget::Config,
-                )))
-            }
+                ))),
+                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+            },
             Effect::PersistSyncMetadata(meta) => {
-                if let Some(etag) = meta.etag.as_deref() {
-                    self.ctx.counters.save_sync_etag(etag)?;
+                let result = (|| -> Result<()> {
+                    if let Some(etag) = meta.etag.as_deref() {
+                        self.ctx.counters.save_sync_etag(etag)?;
+                    }
+                    if let Some(epoch) = meta.last_sync_epoch {
+                        self.ctx.counters.set_last_sync_epoch(epoch)?;
+                    }
+                    if let Some(epoch) = meta.rtc_align_epoch {
+                        self.ctx.counters.set_rtc_align_epoch(epoch)?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                        inkwash_logic::app::PersistTarget::SyncMetadata,
+                    ))),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
-                if let Some(epoch) = meta.last_sync_epoch {
-                    self.ctx.counters.set_last_sync_epoch(epoch)?;
-                }
-                if let Some(epoch) = meta.rtc_align_epoch {
-                    self.ctx.counters.set_rtc_align_epoch(epoch)?;
-                }
-                Ok(EffectOutcome::Completed(EffectOutput::Persisted(
-                    inkwash_logic::app::PersistTarget::SyncMetadata,
-                )))
             }
-            Effect::ProgramRtcAlarm(regs) => {
-                self.ctx.board.rtc.set_alarm(regs)?;
-                Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed))
-            }
-            Effect::DisableRtcAlarm => {
-                self.ctx.board.rtc.clear_alarm()?;
-                Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed))
-            }
-            Effect::AcknowledgeRtcAlarm => {
-                self.ctx.board.rtc.ack_alarm()?;
-                Ok(EffectOutcome::Completed(EffectOutput::AckDone))
-            }
+            Effect::ProgramRtcAlarm(regs) => match self.ctx.board.rtc.set_alarm(regs) {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed)),
+                Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),
+            },
+            Effect::DisableRtcAlarm => match self.ctx.board.rtc.clear_alarm() {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed)),
+                Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),
+            },
+            Effect::AcknowledgeRtcAlarm => match self.ctx.board.rtc.ack_alarm() {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::AckDone)),
+                Err(err) => Err((EffectCategory::Ack, format!("{err:#}"))),
+            },
             Effect::StartTone => {
-                if let Some(audio) = self.ctx.board.audio.as_mut() {
-                    audio.play_sine_stereo(880.0, 0.05, 8000)?;
-                }
+                // The state machine emits StartTone when entering Firing;
+                // the main loop drives the blocking ring screen
+                // (`alarms::ring_screen`) which owns the tone burst
+                // alternation and ENTER polling. We return a synchronous
+                // ToneDone here so the state machine can proceed, but the
+                // tone itself is *not* played by this executor - the
+                // legacy ring_screen does it.
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
-            Effect::StopTone => {
-                if let Some(audio) = self.ctx.board.audio.as_mut() {
-                    audio.set_mute(true)?;
-                }
-                Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
-            }
+            Effect::StopTone => match self
+                .ctx
+                .board
+                .audio
+                .as_mut()
+                .map(|audio| audio.set_mute(true))
+                .unwrap_or(Ok(()))
+            {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::ToneDone)),
+                Err(err) => Err((EffectCategory::Tone, format!("{err:#}"))),
+            },
             // ---- asynchronous / out-of-band effects -------------------------
             Effect::Reply(reply) => {
-                // The legacy `control::dispatch` paths route USB/BLE replies
-                // through the matching channel. The state machine does not
-                // know which channel an `Event::UsbCommand` /
-                // `Event::BleCommand` arrived on; the main loop carries that
-                // fact separately and runs the legacy `control::dispatch` for
-                // now. This branch is exercised when the state machine emits
-                // `Reply::Busy` for an in-flight command (see
-                // `transition_command`) - we mirror the reply onto both
-                // transports; whichever does not have a matching slot drops
-                // the write.
+                // The main loop routes USB/BLE replies through the matching
+                // channel; the state machine emits this Reply when an
+                // `Event::UsbCommand` / `Event::BleCommand` slot is busy.
                 let raw = reply_from_control_reply(reply);
                 crate::usb_console::write_reply(&raw, None);
                 if let Some(ble) = self.ctx.ble_control.as_ref() {
@@ -320,35 +326,53 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
                 }
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
-            Effect::Render(req) => {
-                render_home_into(self.ctx, self.last_clock, req)?;
-                // The actual completion arrives via the EPD task; tell the
-                // caller to expect one. The legacy EPD task's `EpdCompletion`
-                // maps 1:1 to `EffectOutput::RenderDone` - the rendering
-                // itself succeeded if the canvas reached the panel; failures
-                // surface as `EffectFailed` with `EffectError::Render(_)` from
-                // `EpdCompletion.ok = false`.
-                Ok(EffectOutcome::Async)
-            }
+            Effect::Render(req) => match render_home_into(self.ctx, self.last_clock, req) {
+                Ok(()) => {
+                    // EPD completion arrives asynchronously via the EPD
+                    // task. The caller feeds it back through
+                    // `AppRunner::on_effect_completed` with the matching
+                    // `EffectCompletion { output: RenderDone }` once the
+                    // canvas reaches the panel. We return `Async` so the
+                    // caller knows to expect that completion.
+                    Ok(EffectOutcome::Async)
+                }
+                Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
+            },
             Effect::StartSync(req) => {
-                self.ctx.start_sync(
+                let result = self.ctx.start_sync(
                     crate::sync_task::OpSource::Internal,
                     req.now,
                     inkwash_logic::protocol::Command::SyncNow,
-                )?;
-                Ok(EffectOutcome::Async)
+                );
+                match result {
+                    Ok(_) => Ok(EffectOutcome::Async),
+                    Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
+                }
             }
             Effect::StartBlePairing(_req) => Ok(EffectOutcome::Async),
             Effect::StopBlePairing => Ok(EffectOutcome::Async),
-            Effect::EnterLightSleep(plan) => {
-                crate::power::configure_light_sleep()?;
-                let _ = plan;
+            Effect::EnterLightSleep(_plan) => {
+                if let Err(err) = crate::power::configure_light_sleep() {
+                    return Err((EffectCategory::Sleep, format!("{err:#}")));
+                }
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }
             Effect::EnterDeepSleep(plan) => {
                 crate::power::enter_deep_sleep_with_wakeups(plan.maintenance);
             }
         }
+    }
+}
+
+fn err_for_category(category: EffectCategory, msg: &str) -> EffectError {
+    match category {
+        EffectCategory::Ack => EffectError::Ack(msg.to_string()),
+        EffectCategory::Persist => EffectError::Persist(msg.to_string()),
+        EffectCategory::Rtc => EffectError::Rtc(msg.to_string()),
+        EffectCategory::Render => EffectError::Render(msg.to_string()),
+        EffectCategory::Sync => EffectError::Sync(msg.to_string()),
+        EffectCategory::Tone => EffectError::Tone(msg.to_string()),
+        EffectCategory::Sleep => EffectError::Sleep(msg.to_string()),
     }
 }
 
@@ -382,10 +406,9 @@ fn reply_from_control_reply(reply: &ControlReply) -> control::Reply {
     }
 }
 
-/// Re-renders Home on the EPD task, mirroring `main::render_home_now` but
-/// driven by the state machine. The fingerprint / dirty-region logic
-/// stays in the main loop for now - the runner only does the unconditional
-/// paint the state machine asks for.
+/// Re-renders Home on the EPD task. The fingerprint / dirty-region logic
+/// stays in the main loop for now - the runner only does the
+/// unconditional paint the state machine asks for.
 fn render_home_into(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -416,9 +439,4 @@ fn render_home_into(
         charge,
     );
     Ok(())
-}
-
-fn map_err(err: &anyhow::Error) -> EffectError {
-    let msg = format!("{err:#}");
-    EffectError::Ack(msg)
 }

@@ -91,6 +91,11 @@ impl AlarmStore {
 
 /// Handles both deep-sleep alarm wake and an AF flag observed while awake.
 /// Re-arming is deliberately left to the scheduler after the minute changes.
+///
+/// The migration step 2 split: this function still does ACK + persist
+/// inline (the legacy callers expect it). New code paths should call
+/// [`ring_screen`] directly because the state machine owns the ACK and
+/// persist - it emits both as confirmable effects before this loop runs.
 pub fn handle_fired_alarm(
     board: &mut Note4Board,
     alarm_store: &AlarmStore,
@@ -116,6 +121,18 @@ pub fn handle_fired_alarm(
         }
     }
     Ok(())
+}
+
+/// Runs the blocking alarm-ring UI (canvas + tone bursts + ENTER
+/// polling). Caller owns the RTC ACK and the expired-Once persist; this
+/// function is invoked by the main loop *after* `AppRunner` has emitted
+/// `AcknowledgeRtcAlarm` and `PersistAlarms` for the matching alarm.
+pub fn ring_screen(
+    board: &mut Note4Board,
+    usb: &mut UsbConsole,
+    ble: Option<&mut BleControl>,
+) -> Result<()> {
+    ring_until_dismissed(board, usb, ble)
 }
 
 /// Draws the alarm screen, then alternates short tone bursts with polling

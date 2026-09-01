@@ -199,20 +199,16 @@ fn main() -> Result<()> {
     // screen. `power::wake_cause()` reads `esp_sleep_get_wakeup_cause`
     // again (harmless, not a consuming read); unlike the raw cause logged
     // above, this distinguishes ENTER-wake from alarm-wake.
+    // AppRunner is the sole alarm owner from step 2 onwards. The legacy
+    // `alarms::handle_fired_alarm` boot ring is gone: AppRunner now
+    // dispatches the BootSnapshot (with the raw AF/AIE facts captured
+    // after `Note4Board::take` which no longer pre-clears them), the
+    // state machine decides whether to ring, and the main loop drives
+    // `alarms::ring_screen` if the state machine entered Firing. The
+    // wake-cause flag is captured for the legacy AlarmScheduler and the
+    // deep-sleep wake path; the actual ringing comes from the state
+    // machine, not the legacy ring_until_dismissed call.
     let alarm_fired_at_boot = power::wake_cause() == power::WakeCause::RtcAlarm;
-    if alarm_fired_at_boot {
-        log::info!("Woke from RTC alarm; ringing");
-        // BLE is never up this early (only started on entering the pairing
-        // screen), so there is nothing to poll yet - `None` is accurate,
-        // not a shortcut.
-        alarms::handle_fired_alarm(
-            &mut board,
-            &alarm_store,
-            &mut usb_console,
-            None,
-            clock.as_ref(),
-        )?;
-    }
 
     // Keep the PCF8563's single hardware alarm slot pointed at whichever
     // stored alarm is nearest, every boot: after arming/editing an alarm,
@@ -413,11 +409,45 @@ fn main() -> Result<()> {
         watchdog::feed();
         if !boot_dispatched {
             boot_dispatched = true;
-            let snapshot = collect_boot_snapshot(&mut ctx, clock);
-            if let Err(err) =
-                app_runner.dispatch(inkwash_logic::app::Event::Boot(snapshot), &mut ctx)
-            {
+            let boot_result = collect_boot_snapshot(&mut ctx, clock);
+            if boot_result.core_failed {
+                // Architecture says core NVS / RTC failure must enter a
+                // minimal safe mode. We log + keep going rather than
+                // hang the boot loop; the legacy DeviceContext path will
+                // still try to serve screens, but alarm business is
+                // disabled until the next reset. Step 4 (event queue)
+                // will wire the proper safe-mode renderer.
+                log::error!("Core boot fact unavailable; entering degraded mode");
+            }
+            if let Err(err) = app_runner.dispatch(
+                inkwash_logic::app::Event::Boot(boot_result.snapshot),
+                &mut ctx,
+            ) {
                 log::warn!("AppRunner Boot dispatch failed: {err}");
+            }
+            // Boot alarm: if the state machine entered Firing (RTC-alarm
+            // wake), drive the ring screen immediately so the user can
+            // dismiss the alarm without waiting for the next loop
+            // iteration. Same handoff path the runtime AF branch uses:
+            // AppRunner owns ACK + persist + screen selection; the main
+            // loop owns the blocking ring UI; ENTER press dispatches back
+            // into the state machine for Firing -> WaitingForRearm.
+            if matches!(
+                app_runner.state().screen,
+                inkwash_logic::app::Screen::AlarmRinging
+            ) {
+                log::info!("Boot from RTC alarm; entering ring screen");
+                if let Err(err) =
+                    alarms::ring_screen(ctx.board, ctx.usb_console, ctx.ble_control.as_mut())
+                {
+                    log::error!("Boot ring_screen failed: {err}");
+                }
+                let _ = app_runner.dispatch(
+                    inkwash_logic::app::Event::Button(
+                        inkwash_logic::button_event::ButtonEvent::Pressed,
+                    ),
+                    &mut ctx,
+                );
             }
         }
         let mut dirty: Vec<Rect> = Vec::new();
@@ -486,17 +516,17 @@ fn main() -> Result<()> {
             }
         }
 
-        // RTC alarm fast path: GPIO5 is not a light-sleep wake source (its
-        // level floats low during light sleep - see `power::WAKE_PINS`),
-        // so alarm firing is detected by polling the PCF8563 AF flag every
-        // iteration instead of waiting up to 10 s for the gated RTC read.
-        // The flag read is a 2-byte I2C transaction (~50 us), negligible
-        // even at the 20 ms active cadence.
-        // AppRunner RtcAlarmSnapshotReady: feed the state machine on the
-        // low -> high edge of the AF flag. Repeated set-AF observations
-        // are absorbed by the state machine's residue-ACK barrier, so a
-        // single transition is enough. The legacy poll_runtime path still
-        // runs, keeping the device ringing while the runner is brought up.
+        // AppRunner is the sole alarm owner from step 2 onwards. The
+        // low -> high AF edge drives a `RtcAlarmSnapshotReady` event
+        // through the state machine; the state machine then emits
+        // AcknowledgeRtcAlarm + PersistAlarms + StartTone + Render. After
+        // dispatch, if the state machine entered `Firing`, the main loop
+        // drives `alarms::ring_screen` for the blocking ring/dismiss UI;
+        // ENTER press dispatches `Event::Button(Enter/Pressed)` back into
+        // the state machine which transitions to `WaitingForRearm`.
+        //
+        // The legacy `poll_alarm` ringing branch is skipped entirely:
+        // AppRunner owns ACK, persist, ring start, and rearm scheduling.
         if ctx.board.rtc.alarm_flag().unwrap_or(false) {
             if !last_rtc_alarm_flag {
                 last_rtc_alarm_flag = true;
@@ -514,19 +544,33 @@ fn main() -> Result<()> {
                         ) {
                             log::warn!("AppRunner RtcAlarmSnapshotReady dispatch failed: {err}");
                         }
+                        if matches!(
+                            app_runner.state().screen,
+                            inkwash_logic::app::Screen::AlarmRinging
+                        ) {
+                            log::info!("RTC alarm fired; entering ring screen");
+                            if let Err(err) = alarms::ring_screen(
+                                ctx.board,
+                                ctx.usb_console,
+                                ctx.ble_control.as_mut(),
+                            ) {
+                                log::error!("ring_screen failed: {err}");
+                            }
+                            // Dismiss press dispatches ENTER as a state
+                            // machine event; Firing -> WaitingForRearm.
+                            let _ = app_runner.dispatch(
+                                inkwash_logic::app::Event::Button(
+                                    inkwash_logic::button_event::ButtonEvent::Pressed,
+                                ),
+                                &mut ctx,
+                            );
+                            dirty.push(FULL_SCREEN_RECT);
+                        }
                     }
                     Err(err) => {
                         log::warn!("PCF8563 read_time failed (AppRunner alarm fast path): {err}")
                     }
                 }
-            }
-            match ctx.board.rtc.read_time() {
-                Ok(dt) => {
-                    if ctx.poll_runtime(&dt) {
-                        dirty.push(FULL_SCREEN_RECT);
-                    }
-                }
-                Err(err) => log::warn!("PCF8563 read_time failed (alarm fast path): {err}"),
             }
         } else {
             last_rtc_alarm_flag = false;
@@ -861,17 +905,57 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
 
 /// Build the BootSnapshot the state machine consumes in Event::Boot. Fact
 /// gathering is defensive: every read is allowed to fail, with the
-/// corresponding field defaulting to a safe value (an empty list, an
-/// empty config, AF/AIE both false).
+/// Result of a boot snapshot collection. Core failures (RTC reads, alarm
+/// NVS load) are signalled via `core_failed`; the snapshot itself still
+/// carries the partial facts we did manage to read so a future safe-mode
+/// renderer can show a diagnostic screen. Soft failures (todo / inbox /
+/// config) are logged and substituted with empty defaults.
+#[derive(Debug)]
+struct BootSnapshotResult {
+    snapshot: inkwash_logic::app::BootSnapshot,
+    /// True when a *core* fact (RTC AF/AIE, alarm list) could not be
+    /// read - the firmware should enter safe mode rather than trust this
+    /// snapshot for alarm logic.
+    core_failed: bool,
+}
+
 fn collect_boot_snapshot(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
-) -> inkwash_logic::app::BootSnapshot {
-    let rtc_alarm_flag = ctx.board.rtc.alarm_flag().unwrap_or(false);
-    let rtc_alarm_interrupt_enabled = ctx.board.rtc.alarm_interrupt_enabled().unwrap_or(false);
-    let alarms = ctx.alarm_store.load().unwrap_or_default();
-    let todos = ctx.todo_store.load().unwrap_or_default();
-    let inbox = ctx.inbox_store.load().unwrap_or_default();
+) -> BootSnapshotResult {
+    let mut core_failed = false;
+    let rtc_alarm_flag = match ctx.board.rtc.alarm_flag() {
+        Ok(flag) => flag,
+        Err(err) => {
+            log::error!("PCF8563 alarm_flag read failed: {err}");
+            core_failed = true;
+            false
+        }
+    };
+    let rtc_alarm_interrupt_enabled = match ctx.board.rtc.alarm_interrupt_enabled() {
+        Ok(flag) => flag,
+        Err(err) => {
+            log::error!("PCF8563 alarm_interrupt_enabled read failed: {err}");
+            core_failed = true;
+            false
+        }
+    };
+    let alarms = match ctx.alarm_store.load() {
+        Ok(list) => list,
+        Err(err) => {
+            log::error!("Alarm NVS load failed: {err}");
+            core_failed = true;
+            Vec::new()
+        }
+    };
+    let todos = ctx.todo_store.load().unwrap_or_else(|err| {
+        log::warn!("Todo NVS load failed (using empty list): {err}");
+        Vec::new()
+    });
+    let inbox = ctx.inbox_store.load().unwrap_or_else(|err| {
+        log::warn!("Inbox NVS load failed (using empty list): {err}");
+        Vec::new()
+    });
     let config = ctx
         .counters
         .device_config()
@@ -882,14 +966,17 @@ fn collect_boot_snapshot(
             auth_token: String::new(),
         });
     let wake_cause = power::wake_cause();
-    inkwash_logic::app::BootSnapshot {
-        wake_cause,
-        now: clock,
-        rtc_alarm_flag,
-        rtc_alarm_interrupt_enabled,
-        alarms,
-        todos,
-        inbox,
-        config,
+    BootSnapshotResult {
+        snapshot: inkwash_logic::app::BootSnapshot {
+            wake_cause,
+            now: clock,
+            rtc_alarm_flag,
+            rtc_alarm_interrupt_enabled,
+            alarms,
+            todos,
+            inbox,
+            config,
+        },
+        core_failed,
     }
 }

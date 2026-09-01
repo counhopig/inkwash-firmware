@@ -262,9 +262,12 @@ impl Note4Board {
         let i2c_bus: SharedI2c = Rc::new(RefCell::new(i2c));
         let mut rtc = Pcf8563::new(i2c_bus.clone(), PCF8563_ADDR);
         rtc.probe().context("PCF8563 not responding on I2C bus")?;
-        if let Err(err) = rtc.clear_alarm() {
-            log::warn!("PCF8563 clear_alarm failed: {err}");
-        }
+        // architecture requires the boot flow to read both AF and AIE
+        // before deciding what to do, and the state machine is the sole
+        // owner of the AF ACK. `main` reads them post-construction, packs
+        // them into a `BootSnapshot`, dispatches `Event::Boot`, and only
+        // then lets the state machine emit `AcknowledgeRtcAlarm` /
+        // `DisableRtcAlarm` (residue) effects. See `main::boot`.
 
         // ES8311 audio codec: I2S0 TX on GPIO14/15/38/45 (MCLK/BCLK/WS/DOUT),
         // speaker PA enabled on GPIO46, control registers over the I2C0 bus
