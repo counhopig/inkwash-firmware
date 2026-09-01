@@ -1,4 +1,5 @@
 mod alarms;
+mod app_runner;
 mod audio;
 mod ble_control;
 mod board;
@@ -371,6 +372,17 @@ fn main() -> Result<()> {
         last_command: None,
     };
 
+    // AppRunner: bridge between the host-testable state machine in
+    // inkwash_logic::app and the existing drivers. The boot snapshot is
+    // dispatched as the first event in the loop (boot_dispatched flag);
+    // the runner is purely additive for step 2, observing the boot,
+    // minute ticks, and RTC AF edges without disturbing the legacy
+    // DeviceContext scheduling.
+    let mut app_runner = app_runner::AppRunner::new();
+    app_runner.set_last_clock(clock);
+    let mut boot_dispatched = false;
+    let mut last_rtc_alarm_flag = false;
+
     // Two-level polling cadence: while the user
     // interacts - a key is raw-low, a command arrived, a refresh is
     // pending - the loop runs at POLL_INTERVAL_MS so the poll-based
@@ -399,6 +411,15 @@ fn main() -> Result<()> {
     let mut deep_sleep_since: Option<Instant> = None;
     loop {
         watchdog::feed();
+        if !boot_dispatched {
+            boot_dispatched = true;
+            let snapshot = collect_boot_snapshot(&mut ctx, clock);
+            if let Err(err) =
+                app_runner.dispatch(inkwash_logic::app::Event::Boot(snapshot), &mut ctx)
+            {
+                log::warn!("AppRunner Boot dispatch failed: {err}");
+            }
+        }
         let mut dirty: Vec<Rect> = Vec::new();
         let now = Instant::now();
 
@@ -436,6 +457,16 @@ fn main() -> Result<()> {
                         .unwrap_or(true);
                     if changed {
                         clock = Some(dt);
+                        app_runner.set_last_clock(clock);
+                        // AppRunner Tick: feed the state machine on every
+                        // minute boundary. The state machine uses Tick to
+                        // rearm the RTC alarm slot at minute edges and to
+                        // fire scheduled syncs.
+                        if let Err(err) =
+                            app_runner.dispatch(inkwash_logic::app::Event::Tick(dt), &mut ctx)
+                        {
+                            log::warn!("AppRunner Tick dispatch failed: {err}");
+                        }
                         dirty.push(CLOCK_RECT);
                     }
                     // Cron-style sync decisions ride the fresh clock read:
@@ -461,7 +492,34 @@ fn main() -> Result<()> {
         // iteration instead of waiting up to 10 s for the gated RTC read.
         // The flag read is a 2-byte I2C transaction (~50 us), negligible
         // even at the 20 ms active cadence.
+        // AppRunner RtcAlarmSnapshotReady: feed the state machine on the
+        // low -> high edge of the AF flag. Repeated set-AF observations
+        // are absorbed by the state machine's residue-ACK barrier, so a
+        // single transition is enough. The legacy poll_runtime path still
+        // runs, keeping the device ringing while the runner is brought up.
         if ctx.board.rtc.alarm_flag().unwrap_or(false) {
+            if !last_rtc_alarm_flag {
+                last_rtc_alarm_flag = true;
+                match ctx.board.rtc.read_time() {
+                    Ok(dt) => {
+                        let aie = ctx.board.rtc.alarm_interrupt_enabled().unwrap_or(false);
+                        let snapshot = inkwash_logic::app::RtcAlarmSnapshot {
+                            now: dt,
+                            alarm_flag: true,
+                            alarm_interrupt_enabled: aie,
+                        };
+                        if let Err(err) = app_runner.dispatch(
+                            inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
+                            &mut ctx,
+                        ) {
+                            log::warn!("AppRunner RtcAlarmSnapshotReady dispatch failed: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("PCF8563 read_time failed (AppRunner alarm fast path): {err}")
+                    }
+                }
+            }
             match ctx.board.rtc.read_time() {
                 Ok(dt) => {
                     if ctx.poll_runtime(&dt) {
@@ -470,6 +528,8 @@ fn main() -> Result<()> {
                 }
                 Err(err) => log::warn!("PCF8563 read_time failed (alarm fast path): {err}"),
             }
+        } else {
+            last_rtc_alarm_flag = false;
         }
 
         // Poll USB console for incoming commands, dispatch them, and send replies.
@@ -797,4 +857,39 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build the BootSnapshot the state machine consumes in Event::Boot. Fact
+/// gathering is defensive: every read is allowed to fail, with the
+/// corresponding field defaulting to a safe value (an empty list, an
+/// empty config, AF/AIE both false).
+fn collect_boot_snapshot(
+    ctx: &mut DeviceContext<'_>,
+    clock: Option<DateTime>,
+) -> inkwash_logic::app::BootSnapshot {
+    let rtc_alarm_flag = ctx.board.rtc.alarm_flag().unwrap_or(false);
+    let rtc_alarm_interrupt_enabled = ctx.board.rtc.alarm_interrupt_enabled().unwrap_or(false);
+    let alarms = ctx.alarm_store.load().unwrap_or_default();
+    let todos = ctx.todo_store.load().unwrap_or_default();
+    let inbox = ctx.inbox_store.load().unwrap_or_default();
+    let config = ctx
+        .counters
+        .device_config()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| inkwash_logic::device_config::DeviceConfig {
+            server_url: String::new(),
+            auth_token: String::new(),
+        });
+    let wake_cause = power::wake_cause();
+    inkwash_logic::app::BootSnapshot {
+        wake_cause,
+        now: clock,
+        rtc_alarm_flag,
+        rtc_alarm_interrupt_enabled,
+        alarms,
+        todos,
+        inbox,
+        config,
+    }
 }

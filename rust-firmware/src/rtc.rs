@@ -132,6 +132,14 @@ impl Pcf8563 {
         self.read_regs(0x01, &mut ctrl2)?;
         Ok(ctrl2[0] & 0x08 != 0)
     }
+    /// Reads AIE (ctrl2 bit1) without touching AF. A set AF with the
+    /// interrupt disabled is residue, not a ringable trigger - the
+    /// state machine reads both at boot and on every RTC snapshot.
+    pub fn alarm_interrupt_enabled(&mut self) -> Result<bool> {
+        let mut ctrl2 = [0u8; 1];
+        self.read_regs(0x01, &mut ctrl2)?;
+        Ok(ctrl2[0] & 0x02 != 0)
+    }
 
     /// Clears AF (ctrl2 bit3) so the open-drain INT line releases; must be
     /// called after every alarm wake or INT stays asserted low forever.
