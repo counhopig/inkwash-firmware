@@ -94,21 +94,22 @@ pub struct DeviceContext<'a> {
     /// comment for why this exists and why the key includes `Command`,
     /// not just `id`.
     pub last_command: Option<(String, Command, Reply)>,
-    /// Callback the main loop installs to collect a consistent RTC alarm
-    /// snapshot and dispatch it to AppRunner. Blocking pages call
-    /// [`DeviceContext::poll_alarm_snapshot`], which reads the AF edge
-    /// and invokes this callback with the snapshot. The closure captures
-    /// the shared `Rc<RefCell<AppRunner>>` so it can dispatch
-    /// `RtcAlarmSnapshotReady` without borrowing `Self` (which would be
-    /// self-referential). Returns `true` when the resulting screen is
-    /// `AlarmRinging` so the caller can terminate its blocking loop.
-    /// Shared handle to the AppRunner so blocking pages (which own the
-    /// main thread and call [`DeviceContext::poll_background`] /
-    /// [`DeviceContext::poll_local_alerts`]) can still dispatch a
-    /// consistent RTC alarm snapshot through the same state machine.
-    /// Clone the `Rc` out, then call `dispatch` with `self` as the
-    /// driver context - no self-referential borrow.
+    /// [[`DeviceContext::poll_alarm_snapshot`]] dispatches to AppRunner so
+    /// blocking pages (which own the main thread) can still ring an alarm
+    /// through the same state machine. Clone the `Rc` out, then call
+    /// `dispatch` with `self` as the driver context - no self-referential
+    /// borrow.
     pub app_runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
+    /// Unified registry of in-flight AppRunner render kicks, shared by the
+    /// main loop and every blocking page so an EPD completion can always
+    /// find its kick by `request_id`, regardless of who dispatched it.
+    pub pending_renders: std::rc::Rc<std::cell::RefCell<Vec<crate::app_runner::AsyncKick>>>,
+    /// Disabled after a core boot fact failure. Shared by the main loop
+    /// *and* every blocking page so no entry can dispatch to a default
+    /// AppState after a corrupt boot. Set by `main` from its own
+    /// `app_runner_enabled`; `poll_alarm_snapshot` checks it before
+    /// dispatching.
+    pub app_runner_enabled: bool,
 }
 
 impl DeviceContext<'_> {
@@ -192,6 +193,13 @@ impl DeviceContext<'_> {
     /// or rearm the RTC itself; that stays with the state machine via the
     /// dispatch.
     pub fn poll_alarm_snapshot(&mut self) -> bool {
+        // A corrupt boot (core_failed) disables AppRunner for every entry
+        // - the main loop's AF fast path and any blocking page. Without
+        // this guard a default AppState would interpret a real AF as
+        // residue and ACK it off.
+        if !self.app_runner_enabled {
+            return false;
+        }
         let Ok(true) = self.board.rtc.alarm_flag() else {
             return false;
         };
@@ -229,6 +237,10 @@ impl DeviceContext<'_> {
             log::warn!("Blocking page AppRunner RtcAlarmSnapshotReady dispatch failed");
             return false;
         }
+        // Route every render kick this dispatch produced into the shared
+        // registry so the eventual EPD completion (which the main loop
+        // drains against the same registry) can find it by request_id.
+        self.forward_kicks(&runner);
         let firing = matches!(
             runner.borrow().state().screen,
             inkwash_logic::app::Screen::AlarmRinging
@@ -250,8 +262,31 @@ impl DeviceContext<'_> {
                 ),
                 self,
             );
+            // Route the dismiss render kick too.
+            self.forward_kicks(&runner);
         }
         firing
+    }
+
+    /// Moves AppRunner's accumulated render kicks into the shared
+    /// `pending_renders` registry so the main loop's EPD completion match
+    /// can find them by request_id, regardless of who dispatched them.
+    fn forward_kicks(
+        &mut self,
+        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
+    ) {
+        for kick in runner.borrow_mut().take_pending_kicks() {
+            let mut registry = self.pending_renders.borrow_mut();
+            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+                registry.push(kick);
+            } else {
+                log::warn!(
+                    "Blocking page async kick {:?} (op {:?}) not wired; dropped",
+                    kick.effect,
+                    kick.operation_id
+                );
+            }
+        }
     }
 
     /// Services scheduled sync and due-todo reminders. AppRunner owns

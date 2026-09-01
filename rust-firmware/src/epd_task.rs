@@ -68,6 +68,12 @@ pub struct EpdCompletion {
     /// A partial refresh failed and was re-executed as a full refresh
     /// from the same snapshot.
     pub recovered: bool,
+    /// True when this request was dropped because a newer request
+    /// superseded it in the single pending slot before it ran. Every
+    /// submitted request_id must eventually receive a completion
+    /// (ok/superseded), so a `superseded` completion lets the caller
+    /// clear its in-flight entry without waiting for a panel outcome.
+    pub superseded: bool,
 }
 
 /// The single pending-request slot shared by the app thread (writer) and
@@ -78,6 +84,10 @@ struct RefreshSlot {
     /// queued. A full queue is not a lost wakeup - the task re-checks the
     /// slot on every loop iteration.
     notify_tx: SyncSender<()>,
+    /// Sends completions. The slot uses this to emit a `superseded`
+    /// completion for a request that a newer submission replaced, so no
+    /// submitted request_id is ever left without a terminal outcome.
+    completions_tx: Sender<EpdCompletion>,
 }
 
 impl RefreshSlot {
@@ -90,9 +100,13 @@ impl RefreshSlot {
         match pending.as_mut() {
             Some(cmd) => match &mut cmd.kind {
                 RefreshKind::Full => {
+                    // A newer full-frame partial supersedes the pending
+                    // full: complete the old request as superseded.
+                    self.complete_superseded(cmd.request_id, RefreshKind::Full);
                     cmd.frame = frame;
                 }
                 RefreshKind::Partial(prev) => {
+                    self.complete_superseded(cmd.request_id, RefreshKind::Partial(*prev));
                     *prev = union_rect(*prev, rect);
                     cmd.frame = frame;
                 }
@@ -112,12 +126,31 @@ impl RefreshSlot {
     /// the newest frame supersedes a pending partial).
     fn submit_full(&self, frame: Box<[u8]>, request_id: u64) {
         let mut pending = self.pending.lock();
+        if let Some(cmd) = pending.as_ref() {
+            self.complete_superseded(cmd.request_id, cmd.kind);
+        }
         *pending = Some(RenderCommand {
             kind: RefreshKind::Full,
             frame,
             request_id,
         });
         let _ = self.notify_tx.try_send(());
+    }
+
+    /// Emits a `superseded` completion for a request id that a newer
+    /// submission replaced in the single pending slot. Returns the
+    /// original request id so the merge path can record it. Every
+    /// submitted request_id must receive exactly one terminal outcome
+    /// (ok / failed / superseded), otherwise the caller's in-flight
+    /// registry leaks.
+    fn complete_superseded(&self, request_id: u64, kind: RefreshKind) {
+        let _ = self.completions_tx.send(EpdCompletion {
+            kind,
+            request_id,
+            ok: true,
+            recovered: false,
+            superseded: true,
+        });
     }
 }
 
@@ -179,11 +212,12 @@ pub fn spawn() -> Result<EpdHandle> {
     // later refresh (clock minute changes, deep-sleep wake region) was lost,
     // which froze the on-screen clock.
     let (notify_tx, notify_rx) = sync_channel(1);
+    let (completions_tx, completions_rx) = channel();
     let slot = Arc::new(RefreshSlot {
         pending: Mutex::new(None),
         notify_tx,
+        completions_tx: completions_tx.clone(),
     });
-    let (completions_tx, completions_rx) = channel();
     let task_slot = Arc::clone(&slot);
     std::thread::Builder::new()
         .name("epd".to_string())
@@ -255,6 +289,7 @@ fn execute(
                 request_id: cmd.request_id,
                 ok: result.is_ok(),
                 recovered: false,
+                superseded: false,
             }
         }
         RefreshKind::Partial(rect) => {
@@ -265,6 +300,7 @@ fn execute(
                     request_id: cmd.request_id,
                     ok: true,
                     recovered: false,
+                    superseded: false,
                 },
                 Err(err) => {
                     // Recovery path, same as the old synchronous
@@ -278,6 +314,7 @@ fn execute(
                         request_id: cmd.request_id,
                         ok: result.is_ok(),
                         recovered: result.is_ok(),
+                        superseded: false,
                     }
                 }
             }

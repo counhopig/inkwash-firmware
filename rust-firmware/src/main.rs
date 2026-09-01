@@ -363,6 +363,11 @@ fn main() -> Result<()> {
         pending_wifi_op: None,
         last_command: None,
         app_runner: app_runner.clone(),
+        pending_renders: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        // Mirrors the `app_runner_enabled` local below; kept in lockstep
+        // on boot (a core_failed snapshot sets both false) so blocking
+        // page entry points cannot dispatch to a default AppState.
+        app_runner_enabled: true,
     };
 
     // AppRunner: bridge between the host-testable state machine in
@@ -411,7 +416,11 @@ fn main() -> Result<()> {
     // EPD completion matches the next in-flight render. The state
     // machine ignores out-of-order generations so a stale completion
     // is harmless.
-    let mut pending_renders: Vec<app_runner::AsyncKick> = Vec::new();
+    // Unified in-flight render registry, shared with DeviceContext so
+    // blocking pages (which dispatch RtcAlarmSnapshotReady through the
+    // same AppRunner) also register their kicks here for the EPD
+    // completion match.
+    // (ctx.pending_renders owns it; we clone the Rc handle.)
     // Set when the boot-alarm dismiss must repaint the whole screen back
     // to Home (otherwise the panel stays on the ALARM frame - review
     // round 6 P0 #3). The main loop's dirty-rect path consumes it.
@@ -429,6 +438,7 @@ fn main() -> Result<()> {
                 // list would otherwise treat a real AF as residue and
                 // ACK it off, or make alarm decisions on corrupt facts.
                 app_runner_enabled = false;
+                ctx.app_runner_enabled = false;
                 log::error!("Core boot fact unavailable; AppRunner disabled for this boot");
             } else {
                 if let Err(err) = app_runner.borrow_mut().dispatch(
@@ -438,7 +448,7 @@ fn main() -> Result<()> {
                     log::warn!("AppRunner Boot dispatch failed: {err}");
                 }
                 for kick in app_runner.borrow_mut().take_pending_kicks() {
-                    track_kick(kick, &mut pending_renders);
+                    track_kick_shared(&ctx, kick);
                 }
             }
             // Boot alarm: if the state machine entered Firing (RTC-alarm
@@ -467,7 +477,7 @@ fn main() -> Result<()> {
                     &mut ctx,
                 );
                 for kick in app_runner.borrow_mut().take_pending_kicks() {
-                    track_kick(kick, &mut pending_renders);
+                    track_kick_shared(&ctx, kick);
                 }
                 // Dismissed back to Home: force a full refresh so the
                 // panel leaves the ALARM screen. The dirty-rect path
@@ -533,7 +543,7 @@ fn main() -> Result<()> {
                                 log::warn!("AppRunner Tick dispatch failed: {err}");
                             }
                             for kick in app_runner.borrow_mut().take_pending_kicks() {
-                                track_kick(kick, &mut pending_renders);
+                                track_kick_shared(&ctx, kick);
                             }
                         }
                         dirty.push(CLOCK_RECT);
@@ -605,7 +615,7 @@ fn main() -> Result<()> {
                             log::warn!("AppRunner RtcAlarmSnapshotReady dispatch failed: {err}");
                         }
                         for kick in app_runner.borrow_mut().take_pending_kicks() {
-                            track_kick(kick, &mut pending_renders);
+                            track_kick_shared(&ctx, kick);
                         }
                         if matches!(
                             app_runner.borrow().state().screen,
@@ -628,7 +638,7 @@ fn main() -> Result<()> {
                                 &mut ctx,
                             );
                             for kick in app_runner.borrow_mut().take_pending_kicks() {
-                                track_kick(kick, &mut pending_renders);
+                                track_kick_shared(&ctx, kick);
                             }
                             dirty.push(FULL_SCREEN_RECT);
                         }
@@ -677,8 +687,8 @@ fn main() -> Result<()> {
 
         // EPD completion events: feed each one back to the state machine
         // as `EffectCompleted(RenderDone)` / `EffectFailed(Render)`. The
-        // `EpdCompletion` does not carry a render_generation, so the
-        // FIFO `pending_renders` queue pairs each completion with the
+        // shared `pending_renders` registry (reachable from the main loop
+        // and every blocking page) pairs each `EpdCompletion` with the
         // next in-flight render. Out-of-order or extra completions are
         // absorbed by the state machine, which drops effects whose
         // render_generation is older than the current visible state.
@@ -689,14 +699,23 @@ fn main() -> Result<()> {
             // AppRunner render is fed back. Legacy dirty-rect / ring /
             // boot refreshes carry ids with no matching kick and are
             // observed but not fed back.
-            let matched = pending_renders
-                .iter()
-                .position(|kick| kick.request_id == Some(completion.request_id));
-            if let Some(idx) = matched {
-                let kick = pending_renders.remove(idx);
+            let matched_kick = {
+                let mut reg = ctx.pending_renders.borrow_mut();
+                let idx = reg
+                    .iter()
+                    .position(|kick| kick.request_id == Some(completion.request_id));
+                idx.map(|i| reg.remove(i))
+            };
+            if let Some(kick) = matched_kick {
                 if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+                    // A superseded render is still a terminal outcome: the
+                    // newer request that replaced it may or may not pan out,
+                    // but this request's in-flight entry must clear so the
+                    // state machine is not left waiting for a RenderDone
+                    // that will never come. Feed RenderDone (the generation
+                    // check in the state machine drops a stale render).
                     let output = inkwash_logic::app::EffectOutput::RenderDone;
-                    let failure = (!completion.ok).then(|| {
+                    let failure = (!completion.ok && !completion.superseded).then(|| {
                         inkwash_logic::app::EffectError::Render(format!(
                             "epd refresh failed: {:?}",
                             completion.kind
@@ -711,6 +730,12 @@ fn main() -> Result<()> {
                 }
             }
             match completion {
+                EpdCompletion {
+                    ok: true,
+                    superseded: true,
+                    kind,
+                    ..
+                } => log::warn!("EPD refresh superseded: {kind:?}"),
                 EpdCompletion {
                     ok: true,
                     recovered: false,
@@ -1083,20 +1108,15 @@ fn collect_boot_snapshot(
     }
 }
 
-/// Records one in-flight render so the matching `EpdCompletion` can be
-/// fed back to the state machine. Only `Effect::Render` kicks are
-/// tracked - other async effects (sync, BLE, sleep) have their own
-/// completion paths.
-fn track_kick(kick: app_runner::AsyncKick, pending: &mut Vec<app_runner::AsyncKick>) {
+/// Records one in-flight render into the shared `pending_renders`
+/// registry so the matching `EpdCompletion` (by request_id) can be fed
+/// back to the state machine, regardless of which entry point (main
+/// loop or a blocking page) dispatched it. Non-render async kicks are
+/// surfaced with a log and dropped - their transports aren't wired yet.
+fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
+    let mut reg = ctx.pending_renders.borrow_mut();
     match &kick.effect {
-        // Render kicks go into the FIFO so the next EPD completion can be
-        // paired with them.
-        inkwash_logic::app::Effect::Render(_) => pending.push(kick),
-        // StartSync / StartBlePairing / StopBlePairing: let the main loop
-        // dispatch the Side effect to the matching subsystem. These
-        // channels are not yet wired to the state machine in step 2, so
-        // we surface the kick rather than silently dropping it - the state
-        // doc tracks them as pending until their transport is connected.
+        inkwash_logic::app::Effect::Render(_) => reg.push(kick),
         inkwash_logic::app::Effect::StartSync(_) => {
             log::warn!(
                 "AppRunner StartSync kick not yet wired to sync task (op {:?}); dropped",
@@ -1110,8 +1130,6 @@ fn track_kick(kick: app_runner::AsyncKick, pending: &mut Vec<app_runner::AsyncKi
                 kick.operation_id
             );
         }
-        // EnterDeepSleep / EnterLightSleep are handled synchronously in
-        // EffectRunner; they never surface here.
         other => log::warn!(
             "AppRunner async kick {:?} (op {:?}) not handled; dropped",
             other,

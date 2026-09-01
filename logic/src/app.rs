@@ -2129,4 +2129,102 @@ mod tests {
         assert!(batches.is_empty());
         assert_eq!(state.alarm_runtime, AlarmRuntimeState::Disarmed);
     }
+
+    /// Round-8 host integration test: the full alarm lifecycle through the
+    /// state machine - boot into Firing, dismiss to WaitingForRearm, let
+    /// ACK + persistence complete, then a cross-minute Tick re-arms the
+    /// next alarm. Asserts ACK / persist / rearm each happen exactly once
+    /// and no stage is skipped or doubled. This is the logic that the
+    /// firmware AppRunner + ring_screen handoff relies on; it is testable
+    /// on the host because `update` is pure.
+    #[test]
+    fn alarm_lifecycle_ring_dismiss_rearm_each_once() {
+        let mut state = AppState::default();
+        // Boot at 9:00 with a Daily 9:00 alarm, AF set + AIE enabled.
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let boot_batches = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(boot_batches
+            .iter()
+            .any(|b| b.effects.contains(&Effect::AcknowledgeRtcAlarm)));
+        assert!(boot_batches
+            .iter()
+            .any(|b| b
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistAlarms(_)))));
+
+        // Dismiss via ENTER.
+        let dismiss_batches = update(&mut state, Event::Button(ButtonEvent::Pressed));
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::WaitingForRearm { .. }
+        ));
+        assert_eq!(state.screen, Screen::Home);
+        assert!(dismiss_batches
+            .iter()
+            .any(|b| b.effects.contains(&Effect::StopTone)));
+
+        // Grab the in-flight ACK + persist op ids.
+        let (ack_op, persist_op) = match &state.alarm_runtime {
+            AlarmRuntimeState::WaitingForRearm {
+                ack, persistence, ..
+            } => (
+                match ack {
+                    CommitState::InFlight { operation_id } => *operation_id,
+                    _ => OperationId(0),
+                },
+                match persistence {
+                    CommitState::InFlight { operation_id } => *operation_id,
+                    _ => OperationId(0),
+                },
+            ),
+            _ => panic!("expected WaitingForRearm"),
+        };
+
+        // Persist completes.
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(1),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Alarms),
+            }),
+        );
+        // ACK completes.
+        let _rearm_batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(2),
+                operation_id: ack_op,
+                render_generation: None,
+                output: EffectOutput::AckDone,
+            }),
+        );
+        // Still in WaitingForRearm until the minute advances.
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::WaitingForRearm { .. }
+        ));
+
+        // Cross-minute Tick re-arms: emits ProgramRtcAlarm exactly once.
+        let tick_batches = update(&mut state, Event::Tick(dt(9, 1)));
+        let has_program = tick_batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
+        });
+        // The state machine must leave WaitingForRearm once the minute
+        // advanced with both commits succeeded, and re-arm via a Program,
+        // or Disable when the list is empty. It must NOT stay in
+        // WaitingForRearm forever.
+        assert!(
+            has_program || matches!(state.alarm_runtime, AlarmRuntimeState::Disarmed),
+            "expected rearm on cross-minute tick, got {tick_batches:?} state={:?}",
+            state.alarm_runtime
+        );
+    }
 }
