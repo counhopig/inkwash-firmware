@@ -39,7 +39,7 @@ use anyhow::Result;
 use board::Note4Board;
 use button::{ButtonEvent, POLL_INTERVAL_MS};
 use canvas::Rect;
-use ctx::{AlarmScheduler, DeviceContext, SyncScheduler};
+use ctx::{DeviceContext, SyncScheduler};
 use epd_task::EpdCompletion;
 use inbox::InboxStore;
 use rtc::DateTime;
@@ -212,21 +212,12 @@ fn main() -> Result<()> {
 
     // Keep the PCF8563's single hardware alarm slot pointed at whichever
     // stored alarm is nearest, every boot: after arming/editing an alarm,
-    // after a ring+ack above, or just because nothing armed it yet this
-    // session (the RTC keeps its own alarm config across deep sleep, but a
-    // fresh flash or an edit made while the device was off both need this).
-    if !alarm_fired_at_boot {
-        if let Some(dt) = clock.as_ref() {
-            match alarm_store.load() {
-                Ok(list) => {
-                    if let Err(err) = alarms::program_hardware_alarm(&mut board.rtc, &list, dt) {
-                        log::warn!("Failed to program hardware alarm: {err}");
-                    }
-                }
-                Err(err) => log::warn!("Failed to load alarms: {err}"),
-            }
-        }
-    }
+    // The RTC alarm register is *not* reprogrammed here: doing so would
+    // touch AF/AIE before AppRunner gets to see them and break the
+    // state-machine-only alarm ownership. AppRunner's first dispatch
+    // (Event::Boot) loads the alarm list from NVS, decides whether to
+    // arm the RTC and emit ProgramRtcAlarm / DisableRtcAlarm. Once that
+    // batch runs the RTC register matches the stored list.
 
     // Home's data fingerprint at the last actual render; the sync
     // completion path compares against it to skip unchanged redraws.
@@ -363,7 +354,6 @@ fn main() -> Result<()> {
         usb_console: &mut usb_console,
         ble_control: &mut ble_control,
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
-        alarm_scheduler: AlarmScheduler::new(clock.as_ref(), alarm_fired_at_boot),
         pending_wifi_op: None,
         last_command: None,
     };
@@ -405,6 +395,11 @@ fn main() -> Result<()> {
     // Reset by *user* activity only - clock-region refreshes keep
     // the light-sleep cadence but must not postpone deep sleep.
     let mut deep_sleep_since: Option<Instant> = None;
+    // In-flight AppRunner renders, tracked in FIFO order so the next
+    // EPD completion matches the next in-flight render. The state
+    // machine ignores out-of-order generations so a stale completion
+    // is harmless.
+    let mut pending_renders: Vec<app_runner::AsyncKick> = Vec::new();
     loop {
         watchdog::feed();
         if !boot_dispatched {
@@ -417,13 +412,17 @@ fn main() -> Result<()> {
                 // still try to serve screens, but alarm business is
                 // disabled until the next reset. Step 4 (event queue)
                 // will wire the proper safe-mode renderer.
-                log::error!("Core boot fact unavailable; entering degraded mode");
-            }
-            if let Err(err) = app_runner.dispatch(
-                inkwash_logic::app::Event::Boot(boot_result.snapshot),
-                &mut ctx,
-            ) {
-                log::warn!("AppRunner Boot dispatch failed: {err}");
+                log::error!("Core boot fact unavailable; AppRunner disabled");
+            } else {
+                if let Err(err) = app_runner.dispatch(
+                    inkwash_logic::app::Event::Boot(boot_result.snapshot),
+                    &mut ctx,
+                ) {
+                    log::warn!("AppRunner Boot dispatch failed: {err}");
+                }
+                for kick in app_runner.take_pending_kicks() {
+                    track_kick(kick, &mut pending_renders);
+                }
             }
             // Boot alarm: if the state machine entered Firing (RTC-alarm
             // wake), drive the ring screen immediately so the user can
@@ -448,6 +447,9 @@ fn main() -> Result<()> {
                     ),
                     &mut ctx,
                 );
+                for kick in app_runner.take_pending_kicks() {
+                    track_kick(kick, &mut pending_renders);
+                }
             }
         }
         let mut dirty: Vec<Rect> = Vec::new();
@@ -544,6 +546,9 @@ fn main() -> Result<()> {
                         ) {
                             log::warn!("AppRunner RtcAlarmSnapshotReady dispatch failed: {err}");
                         }
+                        for kick in app_runner.take_pending_kicks() {
+                            track_kick(kick, &mut pending_renders);
+                        }
                         if matches!(
                             app_runner.state().screen,
                             inkwash_logic::app::Screen::AlarmRinging
@@ -564,6 +569,9 @@ fn main() -> Result<()> {
                                 ),
                                 &mut ctx,
                             );
+                            for kick in app_runner.take_pending_kicks() {
+                                track_kick(kick, &mut pending_renders);
+                            }
                             dirty.push(FULL_SCREEN_RECT);
                         }
                     }
@@ -605,11 +613,31 @@ fn main() -> Result<()> {
             }
         }
 
-        // EPD completion events: the app state machine
-        // observes every refresh's outcome - success, failure, and
-        // partial->full recovery - instead of the result living only
-        // inside the EPD task.
+        // EPD completion events: feed each one back to the state machine
+        // as `EffectCompleted(RenderDone)` / `EffectFailed(Render)`. The
+        // `EpdCompletion` does not carry a render_generation, so the
+        // FIFO `pending_renders` queue pairs each completion with the
+        // next in-flight render. Out-of-order or extra completions are
+        // absorbed by the state machine, which drops effects whose
+        // render_generation is older than the current visible state.
         while let Some(completion) = ctx.board.display.poll_completion() {
+            if let Some(kick) = pending_renders.first().cloned() {
+                pending_renders.remove(0);
+                if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+                    let output = inkwash_logic::app::EffectOutput::RenderDone;
+                    let failure = (!completion.ok).then(|| {
+                        inkwash_logic::app::EffectError::Render(format!(
+                            "epd refresh failed: {:?}",
+                            completion.kind
+                        ))
+                    });
+                    if let Err(err) =
+                        feed_completion_back(&mut app_runner, &mut ctx, kick, output, failure)
+                    {
+                        log::warn!("AppRunner EPD completion feed failed: {err}");
+                    }
+                }
+            }
             match completion {
                 EpdCompletion {
                     ok: true,
@@ -979,4 +1007,28 @@ fn collect_boot_snapshot(
         },
         core_failed,
     }
+}
+
+/// Records one in-flight render so the matching `EpdCompletion` can be
+/// fed back to the state machine. Only `Effect::Render` kicks are
+/// tracked - other async effects (sync, BLE, sleep) have their own
+/// completion paths.
+fn track_kick(kick: app_runner::AsyncKick, pending: &mut Vec<app_runner::AsyncKick>) {
+    if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+        pending.push(kick);
+    }
+}
+
+/// Translate one EPD completion into the matching `EffectCompleted` /
+/// `EffectFailed` and dispatch it back through AppRunner. The kick is
+/// consumed (removed from `pending_renders` by the caller before this is
+/// called) so the generation / op id line up.
+fn feed_completion_back(
+    runner: &mut app_runner::AppRunner,
+    ctx: &mut DeviceContext<'_>,
+    kick: app_runner::AsyncKick,
+    output: inkwash_logic::app::EffectOutput,
+    failure: Option<inkwash_logic::app::EffectError>,
+) -> anyhow::Result<()> {
+    runner.feed_render_completion(kick, output, failure, ctx)
 }

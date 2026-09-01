@@ -43,6 +43,10 @@ pub struct AppRunner {
     /// Most recent RTC read - threaded into `Effect::Render` so the home
     /// screen does not need a fresh I2C transaction for each refresh.
     last_clock: Option<DateTime>,
+    /// In-flight kicks returned by `dispatch`. The main loop drains them
+    /// and tracks each render so the matching EPD completion can be fed
+    /// back as `EffectCompleted(RenderDone)`.
+    pending_kicks: Vec<AsyncKick>,
 }
 
 impl AppRunner {
@@ -50,6 +54,7 @@ impl AppRunner {
         Self {
             state: AppState::default(),
             last_clock: None,
+            pending_kicks: Vec::new(),
         }
     }
 
@@ -58,6 +63,7 @@ impl AppRunner {
         Self {
             state,
             last_clock: None,
+            pending_kicks: Vec::new(),
         }
     }
 
@@ -76,26 +82,25 @@ impl AppRunner {
     }
 
     /// Dispatch a single event through the state machine and run every
-    /// returned effect batch against the existing drivers.
-    pub fn dispatch(
-        &mut self,
-        event: Event,
-        ctx: &mut DeviceContext<'_>,
-    ) -> Result<Vec<AsyncKick>> {
+    /// returned effect batch against the existing drivers. Asynchronous
+    /// kicks are stashed in `self.pending_kicks`; callers drain them via
+    /// `take_pending_kicks`.
+    pub fn dispatch(&mut self, event: Event, ctx: &mut DeviceContext<'_>) -> Result<()> {
         let batches = app::update(&mut self.state, event);
-        let mut kicks = Vec::new();
         for batch in batches {
-            kicks.extend(self.run_batch(batch, ctx)?);
+            self.run_batch(batch, ctx)?;
         }
-        Ok(kicks)
+        Ok(())
     }
 
-    fn run_batch(
-        &mut self,
-        batch: app::EffectBatch,
-        ctx: &mut DeviceContext<'_>,
-    ) -> Result<Vec<AsyncKick>> {
-        let mut kicks = Vec::new();
+    /// Drain the queue of in-flight asynchronous kicks accumulated by
+    /// the most recent `dispatch` / `on_effect_completed` /
+    /// `on_effect_failed` calls.
+    pub fn take_pending_kicks(&mut self) -> Vec<AsyncKick> {
+        std::mem::take(&mut self.pending_kicks)
+    }
+
+    fn run_batch(&mut self, batch: app::EffectBatch, ctx: &mut DeviceContext<'_>) -> Result<()> {
         let mut runner = EffectRunner {
             ctx,
             last_clock: self.last_clock,
@@ -125,10 +130,10 @@ impl AppRunner {
                     };
                     let chained = app::update(&mut self.state, Event::EffectCompleted(completion));
                     for next in chained {
-                        kicks.extend(self.run_batch(next, ctx)?);
+                        self.run_batch(next, ctx)?;
                     }
                 }
-                Ok(EffectOutcome::Async) => kicks.push(AsyncKick {
+                Ok(EffectOutcome::Async) => self.pending_kicks.push(AsyncKick {
                     batch_id: batch.id,
                     effect_id,
                     operation_id: batch.operation_id,
@@ -145,7 +150,7 @@ impl AppRunner {
                     };
                     let chained = app::update(&mut self.state, Event::EffectFailed(failure));
                     for next in chained {
-                        kicks.extend(self.run_batch(next, ctx)?);
+                        self.run_batch(next, ctx)?;
                     }
                     if batch.failure_policy == FailurePolicy::AbortBatch {
                         break;
@@ -158,7 +163,7 @@ impl AppRunner {
                 last_clock: self.last_clock,
             };
         }
-        Ok(kicks)
+        Ok(())
     }
 
     /// Feed an externally-observed completion back into the state machine.
@@ -167,13 +172,12 @@ impl AppRunner {
         &mut self,
         completion: EffectCompletion,
         ctx: &mut DeviceContext<'_>,
-    ) -> Result<Vec<AsyncKick>> {
+    ) -> Result<()> {
         let batches = app::update(&mut self.state, Event::EffectCompleted(completion));
-        let mut kicks = Vec::new();
         for batch in batches {
-            kicks.extend(self.run_batch(batch, ctx)?);
+            self.run_batch(batch, ctx)?;
         }
-        Ok(kicks)
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -181,13 +185,53 @@ impl AppRunner {
         &mut self,
         failure: EffectFailure,
         ctx: &mut DeviceContext<'_>,
-    ) -> Result<Vec<AsyncKick>> {
+    ) -> Result<()> {
         let batches = app::update(&mut self.state, Event::EffectFailed(failure));
-        let mut kicks = Vec::new();
         for batch in batches {
-            kicks.extend(self.run_batch(batch, ctx)?);
+            self.run_batch(batch, ctx)?;
         }
-        Ok(kicks)
+        Ok(())
+    }
+
+    /// Feed a render completion (success or failure) back into the state
+    /// machine via the matching in-flight `AsyncKick`. Returns
+    /// immediately if the kick carries a non-render effect.
+    pub fn feed_render_completion(
+        &mut self,
+        kick: AsyncKick,
+        output: EffectOutput,
+        failure: Option<EffectError>,
+        ctx: &mut DeviceContext<'_>,
+    ) -> Result<()> {
+        if !matches!(kick.effect, Effect::Render(_)) {
+            return Ok(());
+        }
+        let chained = match failure {
+            Some(err) => {
+                let failure = EffectFailure {
+                    batch_id: kick.batch_id,
+                    effect_id: kick.effect_id,
+                    operation_id: kick.operation_id,
+                    render_generation: kick.render_generation,
+                    error: err,
+                };
+                app::update(&mut self.state, Event::EffectFailed(failure))
+            }
+            None => {
+                let completion = EffectCompletion {
+                    batch_id: kick.batch_id,
+                    effect_id: kick.effect_id,
+                    operation_id: kick.operation_id,
+                    render_generation: kick.render_generation,
+                    output,
+                };
+                app::update(&mut self.state, Event::EffectCompleted(completion))
+            }
+        };
+        for batch in chained {
+            self.run_batch(batch, ctx)?;
+        }
+        Ok(())
     }
 }
 
@@ -198,7 +242,7 @@ impl Default for AppRunner {
 }
 
 /// A side-effect request the dispatch could not complete synchronously.
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct AsyncKick {
     pub batch_id: EffectBatchId,
     pub effect_id: EffectId,
@@ -294,26 +338,29 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
                 Err(err) => Err((EffectCategory::Ack, format!("{err:#}"))),
             },
             Effect::StartTone => {
-                // The state machine emits StartTone when entering Firing;
-                // the main loop drives the blocking ring screen
-                // (`alarms::ring_screen`) which owns the tone burst
-                // alternation and ENTER polling. We return a synchronous
-                // ToneDone here so the state machine can proceed, but the
-                // tone itself is *not* played by this executor - the
-                // legacy ring_screen does it.
+                // The state machine emits StartTone when entering Firing.
+                // The ES8311 codec starts muted; without `set_mute(false)`
+                // here, every subsequent `play_sine_stereo` call from
+                // `alarms::ring_screen` writes to I2S but produces no
+                // sound. ring_screen does the actual tone bursts; this
+                // effect only owns the codec unmute so the first alarm
+                // *and* every alarm after a StopTone are audible.
+                if let Some(audio) = self.ctx.board.audio.as_mut() {
+                    if let Err(err) = audio.set_mute(false) {
+                        return Err((EffectCategory::Tone, format!("{err:#}")));
+                    }
+                }
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
-            Effect::StopTone => match self
-                .ctx
-                .board
-                .audio
-                .as_mut()
-                .map(|audio| audio.set_mute(true))
-                .unwrap_or(Ok(()))
-            {
-                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::ToneDone)),
-                Err(err) => Err((EffectCategory::Tone, format!("{err:#}"))),
-            },
+            Effect::StopTone => {
+                // StopTone must NOT call `set_mute(true)` - doing so
+                // leaves the codec muted after dismiss and silences every
+                // future alarm. ring_screen already stops the I2S stream
+                // (`drain_and_disable` after `play_sine_stereo`); we
+                // simply acknowledge the effect so the state machine can
+                // transition to WaitingForRearm.
+                Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
+            }
             // ---- asynchronous / out-of-band effects -------------------------
             Effect::Reply(reply) => {
                 // The main loop routes USB/BLE replies through the matching
@@ -406,9 +453,14 @@ fn reply_from_control_reply(reply: &ControlReply) -> control::Reply {
     }
 }
 
-/// Re-renders Home on the EPD task. The fingerprint / dirty-region logic
-/// stays in the main loop for now - the runner only does the
-/// unconditional paint the state machine asks for.
+/// Re-renders Home on the EPD task and submits the refresh. The state
+/// machine emits this effect whenever it needs to switch back to Home
+/// (after dismiss, after boot, after a sync-driven data change). The
+/// full-screen refresh best-effort guarantees the canvas reaches the
+/// panel even if the legacy dirty-rect skip logic would otherwise
+/// suppress the refresh. The completion arrives via the EPD task's
+/// `EpdCompletion`, which the main loop feeds back as
+/// `EffectCompleted(RenderDone)` carrying the matching `render_generation`.
 fn render_home_into(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -438,5 +490,10 @@ fn render_home_into(
         battery_percent,
         charge,
     );
+    // Submit the refresh so the canvas reaches the panel. Without
+    // this, a boot alarm dismissed back to Home would leave the panel
+    // stuck on the ALARM screen until the next minute's clock-region
+    // refresh overlaid it (review round 6 P0 #3).
+    ctx.board.display.refresh_full_best_effort();
     Ok(())
 }

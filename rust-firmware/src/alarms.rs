@@ -35,8 +35,8 @@ const MAX_RING_SECS: u64 = 300;
 /// `alarms::StoredAlarm` / `alarms::next_due` (etc.) call site keeps working
 /// unchanged.
 pub use inkwash_logic::alarm_schedule::{
-    date_from_days, days_since_epoch, days_until, is_expired_once, next_due, next_id,
-    next_occurrence_date, Repeat, StoredAlarm,
+    date_from_days, days_since_epoch, days_until, next_due, next_id, next_occurrence_date, Repeat,
+    StoredAlarm,
 };
 
 pub struct AlarmStore {
@@ -89,44 +89,6 @@ impl AlarmStore {
     }
 }
 
-/// Handles both deep-sleep alarm wake and an AF flag observed while awake.
-/// Re-arming is deliberately left to the scheduler after the minute changes.
-///
-/// The migration step 2 split: this function still does ACK + persist
-/// inline (the legacy callers expect it). New code paths should call
-/// [`ring_screen`] directly because the state machine owns the ACK and
-/// persist - it emits both as confirmable effects before this loop runs.
-pub fn handle_fired_alarm(
-    board: &mut Note4Board,
-    alarm_store: &AlarmStore,
-    usb: &mut UsbConsole,
-    ble: Option<&mut BleControl>,
-    now: Option<&DateTime>,
-) -> Result<()> {
-    let mut list = alarm_store.load()?;
-    if !list.iter().any(|alarm| alarm.enabled) {
-        log::warn!("Ignoring RTC alarm signal because no alarms are enabled");
-        board.rtc.clear_alarm()?;
-        return Ok(());
-    }
-
-    ring_until_dismissed(board, usb, ble)?;
-    board.rtc.ack_alarm()?;
-
-    if let Some(now) = now {
-        let before = list.len();
-        list.retain(|alarm| !is_expired_once(alarm, now));
-        if list.len() != before {
-            alarm_store.save(&list)?;
-        }
-    }
-    Ok(())
-}
-
-/// Runs the blocking alarm-ring UI (canvas + tone bursts + ENTER
-/// polling). Caller owns the RTC ACK and the expired-Once persist; this
-/// function is invoked by the main loop *after* `AppRunner` has emitted
-/// `AcknowledgeRtcAlarm` and `PersistAlarms` for the matching alarm.
 pub fn ring_screen(
     board: &mut Note4Board,
     usb: &mut UsbConsole,
