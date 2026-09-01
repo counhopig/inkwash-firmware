@@ -363,6 +363,7 @@ fn main() -> Result<()> {
         pending_wifi_op: None,
         last_command: None,
         app_runner: app_runner.clone(),
+        app_runner_alarm_exit: false,
         pending_renders: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         // Mirrors the `app_runner_enabled` local below; kept in lockstep
         // on boot (a core_failed snapshot sets both false) so blocking
@@ -817,7 +818,13 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("UP long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
-                    dirty.push(FULL_SCREEN_RECT);
+                    if ctx.app_runner_alarm_exit {
+                        // An alarm interrupted the navigation/settings
+                        // stack; AppRunner already rendered Home. Force the
+                        // panel refresh and clear the unwind flag.
+                        ctx.app_runner_alarm_exit = false;
+                        dirty.push(FULL_SCREEN_RECT);
+                    }
                 }
                 ButtonEvent::Released => {}
             }
@@ -832,7 +839,10 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("DOWN long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
-                    dirty.push(FULL_SCREEN_RECT);
+                    if ctx.app_runner_alarm_exit {
+                        ctx.app_runner_alarm_exit = false;
+                        dirty.push(FULL_SCREEN_RECT);
+                    }
                 }
                 ButtonEvent::Released => {}
             }

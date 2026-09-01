@@ -133,12 +133,18 @@ pub fn draw_rows(canvas: &mut Canvas, title: &str, items: &[String], selected: u
 /// drawer"). Making the long-press an explicit outcome lets the Settings
 /// screens behave like the rest of the app instead of silently swallowing
 /// it as a page scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickResult {
     Selected(usize),
     /// Hold ENTER: back out of the list.
     Cancelled,
     /// Long UP/DOWN: the caller should open the navigation drawer.
     OpenNav,
+    /// An RTC alarm interrupted the page (AppRunner rang + dismissed).
+    /// The caller must unwind to the unified router / main loop, which
+    /// re-renders per the current `Screen`. Do NOT treat as a user
+    /// cancel: the page's state may no longer match the visible screen.
+    AlarmInterrupted,
 }
 
 /// Blocking wheel-list picker: draws `items` (already formatted by the
@@ -163,8 +169,10 @@ pub fn pick_from_list(
     let mut needs_redraw = true;
     let mut first_draw = true;
     loop {
-        if ctx.poll_background(now) {
-            return PickResult::Cancelled;
+        match ctx.poll_background(now) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => return PickResult::AlarmInterrupted,
+            crate::ctx::BackgroundOutcome::VisibleChanged => needs_redraw = true,
+            crate::ctx::BackgroundOutcome::NoChange => {}
         }
         if needs_redraw {
             let mut canvas = ctx.board.display.canvas_mut();
@@ -208,19 +216,32 @@ pub fn pick_from_list(
 
 /// Blocking UP/DOWN-cycles-a-number, ENTER-confirms stepper, wrapping in
 /// `[min, max]`. `None` on hold-to-cancel.
+/// Outcome of [`pick_number`] - `Value` on ENTER, `Cancelled` on
+/// hold-to-cancel, `AlarmInterrupted` when an RTC alarm rang over the
+/// editor (the caller must unwind to the unified router, not treat it as
+/// a user cancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberPick {
+    Value(u8),
+    Cancelled,
+    AlarmInterrupted,
+}
+
 pub fn pick_number(
     ctx: &mut DeviceContext,
     now: Option<&DateTime>,
     title: &str,
     min: u8,
     max: u8,
-) -> Option<u8> {
+) -> NumberPick {
     let mut value = min;
     let mut needs_redraw = true;
     let mut first_draw = true;
     loop {
-        if ctx.poll_background(now) {
-            return None;
+        match ctx.poll_background(now) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => return NumberPick::AlarmInterrupted,
+            crate::ctx::BackgroundOutcome::VisibleChanged => needs_redraw = true,
+            crate::ctx::BackgroundOutcome::NoChange => {}
         }
         if needs_redraw {
             let mut canvas = ctx.board.display.canvas_mut();
@@ -279,8 +300,8 @@ pub fn pick_number(
                 value = if value == min { max } else { value - 1 };
                 needs_redraw = true;
             }
-            Nav::Enter => return Some(value),
-            Nav::Cancel => return None,
+            Nav::Enter => return NumberPick::Value(value),
+            Nav::Cancel => return NumberPick::Cancelled,
             Nav::PageUp => {
                 value = value.saturating_add(10).min(max);
                 needs_redraw = true;

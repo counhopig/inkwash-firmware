@@ -104,12 +104,42 @@ pub struct DeviceContext<'a> {
     /// main loop and every blocking page so an EPD completion can always
     /// find its kick by `request_id`, regardless of who dispatched it.
     pub pending_renders: std::rc::Rc<std::cell::RefCell<Vec<crate::app_runner::AsyncKick>>>,
+    /// Set when an RTC alarm interrupted a blocking page and the page
+    /// unwound. The next `poll_alarm_snapshot` / `poll_background` call
+    /// clears it. A nested page that cannot return an alarm-specific
+    /// result (e.g. the alarm editor) sets this so its caller chain can
+    /// unwind to main instead of silently resuming the old page. `main`
+    /// checks it after each blocking screen returns.
+    pub app_runner_alarm_exit: bool,
     /// Disabled after a core boot fact failure. Shared by the main loop
     /// *and* every blocking page so no entry can dispatch to a default
     /// AppState after a corrupt boot. Set by `main` from its own
     /// `app_runner_enabled`; `poll_alarm_snapshot` checks it before
     /// dispatching.
     pub app_runner_enabled: bool,
+}
+
+/// Result of a blocking page's background poll, so a page can distinguish
+/// "an alarm interrupted the page" (must exit to the unified router /
+/// main loop) from ordinary visible changes (redraw / refresh data, keep
+/// the page). Previously this collapsed to a bool, which made every
+/// successful sync / reminder / USB frame look like a user cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    /// An RTC alarm fired and AppRunner rang over the page. The page must
+    /// unwind back to main, which re-renders per the current `Screen`.
+    AlarmHandled,
+    /// Something visible changed (sync receipt, reminder, USB command,
+    /// clock minute) - redraw / refresh data but stay in the page.
+    VisibleChanged,
+    /// Nothing happened.
+    NoChange,
+}
+
+impl BackgroundOutcome {
+    pub fn is_alarm(self) -> bool {
+        matches!(self, BackgroundOutcome::AlarmHandled)
+    }
 }
 
 impl DeviceContext<'_> {
@@ -140,12 +170,14 @@ impl DeviceContext<'_> {
     /// Services USB plus wall-clock scheduled sync while an ordinary screen
     /// owns the main thread. BLE pairing deliberately calls
     /// `poll_usb_control` directly because BLE and Wi-Fi share the radio.
-    pub fn poll_background(&mut self, now: Option<&DateTime>) -> bool {
+    pub fn poll_background(&mut self, now: Option<&DateTime>) -> BackgroundOutcome {
         // Alarm first: a live AF edge while a blocking page owns the
         // thread must dispatch to AppRunner so it rings over the page.
         // This is the device-usable guarantee during migration; the
         // state machine (not a legacy path) owns ACK/persist/rearm.
-        let alarm_changed = self.poll_alarm_snapshot();
+        if self.poll_alarm_snapshot() {
+            return BackgroundOutcome::AlarmHandled;
+        }
         let (usb_changed, _) = self.poll_usb_control(now);
         let runtime_changed =
             if self.sync_scheduler.last_ui_poll.elapsed() >= Duration::from_secs(1) {
@@ -165,7 +197,11 @@ impl DeviceContext<'_> {
         // applied here so the RTC re-arm / NTP alignment stay timely even
         // when the main loop is blocked behind a long-lived screen.
         let sync_changed = self.poll_wifi_ops().is_some();
-        alarm_changed || usb_changed || sync_changed || runtime_changed
+        if usb_changed || sync_changed || runtime_changed {
+            BackgroundOutcome::VisibleChanged
+        } else {
+            BackgroundOutcome::NoChange
+        }
     }
 
     /// Polls the RTC alarm AF edge from a blocking page and dispatches a
@@ -241,6 +277,7 @@ impl DeviceContext<'_> {
         // registry so the eventual EPD completion (which the main loop
         // drains against the same registry) can find it by request_id.
         self.forward_kicks(&runner);
+        self.app_runner_alarm_exit = false;
         let firing = matches!(
             runner.borrow().state().screen,
             inkwash_logic::app::Screen::AlarmRinging
@@ -306,10 +343,17 @@ impl DeviceContext<'_> {
     /// BLE and Wi-Fi cannot be active together on this device. The
     /// alarm business has moved to AppRunner and is no longer polled
     /// here.
-    pub fn poll_local_alerts(&mut self, now: &DateTime) -> bool {
+    pub fn poll_local_alerts(&mut self, now: &DateTime) -> BackgroundOutcome {
         // Alarm edge first (same guarantee as poll_background), then
         // reminders. Used by BLE pairing.
-        self.poll_alarm_snapshot() || self.poll_reminders(now)
+        if self.poll_alarm_snapshot() {
+            return BackgroundOutcome::AlarmHandled;
+        }
+        if self.poll_reminders(now) {
+            BackgroundOutcome::VisibleChanged
+        } else {
+            BackgroundOutcome::NoChange
+        }
     }
 
     fn poll_reminders(&mut self, now: &DateTime) -> bool {

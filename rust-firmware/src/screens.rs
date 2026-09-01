@@ -98,6 +98,11 @@ pub fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
             }
             PickResult::Cancelled => return,
             PickResult::OpenNav => true,
+            PickResult::AlarmInterrupted => {
+                // Alarm rang over Settings: unwind to the unified router.
+                ctx.app_runner_alarm_exit = true;
+                return;
+            }
             _ => false,
         };
         // Long UP/DOWN inside Settings opens the GO TO drawer, matching
@@ -132,6 +137,9 @@ fn sync_interval_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) -> bool
         0,
     );
     let PickResult::Selected(index) = outcome else {
+        if outcome == PickResult::AlarmInterrupted {
+            ctx.app_runner_alarm_exit = true;
+        }
         // Cancelled (hold ENTER) or OpenNav (long UP/DOWN) - surface the
         // nav request upward so Settings can open the GO TO drawer.
         return matches!(outcome, PickResult::OpenNav);
@@ -251,8 +259,13 @@ fn pick_navigation(
     let mut selected = current_index;
     let mut needs_redraw = true;
     loop {
-        if ctx.poll_background(now) {
-            return None;
+        match ctx.poll_background(now) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => {
+                ctx.app_runner_alarm_exit = true;
+                return None;
+            }
+            crate::ctx::BackgroundOutcome::VisibleChanged => needs_redraw = true,
+            crate::ctx::BackgroundOutcome::NoChange => {}
         }
         if needs_redraw {
             let mut canvas = ctx.board.display.canvas_mut();
@@ -334,11 +347,15 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
             // re-renders per the AppRunner's current Screen.
             return;
         }
-        if ctx.poll_background(live_now.as_ref()) {
-            if let Ok(fresh) = ctx.board.rtc.read_time() {
-                live_now = Some(fresh);
+        match ctx.poll_background(live_now.as_ref()) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => return,
+            crate::ctx::BackgroundOutcome::VisibleChanged => {
+                if let Ok(fresh) = ctx.board.rtc.read_time() {
+                    live_now = Some(fresh);
+                }
+                needs_redraw = true;
             }
-            needs_redraw = true;
+            crate::ctx::BackgroundOutcome::NoChange => {}
         }
         if needs_redraw {
             match page {
@@ -856,7 +873,9 @@ fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option
 
     ctx.board.display.refresh_full_best_effort();
     loop {
-        if ctx.poll_background(now) {
+        // Only an alarm unwinds this screen; a visible background change
+        // is ignored here (the next user nav repaints).
+        if ctx.poll_background(now).is_alarm() {
             return;
         }
         match poll_nav(ctx.board) {
@@ -947,10 +966,15 @@ fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected:
     let mut list = ctx.alarm_store.load().unwrap_or_default();
     let mut toggled_id = None;
     if selected >= list.len() {
-        if let Some(alarm) = add_alarm_screen(ctx, now, &list) {
-            list.push(alarm);
-        } else {
-            return;
+        match add_alarm_screen(ctx, now, &list) {
+            AlarmEditOutcome::Added(alarm) => list.push(alarm),
+            AlarmEditOutcome::Cancelled => return,
+            AlarmEditOutcome::AlarmInterrupted => {
+                // Alarm rang over the editor: unwind through the alarm
+                // page to the unified router / main loop.
+                ctx.app_runner_alarm_exit = true;
+                return;
+            }
         }
     } else {
         list[selected].enabled = !list[selected].enabled;
@@ -1135,7 +1159,7 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
     drop(canvas);
     ctx.board.display.refresh_full_best_effort();
     loop {
-        if ctx.poll_background(now) {
+        if ctx.poll_background(now).is_alarm() {
             return;
         }
         match poll_nav(ctx.board) {
@@ -1149,21 +1173,38 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
 /// Two-stage hour/minute stepper for a new daily alarm - editing repeat
 /// mode or a specific one-shot date is left to the PC tool/server sync
 /// path, not this on-device screen.
+/// Outcome of the new-alarm editor so the caller can distinguish a real
+/// alarm add from a user cancel from an RTC alarm interruption (which
+/// must unwind to the unified router, not silently resume the old page).
+enum AlarmEditOutcome {
+    Added(StoredAlarm),
+    Cancelled,
+    AlarmInterrupted,
+}
+
 fn add_alarm_screen(
     ctx: &mut DeviceContext,
     now: Option<&DateTime>,
     existing: &[StoredAlarm],
-) -> Option<StoredAlarm> {
-    let hour = pick_number(ctx, now, "NEW ALARM - HOUR", 0, 23)?;
-    let minute = pick_number(ctx, now, "NEW ALARM - MINUTE", 0, 59)?;
+) -> AlarmEditOutcome {
+    let hour = match pick_number(ctx, now, "NEW ALARM - HOUR", 0, 23) {
+        crate::ui::NumberPick::Value(v) => v,
+        crate::ui::NumberPick::Cancelled => return AlarmEditOutcome::Cancelled,
+        crate::ui::NumberPick::AlarmInterrupted => return AlarmEditOutcome::AlarmInterrupted,
+    };
+    let minute = match pick_number(ctx, now, "NEW ALARM - MINUTE", 0, 59) {
+        crate::ui::NumberPick::Value(v) => v,
+        crate::ui::NumberPick::Cancelled => return AlarmEditOutcome::Cancelled,
+        crate::ui::NumberPick::AlarmInterrupted => return AlarmEditOutcome::AlarmInterrupted,
+    };
     let id = match alarms::next_id(existing) {
         Some(id) => id,
         None => {
             log::warn!("Cannot add alarm: all 256 alarm ids are in use");
-            return None;
+            return AlarmEditOutcome::Cancelled;
         }
     };
-    Some(StoredAlarm {
+    AlarmEditOutcome::Added(StoredAlarm {
         id,
         hour,
         minute,
@@ -1372,14 +1413,11 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 }
                 if last_alarm_poll.elapsed() >= std::time::Duration::from_secs(1) {
                     last_alarm_poll = std::time::Instant::now();
-                    if ctx
-                        .board
-                        .rtc
-                        .read_time()
-                        .ok()
-                        .is_some_and(|fresh| ctx.poll_local_alerts(&fresh))
-                    {
-                        break;
+                    if let Ok(fresh) = ctx.board.rtc.read_time() {
+                        if ctx.poll_local_alerts(&fresh).is_alarm() {
+                            ctx.app_runner_alarm_exit = true;
+                            break;
+                        }
                     }
                 }
                 tick();
