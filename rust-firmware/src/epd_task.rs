@@ -101,12 +101,18 @@ impl RefreshSlot {
             Some(cmd) => match &mut cmd.kind {
                 RefreshKind::Full => {
                     // A newer full-frame partial supersedes the pending
-                    // full: complete the old request as superseded.
+                    // full: complete the old request as superseded, then
+                    // adopt the new request id so the merged command's
+                    // eventual completion carries the *new* id - the old
+                    // id already got its terminal outcome, and the new id
+                    // must not be left without one.
                     self.complete_superseded(cmd.request_id, RefreshKind::Full);
+                    cmd.request_id = request_id;
                     cmd.frame = frame;
                 }
                 RefreshKind::Partial(prev) => {
                     self.complete_superseded(cmd.request_id, RefreshKind::Partial(*prev));
+                    cmd.request_id = request_id;
                     *prev = union_rect(*prev, rect);
                     cmd.frame = frame;
                 }

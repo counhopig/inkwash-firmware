@@ -163,7 +163,9 @@ pub fn pick_from_list(
     let mut needs_redraw = true;
     let mut first_draw = true;
     loop {
-        let _ = ctx.poll_background(now);
+        if ctx.poll_background(now) {
+            return PickResult::Cancelled;
+        }
         if needs_redraw {
             let mut canvas = ctx.board.display.canvas_mut();
             draw_rows(&mut canvas, title, items, selected);
@@ -217,7 +219,9 @@ pub fn pick_number(
     let mut needs_redraw = true;
     let mut first_draw = true;
     loop {
-        let _ = ctx.poll_background(now);
+        if ctx.poll_background(now) {
+            return None;
+        }
         if needs_redraw {
             let mut canvas = ctx.board.display.canvas_mut();
             canvas.clear();

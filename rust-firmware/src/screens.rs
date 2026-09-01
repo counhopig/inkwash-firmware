@@ -251,7 +251,9 @@ fn pick_navigation(
     let mut selected = current_index;
     let mut needs_redraw = true;
     loop {
-        let _ = ctx.poll_background(now);
+        if ctx.poll_background(now) {
+            return None;
+        }
         if needs_redraw {
             let mut canvas = ctx.board.display.canvas_mut();
             draw_navigation_bar(&mut canvas, selected);
@@ -327,6 +329,11 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
     let mut needs_redraw = true;
     let mut first_draw = true;
     loop {
+        if ctx.poll_alarm_snapshot() {
+            // Alarm fired over the page: exit to the main loop, which
+            // re-renders per the AppRunner's current Screen.
+            return;
+        }
         if ctx.poll_background(live_now.as_ref()) {
             if let Ok(fresh) = ctx.board.rtc.read_time() {
                 live_now = Some(fresh);

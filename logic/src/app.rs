@@ -2144,15 +2144,19 @@ mod tests {
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
         let boot_batches = update(&mut state, Event::Boot(snapshot));
         assert_eq!(state.screen, Screen::AlarmRinging);
-        assert!(boot_batches
+        // ACK and persist each occur exactly once across the whole batch.
+        let ack_count = boot_batches
             .iter()
-            .any(|b| b.effects.contains(&Effect::AcknowledgeRtcAlarm)));
-        assert!(boot_batches
+            .flat_map(|b| b.effects.iter())
+            .filter(|e| **e == Effect::AcknowledgeRtcAlarm)
+            .count();
+        let persist_count = boot_batches
             .iter()
-            .any(|b| b
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::PersistAlarms(_)))));
+            .flat_map(|b| b.effects.iter())
+            .filter(|e| matches!(e, Effect::PersistAlarms(_)))
+            .count();
+        assert_eq!(ack_count, 1, "ACK must fire exactly once on ring");
+        assert_eq!(persist_count, 1, "persist must fire exactly once on ring");
 
         // Dismiss via ENTER.
         let dismiss_batches = update(&mut state, Event::Button(ButtonEvent::Pressed));
@@ -2161,9 +2165,12 @@ mod tests {
             AlarmRuntimeState::WaitingForRearm { .. }
         ));
         assert_eq!(state.screen, Screen::Home);
-        assert!(dismiss_batches
+        let stop_count = dismiss_batches
             .iter()
-            .any(|b| b.effects.contains(&Effect::StopTone)));
+            .flat_map(|b| b.effects.iter())
+            .filter(|e| **e == Effect::StopTone)
+            .count();
+        assert_eq!(stop_count, 1, "StopTone must fire exactly once on dismiss");
 
         // Grab the in-flight ACK + persist op ids.
         let (ack_op, persist_op) = match &state.alarm_runtime {
@@ -2210,20 +2217,48 @@ mod tests {
             AlarmRuntimeState::WaitingForRearm { .. }
         ));
 
-        // Cross-minute Tick re-arms: emits ProgramRtcAlarm exactly once.
+        // Cross-minute Tick re-arms: the Daily alarm is still enabled, so
+        // the state machine must emit exactly one ProgramRtcAlarm. The
+        // runtime goes Disarmed (program in flight via pending_rtc) and
+        // only becomes Armed after the RtcProgrammed completion arrives.
         let tick_batches = update(&mut state, Event::Tick(dt(9, 1)));
-        let has_program = tick_batches.iter().any(|b| {
-            b.effects
-                .iter()
-                .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
-        });
-        // The state machine must leave WaitingForRearm once the minute
-        // advanced with both commits succeeded, and re-arm via a Program,
-        // or Disable when the list is empty. It must NOT stay in
-        // WaitingForRearm forever.
+        let program_count = tick_batches
+            .iter()
+            .flat_map(|b| b.effects.iter())
+            .filter(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
+            .count();
+        assert_eq!(
+            program_count, 1,
+            "rearm must fire exactly one ProgramRtcAlarm, got {tick_batches:?} state={:?}",
+            state.alarm_runtime
+        );
+        let program_op = tick_batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
+            })
+            .map(|b| b.operation_id)
+            .expect("program batch present");
+
+        // RTC program completes -> Armed with the Daily alarm id.
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(3),
+                operation_id: program_op,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
+            }),
+        );
         assert!(
-            has_program || matches!(state.alarm_runtime, AlarmRuntimeState::Disarmed),
-            "expected rearm on cross-minute tick, got {tick_batches:?} state={:?}",
+            matches!(
+                state.alarm_runtime,
+                AlarmRuntimeState::Armed { alarm_id: 1 }
+            ),
+            "Daily alarm still enabled: must be Armed {{ alarm_id: 1 }}, got {:?}",
             state.alarm_runtime
         );
     }

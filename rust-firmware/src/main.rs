@@ -708,14 +708,26 @@ fn main() -> Result<()> {
             };
             if let Some(kick) = matched_kick {
                 if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                    // A superseded render is still a terminal outcome: the
-                    // newer request that replaced it may or may not pan out,
-                    // but this request's in-flight entry must clear so the
-                    // state machine is not left waiting for a RenderDone
-                    // that will never come. Feed RenderDone (the generation
-                    // check in the state machine drops a stale render).
+                    if completion.superseded {
+                        // The request was replaced before its command ran
+                        // (EPD latest-wins). It must NOT be reported as
+                        // RenderDone - its pixels never reached the panel.
+                        // The replacement request carries its own request_id
+                        // and will complete (or fail) on its own; we simply
+                        // clear this in-flight entry so the registry does
+                        // not leak, and let the replacement's completion be
+                        // the one fed to the state machine. Once RenderPlan
+                        // (step 5) tracks generations precisely, this keeps
+                        // the "entered queue" vs "displayed on panel"
+                        // distinction honest.
+                        log::warn!(
+                            "AppRunner render (op {:?}) superseded before panel display",
+                            kick.operation_id
+                        );
+                        continue;
+                    }
                     let output = inkwash_logic::app::EffectOutput::RenderDone;
-                    let failure = (!completion.ok && !completion.superseded).then(|| {
+                    let failure = (!completion.ok).then(|| {
                         inkwash_logic::app::EffectError::Render(format!(
                             "epd refresh failed: {:?}",
                             completion.kind
