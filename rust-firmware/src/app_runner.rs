@@ -133,12 +133,21 @@ impl AppRunner {
                         self.run_batch(next, ctx)?;
                     }
                 }
+                Ok(EffectOutcome::AsyncWithId(request_id)) => self.pending_kicks.push(AsyncKick {
+                    batch_id: batch.id,
+                    effect_id,
+                    operation_id: batch.operation_id,
+                    render_generation: batch.render_generation,
+                    effect,
+                    request_id: Some(request_id),
+                }),
                 Ok(EffectOutcome::Async) => self.pending_kicks.push(AsyncKick {
                     batch_id: batch.id,
                     effect_id,
                     operation_id: batch.operation_id,
                     render_generation: batch.render_generation,
                     effect,
+                    request_id: None,
                 }),
                 Err((category, msg)) => {
                     let failure = EffectFailure {
@@ -249,6 +258,9 @@ pub struct AsyncKick {
     pub operation_id: OperationId,
     pub render_generation: Option<RenderGeneration>,
     pub effect: Effect,
+    /// EPD request id echoed by the matching `EpdCompletion`, when the
+    /// kick is a Render whose panel refresh already started.
+    pub request_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +277,7 @@ enum EffectCategory {
 enum EffectOutcome {
     Completed(EffectOutput),
     Async,
+    AsyncWithId(u64),
 }
 
 /// Executes one `Effect` against the existing drivers.
@@ -374,14 +387,12 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::Render(req) => match render_home_into(self.ctx, self.last_clock, req) {
-                Ok(()) => {
-                    // EPD completion arrives asynchronously via the EPD
-                    // task. The caller feeds it back through
-                    // `AppRunner::on_effect_completed` with the matching
-                    // `EffectCompletion { output: RenderDone }` once the
-                    // canvas reaches the panel. We return `Async` so the
-                    // caller knows to expect that completion.
-                    Ok(EffectOutcome::Async)
+                Ok(request_id) => {
+                    // The panel refresh is in flight and its EPD completion
+                    // will carry `request_id`. Return async *with* the id so
+                    // the caller can correlate the eventual completion to
+                    // this kick.
+                    Ok(EffectOutcome::AsyncWithId(request_id))
                 }
                 Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
             },
@@ -453,19 +464,22 @@ fn reply_from_control_reply(reply: &ControlReply) -> control::Reply {
     }
 }
 
-/// Re-renders Home on the EPD task and submits the refresh. The state
-/// machine emits this effect whenever it needs to switch back to Home
-/// (after dismiss, after boot, after a sync-driven data change). The
-/// full-screen refresh best-effort guarantees the canvas reaches the
-/// panel even if the legacy dirty-rect skip logic would otherwise
-/// suppress the refresh. The completion arrives via the EPD task's
-/// `EpdCompletion`, which the main loop feeds back as
-/// `EffectCompleted(RenderDone)` carrying the matching `render_generation`.
+/// Re-renders Home on the EPD task and submits a partial CLOCK_RECT
+/// refresh. The state machine emits this effect on every minute Tick
+/// (the clock displayed a new minute) and on screen transitions back to
+/// Home. Minute ticks must NOT become a full-screen refresh (review
+/// round 7 P1 #5), and the partial refresh is cheap. Screen transitions
+/// (e.g. alarm dismiss returning to Home) are handled by the main loop
+/// pushing FULL_SCREEN_RECT into its dirty path - that is the deliberate
+/// full refresh; this function only repaints the clock region.
+///
+/// Returns the EPD request id so the caller can correlate the eventual
+/// `EpdCompletion` back to this render's `AsyncKick`.
 fn render_home_into(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
     _req: &RenderRequest,
-) -> Result<()> {
+) -> Result<u64> {
     let next_alarm = clock
         .as_ref()
         .and_then(|dt| crate::screens::next_alarm_label(ctx.alarm_store, dt));
@@ -490,10 +504,16 @@ fn render_home_into(
         battery_percent,
         charge,
     );
-    // Submit the refresh so the canvas reaches the panel. Without
-    // this, a boot alarm dismissed back to Home would leave the panel
-    // stuck on the ALARM screen until the next minute's clock-region
-    // refresh overlaid it (review round 6 P0 #3).
-    ctx.board.display.refresh_full_best_effort();
-    Ok(())
+    // Partial CLOCK_RECT refresh only (not full): a minute Tick must not
+    // degrade into a full-screen refresh. The returned id is threaded
+    // back so the eventual EpdCompletion correlates to this render.
+    ctx.board
+        .display
+        .refresh_partial(crate::canvas::Rect {
+            x: 16,
+            y: 36,
+            width: 368,
+            height: 92,
+        })
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
 }

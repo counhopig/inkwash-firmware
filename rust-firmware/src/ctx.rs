@@ -94,6 +94,21 @@ pub struct DeviceContext<'a> {
     /// comment for why this exists and why the key includes `Command`,
     /// not just `id`.
     pub last_command: Option<(String, Command, Reply)>,
+    /// Callback the main loop installs to collect a consistent RTC alarm
+    /// snapshot and dispatch it to AppRunner. Blocking pages call
+    /// [`DeviceContext::poll_alarm_snapshot`], which reads the AF edge
+    /// and invokes this callback with the snapshot. The closure captures
+    /// the shared `Rc<RefCell<AppRunner>>` so it can dispatch
+    /// `RtcAlarmSnapshotReady` without borrowing `Self` (which would be
+    /// self-referential). Returns `true` when the resulting screen is
+    /// `AlarmRinging` so the caller can terminate its blocking loop.
+    /// Shared handle to the AppRunner so blocking pages (which own the
+    /// main thread and call [`DeviceContext::poll_background`] /
+    /// [`DeviceContext::poll_local_alerts`]) can still dispatch a
+    /// consistent RTC alarm snapshot through the same state machine.
+    /// Clone the `Rc` out, then call `dispatch` with `self` as the
+    /// driver context - no self-referential borrow.
+    pub app_runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
 }
 
 impl DeviceContext<'_> {
@@ -125,6 +140,11 @@ impl DeviceContext<'_> {
     /// owns the main thread. BLE pairing deliberately calls
     /// `poll_usb_control` directly because BLE and Wi-Fi share the radio.
     pub fn poll_background(&mut self, now: Option<&DateTime>) -> bool {
+        // Alarm first: a live AF edge while a blocking page owns the
+        // thread must dispatch to AppRunner so it rings over the page.
+        // This is the device-usable guarantee during migration; the
+        // state machine (not a legacy path) owns ACK/persist/rearm.
+        let alarm_changed = self.poll_alarm_snapshot();
         let (usb_changed, _) = self.poll_usb_control(now);
         let runtime_changed =
             if self.sync_scheduler.last_ui_poll.elapsed() >= Duration::from_secs(1) {
@@ -144,7 +164,94 @@ impl DeviceContext<'_> {
         // applied here so the RTC re-arm / NTP alignment stay timely even
         // when the main loop is blocked behind a long-lived screen.
         let sync_changed = self.poll_wifi_ops().is_some();
-        usb_changed || sync_changed || runtime_changed
+        alarm_changed || usb_changed || sync_changed || runtime_changed
+    }
+
+    /// Polls the RTC alarm AF edge from a blocking page and dispatches a
+    /// consistent snapshot to AppRunner via `rtc_alarm_callback`. The
+    /// snapshot is only consumed after all three facts (time, AF, AIE)
+    /// read consistently; a read failure keeps the edge retryable so the
+    /// next poll retries. Returns `true` when AppRunner decided to start
+    /// ringing (the caller should return to the main loop / render the
+    /// alarm screen).
+    ///
+    /// This is the only alarm entry available while a page owns the main
+    /// thread - `main`'s AF fast path does not run then. It must NOT ACK
+    /// or rearm the RTC itself; that stays with the state machine via the
+    /// callback.
+    /// Polls the RTC alarm AF edge from a blocking page and dispatches a
+    /// consistent snapshot to AppRunner via the shared `app_runner`
+    /// handle. The snapshot is only consumed after all three facts
+    /// (time, AF, AIE) read consistently; a read failure keeps the edge
+    /// retryable so the next poll retries. Returns `true` when AppRunner
+    /// decided to start ringing (the caller should return to the main
+    /// loop which drives the blocking ring screen).
+    ///
+    /// This is the only alarm entry available while a page owns the main
+    /// thread - `main`'s AF fast path does not run then. It must NOT ACK
+    /// or rearm the RTC itself; that stays with the state machine via the
+    /// dispatch.
+    pub fn poll_alarm_snapshot(&mut self) -> bool {
+        let Ok(true) = self.board.rtc.alarm_flag() else {
+            return false;
+        };
+        // Read consistent facts first; on any failure leave the edge
+        // retryable (don't consume it).
+        let read = (|| -> anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot> {
+            let now = self.board.rtc.read_time()?;
+            let aie = self.board.rtc.alarm_interrupt_enabled()?;
+            Ok(inkwash_logic::app::RtcAlarmSnapshot {
+                now,
+                alarm_flag: true,
+                alarm_interrupt_enabled: aie,
+            })
+        })();
+        let snapshot = match read {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                log::warn!(
+                    "Blocking page RTC alarm snapshot read failed; stays retryable: {err:#}"
+                );
+                return false;
+            }
+        };
+        // Clone the shared runner out so `self` can be re-borrowed as the
+        // driver context (no self-referential borrow).
+        let runner = self.app_runner.clone();
+        let decode = {
+            let mut r = runner.borrow_mut();
+            r.dispatch(
+                inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
+                self,
+            )
+        };
+        if decode.is_err() {
+            log::warn!("Blocking page AppRunner RtcAlarmSnapshotReady dispatch failed");
+            return false;
+        }
+        let firing = matches!(
+            runner.borrow().state().screen,
+            inkwash_logic::app::Screen::AlarmRinging
+        );
+        if firing {
+            // Drive the blocking ring/dismiss loop right here so the alarm
+            // covers the current page (main's AF fast path is not running).
+            // ACK / persist already happened via the dispatch above.
+            log::info!("RTC alarm fired over blocking page; entering ring screen");
+            if let Err(err) =
+                crate::alarms::ring_screen(self.board, self.usb_console, self.ble_control.as_mut())
+            {
+                log::error!("ring_screen failed: {err}");
+            }
+            // ENTER press -> Firing -> WaitingForRearm.
+            let _ = runner.borrow_mut().dispatch(
+                inkwash_logic::app::Event::Button(
+                    inkwash_logic::button_event::ButtonEvent::Pressed,
+                ),
+                self,
+            );
+        }
+        firing
     }
 
     /// Services scheduled sync and due-todo reminders. AppRunner owns
@@ -165,7 +272,9 @@ impl DeviceContext<'_> {
     /// alarm business has moved to AppRunner and is no longer polled
     /// here.
     pub fn poll_local_alerts(&mut self, now: &DateTime) -> bool {
-        self.poll_reminders(now)
+        // Alarm edge first (same guarantee as poll_background), then
+        // reminders. Used by BLE pairing.
+        self.poll_alarm_snapshot() || self.poll_reminders(now)
     }
 
     fn poll_reminders(&mut self, now: &DateTime) -> bool {

@@ -50,12 +50,17 @@ pub enum RefreshKind {
 pub struct RenderCommand {
     pub kind: RefreshKind,
     pub frame: Box<[u8]>,
+    /// Request identifier the initiator supplied. Carried through to
+    /// `EpdCompletion` so the caller can correlate a completion to the
+    /// exact render even when the single pending slot is re-submitted.
+    pub request_id: u64,
 }
 
 /// Completion report for one executed refresh.
 #[derive(Debug, Clone, Copy)]
 pub struct EpdCompletion {
     pub kind: RefreshKind,
+    pub request_id: u64,
     /// Whether the panel-level refresh succeeded. For a partial refresh
     /// that failed and recovered via a full refresh from the same
     /// snapshot, `ok` is true and `recovered` marks the recovery.
@@ -80,7 +85,7 @@ impl RefreshSlot {
     /// partials union their rects (the newest frame wins), and a pending
     /// full is superseded by the newer frame's full refresh (it covers
     /// everything anyway).
-    fn submit_partial(&self, rect: Rect, frame: Box<[u8]>) {
+    fn submit_partial(&self, rect: Rect, frame: Box<[u8]>, request_id: u64) {
         let mut pending = self.pending.lock();
         match pending.as_mut() {
             Some(cmd) => match &mut cmd.kind {
@@ -96,6 +101,7 @@ impl RefreshSlot {
                 *pending = Some(RenderCommand {
                     kind: RefreshKind::Partial(rect),
                     frame,
+                    request_id,
                 });
             }
         }
@@ -104,11 +110,12 @@ impl RefreshSlot {
 
     /// Submits a full refresh; replaces any pending command (a full of
     /// the newest frame supersedes a pending partial).
-    fn submit_full(&self, frame: Box<[u8]>) {
+    fn submit_full(&self, frame: Box<[u8]>, request_id: u64) {
         let mut pending = self.pending.lock();
         *pending = Some(RenderCommand {
             kind: RefreshKind::Full,
             frame,
+            request_id,
         });
         let _ = self.notify_tx.try_send(());
     }
@@ -118,19 +125,31 @@ impl RefreshSlot {
 pub struct EpdHandle {
     slot: Arc<RefreshSlot>,
     completions: Receiver<EpdCompletion>,
+    /// Monotonic request-id source so each submitted render carries a
+    /// unique id that its completion echoes back. `Cell` because the app
+    /// side is single-threaded and no atomic CAS is available for u64 on
+    /// this target.
+    next_id: std::cell::Cell<u64>,
 }
 
 impl EpdHandle {
     /// Queues a partial refresh of `rect`, merging into any pending
-    /// request (latest-wins).
-    pub fn request_partial(&self, rect: Rect, frame: Box<[u8]>) {
-        self.slot.submit_partial(rect, frame);
+    /// request (latest-wins). Returns the request id the completion will
+    /// echo back.
+    pub fn request_partial(&self, rect: Rect, frame: Box<[u8]>) -> u64 {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.slot.submit_partial(rect, frame, id);
+        id
     }
 
     /// Queues a full refresh of the newest frame, replacing any pending
-    /// request.
-    pub fn request_full(&self, frame: Box<[u8]>) {
-        self.slot.submit_full(frame);
+    /// request. Returns the request id the completion will echo back.
+    pub fn request_full(&self, frame: Box<[u8]>) -> u64 {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.slot.submit_full(frame, id);
+        id
     }
 
     /// Non-blocking drain of completed refreshes.
@@ -173,6 +192,7 @@ pub fn spawn() -> Result<EpdHandle> {
     Ok(EpdHandle {
         slot,
         completions: completions_rx,
+        next_id: std::cell::Cell::new(1),
     })
 }
 
@@ -232,6 +252,7 @@ fn execute(
             let result = refresh_full(handle, &cmd.frame);
             EpdCompletion {
                 kind: RefreshKind::Full,
+                request_id: cmd.request_id,
                 ok: result.is_ok(),
                 recovered: false,
             }
@@ -241,6 +262,7 @@ fn execute(
             match refresh_partial(handle, rect, scratch) {
                 Ok(()) => EpdCompletion {
                     kind: RefreshKind::Partial(rect),
+                    request_id: cmd.request_id,
                     ok: true,
                     recovered: false,
                 },
@@ -253,6 +275,7 @@ fn execute(
                     let result = refresh_full(handle, &cmd.frame);
                     EpdCompletion {
                         kind: RefreshKind::Partial(rect),
+                        request_id: cmd.request_id,
                         ok: result.is_ok(),
                         recovered: result.is_ok(),
                     }

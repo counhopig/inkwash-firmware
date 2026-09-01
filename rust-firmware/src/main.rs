@@ -342,6 +342,12 @@ fn main() -> Result<()> {
     // comment.
     let mut ble_control: Option<ble_control::BleControl> = None;
 
+    // AppRunner shared handle: the state machine is the sole alarm
+    // business owner. Wrapped in Rc<RefCell<>> so blocking pages (which
+    // own the main thread and run via DeviceContext::poll_background)
+    // can dispatch RtcAlarmSnapshotReady through the same instance.
+    let app_runner = std::rc::Rc::new(std::cell::RefCell::new(app_runner::AppRunner::new()));
+
     // Bundle the long-lived state into one context, then run the main loop
     // through it instead of threading board/stores/wifi individually.
     let mut ctx = DeviceContext {
@@ -356,6 +362,7 @@ fn main() -> Result<()> {
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
         pending_wifi_op: None,
         last_command: None,
+        app_runner: app_runner.clone(),
     };
 
     // AppRunner: bridge between the host-testable state machine in
@@ -364,10 +371,15 @@ fn main() -> Result<()> {
     // the runner is purely additive for step 2, observing the boot,
     // minute ticks, and RTC AF edges without disturbing the legacy
     // DeviceContext scheduling.
-    let mut app_runner = app_runner::AppRunner::new();
-    app_runner.set_last_clock(clock);
+    app_runner.borrow_mut().set_last_clock(clock);
     let mut boot_dispatched = false;
     let mut last_rtc_alarm_flag = false;
+    // True when AppRunner may process runtime events. Set false when the
+    // BootSnapshot reports a core fact failure, meaning the state machine
+    // has no trustworthy alarm/NVS/config data and must NOT interpret any
+    // AF / Tick event. This prevents dispatch on a default AppState that
+    // would otherwise treat a real alarm as residue and ACK it off.
+    let mut app_runner_enabled = true;
 
     // Two-level polling cadence: while the user
     // interacts - a key is raw-low, a command arrived, a refresh is
@@ -400,6 +412,10 @@ fn main() -> Result<()> {
     // machine ignores out-of-order generations so a stale completion
     // is harmless.
     let mut pending_renders: Vec<app_runner::AsyncKick> = Vec::new();
+    // Set when the boot-alarm dismiss must repaint the whole screen back
+    // to Home (otherwise the panel stays on the ALARM frame - review
+    // round 6 P0 #3). The main loop's dirty-rect path consumes it.
+    let mut boot_full_refresh = false;
     loop {
         watchdog::feed();
         if !boot_dispatched {
@@ -407,20 +423,21 @@ fn main() -> Result<()> {
             let boot_result = collect_boot_snapshot(&mut ctx, clock);
             if boot_result.core_failed {
                 // Architecture says core NVS / RTC failure must enter a
-                // minimal safe mode. We log + keep going rather than
-                // hang the boot loop; the legacy DeviceContext path will
-                // still try to serve screens, but alarm business is
-                // disabled until the next reset. Step 4 (event queue)
-                // will wire the proper safe-mode renderer.
-                log::error!("Core boot fact unavailable; AppRunner disabled");
+                // minimal safe mode. We set app_runner_enabled = false so
+                // no subsequent Tick / RtcAlarmSnapshotReady reaches
+                // `update` on an uninitialized AppState - an empty alarm
+                // list would otherwise treat a real AF as residue and
+                // ACK it off, or make alarm decisions on corrupt facts.
+                app_runner_enabled = false;
+                log::error!("Core boot fact unavailable; AppRunner disabled for this boot");
             } else {
-                if let Err(err) = app_runner.dispatch(
+                if let Err(err) = app_runner.borrow_mut().dispatch(
                     inkwash_logic::app::Event::Boot(boot_result.snapshot),
                     &mut ctx,
                 ) {
                     log::warn!("AppRunner Boot dispatch failed: {err}");
                 }
-                for kick in app_runner.take_pending_kicks() {
+                for kick in app_runner.borrow_mut().take_pending_kicks() {
                     track_kick(kick, &mut pending_renders);
                 }
             }
@@ -431,29 +448,40 @@ fn main() -> Result<()> {
             // AppRunner owns ACK + persist + screen selection; the main
             // loop owns the blocking ring UI; ENTER press dispatches back
             // into the state machine for Firing -> WaitingForRearm.
-            if matches!(
-                app_runner.state().screen,
-                inkwash_logic::app::Screen::AlarmRinging
-            ) {
+            if app_runner_enabled
+                && matches!(
+                    app_runner.borrow().state().screen,
+                    inkwash_logic::app::Screen::AlarmRinging
+                )
+            {
                 log::info!("Boot from RTC alarm; entering ring screen");
                 if let Err(err) =
                     alarms::ring_screen(ctx.board, ctx.usb_console, ctx.ble_control.as_mut())
                 {
                     log::error!("Boot ring_screen failed: {err}");
                 }
-                let _ = app_runner.dispatch(
+                let _ = app_runner.borrow_mut().dispatch(
                     inkwash_logic::app::Event::Button(
                         inkwash_logic::button_event::ButtonEvent::Pressed,
                     ),
                     &mut ctx,
                 );
-                for kick in app_runner.take_pending_kicks() {
+                for kick in app_runner.borrow_mut().take_pending_kicks() {
                     track_kick(kick, &mut pending_renders);
                 }
+                // Dismissed back to Home: force a full refresh so the
+                // panel leaves the ALARM screen. The dirty-rect path
+                // (which runs once `dirty` is populated this iteration)
+                // picks this up.
+                boot_full_refresh = true;
             }
         }
         let mut dirty: Vec<Rect> = Vec::new();
         let now = Instant::now();
+        if boot_full_refresh {
+            dirty.push(FULL_SCREEN_RECT);
+            boot_full_refresh = false;
+        }
 
         // Power status once per second, unchanged cadence (it gates the
         // charge-status debounce tick).
@@ -489,15 +517,24 @@ fn main() -> Result<()> {
                         .unwrap_or(true);
                     if changed {
                         clock = Some(dt);
-                        app_runner.set_last_clock(clock);
+                        app_runner.borrow_mut().set_last_clock(clock);
                         // AppRunner Tick: feed the state machine on every
                         // minute boundary. The state machine uses Tick to
                         // rearm the RTC alarm slot at minute edges and to
-                        // fire scheduled syncs.
-                        if let Err(err) =
-                            app_runner.dispatch(inkwash_logic::app::Event::Tick(dt), &mut ctx)
-                        {
-                            log::warn!("AppRunner Tick dispatch failed: {err}");
+                        // fire scheduled syncs. Skipped when AppRunner is
+                        // disabled (core boot fact failure): the default
+                        // AppState has no alarm/NVS/config data and must
+                        // not rearm or interpret anything from a Tick.
+                        if app_runner_enabled {
+                            if let Err(err) = app_runner
+                                .borrow_mut()
+                                .dispatch(inkwash_logic::app::Event::Tick(dt), &mut ctx)
+                            {
+                                log::warn!("AppRunner Tick dispatch failed: {err}");
+                            }
+                            for kick in app_runner.borrow_mut().take_pending_kicks() {
+                                track_kick(kick, &mut pending_renders);
+                            }
                         }
                         dirty.push(CLOCK_RECT);
                     }
@@ -531,26 +568,47 @@ fn main() -> Result<()> {
         // AppRunner owns ACK, persist, ring start, and rearm scheduling.
         if ctx.board.rtc.alarm_flag().unwrap_or(false) {
             if !last_rtc_alarm_flag {
-                last_rtc_alarm_flag = true;
-                match ctx.board.rtc.read_time() {
-                    Ok(dt) => {
-                        let aie = ctx.board.rtc.alarm_interrupt_enabled().unwrap_or(false);
+                // Read a *consistent* (time, AF, AIE) snapshot first. The
+                // edge is only consumed (last_rtc_alarm_flag = true) after
+                // ALL three reads succeed and the snapshot is built: a
+                // failure keeps the edge retryable so the next loop
+                // iteration retries instead of silently swallowing this
+                // alarm forever. AIE read errors are propagated (not
+                // masked as false) - a false AIE would make the state
+                // machine treat a real alarm as residue and ACK it off.
+                let read_result = (|| -> anyhow::Result<(DateTime, bool)> {
+                    let dt = ctx.board.rtc.read_time()?;
+                    let aie = ctx.board.rtc.alarm_interrupt_enabled()?;
+                    Ok((dt, aie))
+                })();
+                match read_result {
+                    Ok((dt, aie)) => {
+                        last_rtc_alarm_flag = true;
+                        if !app_runner_enabled {
+                            // AppRunner is disabled (core boot fact
+                            // failure): do not interpret the AF. Move on;
+                            // the edge stays consumed so the next loop
+                            // iteration does not re-read a snapshot that
+                            // would go nowhere.
+                            dirty.push(FULL_SCREEN_RECT);
+                            continue;
+                        }
                         let snapshot = inkwash_logic::app::RtcAlarmSnapshot {
                             now: dt,
                             alarm_flag: true,
                             alarm_interrupt_enabled: aie,
                         };
-                        if let Err(err) = app_runner.dispatch(
+                        if let Err(err) = app_runner.borrow_mut().dispatch(
                             inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
                             &mut ctx,
                         ) {
                             log::warn!("AppRunner RtcAlarmSnapshotReady dispatch failed: {err}");
                         }
-                        for kick in app_runner.take_pending_kicks() {
+                        for kick in app_runner.borrow_mut().take_pending_kicks() {
                             track_kick(kick, &mut pending_renders);
                         }
                         if matches!(
-                            app_runner.state().screen,
+                            app_runner.borrow().state().screen,
                             inkwash_logic::app::Screen::AlarmRinging
                         ) {
                             log::info!("RTC alarm fired; entering ring screen");
@@ -563,20 +621,24 @@ fn main() -> Result<()> {
                             }
                             // Dismiss press dispatches ENTER as a state
                             // machine event; Firing -> WaitingForRearm.
-                            let _ = app_runner.dispatch(
+                            let _ = app_runner.borrow_mut().dispatch(
                                 inkwash_logic::app::Event::Button(
                                     inkwash_logic::button_event::ButtonEvent::Pressed,
                                 ),
                                 &mut ctx,
                             );
-                            for kick in app_runner.take_pending_kicks() {
+                            for kick in app_runner.borrow_mut().take_pending_kicks() {
                                 track_kick(kick, &mut pending_renders);
                             }
                             dirty.push(FULL_SCREEN_RECT);
                         }
                     }
                     Err(err) => {
-                        log::warn!("PCF8563 read_time failed (AppRunner alarm fast path): {err}")
+                        // Edge left unlocked - the next loop iteration
+                        // retries the snapshot read.
+                        log::warn!(
+                            "RTC alarm snapshot read failed; AF edge stays retryable: {err:#}"
+                        );
                     }
                 }
             }
@@ -621,8 +683,17 @@ fn main() -> Result<()> {
         // absorbed by the state machine, which drops effects whose
         // render_generation is older than the current visible state.
         while let Some(completion) = ctx.board.display.poll_completion() {
-            if let Some(kick) = pending_renders.first().cloned() {
-                pending_renders.remove(0);
+            // Match by request_id (echoed by the EPD task) instead of
+            // FIFO: the single EPD slot can merge or overwrite requests,
+            // so only the completion whose id matches an in-flight
+            // AppRunner render is fed back. Legacy dirty-rect / ring /
+            // boot refreshes carry ids with no matching kick and are
+            // observed but not fed back.
+            let matched = pending_renders
+                .iter()
+                .position(|kick| kick.request_id == Some(completion.request_id));
+            if let Some(idx) = matched {
+                let kick = pending_renders.remove(idx);
                 if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
                     let output = inkwash_logic::app::EffectOutput::RenderDone;
                     let failure = (!completion.ok).then(|| {
@@ -631,9 +702,10 @@ fn main() -> Result<()> {
                             completion.kind
                         ))
                     });
-                    if let Err(err) =
-                        feed_completion_back(&mut app_runner, &mut ctx, kick, output, failure)
-                    {
+                    if let Err(err) = {
+                        let mut ar = app_runner.borrow_mut();
+                        feed_completion_back(&mut ar, &mut ctx, kick, output, failure)
+                    } {
                         log::warn!("AppRunner EPD completion feed failed: {err}");
                     }
                 }
@@ -643,6 +715,7 @@ fn main() -> Result<()> {
                     ok: true,
                     recovered: false,
                     kind,
+                    ..
                 } => {
                     log::info!("EPD refresh completed: {kind:?}");
                 }
@@ -650,6 +723,7 @@ fn main() -> Result<()> {
                     ok: true,
                     recovered: true,
                     kind,
+                    ..
                 } => {
                     log::warn!("EPD partial refresh failed; recovered via full refresh ({kind:?})");
                 }
@@ -1014,8 +1088,35 @@ fn collect_boot_snapshot(
 /// tracked - other async effects (sync, BLE, sleep) have their own
 /// completion paths.
 fn track_kick(kick: app_runner::AsyncKick, pending: &mut Vec<app_runner::AsyncKick>) {
-    if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-        pending.push(kick);
+    match &kick.effect {
+        // Render kicks go into the FIFO so the next EPD completion can be
+        // paired with them.
+        inkwash_logic::app::Effect::Render(_) => pending.push(kick),
+        // StartSync / StartBlePairing / StopBlePairing: let the main loop
+        // dispatch the Side effect to the matching subsystem. These
+        // channels are not yet wired to the state machine in step 2, so
+        // we surface the kick rather than silently dropping it - the state
+        // doc tracks them as pending until their transport is connected.
+        inkwash_logic::app::Effect::StartSync(_) => {
+            log::warn!(
+                "AppRunner StartSync kick not yet wired to sync task (op {:?}); dropped",
+                kick.operation_id
+            );
+        }
+        inkwash_logic::app::Effect::StartBlePairing(_)
+        | inkwash_logic::app::Effect::StopBlePairing => {
+            log::warn!(
+                "AppRunner BLE pairing kick not yet wired (op {:?}); dropped",
+                kick.operation_id
+            );
+        }
+        // EnterDeepSleep / EnterLightSleep are handled synchronously in
+        // EffectRunner; they never surface here.
+        other => log::warn!(
+            "AppRunner async kick {:?} (op {:?}) not handled; dropped",
+            other,
+            kick.operation_id
+        ),
     }
 }
 

@@ -99,11 +99,11 @@ impl EpdClient {
     /// Queues a full-screen refresh of the current canvas contents; the
     /// frame is snapshotted now, so the panel shows exactly this frame.
     /// Resets the partial-refresh promotion counter.
-    pub fn refresh_full(&mut self) -> Result<()> {
+    pub fn refresh_full(&mut self) -> Result<u64> {
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
-        self.handle.request_full(frame);
+        let id = self.handle.request_full(frame);
         self.partials_since_full = 0;
-        Ok(())
+        Ok(id)
     }
 
     /// Always refreshes only `rect`, never promotes to a full refresh.
@@ -115,16 +115,16 @@ impl EpdClient {
     /// and promotes to a full refresh after [`PARTIALS_BEFORE_FULL`] of
     /// them; `refresh_full` is for the deliberate full
     /// refreshes (boot, alarm ring).
-    pub fn refresh_partial(&mut self, rect: Rect) -> Result<()> {
+    pub fn refresh_partial(&mut self, rect: Rect) -> Result<u64> {
         if self.partials_since_full >= PARTIALS_BEFORE_FULL {
             self.partials_since_full = 0;
             log::info!("{PARTIALS_BEFORE_FULL} consecutive partial refreshes; promoting to full");
             return self.refresh_full();
         }
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
-        self.handle.request_partial(rect, frame);
+        let id = self.handle.request_partial(rect, frame);
         self.partials_since_full += 1;
-        Ok(())
+        Ok(id)
     }
 
     /// UI screens are best-effort callers: a display fault must not silently
