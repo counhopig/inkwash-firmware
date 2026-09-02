@@ -136,12 +136,6 @@ pub enum BackgroundOutcome {
     NoChange,
 }
 
-impl BackgroundOutcome {
-    pub fn is_alarm(self) -> bool {
-        matches!(self, BackgroundOutcome::AlarmHandled)
-    }
-}
-
 impl DeviceContext<'_> {
     /// Services one queued USB command from any UI loop. Returns
     /// `(visible_change, activity)`: `visible_change` is true when a
@@ -375,15 +369,7 @@ impl DeviceContext<'_> {
     }
 
     fn poll_reminders(&mut self, now: &DateTime) -> bool {
-        crate::reminders::poll(
-            self.board,
-            self.counters,
-            self.todo_store,
-            self.inbox_store,
-            self.usb_console,
-            self.ble_control.as_mut(),
-            now,
-        )
+        crate::reminders::poll(self, now)
     }
 
     /// Runs an urgent/full sync when its wall-clock boundary advances. The

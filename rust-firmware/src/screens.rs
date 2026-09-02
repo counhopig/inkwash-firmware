@@ -1328,6 +1328,13 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
         Ok(true) => {
             let mut result = None;
             while result.is_none() {
+                // An RTC alarm must preempt the sync wait: AppRunner rings
+                // over the page, and we unwind to the unified router so
+                // main re-renders per the current Screen.
+                if ctx.poll_alarm_snapshot() {
+                    ctx.app_runner_alarm_exit = true;
+                    return;
+                }
                 let _ = ctx.poll_usb_control(now);
                 if matches!(poll_nav(ctx.board), Nav::Enter | Nav::Cancel) {
                     // User backed out; the sync continues on the sync task
@@ -1478,9 +1485,27 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 if last_alarm_poll.elapsed() >= std::time::Duration::from_secs(1) {
                     last_alarm_poll = std::time::Instant::now();
                     if let Ok(fresh) = ctx.board.rtc.read_time() {
-                        if ctx.poll_local_alerts(&fresh).is_alarm() {
-                            ctx.app_runner_alarm_exit = true;
-                            break;
+                        match ctx.poll_local_alerts(&fresh) {
+                            crate::ctx::BackgroundOutcome::AlarmHandled => {
+                                ctx.app_runner_alarm_exit = true;
+                                break;
+                            }
+                            crate::ctx::BackgroundOutcome::VisibleChanged => {
+                                // A reminder covered the screen: redraw the
+                                // pairing page so input context and display
+                                // match again.
+                                let mut canvas = ctx.board.display.canvas_mut();
+                                canvas.clear();
+                                header(&mut canvas, "BLE PAIRING");
+                                canvas.draw_text_prop(8, 40, 1, "CONNECTING...");
+                                canvas.draw_text_prop(8, 60, 1, "Service UUID:");
+                                canvas.draw_text_prop(8, 72, 1, "d2c25e50-");
+                                canvas.draw_text_prop(8, 84, 1, "5e22-48d8...");
+                                footer(&mut canvas, "HOLD ENTER BACK");
+                                drop(canvas);
+                                ctx.board.display.refresh_full_best_effort();
+                            }
+                            crate::ctx::BackgroundOutcome::NoChange => {}
                         }
                     }
                 }

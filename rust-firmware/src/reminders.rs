@@ -7,53 +7,34 @@ use std::time::Duration;
 
 use esp_idf_svc::systime::EspSystemTime;
 
-use crate::ble_control::BleControl;
-use crate::board::Note4Board;
 use crate::button::{ButtonEvent, POLL_INTERVAL_MS};
-use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::screens;
-use crate::storage::PersistedCounters;
-use crate::todos::{Todo, TodoStore};
-use crate::usb_console::{reject_pending_command, UsbConsole};
+use crate::todos::Todo;
+use crate::usb_console::reject_pending_command;
 use crate::{ui, watchdog};
 
 const URGENT_RING_MAX_SECS: u64 = 120;
 
 /// Shows both reminder classes in priority order. Urgent inbox alerts go
 /// first; a due-todo reminder may follow after the urgent alert is dismissed.
-pub fn poll(
-    board: &mut Note4Board,
-    counters: &PersistedCounters,
-    todo_store: &TodoStore,
-    inbox_store: &InboxStore,
-    usb: &mut UsbConsole,
-    mut ble: Option<&mut BleControl>,
-    now: &DateTime,
-) -> bool {
-    let urgent_shown = remind_urgent_inbox(board, inbox_store, usb, ble.as_deref_mut());
-    let todo_shown = remind_due_todos(board, counters, todo_store, usb, ble, now);
+pub fn poll(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> bool {
+    let urgent_shown = remind_urgent_inbox(ctx);
+    let todo_shown = remind_due_todos(ctx, now);
     urgent_shown || todo_shown
 }
 
-fn remind_due_todos(
-    board: &mut Note4Board,
-    counters: &PersistedCounters,
-    todo_store: &TodoStore,
-    usb: &mut UsbConsole,
-    ble: Option<&mut BleControl>,
-    now: &DateTime,
-) -> bool {
+fn remind_due_todos(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> bool {
     use inkwash_logic::reminder_dedup::{
         already_reminded_today, due_high_importance_todos, reminder_date_key,
     };
-    match counters.todo_reminded_date() {
+    match ctx.counters.todo_reminded_date() {
         Ok(prev) if already_reminded_today(prev.as_deref(), now) => return false,
         Ok(_) => {}
         Err(err) => log::warn!("Failed to read todo reminder date: {err}"),
     }
 
-    let Ok(list) = todo_store.load() else {
+    let Ok(list) = ctx.todo_store.load() else {
         return false;
     };
     let due: Vec<&Todo> = due_high_importance_todos(&list, now);
@@ -62,22 +43,17 @@ fn remind_due_todos(
     }
 
     let date_key = reminder_date_key(now);
-    if let Err(err) = counters.set_todo_reminded_date(&date_key) {
+    if let Err(err) = ctx.counters.set_todo_reminded_date(&date_key) {
         log::warn!("Failed to record todo reminder date; not reminding: {err}");
         return false;
     }
     log::info!("{} high-importance todo(s) due today; reminding", due.len());
-    show_due_todos(board, &due, usb, ble);
+    show_due_todos(ctx, &due);
     true
 }
 
-fn show_due_todos(
-    board: &mut Note4Board,
-    due: &[&Todo],
-    usb: &mut UsbConsole,
-    mut ble: Option<&mut BleControl>,
-) {
-    let mut canvas = board.display.canvas_mut();
+fn show_due_todos(ctx: &mut crate::ctx::DeviceContext, due: &[&Todo]) {
+    let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
     ui::header(&mut canvas, "TODOS DUE");
     for (index, todo) in due.iter().take(7).enumerate() {
@@ -89,9 +65,9 @@ fn show_due_todos(
     }
     canvas.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
     drop(canvas);
-    board.display.refresh_full_best_effort();
+    ctx.board.display.refresh_full_best_effort();
 
-    if let Some(audio) = board.audio.as_mut() {
+    if let Some(audio) = ctx.board.audio.as_mut() {
         for _ in 0..3 {
             if let Err(err) = audio.play_sine_stereo(1046.0, 0.15, 8000) {
                 log::warn!("Todo reminder tone failed: {err}");
@@ -102,11 +78,18 @@ fn show_due_todos(
     }
     loop {
         watchdog::feed();
-        reject_pending_command(usb);
-        if let Some(ble) = ble.as_deref_mut() {
+        // An RTC alarm preempts the reminder: AppRunner rings over it and
+        // the caller unwinds to main.
+        if ctx.poll_alarm_snapshot() {
+            ctx.app_runner_alarm_exit = true;
+            break;
+        }
+        reject_pending_command(ctx.usb_console);
+        if let Some(ble) = ctx.ble_control.as_mut() {
             crate::ble_control::reject_pending_command(ble);
         }
-        if board
+        if ctx
+            .board
             .key_enter
             .poll()
             .is_some_and(|event| matches!(event, ButtonEvent::Pressed | ButtonEvent::LongPressed))
@@ -117,21 +100,16 @@ fn show_due_todos(
     }
 }
 
-fn remind_urgent_inbox(
-    board: &mut Note4Board,
-    inbox_store: &InboxStore,
-    usb: &mut UsbConsole,
-    ble: Option<&mut BleControl>,
-) -> bool {
-    let Ok(list) = inbox_store.load() else {
+fn remind_urgent_inbox(ctx: &mut crate::ctx::DeviceContext) -> bool {
+    let Ok(list) = ctx.inbox_store.load() else {
         return false;
     };
-    let urgent = inbox_store.unread_urgent().unwrap_or_default();
+    let urgent = ctx.inbox_store.unread_urgent().unwrap_or_default();
     if urgent.is_empty() {
         return false;
     }
     for id in &urgent {
-        if let Err(err) = inbox_store.mark_read(*id) {
+        if let Err(err) = ctx.inbox_store.mark_read(*id) {
             log::warn!("Failed to mark urgent inbox read; not reminding: {err}");
             return false;
         }
@@ -142,17 +120,12 @@ fn remind_urgent_inbox(
         .map(|item| screens::truncate_prop(&item.title, 330))
         .collect();
     log::info!("{} urgent inbox message(s) to show", titles.len());
-    show_urgent(board, &titles, usb, ble);
+    show_urgent(ctx, &titles);
     true
 }
 
-fn show_urgent(
-    board: &mut Note4Board,
-    titles: &[String],
-    usb: &mut UsbConsole,
-    mut ble: Option<&mut BleControl>,
-) {
-    let mut canvas = board.display.canvas_mut();
+fn show_urgent(ctx: &mut crate::ctx::DeviceContext, titles: &[String]) {
+    let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
     ui::header(&mut canvas, "URGENT");
     for (index, title) in titles.iter().take(4).enumerate() {
@@ -163,9 +136,9 @@ fn show_urgent(
     }
     canvas.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
     drop(canvas);
-    board.display.refresh_full_best_effort();
+    ctx.board.display.refresh_full_best_effort();
 
-    if let Some(audio) = board.audio.as_mut() {
+    if let Some(audio) = ctx.board.audio.as_mut() {
         if let Err(err) = audio.set_volume(255) {
             log::warn!("Urgent volume boost failed: {err}");
         }
@@ -175,13 +148,18 @@ fn show_urgent(
     let ring_start = EspSystemTime {}.now();
     loop {
         watchdog::feed();
-        reject_pending_command(usb);
-        if let Some(ble) = ble.as_deref_mut() {
+        // An RTC alarm preempts the urgent reminder (see show_due_todos).
+        if ctx.poll_alarm_snapshot() {
+            ctx.app_runner_alarm_exit = true;
+            return;
+        }
+        reject_pending_command(ctx.usb_console);
+        if let Some(ble) = ctx.ble_control.as_mut() {
             crate::ble_control::reject_pending_command(ble);
         }
-        board.key_enter.poll();
-        if board.key_enter.is_pressed() {
-            while board.key_enter.poll().is_some() {}
+        ctx.board.key_enter.poll();
+        if ctx.board.key_enter.is_pressed() {
+            while ctx.board.key_enter.poll().is_some() {}
             return;
         }
         if (EspSystemTime {}).now().saturating_sub(ring_start)
@@ -191,7 +169,7 @@ fn show_urgent(
             return;
         }
         let (frequency, duration) = SIREN[siren_step % SIREN.len()];
-        if let Some(audio) = board.audio.as_mut() {
+        if let Some(audio) = ctx.board.audio.as_mut() {
             if let Err(err) = audio.play_sine_stereo(frequency, duration, 24000) {
                 log::warn!("Urgent siren note failed: {err}");
             }
@@ -202,13 +180,17 @@ fn show_urgent(
         let poll_deadline = EspSystemTime {}.now() + Duration::from_millis(400);
         loop {
             watchdog::feed();
-            reject_pending_command(usb);
-            if let Some(ble) = ble.as_deref_mut() {
+            if ctx.poll_alarm_snapshot() {
+                ctx.app_runner_alarm_exit = true;
+                return;
+            }
+            reject_pending_command(ctx.usb_console);
+            if let Some(ble) = ctx.ble_control.as_mut() {
                 crate::ble_control::reject_pending_command(ble);
             }
-            board.key_enter.poll();
-            if board.key_enter.is_pressed() {
-                while board.key_enter.poll().is_some() {}
+            ctx.board.key_enter.poll();
+            if ctx.board.key_enter.is_pressed() {
+                while ctx.board.key_enter.poll().is_some() {}
                 return;
             }
             if (EspSystemTime {}).now() >= poll_deadline {
