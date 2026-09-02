@@ -1327,6 +1327,38 @@ fn transition_command(
                 vec![Effect::PersistConfig(cfg)],
             )]
         }
+        ControlRequest::ClearAlarms => {
+            // Empty the local list (authoritative NVS source) and disarm the
+            // RTC slot. Two confirmable ops; the reply waits for both, and a
+            // failure of either errors the command and releases the slot.
+            let persist_op = state.next_operation_id();
+            let rtc_op = state.next_operation_id();
+            state.alarms.alarms.clear();
+            // The stored list is now empty, so the runtime's armed target is
+            // gone; the RTC disable below confirms the hardware follows.
+            state.alarm_runtime = AlarmRuntimeState::Disarmed;
+            set_pending_reply(
+                state,
+                channel,
+                persist_op,
+                ControlRequest::ClearAlarms,
+                vec![persist_op, rtc_op],
+            );
+            vec![
+                batch(
+                    state,
+                    persist_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::PersistAlarms(vec![])],
+                ),
+                batch(
+                    state,
+                    rtc_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::DisableRtcAlarm],
+                ),
+            ]
+        }
         // Other commands need their storage/network side effects, wired in
         // migration step 3. Refuse rather than guess.
         _ => vec![reply_batch(
@@ -2234,6 +2266,119 @@ mod tests {
             })
         }));
         assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn clear_alarms_persists_empty_and_disables_rtc_then_replies_ok() {
+        let mut state = AppState::default();
+        state.alarms.alarms = vec![alarm(1, 9, 0), alarm(2, 10, 30)];
+        state.alarm_runtime = AlarmRuntimeState::Armed { alarm_id: 1 };
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::ClearAlarms));
+        assert!(state.alarms.alarms.is_empty());
+        // Two confirmable batches: PersistAlarms(empty) + DisableRtcAlarm.
+        let persist_op = batches
+            .iter()
+            .find(|b| b.effects.contains(&Effect::PersistAlarms(vec![])))
+            .expect("ClearAlarms must persist an empty list")
+            .operation_id;
+        let rtc_op = batches
+            .iter()
+            .find(|b| b.effects.contains(&Effect::DisableRtcAlarm))
+            .expect("ClearAlarms must disable the RTC alarm")
+            .operation_id;
+        assert!(state.pending_usb_reply.is_some());
+        // Only the persist confirms: no reply yet (rtc still awaited).
+        let mid = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Alarms),
+            }),
+        );
+        assert!(
+            !mid.iter()
+                .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))),
+            "reply must wait for the RTC disable"
+        );
+        // RTC disable confirms -> final Ok on USB, slot released.
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
+            }),
+        );
+        assert!(done.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        }));
+        assert!(state.pending_usb_reply.is_none());
+        assert_eq!(state.alarm_runtime, AlarmRuntimeState::Disarmed);
+    }
+
+    #[test]
+    fn clear_alarms_rtc_failure_replies_error_and_releases_slot() {
+        let mut state = AppState::default();
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::ClearAlarms));
+        let persist_op = batches
+            .iter()
+            .find(|b| b.effects.contains(&Effect::PersistAlarms(vec![])))
+            .unwrap()
+            .operation_id;
+        let rtc_op = batches
+            .iter()
+            .find(|b| b.effects.contains(&Effect::DisableRtcAlarm))
+            .unwrap()
+            .operation_id;
+        // Persist succeeds, RTC disable fails -> error reply + slot release.
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Alarms),
+            }),
+        );
+        let failed = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                error: EffectError::Rtc("rtc bus error".into()),
+            }),
+        );
+        let error_seen = failed.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => message.contains("rtc bus error"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(
+            state.pending_usb_reply.is_none(),
+            "slot released after failure"
+        );
     }
 
     // ---- review round 2 findings -----------------------------------------
