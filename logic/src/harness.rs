@@ -121,7 +121,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::AcknowledgeRtcAlarm => "AcknowledgeRtcAlarm",
         Effect::StartTone => "StartTone",
         Effect::StopTone => "StopTone",
-        Effect::Reply(_) => "Reply",
+        Effect::Reply { .. } => "Reply",
         Effect::Render(_) => "Render",
         Effect::StartSync(_) => "StartSync",
         Effect::StartBlePairing(_) => "StartBlePairing",
@@ -142,7 +142,7 @@ impl EffectExecutor for FakeExecutor {
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm => EffectCategory::Rtc,
             Effect::AcknowledgeRtcAlarm => EffectCategory::Ack,
             Effect::StartTone | Effect::StopTone => EffectCategory::Tone,
-            Effect::Reply(_) => EffectCategory::Ack,
+            Effect::Reply { .. } => EffectCategory::Ack,
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
@@ -175,7 +175,7 @@ impl EffectExecutor for FakeExecutor {
             Effect::StartTone | Effect::StopTone => {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
-            Effect::Reply(_) => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
+            Effect::Reply { .. } => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::Render(req) => {
                 if self.fail_render {
                     return Err((EffectCategory::Render, "render failed".into()));

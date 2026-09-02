@@ -129,14 +129,20 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             // ---- asynchronous / out-of-band effects -------------------------
-            Effect::Reply(reply) => {
-                // The main loop routes USB/BLE replies through the matching
-                // channel; the state machine emits this Reply when an
-                // `Event::UsbCommand` / `Event::BleCommand` slot is busy.
+            Effect::Reply { channel, reply } => {
+                // Write the reply to exactly the transport the request came
+                // from: USB and BLE have independent pending-reply slots, so
+                // a response must never leak to the other channel.
                 let raw = reply_from_control_reply(reply);
-                crate::usb_console::write_reply(&raw, None);
-                if let Some(ble) = self.ctx.ble_control.as_ref() {
-                    ble.write_reply(&raw, None);
+                match channel {
+                    inkwash_logic::protocol::Channel::Usb => {
+                        crate::usb_console::write_reply(&raw, None);
+                    }
+                    inkwash_logic::protocol::Channel::Ble => {
+                        if let Some(ble) = self.ctx.ble_control.as_ref() {
+                            ble.write_reply(&raw, None);
+                        }
+                    }
                 }
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }

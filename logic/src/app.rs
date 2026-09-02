@@ -207,7 +207,15 @@ pub enum Effect {
     StartTone,
     StopTone,
     Render(RenderRequest),
-    Reply(ControlReply),
+    /// Send a control reply to exactly one transport. `channel` is which
+    /// transport receives it: USB and BLE each have an independent pending
+    /// reply slot, and a reply must never be written to the other channel
+    /// (two simultaneous commands - one per transport - would otherwise get
+    /// each other's response).
+    Reply {
+        channel: Channel,
+        reply: ControlReply,
+    },
     StartBlePairing(BlePairingRequest),
     StopBlePairing,
     EnterLightSleep(LightSleepPlan),
@@ -1181,18 +1189,14 @@ fn transition_command(
 ) -> Vec<EffectBatch> {
     // One in-flight command per transport. If the slot is busy, reply busy
     // WITHOUT overwriting the pending reply - overwriting would strand the
-    // first request and block the deep-sleep precondition.
+    // first request and block the deep-sleep precondition. The busy reply
+    // goes only to the channel that sent the new command.
     let slot_occupied = match channel {
         Channel::Usb => state.pending_usb_reply.is_some(),
         Channel::Ble => state.pending_ble_reply.is_some(),
     };
     if slot_occupied {
-        return vec![batch(
-            state,
-            OperationId(0),
-            FailurePolicy::Continue,
-            vec![Effect::Reply(Reply::Busy)],
-        )];
+        return vec![reply_batch(state, channel, Reply::Busy)];
     }
 
     match request {
@@ -1210,13 +1214,12 @@ fn transition_command(
         }
         // Other commands need their storage/network side effects, wired in
         // migration step 3. Refuse rather than guess.
-        _ => vec![batch(
+        _ => vec![reply_batch(
             state,
-            OperationId(0),
-            FailurePolicy::Continue,
-            vec![Effect::Reply(Reply::Error {
+            channel,
+            Reply::Error {
                 message: "command not yet supported".into(),
-            })],
+            },
         )],
     }
 }
@@ -1268,6 +1271,17 @@ fn batch(
         effects,
         failure_policy,
     }
+}
+
+/// A single-reply batch to one transport, carrying no business operation
+/// id (a busy / immediate-error reply is not a tracked in-flight op).
+fn reply_batch(state: &mut AppState, channel: Channel, reply: ControlReply) -> EffectBatch {
+    batch(
+        state,
+        OperationId(0),
+        FailurePolicy::Continue,
+        vec![Effect::Reply { channel, reply }],
+    )
 }
 
 fn render_batch(state: &mut AppState) -> EffectBatch {
@@ -1767,9 +1781,67 @@ mod tests {
         set_pending_reply(&mut state, Channel::Usb, op, ControlRequest::SyncNow);
         let batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
         assert!(state.pending_usb_reply.is_some());
-        assert!(batches
-            .iter()
-            .any(|b| b.effects.contains(&Effect::Reply(Reply::Busy))));
+        assert!(batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Busy
+                    }
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn busy_reply_goes_to_the_busy_transport_only() {
+        let mut state = AppState::default();
+        let op = state.next_operation_id();
+        // USB has an in-flight SyncNow; BLE is free.
+        set_pending_reply(&mut state, Channel::Usb, op, ControlRequest::SyncNow);
+        // A second USB command is busy on USB.
+        let usb_batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
+        assert!(usb_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Busy
+                    }
+                )
+            })
+        }));
+        // A BLE command while USB is busy is NOT busy: the transports have
+        // independent slots, so it is processed (currently unsupported ->
+        // error reply to BLE only).
+        let ble_batches = update(&mut state, Event::BleCommand(ControlRequest::GetStatus));
+        assert!(!ble_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Busy
+                    }
+                )
+            })
+        }));
+        assert!(ble_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Error { .. }
+                    }
+                )
+            })
+        }));
+        // The USB pending reply is untouched.
+        assert!(state.pending_usb_reply.is_some());
+        assert!(state.pending_ble_reply.is_none());
     }
 
     // ---- review round 2 findings -----------------------------------------
