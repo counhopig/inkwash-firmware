@@ -113,7 +113,7 @@ impl RenderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Effect, RenderGeneration, RenderRequest};
+    use crate::app::{Effect, RenderGeneration, RenderIntent, RenderRequest};
     use crate::runner::AsyncKick;
 
     fn kick(id: u64) -> AsyncKick {
@@ -124,6 +124,7 @@ mod tests {
             render_generation: Some(RenderGeneration(1)),
             effect: Effect::Render(RenderRequest {
                 generation: RenderGeneration(1),
+                intent: RenderIntent::Partial,
             }),
             request_id: Some(id),
         }

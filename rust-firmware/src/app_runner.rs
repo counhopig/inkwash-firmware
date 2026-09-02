@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 
-use inkwash_logic::app::{Effect, EffectOutput, RenderRequest};
+use inkwash_logic::app::{Effect, EffectOutput, RenderIntent, RenderRequest};
 use inkwash_logic::protocol::ControlReply;
 use inkwash_logic::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 
@@ -204,21 +204,16 @@ fn reply_from_control_reply(reply: &ControlReply) -> control::Reply {
     }
 }
 
-/// Re-renders Home on the EPD task and submits a partial CLOCK_RECT
-/// refresh. The state machine emits this effect on every minute Tick
-/// (the clock displayed a new minute) and on screen transitions back to
-/// Home. Minute ticks must NOT become a full-screen refresh (review
-/// round 7 P1 #5), and the partial refresh is cheap. Screen transitions
-/// (e.g. alarm dismiss returning to Home) are handled by the main loop
-/// pushing FULL_SCREEN_RECT into its dirty path - that is the deliberate
-/// full refresh; this function only repaints the clock region.
+/// Re-renders Home and submits the refresh requested by the state machine.
+/// Minute ticks use a partial CLOCK_RECT refresh; alarm dismiss uses a full
+/// refresh so the ALARM frame is replaced in one panel operation.
 ///
 /// Returns the EPD request id so the caller can correlate the eventual
 /// `EpdCompletion` back to this render's `AsyncKick`.
 fn render_home_into(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
-    _req: &RenderRequest,
+    req: &RenderRequest,
 ) -> Result<u64> {
     let next_alarm = clock
         .as_ref()
@@ -244,16 +239,14 @@ fn render_home_into(
         battery_percent,
         charge,
     );
-    // Partial CLOCK_RECT refresh only (not full): a minute Tick must not
-    // degrade into a full-screen refresh. The returned id is threaded
-    // back so the eventual EpdCompletion correlates to this render.
-    ctx.board
-        .display
-        .refresh_partial(crate::canvas::Rect {
+    let request_id = match req.intent {
+        RenderIntent::Partial => ctx.board.display.refresh_partial(crate::canvas::Rect {
             x: 16,
             y: 36,
             width: 368,
             height: 92,
-        })
-        .map_err(|e| anyhow::anyhow!("{e:#}"))
+        }),
+        RenderIntent::Full => ctx.board.display.refresh_full(),
+    };
+    request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
 }

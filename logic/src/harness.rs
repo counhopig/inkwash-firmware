@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use crate::alarm_flow::{AlarmHost, AlarmPoll};
-use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, Screen};
+use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, RenderIntent, Screen};
 use crate::background_outcome::BackgroundOutcome;
 use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
 use crate::runner::{AppRunner, EffectCategory, EffectExecutor, EffectOutcome};
@@ -77,6 +77,8 @@ pub struct FakeExecutor {
     pub next_request_id: u64,
     /// Renders issued (request_id, generation) in order.
     pub renders: Vec<(u64, Option<crate::app::RenderGeneration>)>,
+    /// Refresh intents issued in the same order as `renders`.
+    pub render_intents: Vec<RenderIntent>,
     /// When true, `Effect::Render` fails with `EffectError::Render`.
     pub fail_render: bool,
 }
@@ -88,6 +90,7 @@ impl Default for FakeExecutor {
             failures: ScriptedFailures::default(),
             next_request_id: 1,
             renders: Vec::new(),
+            render_intents: Vec::new(),
             fail_render: false,
         }
     }
@@ -179,6 +182,7 @@ impl EffectExecutor for FakeExecutor {
                 let id = self.next_request_id;
                 self.next_request_id += 1;
                 self.renders.push((id, Some(req.generation)));
+                self.render_intents.push(req.intent);
                 Ok(EffectOutcome::AsyncWithId(id))
             }
             Effect::StartSync(_) | Effect::StartBlePairing(_) | Effect::StopBlePairing => {
@@ -493,10 +497,45 @@ mod tests {
         assert!(!h.ringing(), "dismiss leaves ringing screen");
         assert_eq!(h.screen(), &Screen::Home, "dismiss restores Home");
         assert_eq!(h.executor.log.count("StopTone"), 1);
+        assert_eq!(
+            h.executor
+                .render_intents
+                .iter()
+                .filter(|intent| **intent == crate::app::RenderIntent::Full)
+                .count(),
+            1,
+            "alarm dismiss submits exactly one full Home render"
+        );
+        assert_eq!(
+            h.executor.render_intents.last(),
+            Some(&crate::app::RenderIntent::Full),
+            "alarm dismiss is the final render request"
+        );
         assert!(matches!(
             h.state().alarm_runtime,
             AlarmRuntimeState::WaitingForRearm { .. }
         ));
+    }
+
+    #[test]
+    fn minute_tick_keeps_partial_render_intent() {
+        let mut h = Harness::new();
+        h.dispatch(Event::Boot(boot(
+            Some(dt(8, 59)),
+            false,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+        h.dispatch(Event::Tick(dt(9, 0))).unwrap();
+        assert_eq!(
+            h.executor.render_intents,
+            vec![
+                crate::app::RenderIntent::Partial,
+                crate::app::RenderIntent::Partial
+            ],
+            "boot and ordinary minute ticks remain partial renders"
+        );
     }
 
     // ---- verification point 2: runtime alarm preempts everywhere ---------
@@ -940,6 +979,7 @@ mod tests {
             render_generation: Some(crate::app::RenderGeneration(1)),
             effect: Effect::Render(crate::app::RenderRequest {
                 generation: crate::app::RenderGeneration(1),
+                intent: crate::app::RenderIntent::Partial,
             }),
             request_id: Some(5),
         };

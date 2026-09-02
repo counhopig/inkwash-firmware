@@ -217,6 +217,17 @@ pub enum Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderRequest {
     pub generation: RenderGeneration,
+    pub intent: RenderIntent,
+}
+
+/// Refresh mode requested by a state transition. The render intent is kept
+/// in the host-testable request so the firmware executor can preserve cheap
+/// clock updates while making alarm-dismiss transitions atomic on the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RenderIntent {
+    #[default]
+    Partial,
+    Full,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -848,7 +859,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
                 FailurePolicy::Continue,
                 vec![Effect::StopTone],
             ),
-            render_batch(state),
+            render_batch_with_intent(state, RenderIntent::Full),
         ]
     } else {
         vec![]
@@ -1224,12 +1235,17 @@ fn batch(
 }
 
 fn render_batch(state: &mut AppState) -> EffectBatch {
+    render_batch_with_intent(state, RenderIntent::Partial)
+}
+
+fn render_batch_with_intent(state: &mut AppState, intent: RenderIntent) -> EffectBatch {
     EffectBatch {
         id: state.next_batch_id(),
         operation_id: OperationId(0),
         render_generation: Some(state.render_generation),
         effects: vec![Effect::Render(RenderRequest {
             generation: state.render_generation,
+            intent,
         })],
         failure_policy: FailurePolicy::Continue,
     }

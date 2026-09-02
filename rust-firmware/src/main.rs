@@ -424,10 +424,10 @@ fn main() -> Result<()> {
     // same AppRunner) also register their kicks here for the EPD
     // completion match.
     // (ctx.pending_renders owns it; we clone the Rc handle.)
-    // Set when the boot-alarm dismiss must repaint the whole screen back
-    // to Home (otherwise the panel stays on the ALARM frame - review
-    // round 6 P0 #3). The main loop's dirty-rect path consumes it.
-    let mut boot_full_refresh = false;
+    // Marks that the AppRunner already submitted the one full render for an
+    // alarm dismiss this iteration. The final dirty path consumes the
+    // marker to prevent an older CLOCK_RECT request from following it.
+    let mut dismiss_full_refresh = false;
     loop {
         watchdog::feed();
         if !boot_dispatched {
@@ -484,19 +484,11 @@ fn main() -> Result<()> {
                 for kick in app_runner.borrow_mut().take_pending_kicks() {
                     track_kick_shared(&ctx, kick);
                 }
-                // Dismissed back to Home: force a full refresh so the
-                // panel leaves the ALARM screen. The dirty-rect path
-                // (which runs once `dirty` is populated this iteration)
-                // picks this up.
-                boot_full_refresh = true;
+                dismiss_full_refresh = true;
             }
         }
         let mut dirty: Vec<Rect> = Vec::new();
         let now = Instant::now();
-        if boot_full_refresh {
-            dirty.push(FULL_SCREEN_RECT);
-            boot_full_refresh = false;
-        }
 
         // Power status once per second, unchanged cadence (it gates the
         // charge-status debounce tick).
@@ -574,7 +566,7 @@ fn main() -> Result<()> {
                                 .alarm_poll
                                 .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
                             let _ = ctx.alarm_poll.take_alarm_exit();
-                            dirty.push(FULL_SCREEN_RECT);
+                            dismiss_full_refresh = true;
                         }
                         crate::ctx::BackgroundOutcome::VisibleChanged => {
                             dirty.push(FULL_SCREEN_RECT);
@@ -595,9 +587,10 @@ fn main() -> Result<()> {
         // edge / retry / firing semantics are identical on Home and every
         // blocking page.
         if ctx.poll_alarm_snapshot() {
-            // The state machine entered Firing and `poll_alarm_snapshot`
-            // already drove ring_screen + dismiss; force a Home repaint.
-            dirty.push(FULL_SCREEN_RECT);
+            // `poll_alarm_snapshot` drives ring_screen + dismiss. The
+            // dismiss transition itself emits a Full render request, so
+            // there is no second dirty-path refresh here.
+            dismiss_full_refresh = true;
             // Home is the root page: the sticky exit flag exists to let
             // *nested* pages unwind layer by layer. Here we are already
             // at Home, so the flag must be consumed immediately -
@@ -780,6 +773,7 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("UP long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
+                    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
                     // Always restore Home after the navigation stack: a
                     // normal cancel or selecting Home leaves the drawer /
                     // old page on screen but keys already route to Home.
@@ -791,7 +785,11 @@ fn main() -> Result<()> {
                         .alarm_poll
                         .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
                     let _ = ctx.alarm_poll.take_alarm_exit();
-                    dirty.push(FULL_SCREEN_RECT);
+                    if !alarm_interrupted {
+                        dirty.push(FULL_SCREEN_RECT);
+                    } else {
+                        dismiss_full_refresh = true;
+                    }
                 }
                 ButtonEvent::Released => {}
             }
@@ -806,18 +804,37 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("DOWN long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
+                    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
                     // Same consume-for-source sequence as the UP path:
                     // report the blocking-page exit then consume it once.
                     let _ = ctx
                         .alarm_poll
                         .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
                     let _ = ctx.alarm_poll.take_alarm_exit();
-                    dirty.push(FULL_SCREEN_RECT);
+                    if !alarm_interrupted {
+                        dirty.push(FULL_SCREEN_RECT);
+                    } else {
+                        dismiss_full_refresh = true;
+                    }
                 }
                 ButtonEvent::Released => {}
             }
         }
 
+        if dismiss_full_refresh {
+            // The full AppRunner render captured the current Home canvas.
+            // Drop any dirty rectangles collected before/alongside the
+            // alarm so no CLOCK_RECT partial can supersede that request.
+            dismiss_full_refresh = false;
+            dirty.clear();
+            last_home_fp = Some(home_data_fingerprint(
+                ctx.counters,
+                ctx.alarm_store,
+                ctx.todo_store,
+                ctx.inbox_store,
+                clock.as_ref(),
+            ));
+        }
         if !dirty.is_empty() {
             last_home_fp = Some(render_home_now(
                 ctx.board,
@@ -834,12 +851,13 @@ fn main() -> Result<()> {
                 ctx.board
                     .display
                     .refresh_partial_best_effort(FULL_SCREEN_RECT);
+                log::info!("Partial display refresh queued to EPD task");
             } else {
                 for rect in &dirty {
                     ctx.board.display.refresh_partial_best_effort(*rect);
                 }
+                log::info!("Partial display refresh queued to EPD task");
             }
-            log::info!("Partial display refresh queued to EPD task");
         }
 
         // Idle/active selection: input, a dispatched command, or a display
