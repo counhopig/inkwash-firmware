@@ -1338,6 +1338,16 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
             }
         }
     }
+    // A failed StartSync must release the single-flight lock too: the
+    // completion path (transition_sync_completed) will never run for an
+    // effect that failed at dispatch, so without this the next SyncNow
+    // would be told Busy forever.
+    if matches!(state.sync, SyncState::Running { .. })
+        && state.pending_usb_reply.is_none()
+        && state.pending_ble_reply.is_none()
+    {
+        state.sync = SyncState::Idle;
+    }
     batches
 }
 
@@ -2566,6 +2576,46 @@ mod tests {
             })
         }));
         assert!(state.pending_ble_reply.is_none());
+    }
+
+    #[test]
+    fn sync_now_start_failure_releases_lock_and_errors() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let op = batches
+            .iter()
+            .find(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_))))
+            .unwrap()
+            .operation_id;
+        let failed = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Sync("sync task spawn failed".into()),
+            }),
+        );
+        let error_seen = failed.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => message.contains("sync task spawn failed"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(state.pending_usb_reply.is_none());
+        // The single-flight lock is released: the next SyncNow is not Busy.
+        assert_eq!(state.sync, SyncState::Idle);
+        let retry = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
+        assert!(retry
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::StartSync(_))) }));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
     }
 
     #[test]
