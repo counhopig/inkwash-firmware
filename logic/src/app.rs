@@ -603,6 +603,42 @@ impl AppState {
             _ => None,
         }
     }
+
+    /// True when the RTC alarm plan is fully confirmed and the device may
+    /// deep-sleep on the strength of the hardware alarm register plus a
+    /// maintenance wake (migration stage 2 "confirmable power pre-state").
+    ///
+    /// False while any of the following holds, because a deep sleep then
+    /// could strand an unconfirmed RTC write or a ringing alarm:
+    ///
+    /// - an RTC program/disable/ack is in flight (`pending_rtc` /
+    ///   `pending_residue_ack`);
+    /// - a confirmable alarm commit (ACK or persistence) has failed and is
+    ///   awaiting a retry (`retries` non-empty), or is in flight;
+    /// - the alarm runtime is still `Firing` or `WaitingForRearm` (an alarm
+    ///   the user has not fully dismissed, or whose re-arm has not been
+    ///   confirmed);
+    /// - the alarm runtime is `Degraded` (an RTC write/read failure means
+    ///   the hardware slot may not match the stored list).
+    ///
+    /// In the settled, confirmed states (`Armed { .. }` / `Disarmed`) with
+    /// no retries or pending RTC writes the register matches the stored
+    /// alarm list, so the only wake the sleep must still guarantee is the
+    /// maintenance timer - the caller computes that plan separately.
+    pub fn rtc_alarm_plan_confirmed(&self) -> bool {
+        if self.pending_rtc.is_some() || self.pending_residue_ack.is_some() {
+            return false;
+        }
+        if !self.retries.is_empty() {
+            return false;
+        }
+        match &self.alarm_runtime {
+            AlarmRuntimeState::Armed { .. } | AlarmRuntimeState::Disarmed => true,
+            AlarmRuntimeState::Firing { .. }
+            | AlarmRuntimeState::WaitingForRearm { .. }
+            | AlarmRuntimeState::Degraded { .. } => false,
+        }
+    }
 }
 
 /// The single state transition entry point. Mutates `state` and returns the
@@ -1374,6 +1410,97 @@ mod tests {
                 weekday: None,
             }))
         }));
+    }
+
+    #[test]
+    fn default_state_rtc_plan_is_confirmed() {
+        // A fresh default AppState: Disarmed, no retries, no pending RTC.
+        let state = AppState::default();
+        assert!(state.rtc_alarm_plan_confirmed());
+    }
+
+    #[test]
+    fn rtc_plan_not_confirmed_while_program_in_flight() {
+        let mut state = AppState::default();
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(8, 0)), false, true);
+        let batches = update(&mut state, Event::Boot(snapshot));
+        // A program was requested and is in flight (pending_rtc set); the
+        // plan is not confirmed until the RtcProgrammed completion lands.
+        assert!(
+            batches.iter().any(|b| b
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))),
+            "boot must request the program"
+        );
+        assert!(!state.rtc_alarm_plan_confirmed());
+    }
+
+    #[test]
+    fn rtc_plan_confirmed_after_program_success() {
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(8, 0)), false, true);
+        let batches = update(&mut state, Event::Boot(snapshot));
+        let prog = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
+            })
+            .map(|b| b.operation_id)
+            .unwrap();
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: prog,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
+            }),
+        );
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Armed { alarm_id: 1 }
+        ));
+        assert!(state.rtc_alarm_plan_confirmed());
+    }
+
+    #[test]
+    fn rtc_plan_not_confirmed_while_firing() {
+        let mut state = AppState::default();
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let _ = update(
+            &mut state,
+            Event::RtcAlarmSnapshotReady(RtcAlarmSnapshot {
+                now: dt(9, 0),
+                alarm_flag: true,
+                alarm_interrupt_enabled: true,
+            }),
+        );
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Firing { .. }
+        ));
+        assert!(!state.rtc_alarm_plan_confirmed());
+    }
+
+    #[test]
+    fn rtc_plan_not_confirmed_with_pending_retry() {
+        let mut state = AppState::default();
+        // A degraded runtime (failed program) leaves a retry scheduled;
+        // the register may not match the list, so deep sleep is unsafe.
+        state.retries.push(RetryPending {
+            action: RetryAction::ProgramRtc,
+            due_minute: 10,
+        });
+        state.alarm_runtime = AlarmRuntimeState::Degraded {
+            desired_alarm_id: Some(1),
+            error: AlarmHardwareError::RtcWriteFailed,
+        };
+        assert!(!state.rtc_alarm_plan_confirmed());
     }
 
     #[test]

@@ -901,9 +901,21 @@ fn main() -> Result<()> {
         // (GPIO18), the RTC alarm line (GPIO5), and the maintenance timer.
         // UP is not an RTC GPIO and cannot wake deep sleep - documented in
         // development-guide.md.
+        //
+        // Confirmable power pre-state (migration stage 2): only deep-sleep
+        // when the state machine's RTC alarm plan is confirmed - no RTC
+        // program/disable/ack in flight, no retries, alarm runtime settled
+        // (Armed/Disarmed). Entering deep sleep with an unconfirmed RTC
+        // write could strand a ringing alarm or a register that never
+        // matches the stored list. When the runtime is disabled (core boot
+        // fact failure) this stage keeps the legacy behaviour; safe mode is
+        // a later migration stage.
+        let rtc_plan_confirmed =
+            !app_runner_enabled || app_runner.borrow().state().rtc_alarm_plan_confirmed();
         if idle
             && !usb_host_connected
             && ctx.pending_wifi_op.is_none()
+            && rtc_plan_confirmed
             && deep_sleep_since.is_some_and(|since| now.duration_since(since) >= DEEP_SLEEP_AFTER)
         {
             // The wake interval is the *minimum* of the
