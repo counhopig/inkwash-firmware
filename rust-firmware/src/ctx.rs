@@ -104,19 +104,17 @@ pub struct DeviceContext<'a> {
     /// main loop and every blocking page so an EPD completion can always
     /// find its kick by `request_id`, regardless of who dispatched it.
     pub pending_renders: std::rc::Rc<std::cell::RefCell<Vec<crate::app_runner::AsyncKick>>>,
-    /// Set when an RTC alarm interrupted a blocking page and the page
-    /// unwound. The next `poll_alarm_snapshot` / `poll_background` call
-    /// clears it. A nested page that cannot return an alarm-specific
-    /// result (e.g. the alarm editor) sets this so its caller chain can
-    /// unwind to main instead of silently resuming the old page. `main`
-    /// checks it after each blocking screen returns.
-    pub app_runner_alarm_exit: bool,
     /// Disabled after a core boot fact failure. Shared by the main loop
     /// *and* every blocking page so no entry can dispatch to a default
     /// AppState after a corrupt boot. Set by `main` from its own
     /// `app_runner_enabled`; `poll_alarm_snapshot` checks it before
     /// dispatching.
     pub app_runner_enabled: bool,
+    /// Shared alarm-poll orchestration (edge tracking + sticky exit
+    /// flag). Host-testable in `inkwash-logic::alarm_flow`; this field
+    /// holds the state so `poll_alarm_snapshot` runs the exact same
+    /// `AlarmPoll` logic the harness drives.
+    pub alarm_poll: inkwash_logic::alarm_flow::AlarmPoll,
 }
 
 /// Background-poll outcome vocabulary lives in `inkwash-logic` (pure,
@@ -159,7 +157,7 @@ impl DeviceContext<'_> {
     /// being swallowed as a cancel. `main` consumes the flag after each
     /// blocking screen and forces the Home refresh.
     pub fn alarm_exit_pending(&self) -> bool {
-        self.app_runner_alarm_exit
+        self.alarm_poll.alarm_exit()
     }
 
     pub fn poll_background(&mut self, now: Option<&DateTime>) -> BackgroundOutcome {
@@ -231,59 +229,22 @@ impl DeviceContext<'_> {
         if !self.app_runner_enabled {
             return false;
         }
-        let Ok(true) = self.board.rtc.alarm_flag() else {
-            return false;
-        };
-        // Read consistent facts first; on any failure leave the edge
-        // retryable (don't consume it).
-        let read = (|| -> anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot> {
-            let now = self.board.rtc.read_time()?;
-            let aie = self.board.rtc.alarm_interrupt_enabled()?;
-            Ok(inkwash_logic::app::RtcAlarmSnapshot {
-                now,
-                alarm_flag: true,
-                alarm_interrupt_enabled: aie,
-            })
-        })();
-        let snapshot = match read {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                log::warn!(
-                    "Blocking page RTC alarm snapshot read failed; stays retryable: {err:#}"
-                );
-                return false;
-            }
-        };
-        // Clone the shared runner out so `self` can be re-borrowed as the
-        // driver context (no self-referential borrow).
+        // Run the *same* `AlarmPoll` orchestration the host harness
+        // drives (inkwash-logic::alarm_flow): AF edge -> consistent
+        // snapshot -> dispatch -> exit flag. The driver reads the real
+        // RTC; the dispatcher forwards through the shared runner. The
+        // poll state is moved out of `self` so driver + dispatcher can
+        // both borrow `self` while the poll runs, then put back.
+        let mut poll = std::mem::take(&mut self.alarm_poll);
         let runner = self.app_runner.clone();
-        let last_clock = runner.borrow().last_clock();
-        let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
-        let decode = runner.borrow_mut().dispatch(
-            inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
-            &mut executor,
-        );
-        if decode.is_err() {
-            log::warn!("Blocking page AppRunner RtcAlarmSnapshotReady dispatch failed");
-            return false;
-        }
-        // Route every render kick this dispatch produced into the shared
-        // registry so the eventual EPD completion (which the main loop
-        // drains against the same registry) can find it by request_id.
-        self.forward_kicks(&runner);
-        let firing = matches!(
-            runner.borrow().state().screen,
-            inkwash_logic::app::Screen::AlarmRinging
-        );
-        // The flag is SET when an alarm interrupted this page, never
-        // cleared here: a nested page that calls poll_alarm_snapshot and
-        // gets `true` must be able to express to its caller that the
-        // return is alarm-driven. Clearing it before the caller can read
-        // it (the previous code) made browse_page's direct
-        // poll_alarm_snapshot exit invisible to main.
-        if firing {
-            self.app_runner_alarm_exit = true;
-        }
+        let pending_renders = self.pending_renders.clone();
+        let mut host = CtxAlarmHost {
+            ctx: self,
+            runner,
+            pending_renders,
+        };
+        let firing = poll.poll(&mut host);
+        self.alarm_poll = poll;
         if firing {
             // Drive the blocking ring/dismiss loop right here so the alarm
             // covers the current page (main's AF fast path is not running).
@@ -294,40 +255,18 @@ impl DeviceContext<'_> {
             {
                 log::error!("ring_screen failed: {err}");
             }
-            // ENTER press -> Firing -> WaitingForRearm.
-            let last_clock = runner.borrow().last_clock();
-            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
-            let _ = runner.borrow_mut().dispatch(
-                inkwash_logic::app::Event::Button(
-                    inkwash_logic::button_event::ButtonEvent::Pressed,
-                ),
-                &mut executor,
-            );
-            // Route the dismiss render kick too.
-            self.forward_kicks(&runner);
+            let mut poll = std::mem::take(&mut self.alarm_poll);
+            let runner = self.app_runner.clone();
+            let pending_renders = self.pending_renders.clone();
+            let mut host = CtxAlarmHost {
+                ctx: self,
+                runner,
+                pending_renders,
+            };
+            poll.ring_dismiss(&mut host);
+            self.alarm_poll = poll;
         }
         firing
-    }
-
-    /// Moves AppRunner's accumulated render kicks into the shared
-    /// `pending_renders` registry so the main loop's EPD completion match
-    /// can find them by request_id, regardless of who dispatched them.
-    fn forward_kicks(
-        &mut self,
-        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
-    ) {
-        for kick in runner.borrow_mut().take_pending_kicks() {
-            let mut registry = self.pending_renders.borrow_mut();
-            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                registry.push(kick);
-            } else {
-                log::warn!(
-                    "Blocking page async kick {:?} (op {:?}) not wired; dropped",
-                    kick.effect,
-                    kick.operation_id
-                );
-            }
-        }
     }
 
     /// Services scheduled sync and due-todo reminders. AppRunner owns
@@ -650,6 +589,86 @@ fn reply_for_outcome(outcome: &Result<SyncOutcome>) -> Reply {
             log::warn!("Sync failed: {err}");
             Reply::Error {
                 message: format!("Sync failed: {err}"),
+            }
+        }
+    }
+}
+
+/// Single `AlarmHost` adapter over the real RTC + shared runner. Borrows
+/// `&mut DeviceContext` once so `AlarmPoll::poll` runs the exact
+/// orchestration the host harness drives, reading real AF/AIE/time and
+/// forwarding through the shared `AppRunner` / `pending_renders`.
+struct CtxAlarmHost<'a, 'ctx> {
+    ctx: &'a mut DeviceContext<'ctx>,
+    runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
+    pending_renders: std::rc::Rc<std::cell::RefCell<Vec<crate::app_runner::AsyncKick>>>,
+}
+
+impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
+    fn alarm_flag(&mut self) -> Result<bool, String> {
+        self.ctx
+            .board
+            .rtc
+            .alarm_flag()
+            .map_err(|e| format!("{e:#}"))
+    }
+    fn read_snapshot(&mut self) -> Result<inkwash_logic::app::RtcAlarmSnapshot, String> {
+        let now = self
+            .ctx
+            .board
+            .rtc
+            .read_time()
+            .map_err(|e| format!("{e:#}"))?;
+        let aie = self
+            .ctx
+            .board
+            .rtc
+            .alarm_interrupt_enabled()
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(inkwash_logic::app::RtcAlarmSnapshot {
+            now,
+            alarm_flag: true,
+            alarm_interrupt_enabled: aie,
+        })
+    }
+    fn snapshot_ready(&mut self, snapshot: inkwash_logic::app::RtcAlarmSnapshot) -> bool {
+        let last_clock = self.runner.borrow().last_clock();
+        let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
+        let ok = self
+            .runner
+            .borrow_mut()
+            .dispatch(
+                inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
+                &mut executor,
+            )
+            .is_ok();
+        if !ok {
+            return false;
+        }
+        matches!(
+            self.runner.borrow().state().screen,
+            inkwash_logic::app::Screen::AlarmRinging
+        )
+    }
+    fn dismiss(&mut self) {
+        let last_clock = self.runner.borrow().last_clock();
+        let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
+        let _ = self.runner.borrow_mut().dispatch(
+            inkwash_logic::app::Event::Button(inkwash_logic::button_event::ButtonEvent::Pressed),
+            &mut executor,
+        );
+    }
+    fn drain_kicks(&mut self) {
+        for kick in self.runner.borrow_mut().take_pending_kicks() {
+            let mut reg = self.pending_renders.borrow_mut();
+            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+                reg.push(kick);
+            } else {
+                log::warn!(
+                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
+                    kick.effect,
+                    kick.operation_id
+                );
             }
         }
     }

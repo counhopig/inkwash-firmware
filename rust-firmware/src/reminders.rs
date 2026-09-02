@@ -98,7 +98,7 @@ fn show_due_todos(
         // An RTC alarm preempts the reminder: AppRunner rings over it and
         // the caller unwinds to main.
         if ctx.poll_alarm_snapshot() {
-            ctx.app_runner_alarm_exit = true;
+            ctx.alarm_poll.mark_exit();
             return crate::ctx::BackgroundOutcome::AlarmHandled;
         }
         reject_pending_command(ctx.usb_console);
@@ -170,7 +170,7 @@ fn show_urgent(
         watchdog::feed();
         // An RTC alarm preempts the urgent reminder (see show_due_todos).
         if ctx.poll_alarm_snapshot() {
-            ctx.app_runner_alarm_exit = true;
+            ctx.alarm_poll.mark_exit();
             return crate::ctx::BackgroundOutcome::AlarmHandled;
         }
         reject_pending_command(ctx.usb_console);
@@ -201,7 +201,7 @@ fn show_urgent(
         loop {
             watchdog::feed();
             if ctx.poll_alarm_snapshot() {
-                ctx.app_runner_alarm_exit = true;
+                ctx.alarm_poll.mark_exit();
                 return crate::ctx::BackgroundOutcome::AlarmHandled;
             }
             reject_pending_command(ctx.usb_console);

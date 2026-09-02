@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::alarm_flow::{AlarmHost, AlarmPoll};
 use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, Screen};
 use crate::background_outcome::BackgroundOutcome;
 use crate::runner::{AppRunner, AsyncKick, EffectCategory, EffectExecutor, EffectOutcome};
@@ -190,6 +191,68 @@ impl EffectExecutor for FakeExecutor {
     }
 }
 
+/// Fake `AlarmHost` driving the shared `AlarmPoll` orchestration: a
+/// scripted AF edge + snapshot, dispatching through the `Harness`'s
+/// runner. A host test runs the *same* `AlarmPoll` code the firmware's
+/// `DeviceContext::poll_alarm_snapshot` runs.
+#[derive(Debug, Default)]
+pub struct FakeAlarmHost {
+    pub af: bool,
+    pub snapshot: Option<crate::app::RtcAlarmSnapshot>,
+    pub snapshot_error: bool,
+    pub alarm_flag_error: bool,
+    /// Number of snapshot_ready dispatches the harness performed.
+    pub dispatches: usize,
+}
+
+impl FakeAlarmHost {
+    pub fn set(&mut self, af: bool, snapshot: crate::app::RtcAlarmSnapshot) {
+        self.af = af;
+        self.snapshot = Some(snapshot);
+    }
+}
+
+/// Bridges `AlarmPoll` to the `Harness`'s runner + `FakeAlarmHost`.
+struct FakeHostAdapter<'a> {
+    harness: &'a mut Harness,
+    host: &'a mut FakeAlarmHost,
+}
+
+impl AlarmHost for FakeHostAdapter<'_> {
+    fn alarm_flag(&mut self) -> Result<bool, String> {
+        if self.host.alarm_flag_error {
+            Err("af read error".into())
+        } else {
+            Ok(self.host.af)
+        }
+    }
+    fn read_snapshot(&mut self) -> Result<crate::app::RtcAlarmSnapshot, String> {
+        if self.host.snapshot_error {
+            Err("snapshot read error".into())
+        } else {
+            self.host
+                .snapshot
+                .clone()
+                .ok_or_else(|| "no snapshot".into())
+        }
+    }
+    fn snapshot_ready(&mut self, snapshot: crate::app::RtcAlarmSnapshot) -> bool {
+        self.host.dispatches += 1;
+        self.harness
+            .dispatch(Event::RtcAlarmSnapshotReady(snapshot))
+            .is_ok()
+            && self.harness.ringing()
+    }
+    fn dismiss(&mut self) {
+        let _ = self
+            .harness
+            .dispatch(Event::Button(crate::button_event::ButtonEvent::Pressed));
+    }
+    fn drain_kicks(&mut self) {
+        self.harness.drain_kicks();
+    }
+}
+
 /// Convenience driver combining `AppRunner` + `FakeExecutor`, mirroring
 /// the firmware main loop's use: dispatch events, drain render kicks,
 /// and feed EPD completions (including stale ones) back.
@@ -200,6 +263,9 @@ pub struct Harness {
     /// In-flight render kicks (request_id -> kick), matching the
     /// firmware `pending_renders` registry.
     pub pending_renders: Vec<AsyncKick>,
+    /// Shared alarm-poll state; `poll_alarm` runs the same `AlarmPoll`
+    /// orchestration the firmware runs.
+    pub alarm_poll: AlarmPoll,
 }
 
 impl Harness {
@@ -220,6 +286,28 @@ impl Harness {
                 self.pending_renders.push(kick);
             }
         }
+    }
+
+    /// Run the shared `AlarmPoll` orchestration through a fake host.
+    /// Returns true when the state machine entered `AlarmRinging`.
+    pub fn poll_alarm(&mut self, host: &mut FakeAlarmHost) -> bool {
+        let mut poll = std::mem::take(&mut self.alarm_poll);
+        let mut adapter = FakeHostAdapter {
+            harness: self,
+            host,
+        };
+        let firing = poll.poll(&mut adapter);
+        self.alarm_poll = poll;
+        firing
+    }
+
+    /// `main` consumes the sticky exit flag exactly once.
+    pub fn take_alarm_exit(&mut self) -> bool {
+        self.alarm_poll.take_alarm_exit()
+    }
+
+    pub fn alarm_exit(&self) -> bool {
+        self.alarm_poll.alarm_exit()
     }
 
     /// Feed an EPD completion for `request_id` back into the runner.
@@ -602,5 +690,226 @@ mod tests {
             h.state().alarm_runtime,
             AlarmRuntimeState::Armed { alarm_id: 1 }
         ));
+    }
+
+    // ---- shared AlarmPoll orchestration (firmware's poll_alarm_snapshot
+    // runs this exact code) -----------------------------------------------
+
+    #[test]
+    fn alarm_poll_shared_orchestration_rings_via_fake_host() {
+        let mut h = Harness::new();
+        h.dispatch(Event::Boot(boot(
+            Some(dt(8, 59)),
+            false,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host), "shared AlarmPoll must ring");
+        assert_eq!(host.dispatches, 1);
+        assert!(h.alarm_exit(), "exit flag set after ring");
+        // A duplicate edge (still af=true) is not re-dispatched.
+        assert!(!h.poll_alarm(&mut host), "edge consumed -> no re-ring");
+        assert_eq!(host.dispatches, 1);
+        // main consumes the flag exactly once.
+        assert!(h.take_alarm_exit());
+        assert!(!h.take_alarm_exit(), "flag consumed once");
+    }
+
+    #[test]
+    fn alarm_poll_read_failure_keeps_edge_retryable() {
+        let mut h = Harness::new();
+        h.dispatch(Event::Boot(boot(
+            Some(dt(8, 59)),
+            false,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+        let mut host = FakeAlarmHost {
+            af: true,
+            snapshot_error: true,
+            ..FakeAlarmHost::default()
+        };
+        // First read fails: edge not consumed.
+        assert!(!h.poll_alarm(&mut host));
+        // Retry with a good snapshot: rings.
+        host.snapshot_error = false;
+        host.snapshot = Some(snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host));
+        assert_eq!(host.dispatches, 1);
+    }
+
+    #[test]
+    fn alarm_poll_af_clear_resets_edge() {
+        let mut h = Harness::new();
+        h.dispatch(Event::Boot(boot(
+            Some(dt(8, 59)),
+            false,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host));
+        // AF clears (ack) then re-asserts -> a fresh edge rings again.
+        host.af = false;
+        assert!(!h.poll_alarm(&mut host));
+        host.set(true, snapshot(dt(9, 1), true, true));
+        assert!(h.poll_alarm(&mut host));
+        assert_eq!(host.dispatches, 2);
+    }
+
+    // ---- shared reminder orchestration (firmware's reminders::poll) -----
+
+    use crate::reminder_flow::{run_reminders, ReminderHost};
+
+    struct ScriptReminder {
+        urgent: BackgroundOutcome,
+        todo: BackgroundOutcome,
+        urgent_calls: usize,
+        todo_calls: usize,
+    }
+    impl ReminderHost for ScriptReminder {
+        fn urgent(&mut self) -> BackgroundOutcome {
+            self.urgent_calls += 1;
+            self.urgent
+        }
+        fn todo(&mut self) -> BackgroundOutcome {
+            self.todo_calls += 1;
+            self.todo
+        }
+    }
+
+    #[test]
+    fn reminder_chain_urgent_alarm_short_circuits_todo() {
+        let mut s = ScriptReminder {
+            urgent: BackgroundOutcome::AlarmHandled,
+            todo: BackgroundOutcome::VisibleChanged,
+            urgent_calls: 0,
+            todo_calls: 0,
+        };
+        assert_eq!(run_reminders(&mut s), BackgroundOutcome::AlarmHandled);
+        assert_eq!(s.todo_calls, 0, "todo must not run after alarm");
+    }
+
+    #[test]
+    fn reminder_chain_dismiss_variants() {
+        // urgent-only dismiss -> VisibleChanged (page redraws).
+        let mut s = ScriptReminder {
+            urgent: BackgroundOutcome::VisibleChanged,
+            todo: BackgroundOutcome::NoChange,
+            urgent_calls: 0,
+            todo_calls: 0,
+        };
+        assert_eq!(run_reminders(&mut s), BackgroundOutcome::VisibleChanged);
+        // todo-only dismiss -> VisibleChanged.
+        let mut s = ScriptReminder {
+            urgent: BackgroundOutcome::NoChange,
+            todo: BackgroundOutcome::VisibleChanged,
+            urgent_calls: 0,
+            todo_calls: 0,
+        };
+        assert_eq!(run_reminders(&mut s), BackgroundOutcome::VisibleChanged);
+        // urgent+todo dismiss -> VisibleChanged.
+        let mut s = ScriptReminder {
+            urgent: BackgroundOutcome::VisibleChanged,
+            todo: BackgroundOutcome::VisibleChanged,
+            urgent_calls: 0,
+            todo_calls: 0,
+        };
+        assert_eq!(run_reminders(&mut s), BackgroundOutcome::VisibleChanged);
+    }
+
+    // ---- shared EPD registry (superseded terminal rule) ------------------
+
+    use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
+
+    #[test]
+    fn epd_registry_superseded_then_replacement() {
+        let mut h = Harness::new();
+        h.dispatch(Event::Boot(boot(
+            Some(dt(9, 0)),
+            true,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+        let rid = h.pending_renders[0].request_id.unwrap();
+        // Simulate the EPD single-slot: a newer render supersedes the
+        // pending one. Both must end with exactly one terminal each.
+        let (h2, reg) = (Harness::new(), RenderRegistry::new());
+        let _ = h2;
+        let mut reg = reg;
+        reg.register(h.pending_renders[0].clone());
+        let replacement = {
+            let mut k = h.pending_renders[0].clone();
+            k.request_id = Some(rid + 1);
+            k
+        };
+        reg.supersede_then_register(rid, replacement);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(
+            reg.feed(rid, true, false),
+            FeedOutcome::Ignored,
+            "superseded id already terminal"
+        );
+        assert_eq!(
+            reg.feed(rid + 1, true, false),
+            FeedOutcome::Matched(RenderTerminal::Completed)
+        );
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn epd_registry_each_id_one_terminal() {
+        let mut reg = RenderRegistry::new();
+        let k = AsyncKick {
+            batch_id: crate::app::EffectBatchId(0),
+            effect_id: crate::app::EffectId(1),
+            operation_id: crate::app::OperationId(1),
+            render_generation: Some(crate::app::RenderGeneration(1)),
+            effect: Effect::Render(crate::app::RenderRequest {
+                generation: crate::app::RenderGeneration(1),
+            }),
+            request_id: Some(5),
+        };
+        reg.register(k);
+        assert_eq!(
+            reg.feed(5, false, false),
+            FeedOutcome::Matched(RenderTerminal::Failed)
+        );
+        assert_eq!(
+            reg.feed(5, true, true),
+            FeedOutcome::Ignored,
+            "duplicate ignored"
+        );
+        assert_eq!(reg.len(), 0);
+    }
+
+    // ---- page unwind: alarm_exit consumed exactly once by main ----------
+
+    #[test]
+    fn page_unwind_flag_consumed_once_by_main() {
+        let mut h = Harness::new();
+        h.dispatch(Event::Boot(boot(
+            Some(dt(8, 59)),
+            false,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host));
+        // A nested page sees the flag pending.
+        assert!(h.alarm_exit());
+        // main consumes it once; a second consume is a no-op.
+        assert!(h.take_alarm_exit());
+        assert!(!h.take_alarm_exit());
+        assert!(!h.alarm_exit());
     }
 }

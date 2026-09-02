@@ -363,8 +363,8 @@ fn main() -> Result<()> {
         pending_wifi_op: None,
         last_command: None,
         app_runner: app_runner.clone(),
-        app_runner_alarm_exit: false,
         pending_renders: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        alarm_poll: inkwash_logic::alarm_flow::AlarmPoll::new(),
         // Mirrors the `app_runner_enabled` local below; kept in lockstep
         // on boot (a core_failed snapshot sets both false) so blocking
         // page entry points cannot dispatch to a default AppState.
@@ -568,7 +568,7 @@ fn main() -> Result<()> {
                             // reminder already unwound. Clear the sticky
                             // exit flag so a later navigation does not see
                             // this historical alarm as its own exit reason.
-                            ctx.app_runner_alarm_exit = false;
+                            let _ = ctx.alarm_poll.take_alarm_exit();
                             dirty.push(FULL_SCREEN_RECT);
                         }
                         crate::ctx::BackgroundOutcome::VisibleChanged => {
@@ -840,7 +840,7 @@ fn main() -> Result<()> {
                     // The alarm flag only marks WHY the stack unwound and
                     // is cleared here so it does not leak into the next
                     // page.
-                    ctx.app_runner_alarm_exit = false;
+                    let _ = ctx.alarm_poll.take_alarm_exit();
                     dirty.push(FULL_SCREEN_RECT);
                 }
                 ButtonEvent::Released => {}
@@ -856,7 +856,7 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("DOWN long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
-                    ctx.app_runner_alarm_exit = false;
+                    let _ = ctx.alarm_poll.take_alarm_exit();
                     dirty.push(FULL_SCREEN_RECT);
                 }
                 ButtonEvent::Released => {}

@@ -117,7 +117,7 @@ pub fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
             PickResult::OpenNav => true,
             PickResult::AlarmInterrupted => {
                 // Alarm rang over Settings: unwind to the unified router.
-                ctx.app_runner_alarm_exit = true;
+                ctx.alarm_poll.mark_exit();
                 return;
             }
             _ => false,
@@ -155,7 +155,7 @@ fn sync_interval_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) -> bool
     );
     let PickResult::Selected(index) = outcome else {
         if outcome == PickResult::AlarmInterrupted {
-            ctx.app_runner_alarm_exit = true;
+            ctx.alarm_poll.mark_exit();
         }
         // Cancelled (hold ENTER) or OpenNav (long UP/DOWN) - surface the
         // nav request upward so Settings can open the GO TO drawer.
@@ -278,7 +278,7 @@ fn pick_navigation(
     loop {
         match ctx.poll_background(now) {
             crate::ctx::BackgroundOutcome::AlarmHandled => {
-                ctx.app_runner_alarm_exit = true;
+                ctx.alarm_poll.mark_exit();
                 return None;
             }
             crate::ctx::BackgroundOutcome::VisibleChanged => needs_redraw = true,
@@ -931,7 +931,7 @@ fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option
         // returns to the caller, which redraws the page.
         match ctx.poll_background(now) {
             crate::ctx::BackgroundOutcome::AlarmHandled => {
-                ctx.app_runner_alarm_exit = true;
+                ctx.alarm_poll.mark_exit();
                 return;
             }
             crate::ctx::BackgroundOutcome::VisibleChanged => return,
@@ -1031,7 +1031,7 @@ fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected:
             AlarmEditOutcome::AlarmInterrupted => {
                 // Alarm rang over the editor: unwind through the alarm
                 // page to the unified router / main loop.
-                ctx.app_runner_alarm_exit = true;
+                ctx.alarm_poll.mark_exit();
                 return;
             }
         }
@@ -1220,7 +1220,7 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
     loop {
         match ctx.poll_background(now) {
             crate::ctx::BackgroundOutcome::AlarmHandled => {
-                ctx.app_runner_alarm_exit = true;
+                ctx.alarm_poll.mark_exit();
                 return;
             }
             crate::ctx::BackgroundOutcome::VisibleChanged => return,
@@ -1332,7 +1332,7 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 // over the page, and we unwind to the unified router so
                 // main re-renders per the current Screen.
                 if ctx.poll_alarm_snapshot() {
-                    ctx.app_runner_alarm_exit = true;
+                    ctx.alarm_poll.mark_exit();
                     return;
                 }
                 let _ = ctx.poll_usb_control(now);
@@ -1487,7 +1487,7 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                     if let Ok(fresh) = ctx.board.rtc.read_time() {
                         match ctx.poll_local_alerts(&fresh) {
                             crate::ctx::BackgroundOutcome::AlarmHandled => {
-                                ctx.app_runner_alarm_exit = true;
+                                ctx.alarm_poll.mark_exit();
                                 break;
                             }
                             crate::ctx::BackgroundOutcome::VisibleChanged => {
