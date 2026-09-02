@@ -376,7 +376,7 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
         match ctx.poll_background(live_now.as_ref()) {
             crate::ctx::BackgroundOutcome::AlarmHandled => return,
             crate::ctx::BackgroundOutcome::VisibleChanged => {
-                if let Ok(fresh) = ctx.board.rtc.read_time() {
+                if let Ok(fresh) = ctx.rtc.read_time() {
                     live_now = Some(fresh);
                 }
                 needs_redraw = true;
@@ -601,7 +601,7 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
         rtc_poll_ticks = rtc_poll_ticks.saturating_add(1);
         if rtc_poll_ticks >= 50 {
             rtc_poll_ticks = 0;
-            match ctx.board.rtc.read_time() {
+            match ctx.rtc.read_time() {
                 Ok(fresh) => {
                     let visible_time_changed = live_now.as_ref().is_none_or(|old| {
                         old.minute != fresh.minute
@@ -1049,7 +1049,7 @@ fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected:
         }
     }
     if let Some(dt) = now {
-        if let Err(err) = alarms::program_hardware_alarm(&mut ctx.board.rtc, &list, dt) {
+        if let Err(err) = alarms::program_hardware_alarm_via(ctx.rtc, &list, dt) {
             log::warn!("Failed to reprogram hardware alarm: {err}");
         }
     }
@@ -1484,7 +1484,7 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 }
                 if last_alarm_poll.elapsed() >= std::time::Duration::from_secs(1) {
                     last_alarm_poll = std::time::Instant::now();
-                    if let Ok(fresh) = ctx.board.rtc.read_time() {
+                    if let Ok(fresh) = ctx.rtc.read_time() {
                         match ctx.poll_local_alerts(&fresh) {
                             crate::ctx::BackgroundOutcome::AlarmHandled => {
                                 ctx.alarm_poll.mark_exit();

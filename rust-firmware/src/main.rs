@@ -20,6 +20,7 @@ mod nvs_blob;
 mod power;
 mod reminders;
 mod rtc;
+mod rtc_executor;
 mod screens;
 mod storage;
 mod sync;
@@ -128,6 +129,11 @@ fn main() -> Result<()> {
     let woke_from_deep_sleep = power::log_wakeup_cause();
     let mut board = Note4Board::take()?;
     log::info!("Power latch is high; rendering home screen");
+    // The RTC executor owns the sole Pcf8563 driver (see rtc_executor.rs).
+    // Spawned right after board bring-up from the shared I2C bus; every RTC
+    // read/write below goes through this client handle, never `board.rtc`
+    // (which no longer exists).
+    let rtc = rtc_executor::RtcExecutor::spawn(board.i2c_bus.clone())?;
 
     // Taken once and cloned into each store: `EspDefaultNvsPartition::take()`
     // is a true singleton (a global taken-flag, not a ref-counted "take a
@@ -152,7 +158,7 @@ fn main() -> Result<()> {
     // time, so connecting on every reset merely consumes the one safe Wi-Fi
     // session and forces the first user-triggered Sync Now to reboot.
     let mut needs_wifi_sync = false;
-    let mut clock = match board.rtc.read_time() {
+    let mut clock = match rtc.read_time() {
         Ok(mut dt) => {
             log::info!(
                 "PCF8563: {:04}-{:02}-{:02} {:02}:{:02}:{:02} vl={}",
@@ -169,7 +175,7 @@ fn main() -> Result<()> {
                 needs_wifi_sync = true;
                 let offset = counters.timezone_offset_minutes().unwrap_or(0);
                 let seeded = DateTime::from_unix(BUILD_EPOCH_SECS).shifted_minutes(offset as i32);
-                if let Err(err) = board.rtc.write_time(&seeded) {
+                if let Err(err) = rtc.write_time(&seeded) {
                     log::warn!("PCF8563 reseed failed: {err}");
                 } else {
                     dt = seeded;
@@ -280,8 +286,8 @@ fn main() -> Result<()> {
             Ok(Some(creds)) => match wifi_mgr.connect(&creds) {
                 Ok(()) => {
                     let timezone_offset = counters.timezone_offset_minutes().unwrap_or(0);
-                    match wifi::ntp_sync_and_set_rtc(&mut board.rtc, timezone_offset) {
-                        Ok(()) => match board.rtc.read_time() {
+                    match wifi::ntp_sync_and_set_rtc(&rtc, timezone_offset) {
+                        Ok(()) => match rtc.read_time() {
                             Ok(dt) => {
                                 clock = Some(dt);
                                 last_home_fp = Some(render_home_now(
@@ -353,6 +359,7 @@ fn main() -> Result<()> {
     // through it instead of threading board/stores/wifi individually.
     let mut ctx = DeviceContext {
         board: &mut board,
+        rtc: &rtc,
         counters: &counters,
         sync: &sync_task,
         alarm_store: &alarm_store,
@@ -504,7 +511,7 @@ fn main() -> Result<()> {
         };
         if now.duration_since(clock_last) >= clock_interval {
             clock_last = now;
-            match ctx.board.rtc.read_time() {
+            match ctx.rtc.read_time() {
                 Ok(dt) => {
                     let changed = clock
                         .as_ref()
@@ -1066,20 +1073,18 @@ fn collect_boot_snapshot(
     clock: Option<DateTime>,
 ) -> BootSnapshotResult {
     let mut core_failed = false;
-    let rtc_alarm_flag = match ctx.board.rtc.alarm_flag() {
-        Ok(flag) => flag,
+    // RTC alarm facts come from the executor's consistent status read (the
+    // sole RTC owner); a failure marks the boot snapshot core-failed, as
+    // before.
+    let alarm_status = match ctx.rtc.alarm_status() {
+        Ok(status) => status,
         Err(err) => {
-            log::error!("PCF8563 alarm_flag read failed: {err}");
+            log::error!("PCF8563 alarm status read failed: {err}");
             core_failed = true;
-            false
-        }
-    };
-    let rtc_alarm_interrupt_enabled = match ctx.board.rtc.alarm_interrupt_enabled() {
-        Ok(flag) => flag,
-        Err(err) => {
-            log::error!("PCF8563 alarm_interrupt_enabled read failed: {err}");
-            core_failed = true;
-            false
+            crate::rtc_executor::AlarmStatus {
+                alarm_flag: false,
+                alarm_interrupt_enabled: false,
+            }
         }
     };
     let alarms = match ctx.alarm_store.load() {
@@ -1112,8 +1117,8 @@ fn collect_boot_snapshot(
         snapshot: inkwash_logic::app::BootSnapshot {
             wake_cause,
             now: clock,
-            rtc_alarm_flag,
-            rtc_alarm_interrupt_enabled,
+            rtc_alarm_flag: alarm_status.alarm_flag,
+            rtc_alarm_interrupt_enabled: alarm_status.alarm_interrupt_enabled,
             alarms,
             todos,
             inbox,

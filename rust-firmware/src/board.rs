@@ -18,7 +18,6 @@ use crate::button::Button;
 use crate::display::EpdClient;
 use crate::nfc::{self, NfcTag};
 use crate::power;
-use crate::rtc::{Pcf8563, PCF8563_ADDR};
 pub type BoardAdc = AdcDriver<'static, esp_idf_svc::hal::adc::ADCU1>;
 
 /// I2C0 is shared between the PCF8563 RTC, the ES8311 audio codec, and the
@@ -69,7 +68,11 @@ pub struct Note4Board {
     /// comment for why defaulting to "empty" is actively wrong.
     last_battery_percent: Option<u8>,
     pub display: EpdClient,
-    pub rtc: Pcf8563,
+    /// The shared I2C0 bus (RTC + audio codec + NFC). The PCF8563 driver
+    /// lives on the RTC executor task; `main` spawns that executor from a
+    /// clone of this bus handle right after `Note4Board::take`, and the
+    /// audio/NFC drivers hold their own clones.
+    pub i2c_bus: SharedI2c,
     /// One-shot wake interrupts for the idle loop (see `wake.rs`): the
     /// three nav keys resume the main loop's idle wait the moment they
     /// assert, instead of waiting out the 1 s poll. (The RTC alarm line is
@@ -266,14 +269,13 @@ impl Note4Board {
         let i2c = I2cDriver::new(peripherals.i2c0, pins.gpio47, pins.gpio48, &i2c_config)
             .context("failed to install I2C0 driver on GPIO47/48")?;
         let i2c_bus: SharedI2c = Arc::new(Mutex::new(i2c));
-        let mut rtc = Pcf8563::new(i2c_bus.clone(), PCF8563_ADDR);
-        rtc.probe().context("PCF8563 not responding on I2C bus")?;
-        // architecture requires the boot flow to read both AF and AIE
-        // before deciding what to do, and the state machine is the sole
-        // owner of the AF ACK. `main` reads them post-construction, packs
-        // them into a `BootSnapshot`, dispatches `Event::Boot`, and only
-        // then lets the state machine emit `AcknowledgeRtcAlarm` /
-        // `DisableRtcAlarm` (residue) effects. See `main::boot`.
+        // The PCF8563 driver and its registers are owned by the dedicated
+        // RTC executor task (`rtc_executor.rs`), not by the board: no code
+        // outside that single owner touches the RTC I2C registers. `main`
+        // spawns the executor from the shared bus right after
+        // `Note4Board::take`. The old `rtc.probe()` here is gone - probing
+        // now lives on the executor task, whose spawn awaits the probe
+        // result so a dead RTC still fails boot loudly.
 
         // ES8311 audio codec: I2S0 TX on GPIO14/15/38/45 (MCLK/BCLK/WS/DOUT),
         // speaker PA enabled on GPIO46, control registers over the I2C0 bus
@@ -330,7 +332,7 @@ impl Note4Board {
             adc,
             last_battery_percent: None,
             display,
-            rtc,
+            i2c_bus: i2c_bus.clone(),
             wake,
             audio,
             nfc,

@@ -9,7 +9,8 @@ use esp_idf_svc::systime::EspSystemTime;
 use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use heapless::String as HeaplessString;
 
-use crate::rtc::{DateTime, Pcf8563};
+use crate::rtc::DateTime;
+use crate::rtc_executor::RtcExecutor;
 use crate::storage::WifiCreds;
 use crate::watchdog;
 
@@ -301,8 +302,9 @@ pub fn ntp_sync_epoch() -> Result<u64> {
 }
 
 /// Starts the SNTP client, waits for the first sync and pushes the obtained
-/// time into the PCF8563 RTC.
-pub fn ntp_sync_and_set_rtc(rtc: &mut Pcf8563, timezone_offset_minutes: i16) -> Result<()> {
+/// time into the PCF8563 RTC through its executor client (the only owner
+/// of the RTC driver).
+pub fn ntp_sync_and_set_rtc(rtc: &RtcExecutor, timezone_offset_minutes: i16) -> Result<()> {
     let epoch_secs = ntp_sync_epoch()?;
     let dt = DateTime::from_unix(epoch_secs).shifted_minutes(timezone_offset_minutes as i32);
     rtc.write_time(&dt)

@@ -247,7 +247,7 @@ fn dispatch_inner(
         }
 
         Command::ClearAlarms => match ctx.alarm_store.save(&[]) {
-            Ok(()) => match ctx.board.rtc.clear_alarm() {
+            Ok(()) => match ctx.rtc.disable() {
                 Ok(()) => {
                     log::info!("USB/BLE control: all alarms cleared");
                     Reply::Ok
@@ -269,21 +269,20 @@ fn dispatch_inner(
             }
             let old_offset = ctx.counters.timezone_offset_minutes().unwrap_or(0);
             let adjusted = ctx
-                .board
                 .rtc
                 .read_time()
                 .map(|dt| dt.shifted_minutes((offset_minutes - old_offset) as i32));
             // Commit the hardware clock first. Persisting the new offset
             // before this write would make a retry calculate a zero delta
             // after an RTC failure, permanently leaving the two out of sync.
-            match adjusted.and_then(|dt| ctx.board.rtc.write_time(&dt)) {
+            match adjusted.and_then(|dt| ctx.rtc.write_time(&dt)) {
                 Ok(()) => match ctx.counters.save_timezone_offset_minutes(offset_minutes) {
                     Ok(()) => Reply::Ok,
                     Err(err) => {
                         // Best-effort rollback keeps the RTC consistent with
                         // the still-persisted old offset.
-                        if let Ok(dt) = ctx.board.rtc.read_time() {
-                            let _ = ctx.board.rtc.write_time(
+                        if let Ok(dt) = ctx.rtc.read_time() {
+                            let _ = ctx.rtc.write_time(
                                 &dt.shifted_minutes((old_offset - offset_minutes) as i32),
                             );
                         }

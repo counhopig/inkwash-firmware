@@ -92,15 +92,15 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
             }
-            Effect::ProgramRtcAlarm(regs) => match self.ctx.board.rtc.set_alarm(regs) {
+            Effect::ProgramRtcAlarm(regs) => match self.ctx.rtc.program(regs) {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed)),
                 Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),
             },
-            Effect::DisableRtcAlarm => match self.ctx.board.rtc.clear_alarm() {
+            Effect::DisableRtcAlarm => match self.ctx.rtc.disable() {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed)),
                 Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),
             },
-            Effect::AcknowledgeRtcAlarm => match self.ctx.board.rtc.ack_alarm() {
+            Effect::AcknowledgeRtcAlarm => match self.ctx.rtc.acknowledge() {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::AckDone)),
                 Err(err) => Err((EffectCategory::Ack, format!("{err:#}"))),
             },

@@ -1,7 +1,7 @@
 //! Multi-alarm store, backed by one NVS blob. The PCF8563 only has a single
-//! live hardware alarm slot, so `program_hardware_alarm` always figures out
-//! which stored alarm is chronologically nearest and reprograms the RTC to
-//! just that one - see `rtc::Pcf8563::set_alarm`.
+//! live hardware alarm slot, so `program_hardware_alarm_via` always figures
+//! out which stored alarm is chronologically nearest and reprograms the RTC
+//! to just that one through the executor - see `rtc::Pcf8563::set_alarm`.
 
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
@@ -14,7 +14,7 @@ use crate::board::Note4Board;
 use crate::button::POLL_INTERVAL_MS;
 use crate::canvas::Canvas;
 use crate::nvs_blob::{read_blob, write_blob, DirtySet};
-use crate::rtc::{AlarmRegs, DateTime, Pcf8563};
+use crate::rtc::DateTime;
 use crate::usb_console::{reject_pending_command, UsbConsole};
 use crate::{ui, watchdog};
 
@@ -29,11 +29,10 @@ const BLOB_BUF_LEN: usize = 1024;
 const MAX_RING_SECS: u64 = 300;
 
 /// `Repeat`/`StoredAlarm` and every pure ordering/recurrence/ID-allocation
-/// function below (down to `program_hardware_alarm`) live in `inkwash-logic`
-/// so they can be unit-tested on the host - this crate is the single source
-/// of truth, re-exported here so every existing `alarms::Repeat` /
-/// `alarms::StoredAlarm` / `alarms::next_due` (etc.) call site keeps working
-/// unchanged.
+/// function live in `inkwash-logic` so they can be unit-tested on the host
+/// — this crate is the single source of truth, re-exported here so every
+/// existing `alarms::Repeat` / `alarms::StoredAlarm` / `alarms::next_due`
+/// call site keeps working unchanged.
 pub use inkwash_logic::alarm_schedule::{
     date_from_days, days_since_epoch, days_until, next_due, next_id, next_occurrence_date, Repeat,
     StoredAlarm,
@@ -204,84 +203,46 @@ pub fn maintenance_wakeup_delay(alarms: &[StoredAlarm], now: &DateTime) -> Optio
 }
 
 /// Reprograms the PCF8563's single hardware alarm slot to whichever stored
-/// alarm is nearest, or clears it if none are enabled. Call after boot,
-/// after any alarm-list edit, and immediately after acking a fired alarm.
-pub fn program_hardware_alarm(
-    rtc: &mut Pcf8563,
+/// alarm is nearest, or clears it if none are enabled. All RTC I2C goes
+/// through the executor client (`rtc_executor::RtcExecutor`) — the only
+/// owner of the driver — so this function takes the client instead of a
+/// `&mut Pcf8563`.
+pub fn program_hardware_alarm_via(
+    rtc: &crate::rtc_executor::RtcExecutor,
     alarms: &[StoredAlarm],
     now: &DateTime,
 ) -> Result<()> {
     match next_due(alarms, now) {
         Some(alarm) => {
-            let day: Option<u8>;
-            let weekday: Option<u8>;
-            match &alarm.repeat {
-                Repeat::Daily => {
-                    day = None;
-                    weekday = None;
+            // The once-outside-month case (defer arm to avoid a false ring)
+            // and the register fields for each repeat are pure logic in
+            // inkwash-logic; issue the executor command for the target.
+            let regs = inkwash_logic::alarm_schedule::alarm_regs_for(alarm, now);
+            match regs {
+                Some(regs) => {
+                    rtc.program(&regs)?;
+                    log::info!(
+                        "Hardware alarm armed via executor: id={} {:02}:{:02} ({:?})",
+                        alarm.id,
+                        alarm.hour,
+                        alarm.minute,
+                        alarm.repeat
+                    );
                 }
-                Repeat::Weekly { .. } => {
-                    // The PCF8563 supports weekday matching, so arm the
-                    // next covered weekday; every ring is re-programmed by
-                    // the ack-and-rearm flow, so it can't keep firing on
-                    // later weeks that don't contain a nearer alarm.
-                    let (_, _, _, dow) =
-                        next_occurrence_date(&alarm.repeat, alarm.hour, alarm.minute, now);
-                    day = None;
-                    weekday = Some(dow);
+                None => {
+                    log::info!(
+                        "Once alarm id={} is outside the current month ({:04}-{:02}); deferring hardware arm to avoid an early false ring",
+                        alarm.id,
+                        now.year,
+                        now.month
+                    );
+                    rtc.disable()?;
                 }
-                Repeat::Monthly { .. } => {
-                    let (_, _, day_of_month, _) =
-                        next_occurrence_date(&alarm.repeat, alarm.hour, alarm.minute, now);
-                    day = Some(day_of_month);
-                    weekday = None;
-                }
-                Repeat::Once {
-                    year,
-                    month,
-                    day: d,
-                } => {
-                    // The PCF8563 alarm slot has no month/year register - it
-                    // only compares day-of-month, hour, and minute. Arming
-                    // `day` while `now` is outside the alarm's target month
-                    // would make the chip fire on this month's (or an
-                    // earlier month's) occurrence of that day-of-month,
-                    // ringing the alarm months before the real date. Only
-                    // arm the hardware once we're actually in the target
-                    // month; otherwise leave the slot cleared until a later
-                    // boot/sync/edit re-evaluates (periodic auto-sync calls
-                    // this function on every successful sync, so a
-                    // configured device re-checks at least that often).
-                    if now.year == *year && now.month == *month {
-                        day = Some(*d);
-                        weekday = None;
-                    } else {
-                        log::info!(
-                            "Once alarm id={} scheduled for {:04}-{:02}-{:02} {:02}:{:02} is outside the current month ({:04}-{:02}); deferring hardware arm to avoid an early false ring",
-                            alarm.id, year, month, d, alarm.hour, alarm.minute, now.year, now.month
-                        );
-                        rtc.clear_alarm()?;
-                        return Ok(());
-                    }
-                }
-            };
-            rtc.set_alarm(&AlarmRegs {
-                minute: alarm.minute,
-                hour: alarm.hour,
-                day,
-                weekday,
-            })?;
-            log::info!(
-                "Hardware alarm armed: id={} {:02}:{:02} ({:?})",
-                alarm.id,
-                alarm.hour,
-                alarm.minute,
-                alarm.repeat
-            );
+            }
         }
         None => {
-            rtc.clear_alarm()?;
-            log::info!("No enabled alarms; hardware alarm cleared");
+            rtc.disable()?;
+            log::info!("No enabled alarms; hardware alarm cleared via executor");
         }
     }
     Ok(())

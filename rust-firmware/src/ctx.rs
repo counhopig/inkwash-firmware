@@ -73,6 +73,10 @@ impl SyncScheduler {
 /// and threaded through the UI/sync/control layers by reference.
 pub struct DeviceContext<'a> {
     pub board: &'a mut Note4Board,
+    /// RTC executor client: the only way business/UI code reaches the RTC.
+    /// The PCF8563 driver itself lives on the executor task
+    /// (`rtc_executor.rs`); `DeviceContext` never holds a `Pcf8563`.
+    pub rtc: &'a crate::rtc_executor::RtcExecutor,
     pub counters: &'a PersistedCounters,
     /// Handle to the sync task, which owns the process's one `WifiManager`
     /// (replaces the old direct `wifi_mgr` field - see `sync_task.rs`).
@@ -136,7 +140,7 @@ impl DeviceContext<'_> {
             return (false, false);
         };
         let changes_visible_state = !matches!(cmd, Command::GetStatus);
-        let fresh_now = self.board.rtc.read_time().ok();
+        let fresh_now = self.rtc.read_time().ok();
         let reply = control::dispatch(
             self,
             control::Channel::Usb,
@@ -173,7 +177,7 @@ impl DeviceContext<'_> {
         let runtime_outcome =
             if self.sync_scheduler.last_ui_poll.elapsed() >= Duration::from_secs(1) {
                 self.sync_scheduler.last_ui_poll = Instant::now();
-                match self.board.rtc.read_time() {
+                match self.rtc.read_time() {
                     Ok(fresh) => self.poll_runtime(&fresh),
                     Err(err) => {
                         log::warn!("RTC read failed in UI background poll: {err}");
@@ -456,7 +460,7 @@ impl DeviceContext<'_> {
                         None
                     } else {
                         log::info!("Urgent message available; dispatching full sync");
-                        match self.board.rtc.read_time() {
+                        match self.rtc.read_time() {
                             Ok(now) => {
                                 if let Err(err) =
                                     self.start_sync(OpSource::Internal, now, Command::SyncNow)
@@ -496,10 +500,10 @@ impl DeviceContext<'_> {
         if outcome.is_ok() {
             // The sync task saved the merged alarm list to NVS; re-point
             // the PCF8563's single alarm slot at the new nearest alarm.
-            match self.board.rtc.read_time() {
+            match self.rtc.read_time() {
                 Ok(now) => {
                     match self.alarm_store.load().and_then(|list| {
-                        crate::alarms::program_hardware_alarm(&mut self.board.rtc, &list, &now)
+                        crate::alarms::program_hardware_alarm_via(self.rtc, &list, &now)
                     }) {
                         Ok(()) => {}
                         Err(err) => {
@@ -515,7 +519,7 @@ impl DeviceContext<'_> {
             if let Some(epoch) = ntp_epoch {
                 let tz = self.counters.timezone_offset_minutes().unwrap_or(0);
                 let dt = DateTime::from_unix(epoch).shifted_minutes(tz as i32);
-                match self.board.rtc.write_time(&dt) {
+                match self.rtc.write_time(&dt) {
                     Ok(()) => {
                         log::info!("NTP alignment applied to RTC");
                         if let Err(err) = self.counters.set_rtc_align_epoch(epoch) {
@@ -598,10 +602,10 @@ fn reply_for_outcome(outcome: &Result<SyncOutcome>) -> Reply {
     }
 }
 
-/// Single `AlarmHost` adapter over the real RTC + shared runner. Borrows
-/// `&mut DeviceContext` once so `AlarmPoll::poll` runs the exact
-/// orchestration the host harness drives, reading real AF/AIE/time and
-/// forwarding through the shared `AppRunner` / `pending_renders`.
+/// Single `AlarmHost` adapter over the RTC executor + shared runner.
+/// Borrows `&mut DeviceContext` once so `AlarmPoll::poll` runs the exact
+/// orchestration the host harness drives; RTC facts come from the executor
+/// client (the sole owner), never from a direct `board.rtc` access.
 struct CtxAlarmHost<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
@@ -611,29 +615,15 @@ struct CtxAlarmHost<'a, 'ctx> {
 impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
     fn alarm_flag(&mut self) -> Result<bool, String> {
         self.ctx
-            .board
             .rtc
-            .alarm_flag()
+            .alarm_status()
+            .map(|status| status.alarm_flag)
             .map_err(|e| format!("{e:#}"))
     }
     fn read_snapshot(&mut self) -> Result<inkwash_logic::app::RtcAlarmSnapshot, String> {
-        let now = self
-            .ctx
-            .board
-            .rtc
-            .read_time()
-            .map_err(|e| format!("{e:#}"))?;
-        let aie = self
-            .ctx
-            .board
-            .rtc
-            .alarm_interrupt_enabled()
-            .map_err(|e| format!("{e:#}"))?;
-        Ok(inkwash_logic::app::RtcAlarmSnapshot {
-            now,
-            alarm_flag: true,
-            alarm_interrupt_enabled: aie,
-        })
+        // The executor returns a consistent (time, AF, AIE) snapshot and
+        // honors its own duplicate latch while AF stays asserted.
+        self.ctx.rtc.snapshot().map_err(|e| format!("{e:#}"))
     }
     fn snapshot_ready(&mut self, snapshot: inkwash_logic::app::RtcAlarmSnapshot) -> bool {
         let last_clock = self.runner.borrow().last_clock();
