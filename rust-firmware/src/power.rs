@@ -163,13 +163,11 @@ pub fn wake_cause() -> WakeCause {
 ///   here for the periodic wakeups (the main loop's idle cadence drives
 ///   them).
 ///
-/// USB-Serial-JTAG cannot wake light sleep on ESP32-S3: no such API
-/// exists in IDF 5.5 (`SOC_USB_SERIAL_JTAG_SUPPORT_LIGHT_SLEEP` is unset
-/// on every chip; TODO IDF-6395). USB commands arriving while asleep sit
-/// in the controller FIFO until the next periodic wake (<= 1 s at the
-/// idle cadence), and opening the serial port resets the chip anyway
-/// (development-guide.md §13), so the desktop tool always starts from an
-/// awake boot.
+/// USB-Serial-JTAG cannot wake light sleep on ESP32-S3. The sdkconfig option
+/// `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION` makes IDF hold its own
+/// `ESP_PM_NO_LIGHT_SLEEP` lock while a real host sends USB SOF packets, so
+/// an attached desktop tool or log collector remains usable. With no host
+/// (battery or charge-only cable), automatic light sleep works normally.
 ///
 /// Call once at boot, after the board and Wi-Fi bring-up (Wi-Fi being
 /// disconnected is a precondition for actually sleeping; the config below
@@ -205,6 +203,17 @@ pub fn configure_light_sleep() -> Result<()> {
 
     log::info!("Light sleep armed: keys GPIO0/18/39 wake");
     Ok(())
+}
+
+/// True while USB Serial/JTAG receives SOF packets from a real USB host.
+/// A charge-only source has no SOF traffic and therefore returns false.
+///
+/// IDF's connection monitor is linked because USB Serial/JTAG is the active
+/// console. In addition to IDF's automatic-light-sleep lock, the main loop
+/// uses this signal to avoid explicitly entering deep sleep under an active
+/// debugging/control connection.
+pub fn usb_host_connected() -> bool {
+    unsafe { esp_idf_svc::sys::usb_serial_jtag_is_connected() }
 }
 
 /// RAII block on automatic light sleep: an `esp_pm` `ESP_PM_NO_LIGHT_SLEEP`

@@ -86,7 +86,14 @@ GPIO 26-37 are occupied by Octal PSRAM and must not be used as ordinary GPIOs.
 
 ### Deep-Sleep Tier (Automatic)
 
-The firmware has two sleep tiers: light sleep engages automatically whenever the main loop is idle (both cores idle past `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`), and after **5 minutes** without user activity the device drops to deep sleep for µA-level idle power. Deep-sleep wake sources:
+The firmware has two sleep tiers: light sleep engages automatically whenever
+the main loop is idle (both cores idle past
+`CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`), and after **5 minutes** without user
+activity the device drops to deep sleep for µA-level idle power. While a real
+USB host is connected, `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION` blocks automatic
+light sleep and the main loop pauses its explicit deep-sleep timer so logs and
+the control protocol remain connected. A charge-only source sends no USB SOF
+packets and does not block either sleep tier. Deep-sleep wake sources:
 
 | Source | Pin | Notes |
 | --- | --- | --- |
@@ -97,7 +104,12 @@ The firmware has two sleep tiers: light sleep engages automatically whenever the
 
 **Deep-sleep limitations (by hardware):**
 - **UP (GPIO39) cannot wake deep sleep.** GPIO39 is not an RTC-capable pin, so it is the one nav key excluded from the ext1 wake mask (`power.rs:89` masks GPIO0|GPIO5|GPIO18). ENTER and DOWN both wake deep sleep; UP is light-sleep-only. Users must press ENTER or DOWN to resume from deep sleep.
-- **USB cannot wake deep sleep.** USB-Serial-JTAG has no light- or deep-sleep wake path on ESP32-S3 (IDF-6395); a USB command sent while asleep waits for the next periodic wake (≤1 s in light sleep) or, from deep sleep, for the host to reopen the serial port - opening/closing the port resets the chip (see §13), so the desktop tool always starts from a fresh, awake boot. The tool's command timeout (35/45 s) covers the reset + boot.
+- **USB cannot wake deep sleep.** USB-Serial-JTAG has no light- or deep-sleep
+  wake path on ESP32-S3. The firmware therefore does not enter either sleep
+  tier while a real USB host is connected. If USB is attached only after the
+  device is already in deep sleep, press ENTER/DOWN or reset/re-plug it first;
+  opening the serial port may reset the chip (see §13). The desktop tool's
+  35/45 s timeout covers a fresh boot.
 - The maintenance timer wake boots into the normal loop; the aligned sync scheduler then fires at the next :00/:30 boundary, so scheduled syncs survive deep sleep.
 
 See `rust-firmware/src/power.rs` (`enter_deep_sleep_with_wakeups`) and `rust-firmware/src/main.rs` (the deep-sleep tier in the main loop).
@@ -205,14 +217,22 @@ espflash board-info --port /dev/ttyACM0
 Full backup:
 
 ```bash
-espflash save-image \
-  --port /dev/ttyACM0 --chip esp32s3 \
-  --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
+mkdir -p backups
+esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 \
+  read_flash 0x0 0x1000000 \
   backups/note4-factory-$(date +%Y%m%d-%H%M%S).bin
-sha256sum backups/*.bin > backups/SHA256SUMS
+sha256sum backups/note4-factory-*.bin > backups/SHA256SUMS
 ```
 
-The expected size of `backups\note4-factory-YYYYMMDD-HHMMSS.bin` is `16777216` bytes. The backup and SHA-256 should be copied to at least one physically isolated location.
+On macOS, replace `/dev/ttyACM0` with `/dev/cu.usbmodem*` and use
+`shasum -a 256` if `sha256sum` is unavailable. The expected size of
+`backups/note4-factory-YYYYMMDD-HHMMSS.bin` is exactly `16777216` bytes.
+Read it a second time to a different file and require identical SHA-256
+values before treating it as a recovery image. Copy the verified backup and
+hash to at least one physically isolated location.
+
+`espflash save-image` does **not** read a connected device: it converts a
+local ELF into a flashable image. Do not use it for factory backup.
 
 ## 7. Building the Rust Firmware
 
@@ -240,6 +260,7 @@ Run from the repository root:
 ```bash
 espflash flash \
   --port /dev/ttyACM0 \
+  --before usb-reset \
   --chip esp32s3 \
   --flash-size 16mb \
   --flash-mode dio \
@@ -251,6 +272,46 @@ espflash monitor --port /dev/ttyACM0
 ```
 
 Exit the monitor with `Ctrl+C`. If flashing fails, exit the monitor first, then rerun the flash command.
+NOTE4 uses the ESP32-S3 USB-Serial-JTAG peripheral; `--before usb-reset` is
+the verified reset sequence. If automatic connection still fails, keep USB
+connected, hold the voice/ENTER button (BOOT), press the left-side RESET
+pinhole once, release BOOT, and retry. This is the same manual download-mode
+sequence documented by the official ZECTRIX updater.
+
+### Browser flashing with the official ZECTRIX tool
+
+The official updater accepts a `.bin` at address `0x0000`, while this
+repository's normal build artifact is an ELF. Generate a complete merged
+image containing the bootloader, partition table, and application:
+
+```bash
+espflash save-image \
+  --chip esp32s3 \
+  --flash-size 16mb \
+  --flash-mode dio \
+  --flash-freq 80mhz \
+  --partition-table rust-firmware/partitions.csv \
+  --merge \
+  rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4 \
+  inkwash-note4-merged.bin
+
+wc -c inkwash-note4-merged.bin
+sha256sum inkwash-note4-merged.bin
+```
+
+The byte count must be `16777216`. Open the
+[official ZECTRIX firmware updater](https://zectrix.com/firmware-updater.html)
+in a current desktop Chrome or Edge, connect the NOTE4 directly with a data
+cable, choose `inkwash-note4-merged.bin`, keep the default write address
+`0x0000`, and keep **Preserve device settings** enabled unless the test
+explicitly requires a clean NVS. Keep the page open, USB attached, and the
+computer awake until the tool reports both installation and restart complete.
+
+The browser operates locally and uses Web Serial; Safari and Firefox are not
+supported. Never select a NOTE4C image or change the write address for the
+merged image. If settings backup fails, cancel and investigate before the
+first test flash; continuing without preservation is only appropriate after
+the device-specific full backup in §6 has been verified.
 
 ### Success Criteria
 
@@ -404,6 +465,107 @@ A `Status { ... }` reply proves the freshly-flashed firmware booted and
 is polling commands; the CLI also echoes the recent boot log lines
 alongside the reply.
 
+### Watching logs on a running device without disturbing it
+
+The board's USB-Serial/JTAG peripheral shares its modem-control lines
+(DTR/RTS) with GPIO0 - the ENTER button and the boot-mode strap - so
+*how* a host tool opens the port decides whether the device keeps
+running or gets a spurious keypress, a reset, or a stuck download-mode
+entry. These rules are load-bearing for any interactive debugging
+session; they were learned the hard way during migration smoke tests
+(see `control-protocol.md` for the underlying wiring and
+`inkwash-desktop/src/transport/usb.rs` for the reference
+implementation):
+
+For agent-driven tests, use the repository's non-interactive collector instead
+of `espflash monitor`:
+
+```bash
+mkdir -p test-results
+python3 scripts/capture-serial.py \
+  --duration 420 \
+  --output test-results/note4-serial.log \
+  --expect 'Inkwash NOTE4 Rust bring-up starting' \
+  --expect 'EPD refresh completed'
+```
+
+It requires `pyserial`, runs without a TTY, timestamps every line in UTC,
+releases DTR/RTS **before** opening the device, reconnects after USB
+re-enumeration, and exits by itself. A missing `--expect` pattern makes the
+command fail, so an agent cannot mistake an empty log for a passing test. Pass
+`--port /dev/cu.usbmodem1101` when more than one serial device is connected;
+otherwise the script auto-detects `/dev/cu.usbmodem*` and `/dev/ttyACM*`.
+
+Opening this board's USB Serial/JTAG port can still produce
+`rst:0x15 (USB_UART_CHIP_RESET)` even when DTR/RTS were set inactive before
+`open()`; this was reproduced with the collector on 2026-09-02. Treat a
+collector session as the start of a fresh boot unless the captured reset reason
+proves otherwise. It is suitable for boot and post-boot smoke evidence, but it
+cannot prove that a previously running uptime/soak session survived, and an
+automatic reconnect can contaminate deep-sleep or maintenance-wake evidence.
+Use photos/video, the displayed clock/action, and the final reset reason for
+those tests; do not claim a non-disruptive sleep/soak pass from USB logs alone.
+
+The collector is read-only and must not run at the same time as flashing or an
+`inkwash-desktop` USB command because a serial port has one owner. For a smoke
+test, use this evidence sequence:
+
+1. Flash the image and wait for the flasher to release the port.
+2. Run `inkwash-desktop --status <port> > test-results/status.txt 2>&1`. The
+   status command supplies the revision and recent boot lines even if the
+   collector missed the first two seconds.
+3. Start `capture-serial.py` for the bounded test window, then perform physical
+   button, sleep, alarm, or display actions. Do not run another USB command
+   until capture exits.
+4. Evaluate the log with explicit `--expect` expressions or `rg`; preserve the
+   log and command exit status in the test record. Log silence is a failed or
+   blocked evidence step, never a pass.
+
+The lower-level rules remain:
+
+1. **Release DTR and RTS before opening the port, but do not assume this makes
+   opening non-disruptive.**
+   Host defaults vary (pyserial asserts DTR by default, and on some
+   platforms opening alone asserts both lines). Asserting either pulls
+   GPIO0 low, which the firmware cannot distinguish from a real ENTER
+   press - the device may open a menu, dismiss an alarm, or appear to
+   "not respond" while it is actually busy handling your fake press.
+   Desktop releases them immediately after `open()`:
+   `write_data_terminal_ready(false)` + `write_request_to_send(false)`.
+   The collector creates a closed `Serial(port=None)`, sets both values false,
+   and only then calls `open()`. This reduces one known reset source, but the
+   macOS/USB stack can still cause `USB_UART_CHIP_RESET`; always inspect the
+   captured reset reason.
+
+2. **Do not run `espflash monitor` / `board-info` / `reset` against a
+   device that is running application firmware you want to keep alive.**
+   These tools connect through the ROM bootloader and upload a flash
+   stub, which halts or wedges the running app (observed: a live device
+   went unresponsive until physically re-plugged). They are for
+   flashing and bootloader-level checks, not for observing a running
+   system.
+
+3. **Do not require the raw collector to prove early boot.** The app prints
+   its banner during the small gap between flashing and reopening the port.
+   Use `inkwash-desktop --status` for the buffered recent boot lines and use
+   the collector for subsequent runtime events. If an unbuffered ROM/early
+   boot line is essential, run `espflash flash --monitor` from a real PTY and
+   treat that as a separate, interactive diagnostic run.
+
+4. **Prefer `inkwash-desktop` for talking to a live device.** Its USB
+   transport already implements rules 1 and 2, and `--status` /
+   `--sync` exercise the real control protocol. Write a throwaway
+   pyserial reader only when you need raw log bytes and cannot use the
+   desktop CLI.
+
+5. **When a reset is genuinely required while the app is running,
+   use the physical ENTER/BOOT button** (hold it and trigger a reset to
+   enter download mode) rather than a tool's DTR/RTS reset - the strap
+   is what the ROM bootloader expects, and it avoids the spurious-press
+   side effects above. After any tool-induced reset the USB node may
+   vanish for several seconds or need a physical re-plug; that is the
+   USB-JTAG re-enumerating, not necessarily a dead board.
+
 ### Powers off shortly after power-on
 
 `GPIO17` is the main power soft latch. It must be configured as a high output early in boot. An RTC GPIO hold must also be designed before entering deep sleep, otherwise the device may truly power off.
@@ -430,115 +592,192 @@ Do not commit `sdkconfig`, build directories, factory backups, or logs containin
 
 For each new peripheral, run standalone tests first, then integrate it into the main application. Display, power, and sleep changes carry the highest risk; always keep a recoverable serial path and the factory backup.
 
-## 13. Hardware Smoke-Test Checklist
+## 13. Physical-Hardware Test Procedure
 
-A repeatable checklist for exercising boot, sync, alarm, and BLE/USB
-recovery on a physical NOTE4 after flashing. This is the manual counterpart
-to `logic/`'s host-runnable tests: the `logic` crate locks down the *pure*
-scheduling, validation, and dedup rules on every commit without hardware;
-this checklist is for everything those tests cannot reach - real I2C
-timing, real Wi-Fi association, real flash wear, real button debounce, a
-real watchdog.
+This procedure is the release gate for behavior that host tests cannot
+exercise: power retention, USB reset behavior, I2C peripherals, the real EPD
+waveform, RTC wake, audio, Wi-Fi/BLE radios, and NVS persistence. Run the
+quick gate after every firmware flash. Run the affected feature stages after
+changes to their modules, and run the full gate before a release.
 
-Run this after any change touching `sync.rs`, `wifi.rs`, `alarms.rs`,
-`reminders.rs`, `ctx.rs`, `main.rs`, `ble_control.rs`, or `usb_console.rs`.
-Record the flashed revision (`git describe`, logged once at boot as
-`GIT_REV`) alongside results.
+### 13.1 Test record and stop rules
 
-### Flash and boot
+Create one result record per device and build. Record:
 
-- [ ] Build in release mode; flash via `scripts/build-rust.sh` /
-      `espflash flash --monitor` in DIO mode, 80 MHz, 16 MB flash. NOTE4
-      only - NOTE4C and QIO mode are forbidden (see §2 Safety Matters).
-- [ ] Boot log shows: power latch high, RTC read (or a clear reseed-from-VL
-      message), display full refresh, Wi-Fi stack init - with **no**
-      watchdog reset or panic anywhere in the sequence.
-- [ ] `GIT_REV` in the first boot log lines matches the commit under test
-      (not the stale ESP-IDF `App version` field).
+| Field | Required value |
+| --- | --- |
+| Device | NOTE4 black-and-white; device label or MAC; never a NOTE4C |
+| Build | `git rev-parse HEAD`, `git describe --always --dirty`, merged-bin SHA-256 |
+| Flash | CLI or official browser updater; whether settings were preserved |
+| Network | AP model/security mode; server version or commit |
+| Times | start/end time and timezone |
+| Evidence | boot log, photos of display/alarm, command results, failure timestamps |
 
-### Wi-Fi and sync
+Stop the run immediately and restore or diagnose before further refreshes if
+the device power-cycles repeatedly, boot reports QIO, the EPD BUSY line never
+finishes, the panel shows abnormal sustained noise rather than a normal flash,
+the enclosure becomes hot, or the flashed revision differs from the test
+record. Do not repeatedly power-cycle or refresh the EPD to “see if it clears.”
 
-- [ ] `set_wifi` (USB) against a real AP saves only after a successful
-      DHCP-timeout-free connect; a bad SSID/password is rejected without
-      corrupting the previously-saved credentials.
-- [ ] `sync_now` (USB, or the on-device menu) completes and applies
-      alarms/todos/inbox; confirm via `get_status` or the on-device list.
-- [ ] A **second** sync in the same boot session (USB `sync_now` again, or
-      wait for the next urgent-poll boundary) also completes - regression
-      guard for the old "second connect crashes" class of bug (see
-      `wifi.rs`'s `WifiManager` doc comment).
-- [ ] If testing the PMF workaround: connect to a PMF-required or
-      PMF-optional AP that previously failed with `assoc -> init` right
-      after `Wi-Fi connected`; confirm it now associates and reaches DHCP.
-- [ ] **Long soak** (leave running, do not skip this one): let the device
-      idle through several hours' worth of urgent-poll and full-sync
-      boundaries in one boot session (no reboot). Watch for a task-watchdog
-      abort; a clean multi-hour run with dozens of sync cycles and no reset
-      is the bar for calling any soak-related item fixed, not just "not
-      observed yet in 20 minutes."
+Use one continuous log session when raw logs are required. Opening or reopening
+serial tools can reset this board and invalidates pre-existing sleep, wake,
+uptime, and alarm evidence.
+For agent-driven evidence, use the bounded `scripts/capture-serial.py` command
+from §11 and list required `--expect` patterns before starting the stage. Do
+not run `inkwash-desktop`, `espflash`, or a second reader while it owns the
+port. Use `inkwash-desktop --status <port>` and `--sync <port>` only between
+capture windows; reserve `espflash monitor` and `board-info` for the
+flash/debug boundary described in §11.
 
-### Alarms
+### 13.2 Stage A — preparation and image gate
 
-- [ ] Arm a one-shot (`Once`) alarm a few minutes out; let it fire from
-      **deep sleep** (device asleep when the RTC alarm triggers, not
-      already awake) - this exact path (`main.rs`'s `alarm_fired_at_boot`)
-      has historically been the least-tested wake path.
-- [ ] ENTER dismisses within ~1s of a short press; sound stops immediately.
-- [ ] AF flag is acknowledged and the fired one-shot is removed from the
-      store (`Alarm dismissed` -> `No enabled alarms; hardware alarm
-      cleared`, or the next alarm re-armed if more are enabled).
-- [ ] Arm a **recurring** (`Weekly`/`Monthly`/`Daily`) alarm, let it fire and
-      dismiss it, and confirm the hardware alarm slot is **re-armed** for
-      the next occurrence (not left cleared).
-- [ ] While the alarm is ringing, send a USB command and confirm
-      `{"status":"busy"}` comes back within a few seconds (not silence).
-- [ ] Repeat the busy-reply check over **BLE** (open the pairing screen in
-      another test run, or verify via the BLE reply-during-ring path) -
-      confirms BLE is no longer silent during a blocking screen.
+- [ ] Confirm the case/display is the black-and-white NOTE4 and match it to
+      the device-specific 16 MiB backup and SHA-256 from §6.
+- [ ] Run `cargo +esp fmt --manifest-path rust-firmware/Cargo.toml -- --check`,
+      `cd logic && cargo test --locked`, then `./scripts/build-rust.sh --release`.
+- [ ] For browser flashing, generate the merged image with §8 and require a
+      `16777216` byte file. Record its SHA-256 before selecting it in Chrome or
+      Edge. For CLI flashing, require DIO, 80 MHz, 16 MB, the repository
+      partition table, and `--before usb-reset`.
+- [ ] Close all other serial clients. Keep the computer awake and USB directly
+      connected until flash verification and restart complete.
 
-### Reminders
+**Pass:** checks/build succeed, artifact identity is recorded, and the flasher
+reports a verified write and restart. **Fail:** wrong model/image, size/hash
+mismatch, a settings-backup failure without an approved clean-NVS test, or any
+write/verify error.
 
-- [ ] A due, high-importance Todo triggers the full-screen reminder exactly
-      once per day, even across multiple boots on the same date.
-- [ ] An urgent (`Alert`, `High` priority) inbox item triggers the siren
-      reminder; dismiss with ENTER.
-- [ ] Both reminder types interrupt whichever screen is open (Calendar,
-      Settings, list/detail, BLE pairing) and return to a correctly redrawn
-      page afterward.
+### 13.3 Stage B — five-minute quick gate
 
-### BLE and USB recovery
+- [ ] Release the power key after boot; the device remains powered.
+- [ ] Boot shows `Inkwash NOTE4 Rust bring-up starting (git <rev>)`; `<rev>`
+      matches the recorded build. Confirm `mode:DIO`, a valid PCF8563 read (or
+      an explicit VL reseed), initial EPD refresh, and no panic/watchdog loop.
+- [ ] Home finishes one normal full refresh and shows a plausible clock,
+      battery, next-alarm, and Todo state. Full-refresh flashing/brief inversion
+      is normal; a permanently busy or noisy panel is not.
+- [ ] Short-press ENTER, UP, and DOWN once. Long-press UP or DOWN, navigate all
+      top-level pages, then return Home; no key sticks or phantom ENTER occurs.
+- [ ] Run `inkwash-desktop --status <port>` once. It returns `Status { ... }`
+      within the default 35 s timeout and echoes the expected boot revision.
+- [ ] Unplug USB, confirm battery operation, then reconnect once and repeat
+      `--status`. Verify retained configuration and a clean boot.
 
-- [ ] Open the BLE pairing screen, connect a client, send a command, get a
-      reply; leave the screen and confirm advertising stops (RAM reclaimed,
-      not left running).
-- [ ] Disconnect/reconnect BLE and unplug/replug USB repeatedly over a
-      longer session; confirm BLE teardown doesn't affect a later Wi-Fi
-      sync.
-- [ ] Opening the USB serial port with a naive client (default `pyserial`
-      `Serial(...)`, DTR/RTS not pre-cleared) resets the chip - expected,
-      not a regression; confirms the warning in [`control-protocol.md`](control-protocol.md)
-      is still accurate.
+**Pass:** all items pass without an unexplained reset. This is the minimum gate
+for any flashed build. A compile or successful write alone is not a hardware
+pass.
 
-### Capacity
+### 13.4 Stage C — Wi-Fi, sync, and persistence
 
-- [ ] Sync a maximal alarm list, Todo list, and Inbox (near NVS blob caps -
-      see `alarms::BLOB_BUF_LEN` / `todos::BLOB_BUF_LEN` /
-      `inbox::BLOB_BUF_LEN`); confirm pagination/truncation and no NVS
-      write failure, and check the e-paper for visible ghosting after
-      several full refreshes.
+- [ ] Save a deliberately invalid SSID/password through the desktop UI; require
+      an explicit failure. Reboot and confirm the previously valid credentials
+      still work.
+- [ ] Save the valid 2.4 GHz credentials, reach DHCP, and run
+      `inkwash-desktop --sync <port>`. Verify alarms, Todos, and Inbox both in
+      `--status` and on their device pages.
+- [ ] Change one server-side item, sync again in the **same boot**, and verify
+      the second result. This guards the historical second-connect failure.
+- [ ] Mark a supported local state change, sync, reboot, and sync again. Verify
+      the server merge and the device NVS state agree; no older payload replaces
+      the change.
+- [ ] If PMF behavior changed, repeat against the target PMF-required or
+      PMF-optional AP and require association plus DHCP.
+
+**Pass:** failure does not corrupt known-good credentials; two same-boot syncs
+and one rebooted persistence cycle converge without panic, watchdog, or lost
+state.
+
+### 13.5 Stage D — display, sleep, and wake
+
+- [ ] Leave the Home screen through at least two minute changes. Each displayed
+      minute advances and later EPD refreshes continue; capture
+      `EPD refresh completed` or documented full-recovery logs.
+- [ ] Disconnect the USB data host, then leave the device untouched for more
+      than five minutes. Confirm deep sleep from display behavior and the next
+      wake cause; an attached USB host intentionally blocks both sleep tiers.
+- [ ] Press UP only: it must not wake deep sleep (GPIO39 limitation). Press
+      ENTER, then repeat with DOWN in a separate sleep cycle; each wakes and
+      redraws a current Home screen.
+- [ ] Allow one maintenance-timer wake cycle. The displayed time must not remain
+      permanently frozen, and there must be no reset loop or EPD task stall.
+- [ ] Inspect the screen after several partial and full refreshes. Text remains
+      readable and ghosting clears on a full refresh.
+
+**Pass:** time continues advancing, ENTER/DOWN wake reliably, UP behavior
+matches the documented hardware limitation, and refresh processing does not
+stall after the first command.
+
+### 13.6 Stage E — offline alarm and reminder gate
+
+- [ ] Sync a one-shot (`Once`) alarm several minutes ahead, then disable Wi-Fi
+      or make the server unreachable and let the device enter deep sleep.
+- [ ] The RTC wakes the device and audio/display alarm begins at the scheduled
+      local time. Record scheduled and observed times; ENTER stops sound within
+      about one second.
+- [ ] Confirm the PCF8563 AF flag is acknowledged and the fired one-shot is
+      removed; logs show either the next alarm armed or the hardware alarm
+      cleared.
+- [ ] Repeat with one recurring `Daily`, `Weekly`, or `Monthly` alarm and verify
+      its next occurrence is re-armed after dismissal.
+- [ ] During a separate ringing run, send a USB command and require
+      `{"status":"busy"}` within a few seconds. If BLE control changed, repeat
+      the busy-response check over BLE.
+- [ ] Trigger a due high-importance Todo and an urgent `Alert`/`High` Inbox
+      reminder. Each fires once per intended rule, interrupts the current page,
+      dismisses with ENTER, and redraws that page correctly. Reboot on the same
+      date and confirm the Todo does not duplicate.
+
+**Pass:** the one-shot alarm rings entirely offline from deep sleep, dismissal
+clears/re-arms hardware state correctly, and reminder dedup survives reboot.
+Until this stage passes, alarm behavior must be reported as unverified on
+hardware.
+
+### 13.7 Stage F — BLE/USB recovery and capacity
+
+- [ ] Open the BLE pairing page, connect, send `get_status`, and receive a
+      reply. Leave the page and verify advertising stops; reconnect in a fresh
+      pairing session.
+- [ ] Perform three controlled USB unplug/replug cycles, running one `--status`
+      after each. Then perform BLE connect/disconnect and a Wi-Fi sync; all
+      transports remain usable.
+- [ ] Sync payloads near `alarms::BLOB_BUF_LEN`, `todos::BLOB_BUF_LEN`, and
+      `inbox::BLOB_BUF_LEN`. Verify the documented limit/truncation behavior,
+      pagination, successful NVS writes, and a clean reboot/readback.
+
+**Pass:** transport teardown does not poison the next transport or Wi-Fi, and
+near-limit state survives NVS persistence without silent loss.
+
+### 13.8 Stage G — soak and release decision
+
+- [ ] Leave the normal release configuration running for at least six hours,
+      spanning multiple urgent polls, full-sync boundaries, deep-sleep entries,
+      and maintenance wakes. Do not reopen/reset the serial port during the run.
+- [ ] At the end, record `--status`, displayed time, battery state, last
+      successful sync, and any reset reason. Perform one final manual sync and
+      one navigation pass.
+
+**Pass:** no panic, watchdog abort, unexplained reset, frozen clock, transport
+loss, or missed scheduled action. Mark each stage `PASS`, `FAIL`, or `BLOCKED`;
+`BLOCKED` is not a pass. A release is hardware-verified only when Stages A-G
+pass on the target NOTE4. For a narrow change, record exactly which stages were
+rerun and keep untouched stages tied to their most recent build/device record.
 
 ## 14. Restoring Factory Firmware
 
 Only use the full backup **of that specific device**:
 
 ```bash
-esptool.py -p /dev/ttyACM0 -b 921600 write_flash 0x0 backups/note4-factory-20260815-213553.bin
+esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 \
+  write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB \
+  0x0 backups/note4-factory-20260815-213553.bin
 ```
 
 After restoring, re-read the Flash or compute the backup file hash to confirm the correct image was used. Never write another device's or a NOTE4C's backup into this device.
 
 ## 15. References
 
+- ZECTRIX support and USB tool: <https://zectrix.com/support.html#firmware-updater>
+- ZECTRIX firmware updater: <https://zectrix.com/firmware-updater.html>
 - ZECTRIX open-source resources: <https://www.zectrix.com/open-source.html>
 - NOTE4 hardware specifications: <https://wiki.zectrix.com/zh/hardware/note/spec>
 - Firmware resources: <https://wiki.zectrix.com/zh/software/firmware>

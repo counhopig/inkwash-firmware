@@ -21,6 +21,7 @@ tools/*/*.png
 backups/*.bin
 tmp/*
 logs/
+test-results/
 
 # Python tooling
 *.pyc

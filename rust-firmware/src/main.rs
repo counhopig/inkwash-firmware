@@ -61,9 +61,10 @@ const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 /// 10 s boundary-detection granularity is fine for the :00/:30-aligned
 /// scheduler.
 const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Quiet time before the deep-sleep tier: after this
-/// long without *user* activity (clock-region refreshes do not count),
-/// the device enters deep sleep instead of idling in light sleep.
+/// Quiet time before the deep-sleep tier: after this long without *user*
+/// activity (clock-region refreshes do not count), and only when no USB host
+/// is connected, the device enters deep sleep instead of idling in light
+/// sleep.
 const DEEP_SLEEP_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Fallback maintenance wake when no future alarm needs a month-boundary
 /// wake: 10 minutes. Each wake boots, re-renders and refreshes just the
@@ -865,13 +866,26 @@ fn main() -> Result<()> {
             deep_sleep_since.get_or_insert(now);
         }
 
+        // A connected USB host is an active debugging/control session even
+        // when it is only reading logs and sends no command frames. IDF's
+        // CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION lock keeps automatic light
+        // sleep from breaking the USB peripheral; this matching guard keeps
+        // the firmware's explicit five-minute deep-sleep tier from doing the
+        // same. Clear the timer so disconnecting starts a fresh five-minute
+        // grace period instead of sleeping immediately.
+        let usb_host_connected = power::usb_host_connected();
+        if usb_host_connected {
+            deep_sleep_since = None;
+        }
+
         // Deep-sleep tier: after DEEP_SLEEP_AFTER of
-        // idle light sleep with no user activity and no Wi-Fi op in
+        // idle light sleep with no user activity, USB host, or Wi-Fi op in
         // flight, drop to deep sleep. Wake sources: ENTER (GPIO0), DOWN
         // (GPIO18), the RTC alarm line (GPIO5), and the maintenance timer.
-        // UP is not an RTC GPIO and cannot wake deep sleep - documented
-        // in development-guide.md.
+        // UP is not an RTC GPIO and cannot wake deep sleep - documented in
+        // development-guide.md.
         if idle
+            && !usb_host_connected
             && ctx.pending_wifi_op.is_none()
             && deep_sleep_since.is_some_and(|since| now.duration_since(since) >= DEEP_SLEEP_AFTER)
         {
