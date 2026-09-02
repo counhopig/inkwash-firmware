@@ -1,16 +1,17 @@
-//! Firmware-side `EffectExecutor` for the host-testable runner.
+//! Firmware-side `EffectExecutor` for the host-testable `Runtime`.
 //!
-//! The application-state driving engine (batch execution, EffectId
-//! allocation, AbortBatch semantics, completion feedback, async-kick
-//! collection, render-completion routing) lives in
-//! `inkwash_logic::runner` and is host-testable with a fake executor.
-//! This module provides the *real* executor: `EffectRunner` runs each
-//! `Effect` against `DeviceContext`'s drivers (RTC, NVS stores, audio,
-//! display, USB/BLE), plus the render/reply helpers it needs.
+//! The application-state driving engine (event queue, single
+//! `App::update` consumer, batch execution, EffectId allocation,
+//! AbortBatch semantics, completion feedback, async-kick collection,
+//! render-completion routing) lives in `inkwash_logic::runtime` and is
+//! host-testable with a fake executor. This module provides the *real*
+//! executor: `EffectRunner` runs each `Effect` against `DeviceContext`'s
+//! drivers (RTC, NVS stores, audio, display, USB/BLE), plus the
+//! render/reply helpers it needs.
 //!
-//! `AppRunner`, `AsyncKick`, `EffectOutcome`, `EffectCategory` and
-//! `err_for_category` are re-exported from `inkwash_logic::runner` so
-//! the firmware call sites (`main.rs`) are unchanged in spelling.
+//! `Runtime`, `AsyncKick`, `EffectOutcome`, `EffectCategory` and
+//! `err_for_category` come from `inkwash_logic`; this module re-exports
+//! the names the firmware call sites use.
 
 use anyhow::Result;
 
@@ -18,7 +19,8 @@ use inkwash_logic::app::{Effect, EffectOutput, RenderIntent, RenderRequest};
 use inkwash_logic::protocol::ControlReply;
 use inkwash_logic::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 
-pub use inkwash_logic::runner::{AppRunner, AsyncKick};
+pub use inkwash_logic::runner::AsyncKick;
+pub use inkwash_logic::runtime::Runtime as AppRunner;
 
 use crate::alarms::AlarmStore;
 use crate::control::{self, Reply};
@@ -26,7 +28,7 @@ use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
 
 /// Executes one `Effect` against the existing drivers, reporting the
-/// outcome back to `inkwash_logic::runner::AppRunner`.
+/// outcome back to the `inkwash_logic::runtime::Runtime` consumer.
 pub struct EffectRunner<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     last_clock: Option<DateTime>,

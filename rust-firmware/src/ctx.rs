@@ -638,32 +638,27 @@ impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
     fn snapshot_ready(&mut self, snapshot: inkwash_logic::app::RtcAlarmSnapshot) -> bool {
         let last_clock = self.runner.borrow().last_clock();
         let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
-        let ok = self
-            .runner
-            .borrow_mut()
-            .dispatch(
-                inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
-                &mut executor,
+        let mut runtime = self.runner.borrow_mut();
+        runtime.push(inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot));
+        let ok = runtime.pump(&mut executor);
+        drop(runtime);
+        ok.is_ok()
+            && matches!(
+                self.runner.borrow().state().screen,
+                inkwash_logic::app::Screen::AlarmRinging
             )
-            .is_ok();
-        if !ok {
-            return false;
-        }
-        matches!(
-            self.runner.borrow().state().screen,
-            inkwash_logic::app::Screen::AlarmRinging
-        )
     }
     fn dismiss(&mut self) {
         let last_clock = self.runner.borrow().last_clock();
         let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
-        let _ = self.runner.borrow_mut().dispatch(
-            inkwash_logic::app::Event::Button(inkwash_logic::button_event::ButtonEvent::Pressed),
-            &mut executor,
-        );
+        let mut runtime = self.runner.borrow_mut();
+        runtime.push(inkwash_logic::app::Event::Button(
+            inkwash_logic::button_event::ButtonEvent::Pressed,
+        ));
+        let _ = runtime.pump(&mut executor);
     }
     fn drain_kicks(&mut self) {
-        for kick in self.runner.borrow_mut().take_pending_kicks() {
+        for kick in self.runner.borrow_mut().take_kicks() {
             let mut reg = self.pending_renders.borrow_mut();
             if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
                 reg.register(kick);

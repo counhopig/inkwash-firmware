@@ -1,6 +1,6 @@
-//! Host fake harness for the generic `runner::AppRunner`.
+//! Host fake harness for the `runtime::Runtime` single-consumer loop.
 //!
-//! `runner::AppRunner` executes effect batches through a caller-provided
+//! `Runtime` executes effect batches through a caller-provided
 //! `EffectExecutor`. The firmware provides the real executor
 //! (`rust-firmware::app_runner::EffectRunner`) that drives
 //! `DeviceContext`; this module provides a recording fake so the full
@@ -13,7 +13,7 @@
 //! first N times (e.g. an RTC I2C glitch) to exercise the retry paths.
 //! Render effects return `AsyncWithId` with a caller-controlled request
 //! id, so the harness can drive EPD completions (including stale ones)
-//! through `AppRunner::feed_render_completion`.
+//! through the render-registry feed.
 
 use std::collections::BTreeMap;
 
@@ -21,7 +21,8 @@ use crate::alarm_flow::{AlarmHost, AlarmPoll};
 use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, RenderIntent, Screen};
 use crate::background_outcome::BackgroundOutcome;
 use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
-use crate::runner::{AppRunner, EffectCategory, EffectExecutor, EffectOutcome};
+use crate::runner::{EffectCategory, EffectExecutor, EffectOutcome};
+use crate::runtime::Runtime;
 
 /// Counts how many times each effect variant ran. Keyed by a stable
 /// string label so the harness can assert "ACK ran exactly once".
@@ -264,12 +265,12 @@ impl AlarmHost for FakeHostAdapter<'_> {
     }
 }
 
-/// Convenience driver combining `AppRunner` + `FakeExecutor`, mirroring
-/// the firmware main loop's use: dispatch events, drain render kicks,
-/// and feed EPD completions (including stale ones) back.
+/// Convenience driver combining `Runtime` + `FakeExecutor`, mirroring
+/// the firmware's single-consumer event loop: push events, pump, drain
+/// render kicks, and feed EPD completions (including stale ones) back.
 #[derive(Debug, Default)]
 pub struct Harness {
-    pub runner: AppRunner,
+    pub runtime: Runtime,
     pub executor: FakeExecutor,
     /// Shared render-request registry (the same type the firmware uses),
     /// so EPD completion tests exercise `RenderRegistry::register/feed`.
@@ -284,15 +285,19 @@ impl Harness {
         Self::default()
     }
 
+    /// Push one event into the queue and pump the runtime to quiescence
+    /// (high-priority tier first, merged ticks last), then register any
+    /// newly-issued render kicks.
     pub fn dispatch(&mut self, event: Event) -> Result<(), String> {
-        self.runner.dispatch(event, &mut self.executor)?;
+        self.runtime.push(event);
+        self.runtime.pump(&mut self.executor)?;
         self.drain_kicks();
         Ok(())
     }
 
     /// Move newly-issued render kicks into the shared `RenderRegistry`.
     pub fn drain_kicks(&mut self) {
-        for kick in self.runner.take_pending_kicks() {
+        for kick in self.runtime.take_kicks() {
             if kick.is_render() {
                 self.pending_renders.register(kick);
             }
@@ -353,11 +358,11 @@ impl Harness {
         );
     }
 
-    /// Feed an EPD completion for `request_id` back into the runner via
+    /// Feed an EPD completion for `request_id` back into the runtime via
     /// the shared `RenderRegistry::feed` (the same type the firmware
-    /// uses). Completed/Failed feed the returned kick back; Superseded
-    /// only terminates it; Ignored (stale/duplicate) does nothing.
-    /// Returns true when a matching kick existed and reached a terminal.
+    /// uses). Completed/Failed push an EffectCompleted/EffectFailed event
+    /// and pump; Superseded only terminates it; Ignored (stale/duplicate)
+    /// does nothing. Returns true when a matching kick reached a terminal.
     pub fn complete_render(&mut self, request_id: u64, ok: bool) -> Result<bool, String> {
         let outcome = self.pending_renders.feed(request_id, ok, false);
         match outcome {
@@ -371,12 +376,27 @@ impl Harness {
                 } else {
                     None
                 };
-                self.runner.feed_render_completion(
-                    kick,
-                    EffectOutput::RenderDone,
-                    failure,
-                    &mut self.executor,
-                )?;
+                let completion = crate::app::EffectCompletion {
+                    batch_id: kick.batch_id,
+                    effect_id: kick.effect_id,
+                    operation_id: kick.operation_id,
+                    render_generation: kick.render_generation,
+                    output: EffectOutput::RenderDone,
+                };
+                match failure {
+                    Some(error) => {
+                        self.runtime
+                            .push(Event::EffectFailed(crate::app::EffectFailure {
+                                batch_id: kick.batch_id,
+                                effect_id: kick.effect_id,
+                                operation_id: kick.operation_id,
+                                render_generation: kick.render_generation,
+                                error,
+                            }));
+                    }
+                    None => self.runtime.push(Event::EffectCompleted(completion)),
+                }
+                self.runtime.pump(&mut self.executor)?;
                 self.drain_kicks();
                 Ok(true)
             }
@@ -385,11 +405,11 @@ impl Harness {
     }
 
     pub fn screen(&self) -> &Screen {
-        &self.runner.state().screen
+        &self.runtime.state().screen
     }
 
     pub fn state(&self) -> &AppState {
-        self.runner.state()
+        self.runtime.state()
     }
 
     /// Convenience: is an alarm currently ringing?

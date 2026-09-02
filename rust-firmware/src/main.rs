@@ -449,10 +449,7 @@ fn main() -> Result<()> {
                     inkwash_logic::app::Event::Boot(boot_result.snapshot),
                     &mut ctx,
                 ) {
-                    log::warn!("AppRunner Boot dispatch failed: {err}");
-                }
-                for kick in app_runner.borrow_mut().take_pending_kicks() {
-                    track_kick_shared(&ctx, kick);
+                    log::warn!("Runtime Boot dispatch failed: {err}");
                 }
             }
             // Boot alarm: if the state machine entered Firing (RTC-alarm
@@ -481,9 +478,6 @@ fn main() -> Result<()> {
                     ),
                     &mut ctx,
                 );
-                for kick in app_runner.borrow_mut().take_pending_kicks() {
-                    track_kick_shared(&ctx, kick);
-                }
                 dismiss_full_refresh = true;
             }
         }
@@ -525,23 +519,21 @@ fn main() -> Result<()> {
                     if changed {
                         clock = Some(dt);
                         app_runner.borrow_mut().set_last_clock(clock);
-                        // AppRunner Tick: feed the state machine on every
+                        // Runtime Tick: feed the state machine on every
                         // minute boundary. The state machine uses Tick to
                         // rearm the RTC alarm slot at minute edges and to
-                        // fire scheduled syncs. Skipped when AppRunner is
-                        // disabled (core boot fact failure): the default
-                        // AppState has no alarm/NVS/config data and must
-                        // not rearm or interpret anything from a Tick.
+                        // fire scheduled syncs. Skipped when the runtime
+                        // is disabled (core boot fact failure): the
+                        // default AppState has no alarm/NVS/config data
+                        // and must not rearm or interpret anything from
+                        // a Tick.
                         if app_runner_enabled {
                             if let Err(err) = dispatch_app_runner(
                                 &app_runner,
                                 inkwash_logic::app::Event::Tick(dt),
                                 &mut ctx,
                             ) {
-                                log::warn!("AppRunner Tick dispatch failed: {err}");
-                            }
-                            for kick in app_runner.borrow_mut().take_pending_kicks() {
-                                track_kick_shared(&ctx, kick);
+                                log::warn!("Runtime Tick dispatch failed: {err}");
                             }
                         }
                         dirty.push(CLOCK_RECT);
@@ -1131,28 +1123,31 @@ fn collect_boot_snapshot(
     }
 }
 
-/// Dispatches an event through AppRunner using a fresh per-batch
-/// `EffectRunner` borrowing `ctx`. Captures the runner's last_clock
-/// first so the `Rc<RefCell<AppRunner>>` and `ctx` borrows do not
-/// conflict (the executor holds `&mut ctx`, which `dispatch` also
-/// needs).
+/// Pushes one event into the shared runtime queue and pumps the single
+/// `App::update` consumer to quiescence with a fresh per-pump
+/// `EffectRunner` borrowing `ctx`. This is the only path events take into
+/// the state machine; render kicks registered during the pump are routed
+/// to the shared EPD registry here, so call sites never drain kicks by
+/// hand.
 fn dispatch_app_runner(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
 ) -> anyhow::Result<()> {
     let last_clock = runner.borrow().last_clock();
-    let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
-    runner
-        .borrow_mut()
-        .dispatch(event, &mut executor)
-        .map_err(|e| anyhow::anyhow!(e))
+    {
+        let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
+        let mut runtime = runner.borrow_mut();
+        runtime.push(event);
+        runtime
+            .pump(&mut executor)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    for kick in runner.borrow_mut().take_kicks() {
+        track_kick_shared(ctx, kick);
+    }
+    Ok(())
 }
-
-/// Records one in-flight render into the shared `pending_renders`
-/// registry so the matching `EpdCompletion` (by request_id) can be fed
-/// back to the state machine, regardless of which entry point (main
-/// loop or a blocking page) dispatched it. Non-render async kicks are
 /// surfaced with a log and dropped - their transports aren't wired yet.
 fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
     let mut reg = ctx.pending_renders.borrow_mut();
@@ -1180,7 +1175,7 @@ fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
 }
 
 /// Translate one EPD completion into the matching `EffectCompleted` /
-/// `EffectFailed` and dispatch it back through AppRunner. The kick is
+/// `EffectFailed` and dispatch it back through the runtime. The kick is
 /// consumed (removed from `pending_renders` by the caller before this is
 /// called) so the generation / op id line up.
 fn feed_completion_back(
@@ -1190,10 +1185,21 @@ fn feed_completion_back(
     output: inkwash_logic::app::EffectOutput,
     failure: Option<inkwash_logic::app::EffectError>,
 ) -> anyhow::Result<()> {
-    let last_clock = runner.borrow().last_clock();
-    let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
-    runner
-        .borrow_mut()
-        .feed_render_completion(kick, output, failure, &mut executor)
-        .map_err(|e| anyhow::anyhow!(e))
+    let event = match failure {
+        Some(error) => inkwash_logic::app::Event::EffectFailed(inkwash_logic::app::EffectFailure {
+            batch_id: kick.batch_id,
+            effect_id: kick.effect_id,
+            operation_id: kick.operation_id,
+            render_generation: kick.render_generation,
+            error,
+        }),
+        None => inkwash_logic::app::Event::EffectCompleted(inkwash_logic::app::EffectCompletion {
+            batch_id: kick.batch_id,
+            effect_id: kick.effect_id,
+            operation_id: kick.operation_id,
+            render_generation: kick.render_generation,
+            output,
+        }),
+    };
+    dispatch_app_runner(runner, event, ctx)
 }
