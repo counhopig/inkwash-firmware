@@ -118,7 +118,32 @@ pub struct PendingReply {
     pub operation_id: OperationId,
     pub request: ControlRequest,
     pub channel: Channel,
+    /// The final reply, filled once the command's confirmable effects have
+    /// all completed (`None` while the command is in flight).
     pub reply: Option<ControlReply>,
+    /// The confirmable operation ids the in-flight command still awaits.
+    /// Each matching `Persisted`/`RtcProgrammed`/`AckDone` completion
+    /// removes its id; the final reply fires when the set is empty. An
+    /// immediate/busy reply never occupies a slot.
+    pub awaiting_ops: Vec<OperationId>,
+}
+
+impl PendingReply {
+    /// A new in-flight command awaiting the given confirmable completions.
+    fn awaiting(
+        operation_id: OperationId,
+        request: ControlRequest,
+        channel: Channel,
+        awaiting_ops: Vec<OperationId>,
+    ) -> Self {
+        Self {
+            operation_id,
+            request,
+            channel,
+            reply: None,
+            awaiting_ops,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -148,6 +173,31 @@ pub struct ConnectivityState {
     pub wifi_configured: bool,
     pub server_configured: bool,
     pub wifi_connected: bool,
+}
+
+/// Device configuration facts the state machine can act on. Secrets (the
+/// server auth token, the Wi-Fi password) never enter `AppState`: the
+/// firmware persists them in NVS and only reports *presence* flags and the
+/// non-secret SSID/server URL here.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ConfigState {
+    /// Wi-Fi SSID (non-secret) + whether a password is set.
+    pub wifi_ssid: Option<String>,
+    pub wifi_has_password: bool,
+    /// Server URL (non-secret) + whether an auth token is set.
+    pub server_url: Option<String>,
+    pub server_has_token: bool,
+    /// UTC offset in minutes (non-secret).
+    pub timezone_offset_minutes: i16,
+}
+
+impl ConfigState {
+    pub fn wifi_configured(&self) -> bool {
+        self.wifi_ssid.is_some()
+    }
+    pub fn server_configured(&self) -> bool {
+        self.server_url.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -513,6 +563,11 @@ pub struct AppState {
     pub inbox: InboxState,
     pub sync: SyncState,
     pub connectivity: ConnectivityState,
+    /// Device configuration (server endpoint + Wi-Fi presence flags). Holds
+    /// only what the UI/status layer needs; the secrets (auth token,
+    /// Wi-Fi password) are never stored in `AppState` - the firmware keeps
+    /// them in NVS and only reports booleans.
+    pub config: ConfigState,
     pub power: PowerState,
     pub pending_usb_reply: Option<PendingReply>,
     pub pending_ble_reply: Option<PendingReply>,
@@ -543,6 +598,7 @@ impl Default for AppState {
             inbox: InboxState::default(),
             sync: SyncState::Idle,
             connectivity: ConnectivityState::default(),
+            config: ConfigState::default(),
             power: PowerState::default(),
             pending_usb_reply: None,
             pending_ble_reply: None,
@@ -1104,6 +1160,22 @@ fn transition_effect_completed(
         }
         _ => {}
     }
+    // A command awaiting a confirmable completion (Persist / RTC program /
+    // ACK) resolves its awaiting set; when none remains, emit the final
+    // reply on the transport that sent the command. This runs for every
+    // confirmable output so commands and alarm-internal ops share one path.
+    if matches!(
+        completion.output,
+        EffectOutput::Persisted(_) | EffectOutput::RtcProgrammed | EffectOutput::AckDone
+    ) {
+        for channel in [Channel::Usb, Channel::Ble] {
+            if let Some((found_channel, reply)) =
+                resolve_command_confirmation(state, completion.operation_id, channel)
+            {
+                batches.push(reply_batch(state, found_channel, reply));
+            }
+        }
+    }
     // A commit that completes after the cross-minute tick has already set
     // `minute_advanced` must re-arm right away, not wait for the next tick.
     if let Some(now) = state.clock.now {
@@ -1179,7 +1251,28 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
         // surfaced but do not alter the alarm commit state in step 1.
         _ => {}
     }
-    vec![]
+    // A command's confirmable effect failed: error the client on the
+    // transport that sent the command and clear the slot. This is separate
+    // from the alarm-internal retry logic above - a control command is not
+    // auto-retried (the client resends).
+    let mut batches = Vec::new();
+    let error_message = match &failure.error {
+        EffectError::Persist(msg)
+        | EffectError::Rtc(msg)
+        | EffectError::Ack(msg)
+        | EffectError::Sync(msg) => msg.clone(),
+        _ => String::new(),
+    };
+    if !error_message.is_empty() {
+        for channel in [Channel::Usb, Channel::Ble] {
+            if let Some(reply) =
+                fail_command_reply(state, channel, failure.operation_id, error_message.clone())
+            {
+                batches.push(reply_batch(state, channel, reply));
+            }
+        }
+    }
+    batches
 }
 
 fn transition_command(
@@ -1200,17 +1293,39 @@ fn transition_command(
     }
 
     match request {
-        ControlRequest::SyncNow => {
+        // SyncNow's async result flow (SyncCompleted -> merge/persist/RTC ->
+        // final reply) is wired in the next Stage-3 increment. Until then
+        // the firmware handles SyncNow on its legacy path and never routes
+        // it here; keep the transition a no-op rather than strand a reply
+        // slot that nothing will resolve.
+        ControlRequest::SyncNow => vec![],
+        ControlRequest::SetServer { url, token } => {
+            // Persist the server endpoint (no network verification needed;
+            // the URL is hard to validate without a request). The client is
+            // told once the write confirms. Clearing the stale ETag rides
+            // the same transition (sync-metadata side effect) so the old
+            // endpoint's conditional-request state cannot survive a server
+            // change.
             let op = state.next_operation_id();
-            let now = state.clock.now.unwrap_or_default();
-            set_pending_reply(state, channel, op, ControlRequest::SyncNow);
-            let b = batch(
+            // Update the status-visible facts immediately (URL presence);
+            // the token itself is only carried to the persistence effect.
+            state.config.server_url = Some(url.clone());
+            state.config.server_has_token = !token.is_empty();
+            let cfg = DeviceConfig {
+                server_url: url,
+                auth_token: token,
+            };
+            let pending_request = ControlRequest::SetServer {
+                url: cfg.server_url.clone(),
+                token: cfg.auth_token.clone(),
+            };
+            set_pending_reply(state, channel, op, pending_request, vec![op]);
+            vec![batch(
                 state,
                 op,
-                FailurePolicy::Continue,
-                vec![Effect::StartSync(SyncRequest { now })],
-            );
-            vec![b]
+                FailurePolicy::AbortBatch,
+                vec![Effect::PersistConfig(cfg)],
+            )]
         }
         // Other commands need their storage/network side effects, wired in
         // migration step 3. Refuse rather than guess.
@@ -1226,22 +1341,73 @@ fn transition_command(
 
 // ---- helpers -------------------------------------------------------------
 
+/// Records an in-flight command on `channel`'s pending-reply slot. The
+/// slot is taken (at most one command per transport); the caller has
+/// already checked it is free.
 fn set_pending_reply(
     state: &mut AppState,
     channel: Channel,
     op: OperationId,
     request: ControlRequest,
+    awaiting_ops: Vec<OperationId>,
 ) {
     let slot = match channel {
         Channel::Usb => &mut state.pending_usb_reply,
         Channel::Ble => &mut state.pending_ble_reply,
     };
-    *slot = Some(PendingReply {
-        operation_id: op,
-        request,
-        channel,
-        reply: None,
-    });
+    *slot = Some(PendingReply::awaiting(op, request, channel, awaiting_ops));
+}
+
+/// Resolves `channel`'s pending-reply slot after one of its awaited
+/// confirmable ops completed. Removes the op from `awaiting_ops`; when the
+/// set empties, takes the slot and returns the final reply to send on that
+/// channel. Returns `None` while the command still awaits another op, or if
+/// the slot does not await this op.
+fn resolve_command_confirmation(
+    state: &mut AppState,
+    completed_op: OperationId,
+    channel: Channel,
+) -> Option<(Channel, ControlReply)> {
+    let slot = match channel {
+        Channel::Usb => &mut state.pending_usb_reply,
+        Channel::Ble => &mut state.pending_ble_reply,
+    };
+    let pending = slot.as_mut()?;
+    let before = pending.awaiting_ops.len();
+    pending.awaiting_ops.retain(|op| *op != completed_op);
+    if pending.awaiting_ops.len() == before {
+        // This slot was not awaiting this op.
+        return None;
+    }
+    if pending.awaiting_ops.is_empty() {
+        let reply = pending.reply.take().unwrap_or(ControlReply::Ok);
+        *slot = None;
+        Some((channel, reply))
+    } else {
+        None
+    }
+}
+
+/// Fails an in-flight command on `channel` when `failed_op` is one of its
+/// awaited confirmable ops: the client gets an error reply and the slot
+/// clears. The request is not auto-retried (the client resends).
+fn fail_command_reply(
+    state: &mut AppState,
+    channel: Channel,
+    failed_op: OperationId,
+    message: String,
+) -> Option<ControlReply> {
+    let slot = match channel {
+        Channel::Usb => &mut state.pending_usb_reply,
+        Channel::Ble => &mut state.pending_ble_reply,
+    };
+    let pending = slot.as_ref()?;
+    if !pending.awaiting_ops.contains(&failed_op) {
+        return None;
+    }
+    let reply = ControlReply::Error { message };
+    *slot = None;
+    Some(reply)
 }
 
 /// Removes a fired one-shot from the stored list (its date has passed);
@@ -1778,7 +1944,13 @@ mod tests {
     fn busy_transport_replies_busy_without_overwriting_pending() {
         let mut state = AppState::default();
         let op = state.next_operation_id();
-        set_pending_reply(&mut state, Channel::Usb, op, ControlRequest::SyncNow);
+        set_pending_reply(
+            &mut state,
+            Channel::Usb,
+            op,
+            ControlRequest::SyncNow,
+            vec![op],
+        );
         let batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
         assert!(state.pending_usb_reply.is_some());
         assert!(batches.iter().any(|b| {
@@ -1799,7 +1971,13 @@ mod tests {
         let mut state = AppState::default();
         let op = state.next_operation_id();
         // USB has an in-flight SyncNow; BLE is free.
-        set_pending_reply(&mut state, Channel::Usb, op, ControlRequest::SyncNow);
+        set_pending_reply(
+            &mut state,
+            Channel::Usb,
+            op,
+            ControlRequest::SyncNow,
+            vec![op],
+        );
         // A second USB command is busy on USB.
         let usb_batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
         assert!(usb_batches.iter().any(|b| {
@@ -1895,6 +2073,167 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn set_server_persists_then_replies_ok_on_the_sending_channel() {
+        let mut state = AppState::default();
+        // USB sends SetServer; it must occupy only the USB slot.
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetServer {
+                url: "https://sync.example".into(),
+                token: "secret".into(),
+            }),
+        );
+        assert!(state.pending_usb_reply.is_some());
+        assert!(state.pending_ble_reply.is_none());
+        // The transition must request a PersistConfig carrying the new cfg.
+        let persist_batch = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistConfig(_)))
+            })
+            .expect("SetServer must emit a PersistConfig effect");
+        let op = persist_batch.operation_id;
+        // No reply yet: the command awaits its confirmable persist.
+        assert!(!batches
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::Reply { .. })) }));
+        // The persist confirms -> the final Ok reply goes to USB only.
+        let confirm_batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Config),
+            }),
+        );
+        assert!(confirm_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        }));
+        // The slot is released (command done).
+        assert!(state.pending_usb_reply.is_none());
+        // Status-visible config facts updated.
+        assert_eq!(
+            state.config.server_url.as_deref(),
+            Some("https://sync.example")
+        );
+        assert!(state.config.server_has_token);
+    }
+
+    #[test]
+    fn set_server_persist_failure_replies_error_and_releases_slot() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::BleCommand(ControlRequest::SetServer {
+                url: "https://sync.example".into(),
+                token: String::new(),
+            }),
+        );
+        let op = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistConfig(_)))
+            })
+            .expect("SetServer must emit PersistConfig")
+            .operation_id;
+        let fail_batches = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Persist("nvs write failed".into()),
+            }),
+        );
+        let error_seen = fail_batches.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Ble,
+                    reply: Reply::Error { message },
+                } => message.contains("nvs write failed"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(
+            state.pending_ble_reply.is_none(),
+            "slot released on failure"
+        );
+    }
+
+    #[test]
+    fn set_server_does_not_reply_until_all_awaited_ops_complete() {
+        let mut state = AppState::default();
+        // Two awaited ops (simulating a multi-step command): one completes,
+        // the reply must wait for the other.
+        let op1 = state.next_operation_id();
+        let op2 = state.next_operation_id();
+        set_pending_reply(
+            &mut state,
+            Channel::Usb,
+            op1,
+            ControlRequest::SetServer {
+                url: "x".into(),
+                token: "".into(),
+            },
+            vec![op1, op2],
+        );
+        let mid = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op1,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Config),
+            }),
+        );
+        assert!(
+            !mid.iter()
+                .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))),
+            "reply must wait for the final awaited op"
+        );
+        assert!(state.pending_usb_reply.is_some(), "slot stays until done");
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op2,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
+            }),
+        );
+        assert!(done.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        }));
+        assert!(state.pending_usb_reply.is_none());
     }
 
     // ---- review round 2 findings -----------------------------------------
