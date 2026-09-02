@@ -127,6 +127,32 @@ impl AlarmPoll {
     }
 }
 
+/// Where an alarm interrupted execution, deciding how the sticky exit
+/// flag is consumed. Home is the root page: the flag must be cleared
+/// right after the alarm so a later Navigation/Settings entry does not
+/// treat the historical alarm as its own exit reason. A blocking page /
+/// reminder must keep the flag set for its caller chain, and `main`
+/// consumes it exactly once when the stack unwinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmSource {
+    /// The alarm interrupted the root Home loop.
+    Home,
+    /// The alarm interrupted a nested page / reminder stack.
+    BlockingPage,
+}
+
+impl AlarmPoll {
+    /// Consume the exit flag according to the source policy. Returns
+    /// true when the flag was set (Home consumes it immediately;
+    /// BlockingPage reports it as pending for the caller).
+    pub fn consume_for(&mut self, source: AlarmSource) -> bool {
+        match source {
+            AlarmSource::Home => self.take_alarm_exit(),
+            AlarmSource::BlockingPage => self.alarm_exit(),
+        }
+    }
+}
+
 /// Convenience: a page's alarm-unwind check. A nested page that cannot
 /// return an alarm-specific result sets the flag via [`AlarmPoll::mark`].
 impl AlarmPoll {

@@ -594,10 +594,16 @@ fn main() -> Result<()> {
             // The state machine entered Firing and `poll_alarm_snapshot`
             // already drove ring_screen + dismiss; force a Home repaint.
             dirty.push(FULL_SCREEN_RECT);
+            // Home is the root page: the sticky exit flag exists to let
+            // *nested* pages unwind layer by layer. Here we are already
+            // at Home, so the flag must be consumed immediately -
+            // otherwise the next Navigation/Settings entry would see a
+            // historical alarm as its own exit reason and return at once
+            // (round-22 P1). Blocking-page / reminder paths keep the
+            // flag set for their caller chains and main consumes it when
+            // they return (see the open_navigation handlers).
+            let _ = ctx.alarm_poll.take_alarm_exit();
         }
-        // `main` consumes the sticky alarm-exit flag exactly once after a
-        // blocking screen returns (see the open_navigation handlers); an
-        // alarm raised here leaves it set for that path.
         // Poll USB console for incoming commands, dispatch them, and send replies.
         let (usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
         if usb_changed {

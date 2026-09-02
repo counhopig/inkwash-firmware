@@ -918,4 +918,122 @@ mod tests {
         assert!(!h.take_alarm_exit());
         assert!(!h.alarm_exit());
     }
+
+    // ---- main/background routing: Home vs blocking consumption ------
+
+    use crate::alarm_flow::AlarmSource;
+
+    fn boot_clean(h: &mut Harness) {
+        h.dispatch(Event::Boot(boot(
+            Some(dt(8, 59)),
+            false,
+            true,
+            vec![alarm(1, 9, 0)],
+        )))
+        .unwrap();
+    }
+
+    fn fire_home_alarm(h: &mut Harness) {
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host));
+        assert!(h.alarm_exit(), "AlarmPoll sets the flag on ring");
+        // Home is the root: consume immediately.
+        assert!(h.alarm_poll.consume_for(AlarmSource::Home));
+        assert!(!h.alarm_exit(), "Home alarm flag cleared at once");
+    }
+
+    #[test]
+    fn home_alarm_consumes_exit_flag_immediately() {
+        let mut h = Harness::new();
+        boot_clean(&mut h);
+        fire_home_alarm(&mut h);
+        // Next Navigation/Settings entry sees no pending alarm.
+        assert!(!h.alarm_exit(), "no sticky flag leaked to next page");
+    }
+
+    #[test]
+    fn blocking_alarm_keeps_flag_until_main_consumes() {
+        let mut h = Harness::new();
+        boot_clean(&mut h);
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host));
+        // Blocking source: flag stays for the caller chain.
+        assert!(h.alarm_poll.consume_for(AlarmSource::BlockingPage));
+        assert!(h.alarm_exit(), "blocking alarm keeps flag pending");
+        // main consumes when the stack unwinds.
+        assert!(h.take_alarm_exit());
+        assert!(!h.alarm_exit());
+    }
+
+    #[test]
+    fn home_then_blocking_do_not_leak_flags() {
+        let mut h = Harness::new();
+        boot_clean(&mut h);
+        // A Home alarm consumes its flag immediately.
+        fire_home_alarm(&mut h);
+        // A later blocking-page alarm (AF cleared then re-asserted) sets a
+        // fresh flag that must NOT be cleared by the Home policy.
+        let mut host = FakeAlarmHost {
+            af: false,
+            ..FakeAlarmHost::default()
+        };
+        assert!(!h.poll_alarm(&mut host), "AF clear resets the edge");
+        host.set(true, snapshot(dt(9, 1), true, true));
+        assert!(h.poll_alarm(&mut host));
+        assert!(h.alarm_exit(), "blocking alarm flag set after Home alarm");
+        // main consumes once; a duplicate consume is a no-op.
+        assert!(h.take_alarm_exit());
+        assert!(!h.take_alarm_exit());
+        assert!(!h.alarm_exit());
+    }
+
+    #[test]
+    fn blocking_then_home_do_not_leak_flags() {
+        let mut h = Harness::new();
+        boot_clean(&mut h);
+        // Blocking alarm: flag pending.
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        assert!(h.poll_alarm(&mut host));
+        assert!(h.alarm_exit());
+        // main consumes (stack unwound).
+        assert!(h.take_alarm_exit());
+        assert!(!h.alarm_exit());
+        // A Home alarm afterwards (AF cleared then re-asserted) consumes
+        // its own flag immediately and leaves nothing pending.
+        host.af = false;
+        assert!(!h.poll_alarm(&mut host), "AF clear resets the edge");
+        fire_home_alarm(&mut h);
+        assert!(!h.alarm_exit());
+    }
+
+    #[test]
+    fn full_route_home_alarm_then_navigation_entry() {
+        let mut h = Harness::new();
+        boot_clean(&mut h);
+        // Home alarm fires and is consumed at the root.
+        fire_home_alarm(&mut h);
+        // User opens Navigation/Settings: the page entry check
+        // (alarm_exit_pending) must be false, so it does not immediately
+        // return. Simulate that check.
+        assert!(!h.alarm_exit(), "Navigation entry sees no pending alarm");
+        // And a reminder in that page, dismissed, propagates VisibleChanged
+        // for the redraw without any alarm involvement.
+        use crate::reminder_flow::{run_reminders, ReminderHost};
+        struct NoAlarm;
+        impl ReminderHost for NoAlarm {
+            fn urgent(&mut self) -> BackgroundOutcome {
+                BackgroundOutcome::NoChange
+            }
+            fn todo(&mut self) -> BackgroundOutcome {
+                BackgroundOutcome::VisibleChanged
+            }
+        }
+        assert_eq!(
+            run_reminders(&mut NoAlarm),
+            BackgroundOutcome::VisibleChanged
+        );
+    }
 }
