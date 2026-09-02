@@ -740,10 +740,36 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::EffectFailed(failure) => transition_effect_failed(state, failure),
         Event::UsbCommand(request) => transition_command(state, Channel::Usb, request),
         Event::BleCommand(request) => transition_command(state, Channel::Ble, request),
+        Event::SyncCompleted(result) => transition_sync_completed(state, result),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
     }
+}
+
+/// A completed network sync resolves the running sync (single-flight
+/// arbitration) and the SyncNow pending reply: `Ok` replies Ok on the
+/// transport that requested it, `Failed` replies an error. The firmware
+/// network task still applies the merged data to NVS in this interim
+/// split; the persist-effects cutover moves that into the state machine
+/// in a later Stage-3 sub-increment.
+fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<EffectBatch> {
+    let reply = match &result {
+        SyncResult::Ok { .. } => Reply::Ok,
+        SyncResult::Failed(message) => Reply::Error {
+            message: message.clone(),
+        },
+    };
+    let mut batches = Vec::new();
+    // Release the single-flight lock, then resolve whichever transport was
+    // running the sync (its pending reply carries the sync's request id).
+    state.sync = SyncState::Idle;
+    for channel in [Channel::Usb, Channel::Ble] {
+        if let Some((found_channel, resolved)) = resolve_sync_completion(state, channel, &reply) {
+            batches.push(reply_batch(state, found_channel, resolved));
+        }
+    }
+    batches
 }
 
 fn transition_boot(state: &mut AppState, snapshot: BootSnapshot) -> Vec<EffectBatch> {
@@ -1333,12 +1359,34 @@ fn transition_command(
     }
 
     match request {
-        // SyncNow's async result flow (SyncCompleted -> merge/persist/RTC ->
-        // final reply) is wired in the next Stage-3 increment. Until then
-        // the firmware handles SyncNow on its legacy path and never routes
-        // it here; keep the transition a no-op rather than strand a reply
-        // slot that nothing will resolve.
-        ControlRequest::SyncNow => vec![],
+        ControlRequest::SyncNow => {
+            // Single network operation at a time (SyncState arbitration): if
+            // a sync is already running (from USB, BLE or the scheduler),
+            // this transport is told Busy and its request is not queued.
+            if state.sync != SyncState::Idle {
+                return vec![reply_batch(state, channel, Reply::Busy)];
+            }
+            let Some(now) = state.clock.now else {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "System time not available".into(),
+                    },
+                )];
+            };
+            let op = state.next_operation_id();
+            state.sync = SyncState::Running { request_id: op };
+            // The reply is resolved by Event::SyncCompleted (Ok / Failed)
+            // on the transport that requested the sync.
+            set_pending_reply(state, channel, op, ControlRequest::SyncNow, vec![op]);
+            vec![batch(
+                state,
+                op,
+                FailurePolicy::Continue,
+                vec![Effect::StartSync(SyncRequest { now })],
+            )]
+        }
         // SetServer's stale-ETag-clear side effect (NVS sync-metadata
         // bookkeeping) migrates with the sync-metadata state; the firmware
         // keeps routing it on the legacy path until then. If it ever does
@@ -1501,6 +1549,30 @@ fn apply_confirmed_timezone(state: &mut AppState, completed_op: OperationId, cha
     if let ControlRequest::SetTimezone { offset_minutes } = &pending.request {
         state.config.timezone_offset_minutes = *offset_minutes;
     }
+}
+
+/// Resolves a completed sync's pending SyncNow reply on `channel` with the
+/// result-specific reply (Ok / Failed). Returns `(channel, reply)` when the
+/// slot holds a SyncNow request still awaiting its sync, clearing the slot.
+fn resolve_sync_completion(
+    state: &mut AppState,
+    channel: Channel,
+    reply: &ControlReply,
+) -> Option<(Channel, ControlReply)> {
+    let slot = match channel {
+        Channel::Usb => &mut state.pending_usb_reply,
+        Channel::Ble => &mut state.pending_ble_reply,
+    };
+    let pending = slot.as_ref()?;
+    let is_sync = matches!(pending.request, ControlRequest::SyncNow)
+        && !pending.awaiting_ops.is_empty()
+        && pending.reply.is_none();
+    if !is_sync {
+        return None;
+    }
+    let reply = reply.clone();
+    *slot = None;
+    Some((channel, reply))
 }
 
 /// Resolves `channel`'s pending-reply slot after one of its awaited
@@ -2493,6 +2565,122 @@ mod tests {
                 )
             })
         }));
+        assert!(state.pending_ble_reply.is_none());
+    }
+
+    #[test]
+    fn sync_now_starts_sync_and_takes_one_reply_slot() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        assert!(state.pending_usb_reply.is_some());
+        assert!(state.pending_ble_reply.is_none());
+        assert!(batches
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::StartSync(_))) }));
+    }
+
+    #[test]
+    fn sync_now_while_running_replies_busy_on_either_transport() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        // A second sync from the other transport is busy (single-flight).
+        let ble_batches = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
+        assert!(ble_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Busy
+                    }
+                )
+            })
+        }));
+        assert!(state.pending_ble_reply.is_none(), "busy takes no slot");
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        // The USB sync's own slot is untouched.
+        assert!(state.pending_usb_reply.is_some());
+    }
+
+    #[test]
+    fn sync_completed_ok_replies_ok_on_the_requesting_transport() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        let done = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                alarm_count: 1,
+                todo_count: 2,
+                inbox_count: 0,
+                inbox_truncated: false,
+                etag: None,
+            }),
+        );
+        assert!(done.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        }));
+        assert!(state.pending_ble_reply.is_none());
+        assert_eq!(state.sync, SyncState::Idle);
+        // The other transport has no pending reply.
+        assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn sync_completed_failed_replies_error_on_the_requesting_transport() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let done = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Failed("connection refused".into())),
+        );
+        let error_seen = done.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => message.contains("connection refused"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(state.pending_usb_reply.is_none());
+        assert_eq!(state.sync, SyncState::Idle);
+    }
+
+    #[test]
+    fn sync_completed_without_running_sync_is_harmless() {
+        // A stale / unsolicited completion (e.g. after a deep-sleep restart
+        // replayed the sync receipt) must not fabricate a reply.
+        let mut state = AppState::default();
+        let done = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                alarm_count: 0,
+                todo_count: 0,
+                inbox_count: 0,
+                inbox_truncated: false,
+                etag: None,
+            }),
+        );
+        assert!(!done
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
+        assert_eq!(state.sync, SyncState::Idle);
+        assert!(state.pending_usb_reply.is_none());
         assert!(state.pending_ble_reply.is_none());
     }
 
