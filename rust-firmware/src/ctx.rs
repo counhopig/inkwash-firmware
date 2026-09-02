@@ -183,25 +183,28 @@ impl DeviceContext<'_> {
             return BackgroundOutcome::AlarmHandled;
         }
         let (usb_changed, _) = self.poll_usb_control(now);
-        let runtime_changed =
+        let runtime_outcome =
             if self.sync_scheduler.last_ui_poll.elapsed() >= Duration::from_secs(1) {
                 self.sync_scheduler.last_ui_poll = Instant::now();
                 match self.board.rtc.read_time() {
                     Ok(fresh) => self.poll_runtime(&fresh),
                     Err(err) => {
                         log::warn!("RTC read failed in UI background poll: {err}");
-                        false
+                        BackgroundOutcome::NoChange
                     }
                 }
             } else {
-                false
+                BackgroundOutcome::NoChange
             };
+        if runtime_outcome == BackgroundOutcome::AlarmHandled {
+            return BackgroundOutcome::AlarmHandled;
+        }
         // Receipts for Wi-Fi operations dispatched while this screen owns
         // the thread (scheduler syncs, deferred SetWifi/SyncNow replies):
         // applied here so the RTC re-arm / NTP alignment stay timely even
         // when the main loop is blocked behind a long-lived screen.
         let sync_changed = self.poll_wifi_ops().is_some();
-        if usb_changed || sync_changed || runtime_changed {
+        if usb_changed || sync_changed || runtime_outcome == BackgroundOutcome::VisibleChanged {
             BackgroundOutcome::VisibleChanged
         } else {
             BackgroundOutcome::NoChange
@@ -345,10 +348,18 @@ impl DeviceContext<'_> {
     /// function only schedules network + reminder work, mirroring what
     /// it did before AppRunner existed; the legacy alarm branch is
     /// gone so the two paths cannot race for the same AF.
-    pub fn poll_runtime(&mut self, now: &DateTime) -> bool {
+    pub fn poll_runtime(&mut self, now: &DateTime) -> BackgroundOutcome {
         let sync_changed = self.poll_scheduled_sync(now);
-        let reminder_changed = self.poll_reminders(now);
-        sync_changed || reminder_changed
+        // An alarm preempted a reminder: surface it so the caller can
+        // unwind to main.
+        if self.poll_reminders(now) == BackgroundOutcome::AlarmHandled {
+            return BackgroundOutcome::AlarmHandled;
+        }
+        if sync_changed {
+            BackgroundOutcome::VisibleChanged
+        } else {
+            BackgroundOutcome::NoChange
+        }
     }
 
     /// Services reminders only. BLE pairing uses this variant because
@@ -357,18 +368,15 @@ impl DeviceContext<'_> {
     /// here.
     pub fn poll_local_alerts(&mut self, now: &DateTime) -> BackgroundOutcome {
         // Alarm edge first (same guarantee as poll_background), then
-        // reminders. Used by BLE pairing.
+        // reminders. Used by BLE pairing. A reminder that was preempted
+        // by an alarm propagates AlarmHandled.
         if self.poll_alarm_snapshot() {
             return BackgroundOutcome::AlarmHandled;
         }
-        if self.poll_reminders(now) {
-            BackgroundOutcome::VisibleChanged
-        } else {
-            BackgroundOutcome::NoChange
-        }
+        self.poll_reminders(now)
     }
 
-    fn poll_reminders(&mut self, now: &DateTime) -> bool {
+    fn poll_reminders(&mut self, now: &DateTime) -> BackgroundOutcome {
         crate::reminders::poll(self, now)
     }
 

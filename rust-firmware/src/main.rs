@@ -558,7 +558,7 @@ fn main() -> Result<()> {
                     // 30 s boundary, gated once/day anyway). Ordinary menu
                     // loops service this same scheduler through
                     // DeviceContext.
-                    if ctx.poll_runtime(&dt) {
+                    if ctx.poll_runtime(&dt) != crate::ctx::BackgroundOutcome::NoChange {
                         dirty.push(FULL_SCREEN_RECT);
                     }
                 }

@@ -17,42 +17,57 @@ use crate::{ui, watchdog};
 const URGENT_RING_MAX_SECS: u64 = 120;
 
 /// Shows both reminder classes in priority order. Urgent inbox alerts go
-/// first; a due-todo reminder may follow after the urgent alert is dismissed.
-pub fn poll(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> bool {
-    let urgent_shown = remind_urgent_inbox(ctx);
-    let todo_shown = remind_due_todos(ctx, now);
-    urgent_shown || todo_shown
+/// first; a due-todo reminder may follow after the urgent alert is
+/// dismissed. Returns a structured outcome so the caller can tell an RTC
+/// alarm that preempted a reminder from an ordinary reminder dismissal.
+/// An alarm short-circuits the chain: no further reminder class runs after
+/// one.
+pub fn poll(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> crate::ctx::BackgroundOutcome {
+    match remind_urgent_inbox(ctx) {
+        crate::ctx::BackgroundOutcome::AlarmHandled => {
+            return crate::ctx::BackgroundOutcome::AlarmHandled;
+        }
+        other => other,
+    };
+    remind_due_todos(ctx, now)
 }
 
-fn remind_due_todos(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> bool {
+fn remind_due_todos(
+    ctx: &mut crate::ctx::DeviceContext,
+    now: &DateTime,
+) -> crate::ctx::BackgroundOutcome {
     use inkwash_logic::reminder_dedup::{
         already_reminded_today, due_high_importance_todos, reminder_date_key,
     };
     match ctx.counters.todo_reminded_date() {
-        Ok(prev) if already_reminded_today(prev.as_deref(), now) => return false,
+        Ok(prev) if already_reminded_today(prev.as_deref(), now) => {
+            return crate::ctx::BackgroundOutcome::NoChange;
+        }
         Ok(_) => {}
         Err(err) => log::warn!("Failed to read todo reminder date: {err}"),
     }
 
     let Ok(list) = ctx.todo_store.load() else {
-        return false;
+        return crate::ctx::BackgroundOutcome::NoChange;
     };
     let due: Vec<&Todo> = due_high_importance_todos(&list, now);
     if due.is_empty() {
-        return false;
+        return crate::ctx::BackgroundOutcome::NoChange;
     }
 
     let date_key = reminder_date_key(now);
     if let Err(err) = ctx.counters.set_todo_reminded_date(&date_key) {
         log::warn!("Failed to record todo reminder date; not reminding: {err}");
-        return false;
+        return crate::ctx::BackgroundOutcome::NoChange;
     }
     log::info!("{} high-importance todo(s) due today; reminding", due.len());
-    show_due_todos(ctx, &due);
-    true
+    show_due_todos(ctx, &due)
 }
 
-fn show_due_todos(ctx: &mut crate::ctx::DeviceContext, due: &[&Todo]) {
+fn show_due_todos(
+    ctx: &mut crate::ctx::DeviceContext,
+    due: &[&Todo],
+) -> crate::ctx::BackgroundOutcome {
     let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
     ui::header(&mut canvas, "TODOS DUE");
@@ -82,7 +97,7 @@ fn show_due_todos(ctx: &mut crate::ctx::DeviceContext, due: &[&Todo]) {
         // the caller unwinds to main.
         if ctx.poll_alarm_snapshot() {
             ctx.app_runner_alarm_exit = true;
-            break;
+            return crate::ctx::BackgroundOutcome::AlarmHandled;
         }
         reject_pending_command(ctx.usb_console);
         if let Some(ble) = ctx.ble_control.as_mut() {
@@ -98,20 +113,21 @@ fn show_due_todos(ctx: &mut crate::ctx::DeviceContext, due: &[&Todo]) {
         }
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
     }
+    crate::ctx::BackgroundOutcome::VisibleChanged
 }
 
-fn remind_urgent_inbox(ctx: &mut crate::ctx::DeviceContext) -> bool {
+fn remind_urgent_inbox(ctx: &mut crate::ctx::DeviceContext) -> crate::ctx::BackgroundOutcome {
     let Ok(list) = ctx.inbox_store.load() else {
-        return false;
+        return crate::ctx::BackgroundOutcome::NoChange;
     };
     let urgent = ctx.inbox_store.unread_urgent().unwrap_or_default();
     if urgent.is_empty() {
-        return false;
+        return crate::ctx::BackgroundOutcome::NoChange;
     }
     for id in &urgent {
         if let Err(err) = ctx.inbox_store.mark_read(*id) {
             log::warn!("Failed to mark urgent inbox read; not reminding: {err}");
-            return false;
+            return crate::ctx::BackgroundOutcome::NoChange;
         }
     }
     let titles: Vec<String> = list
@@ -120,11 +136,13 @@ fn remind_urgent_inbox(ctx: &mut crate::ctx::DeviceContext) -> bool {
         .map(|item| screens::truncate_prop(&item.title, 330))
         .collect();
     log::info!("{} urgent inbox message(s) to show", titles.len());
-    show_urgent(ctx, &titles);
-    true
+    show_urgent(ctx, &titles)
 }
 
-fn show_urgent(ctx: &mut crate::ctx::DeviceContext, titles: &[String]) {
+fn show_urgent(
+    ctx: &mut crate::ctx::DeviceContext,
+    titles: &[String],
+) -> crate::ctx::BackgroundOutcome {
     let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
     ui::header(&mut canvas, "URGENT");
@@ -151,7 +169,7 @@ fn show_urgent(ctx: &mut crate::ctx::DeviceContext, titles: &[String]) {
         // An RTC alarm preempts the urgent reminder (see show_due_todos).
         if ctx.poll_alarm_snapshot() {
             ctx.app_runner_alarm_exit = true;
-            return;
+            return crate::ctx::BackgroundOutcome::AlarmHandled;
         }
         reject_pending_command(ctx.usb_console);
         if let Some(ble) = ctx.ble_control.as_mut() {
@@ -160,13 +178,13 @@ fn show_urgent(ctx: &mut crate::ctx::DeviceContext, titles: &[String]) {
         ctx.board.key_enter.poll();
         if ctx.board.key_enter.is_pressed() {
             while ctx.board.key_enter.poll().is_some() {}
-            return;
+            return crate::ctx::BackgroundOutcome::VisibleChanged;
         }
         if (EspSystemTime {}).now().saturating_sub(ring_start)
             >= Duration::from_secs(URGENT_RING_MAX_SECS)
         {
             log::warn!("Urgent reminder timed out after {URGENT_RING_MAX_SECS}s");
-            return;
+            return crate::ctx::BackgroundOutcome::VisibleChanged;
         }
         let (frequency, duration) = SIREN[siren_step % SIREN.len()];
         if let Some(audio) = ctx.board.audio.as_mut() {
@@ -182,7 +200,7 @@ fn show_urgent(ctx: &mut crate::ctx::DeviceContext, titles: &[String]) {
             watchdog::feed();
             if ctx.poll_alarm_snapshot() {
                 ctx.app_runner_alarm_exit = true;
-                return;
+                return crate::ctx::BackgroundOutcome::AlarmHandled;
             }
             reject_pending_command(ctx.usb_console);
             if let Some(ble) = ctx.ble_control.as_mut() {
@@ -191,7 +209,7 @@ fn show_urgent(ctx: &mut crate::ctx::DeviceContext, titles: &[String]) {
             ctx.board.key_enter.poll();
             if ctx.board.key_enter.is_pressed() {
                 while ctx.board.key_enter.poll().is_some() {}
-                return;
+                return crate::ctx::BackgroundOutcome::VisibleChanged;
             }
             if (EspSystemTime {}).now() >= poll_deadline {
                 break;
