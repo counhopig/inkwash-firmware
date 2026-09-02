@@ -818,13 +818,14 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("UP long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
-                    if ctx.app_runner_alarm_exit {
-                        // An alarm interrupted the navigation/settings
-                        // stack; AppRunner already rendered Home. Force the
-                        // panel refresh and clear the unwind flag.
-                        ctx.app_runner_alarm_exit = false;
-                        dirty.push(FULL_SCREEN_RECT);
-                    }
+                    // Always restore Home after the navigation stack: a
+                    // normal cancel or selecting Home leaves the drawer /
+                    // old page on screen but keys already route to Home.
+                    // The alarm flag only marks WHY the stack unwound and
+                    // is cleared here so it does not leak into the next
+                    // page.
+                    ctx.app_runner_alarm_exit = false;
+                    dirty.push(FULL_SCREEN_RECT);
                 }
                 ButtonEvent::Released => {}
             }
@@ -839,10 +840,8 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("DOWN long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
-                    if ctx.app_runner_alarm_exit {
-                        ctx.app_runner_alarm_exit = false;
-                        dirty.push(FULL_SCREEN_RECT);
-                    }
+                    ctx.app_runner_alarm_exit = false;
+                    dirty.push(FULL_SCREEN_RECT);
                 }
                 ButtonEvent::Released => {}
             }

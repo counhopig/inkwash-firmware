@@ -170,6 +170,16 @@ impl DeviceContext<'_> {
     /// Services USB plus wall-clock scheduled sync while an ordinary screen
     /// owns the main thread. BLE pairing deliberately calls
     /// `poll_usb_control` directly because BLE and Wi-Fi share the radio.
+    /// Returns true when an RTC alarm interrupted the page stack and the
+    /// current layer must unwind to main. Nested page loops call this
+    /// after every nested call (picker, editor, sub-screen) returns, so
+    /// the alarm propagates through arbitrarily deep nesting instead of
+    /// being swallowed as a cancel. `main` consumes the flag after each
+    /// blocking screen and forces the Home refresh.
+    pub fn alarm_exit_pending(&self) -> bool {
+        self.app_runner_alarm_exit
+    }
+
     pub fn poll_background(&mut self, now: Option<&DateTime>) -> BackgroundOutcome {
         // Alarm first: a live AF edge while a blocking page owns the
         // thread must dispatch to AppRunner so it rings over the page.
@@ -277,11 +287,19 @@ impl DeviceContext<'_> {
         // registry so the eventual EPD completion (which the main loop
         // drains against the same registry) can find it by request_id.
         self.forward_kicks(&runner);
-        self.app_runner_alarm_exit = false;
         let firing = matches!(
             runner.borrow().state().screen,
             inkwash_logic::app::Screen::AlarmRinging
         );
+        // The flag is SET when an alarm interrupted this page, never
+        // cleared here: a nested page that calls poll_alarm_snapshot and
+        // gets `true` must be able to express to its caller that the
+        // return is alarm-driven. Clearing it before the caller can read
+        // it (the previous code) made browse_page's direct
+        // poll_alarm_snapshot exit invisible to main.
+        if firing {
+            self.app_runner_alarm_exit = true;
+        }
         if firing {
             // Drive the blocking ring/dismiss loop right here so the alarm
             // covers the current page (main's AF fast path is not running).

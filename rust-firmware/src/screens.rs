@@ -64,6 +64,11 @@ pub fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
         "SLEEP".to_string(),
     ];
     loop {
+        // An alarm may have interrupted a nested screen; unwind Settings
+        // to the unified router.
+        if ctx.alarm_exit_pending() {
+            return;
+        }
         let want_nav = match pick_from_list(
             ctx,
             now,
@@ -74,11 +79,23 @@ pub fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
         ) {
             PickResult::Selected(0) => {
                 sync_now_screen(ctx, now);
+                if ctx.alarm_exit_pending() {
+                    return;
+                }
                 false
             }
-            PickResult::Selected(1) => sync_interval_screen(ctx, now),
+            PickResult::Selected(1) => {
+                let nav = sync_interval_screen(ctx, now);
+                if ctx.alarm_exit_pending() {
+                    return;
+                }
+                nav
+            }
             PickResult::Selected(2) => {
                 ble_pairing_screen(ctx, now);
+                if ctx.alarm_exit_pending() {
+                    return;
+                }
                 false
             }
             PickResult::Selected(3) => {
@@ -308,6 +325,8 @@ fn pick_navigation(
 pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
     loop {
         let Some(selected) = pick_navigation(ctx, now, Page::Home) else {
+            // Cancel or alarm - either way unwind; the alarm flag tells
+            // main why.
             return;
         };
         match selected {
@@ -322,7 +341,14 @@ pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 browse_page(ctx, page, now);
                 return;
             }
-            5 => open_menu(ctx, now),
+            5 => {
+                open_menu(ctx, now);
+                // An alarm inside Settings (or a nested screen) must
+                // unwind open_navigation too.
+                if ctx.alarm_exit_pending() {
+                    return;
+                }
+            }
             _ => {}
         }
     }
@@ -462,8 +488,22 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
                     Some(2) => page = Page::Inbox,
                     Some(3) => page = Page::Alarms,
                     Some(4) => page = Page::Todos,
-                    Some(5) => open_menu(ctx, live_now.as_ref()),
-                    Some(_) | None => {}
+                    Some(5) => {
+                        open_menu(ctx, live_now.as_ref());
+                        // An alarm inside Settings (or a nested screen
+                        // reached from it) must unwind the whole stack.
+                        if ctx.alarm_exit_pending() {
+                            return;
+                        }
+                    }
+                    // Alarm (or cancel): pick_navigation sets the flag on
+                    // alarm and returns None; exit instead of resuming the
+                    // page.
+                    Some(_) | None => {
+                        if ctx.alarm_exit_pending() {
+                            return;
+                        }
+                    }
                 }
                 needs_redraw = true;
             }
@@ -532,12 +572,25 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
             Nav::Enter => {
                 match page {
                     Page::Home => {}
-                    Page::Alarms => activate_alarm_row(ctx, live_now.as_ref(), alarm_selected),
+                    Page::Alarms => {
+                        activate_alarm_row(ctx, live_now.as_ref(), alarm_selected);
+                        if ctx.alarm_exit_pending() {
+                            return;
+                        }
+                    }
                     Page::Todos => activate_todo_row(ctx.todo_store, todo_selected),
-                    Page::Inbox => open_inbox_item(ctx, live_now.as_ref(), inbox_selected),
+                    Page::Inbox => {
+                        open_inbox_item(ctx, live_now.as_ref(), inbox_selected);
+                        if ctx.alarm_exit_pending() {
+                            return;
+                        }
+                    }
                     Page::Calendar => {
                         if let Some(dt) = live_now.as_ref() {
                             week_view(ctx, dt.year, dt.month, cal_selected_day, live_now.as_ref());
+                            if ctx.alarm_exit_pending() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -873,10 +926,16 @@ fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option
 
     ctx.board.display.refresh_full_best_effort();
     loop {
-        // Only an alarm unwinds this screen; a visible background change
-        // is ignored here (the next user nav repaints).
-        if ctx.poll_background(now).is_alarm() {
-            return;
+        // An alarm unwinds to the unified router; a visible background
+        // change (e.g. a full-screen reminder just covered this view)
+        // returns to the caller, which redraws the page.
+        match ctx.poll_background(now) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => {
+                ctx.app_runner_alarm_exit = true;
+                return;
+            }
+            crate::ctx::BackgroundOutcome::VisibleChanged => return,
+            crate::ctx::BackgroundOutcome::NoChange => {}
         }
         match poll_nav(ctx.board) {
             Nav::None => {}
@@ -1159,8 +1218,13 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
     drop(canvas);
     ctx.board.display.refresh_full_best_effort();
     loop {
-        if ctx.poll_background(now).is_alarm() {
-            return;
+        match ctx.poll_background(now) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => {
+                ctx.app_runner_alarm_exit = true;
+                return;
+            }
+            crate::ctx::BackgroundOutcome::VisibleChanged => return,
+            crate::ctx::BackgroundOutcome::NoChange => {}
         }
         match poll_nav(ctx.board) {
             Nav::None => {}
