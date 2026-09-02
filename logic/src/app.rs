@@ -250,6 +250,11 @@ pub enum Effect {
     PersistInbox(Vec<InboxItem>),
     PersistConfig(DeviceConfig),
     PersistSyncMetadata(SyncMetadata),
+    /// Persist the UTC-offset minutes (SetTimezone's NVS write).
+    PersistTimezone(i16),
+    /// Write the RTC clock to an absolute time (SetTimezone's hardware
+    /// write; confirmable through the RTC executor).
+    WriteRtcTime(DateTime),
     ProgramRtcAlarm(AlarmRegs),
     DisableRtcAlarm,
     AcknowledgeRtcAlarm,
@@ -326,6 +331,8 @@ pub enum PersistTarget {
     Inbox,
     Config,
     SyncMetadata,
+    /// SetTimezone's timezone-offset NVS write.
+    Timezone,
 }
 
 /// Outcome of a completed effect, fed back to `update` via
@@ -336,6 +343,8 @@ pub enum EffectOutput {
     SyncDone(SyncResult),
     Persisted(PersistTarget),
     RtcProgrammed,
+    /// A `WriteRtcTime` (SetTimezone clock write) confirmed.
+    RtcTimeWritten,
     AckDone,
     ToneDone,
     BlePairingDone,
@@ -1182,15 +1191,22 @@ fn transition_effect_completed(
                 None => {}
             }
         }
+        EffectOutput::Persisted(PersistTarget::Timezone) => {
+            // A SetTimezone timezone-offset persist confirmed: apply the
+            // target offset to the status-visible config now (NVS holds it
+            // authoritatively; the generic resolver below sends the reply).
+            for channel in [Channel::Usb, Channel::Ble] {
+                apply_confirmed_timezone(state, completion.operation_id, channel);
+            }
+        }
         _ => {}
     }
-    // A command awaiting a confirmable completion (Persist / RTC program /
-    // ACK) resolves its awaiting set; when none remains, emit the final
-    // reply on the transport that sent the command. This runs for every
-    // confirmable output so commands and alarm-internal ops share one path.
     if matches!(
         completion.output,
-        EffectOutput::Persisted(_) | EffectOutput::RtcProgrammed | EffectOutput::AckDone
+        EffectOutput::Persisted(_)
+            | EffectOutput::RtcProgrammed
+            | EffectOutput::RtcTimeWritten
+            | EffectOutput::AckDone
     ) {
         for channel in [Channel::Usb, Channel::Ble] {
             if let Some((found_channel, reply)) =
@@ -1382,6 +1398,62 @@ fn transition_command(
             };
             vec![reply_batch(state, channel, status)]
         }
+        ControlRequest::SetTimezone { offset_minutes } => {
+            // Validate the offset is a sane UTC window first. The hardware
+            // clock is shifted by the delta (new - old) so the *instant* is
+            // preserved; both the RTC write and the timezone persist are
+            // confirmable, and the reply waits for both. On failure the
+            // in-state offset is rolled back by the failure handler.
+            if !(-720..=840).contains(&offset_minutes) {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "Timezone offset must be between -720 and 840 minutes".into(),
+                    },
+                )];
+            }
+            let Some(now) = state.clock.now else {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "System time not available".into(),
+                    },
+                )];
+            };
+            let old_offset = state.config.timezone_offset_minutes;
+            let delta = (offset_minutes - old_offset) as i32;
+            let shifted = now.shifted_minutes(delta);
+            let time_op = state.next_operation_id();
+            let tz_op = state.next_operation_id();
+            // The offset is NOT updated optimistically: NVS is authoritative
+            // and only the confirmed persist applies it (see
+            // transition_effect_completed's Persisted(Timezone) branch). A
+            // failed command therefore never leaves the in-state offset
+            // diverged from NVS.
+            set_pending_reply(
+                state,
+                channel,
+                time_op,
+                ControlRequest::SetTimezone { offset_minutes },
+                vec![time_op, tz_op],
+            );
+            vec![
+                batch(
+                    state,
+                    time_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::WriteRtcTime(shifted)],
+                ),
+                batch(
+                    state,
+                    tz_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::PersistTimezone(offset_minutes)],
+                ),
+            ]
+        }
         // Other commands need their storage/network side effects, wired in
         // migration step 3. Refuse rather than guess.
         _ => vec![reply_batch(
@@ -1411,6 +1483,24 @@ fn set_pending_reply(
         Channel::Ble => &mut state.pending_ble_reply,
     };
     *slot = Some(PendingReply::awaiting(op, request, channel, awaiting_ops));
+}
+
+/// Applies a confirmed SetTimezone persist to the status-visible offset.
+/// The target comes from the pending command's request (the slot holds the
+/// `SetTimezone { offset_minutes }` that initiated the persist), so the
+/// offset field only ever reflects a value NVS now holds.
+fn apply_confirmed_timezone(state: &mut AppState, completed_op: OperationId, channel: Channel) {
+    let slot = match channel {
+        Channel::Usb => &state.pending_usb_reply,
+        Channel::Ble => &state.pending_ble_reply,
+    };
+    let Some(pending) = slot else { return };
+    if !pending.awaiting_ops.contains(&completed_op) {
+        return;
+    }
+    if let ControlRequest::SetTimezone { offset_minutes } = &pending.request {
+        state.config.timezone_offset_minutes = *offset_minutes;
+    }
 }
 
 /// Resolves `channel`'s pending-reply slot after one of its awaited
@@ -2250,6 +2340,160 @@ mod tests {
         assert!(has_tok);
         assert_eq!(tz, -300);
         assert!(state.pending_usb_reply.is_none(), "GetStatus takes no slot");
+    }
+
+    #[test]
+    fn set_timezone_writes_rtc_and_persists_then_replies_ok() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0)); // 10:00 local under old offset
+        state.config.timezone_offset_minutes = 0; // old UTC+0
+                                                  // New offset UTC+8: delta +480 -> RTC becomes 18:00.
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetTimezone {
+                offset_minutes: 480,
+            }),
+        );
+        assert!(state.pending_usb_reply.is_some());
+        let rtc_batch = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::WriteRtcTime(_)))
+            })
+            .expect("SetTimezone must write the RTC clock");
+        assert!(matches!(
+            rtc_batch
+                .effects
+                .iter()
+                .find(|e| matches!(e, Effect::WriteRtcTime(_))),
+            Some(Effect::WriteRtcTime(dt)) if dt.hour == 18 && dt.minute == 0
+        ));
+        let rtc_op = rtc_batch.operation_id;
+        let tz_batch = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistTimezone(_)))
+            })
+            .expect("SetTimezone must persist the offset");
+        let tz_op = tz_batch.operation_id;
+        // RTC write alone confirms: no reply yet, offset not yet applied.
+        let mid = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                output: EffectOutput::RtcTimeWritten,
+            }),
+        );
+        assert!(
+            !mid.iter()
+                .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))),
+            "reply must wait for the timezone persist"
+        );
+        assert_eq!(
+            state.config.timezone_offset_minutes, 0,
+            "offset applies on persist confirm"
+        );
+        // Timezone persist confirms -> offset applied + Ok on USB.
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: tz_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Timezone),
+            }),
+        );
+        assert_eq!(state.config.timezone_offset_minutes, 480);
+        assert!(done.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        }));
+        assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn set_timezone_rtc_failure_replies_error_and_leaves_offset_unchanged() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.timezone_offset_minutes = 0;
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetTimezone {
+                offset_minutes: 480,
+            }),
+        );
+        let rtc_op = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::WriteRtcTime(_)))
+            })
+            .unwrap()
+            .operation_id;
+        let failed = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                error: EffectError::Rtc("rtc bus error".into()),
+            }),
+        );
+        let error_seen = failed.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => message.contains("rtc bus error"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(state.pending_usb_reply.is_none(), "slot released");
+        assert_eq!(
+            state.config.timezone_offset_minutes, 0,
+            "offset must not change on a failed SetTimezone"
+        );
+    }
+
+    #[test]
+    fn set_timezone_rejects_out_of_range_offset() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::BleCommand(ControlRequest::SetTimezone {
+                offset_minutes: 2000,
+            }),
+        );
+        assert!(batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Error { .. }
+                    }
+                )
+            })
+        }));
+        assert!(state.pending_ble_reply.is_none());
     }
 
     #[test]

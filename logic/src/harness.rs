@@ -116,6 +116,8 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistInbox(_) => "PersistInbox",
         Effect::PersistConfig(_) => "PersistConfig",
         Effect::PersistSyncMetadata(_) => "PersistSyncMetadata",
+        Effect::PersistTimezone(_) => "PersistTimezone",
+        Effect::WriteRtcTime(_) => "WriteRtcTime",
         Effect::ProgramRtcAlarm(_) => "ProgramRtcAlarm",
         Effect::DisableRtcAlarm => "DisableRtcAlarm",
         Effect::AcknowledgeRtcAlarm => "AcknowledgeRtcAlarm",
@@ -138,8 +140,11 @@ impl EffectExecutor for FakeExecutor {
             | Effect::PersistTodos(_)
             | Effect::PersistInbox(_)
             | Effect::PersistConfig(_)
-            | Effect::PersistSyncMetadata(_) => EffectCategory::Persist,
-            Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm => EffectCategory::Rtc,
+            | Effect::PersistSyncMetadata(_)
+            | Effect::PersistTimezone(_) => EffectCategory::Persist,
+            Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm | Effect::WriteRtcTime(_) => {
+                EffectCategory::Rtc
+            }
             Effect::AcknowledgeRtcAlarm => EffectCategory::Ack,
             Effect::StartTone | Effect::StopTone => EffectCategory::Tone,
             Effect::Reply { .. } => EffectCategory::Ack,
@@ -171,6 +176,10 @@ impl EffectExecutor for FakeExecutor {
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm => {
                 Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed))
             }
+            Effect::WriteRtcTime(_) => Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten)),
+            Effect::PersistTimezone(_) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                crate::app::PersistTarget::Timezone,
+            ))),
             Effect::AcknowledgeRtcAlarm => Ok(EffectOutcome::Completed(EffectOutput::AckDone)),
             Effect::StartTone | Effect::StopTone => {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))

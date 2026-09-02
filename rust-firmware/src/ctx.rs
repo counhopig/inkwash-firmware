@@ -134,6 +134,10 @@ pub use inkwash_logic::background_outcome::BackgroundOutcome;
 /// with the sync-metadata state (the SyncCompleted increment); until then
 /// the legacy path preserves that side effect exactly.
 pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
+    // SetTimezone is not routed here yet: shifting the RTC by the offset
+    // delta needs a fresh clock fact, which the unified event loop (later
+    // migration stage) guarantees. Until then the legacy path reads the
+    // RTC directly.
     matches!(cmd, Command::ClearAlarms)
 }
 

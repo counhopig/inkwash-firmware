@@ -93,6 +93,20 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 ))),
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
             },
+            Effect::PersistTimezone(offset_minutes) => match self
+                .ctx
+                .counters
+                .save_timezone_offset_minutes(*offset_minutes)
+            {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                    inkwash_logic::app::PersistTarget::Timezone,
+                ))),
+                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+            },
+            Effect::WriteRtcTime(dt) => match self.ctx.rtc.write_time(dt) {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten)),
+                Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),
+            },
             Effect::PersistSyncMetadata(meta) => {
                 let result = (|| -> Result<()> {
                     if let Some(etag) = meta.etag.as_deref() {
