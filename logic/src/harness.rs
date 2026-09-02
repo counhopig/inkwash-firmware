@@ -462,6 +462,7 @@ pub mod helpers {
                 server_url: String::new(),
                 auth_token: String::new(),
             },
+            status: crate::app::DeviceStatus::default(),
         }
     }
 

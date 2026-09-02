@@ -194,7 +194,8 @@ mod tests {
     use super::*;
     use crate::alarm_schedule::StoredAlarm;
     use crate::app::{
-        AlarmRuntimeState, BootSnapshot, Effect, EffectError, EffectOutput, PersistTarget, Screen,
+        AlarmRuntimeState, BootSnapshot, DeviceStatus, Effect, EffectError, EffectOutput,
+        PersistTarget, Screen,
     };
     use crate::device_config::DeviceConfig;
     use crate::event_queue::Priority;
@@ -227,6 +228,7 @@ mod tests {
                 server_url: String::new(),
                 auth_token: String::new(),
             },
+            status: DeviceStatus::default(),
         })
     }
 

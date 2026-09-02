@@ -397,6 +397,20 @@ pub struct BootSnapshot {
     pub todos: Vec<Todo>,
     pub inbox: Vec<InboxItem>,
     pub config: DeviceConfig,
+    /// Status-visible device facts (wi-fi presence, timezone) gathered at
+    /// boot. Secrets are never included.
+    pub status: DeviceStatus,
+}
+
+/// Status-visible device configuration facts gathered at boot for
+/// `GetStatus`. Mirrors `ConfigState`'s fields; carried on `BootSnapshot`
+/// so the state machine's `ConfigState` is populated from a fact, never
+/// from a driver read.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DeviceStatus {
+    pub wifi_ssid: Option<String>,
+    pub wifi_has_password: bool,
+    pub timezone_offset_minutes: i16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -728,6 +742,16 @@ fn transition_boot(state: &mut AppState, snapshot: BootSnapshot) -> Vec<EffectBa
     state.alarms.alarms = snapshot.alarms;
     state.todos.todos = snapshot.todos;
     state.inbox.items = snapshot.inbox;
+    // Status-visible config facts (no secrets). The server URL presence
+    // comes from the persisted config; wifi/timezone come from the boot
+    // status fact.
+    state.config.server_url = Some(snapshot.config.server_url).filter(|s| !s.is_empty());
+    state.config.server_has_token = !snapshot.config.auth_token.is_empty();
+    state.config.wifi_ssid = snapshot.status.wifi_ssid;
+    state.config.wifi_has_password = snapshot.status.wifi_has_password;
+    state.config.timezone_offset_minutes = snapshot.status.timezone_offset_minutes;
+    state.connectivity.wifi_configured = state.config.wifi_configured();
+    state.connectivity.server_configured = state.config.server_configured();
 
     let mut batches = Vec::new();
     // An asserted AF at boot resolves through the same path as a runtime
@@ -1342,6 +1366,22 @@ fn transition_command(
                 ),
             ]
         }
+        ControlRequest::GetStatus => {
+            // A pure read: build the status reply from the facts in state
+            // (no side effects, no pending slot). Same result regardless of
+            // transport - the channel only selects where the reply goes.
+            let status = Reply::Status {
+                wifi_configured: state.config.wifi_configured(),
+                server_configured: state.config.server_configured(),
+                wifi_connected: state.connectivity.wifi_connected,
+                wifi_ssid: state.config.wifi_ssid.clone(),
+                wifi_has_password: state.config.wifi_has_password,
+                server_url: state.config.server_url.clone(),
+                server_has_token: state.config.server_has_token,
+                timezone_offset_minutes: state.config.timezone_offset_minutes,
+            };
+            vec![reply_batch(state, channel, status)]
+        }
         // Other commands need their storage/network side effects, wired in
         // migration step 3. Refuse rather than guess.
         _ => vec![reply_batch(
@@ -1587,6 +1627,7 @@ mod tests {
                 server_url: String::new(),
                 auth_token: String::new(),
             },
+            status: DeviceStatus::default(),
         }
     }
 
@@ -2007,8 +2048,8 @@ mod tests {
             })
         }));
         // A BLE command while USB is busy is NOT busy: the transports have
-        // independent slots, so it is processed (currently unsupported ->
-        // error reply to BLE only).
+        // independent slots, so it is processed - GetStatus is a pure read
+        // and replies Status to BLE only.
         let ble_batches = update(&mut state, Event::BleCommand(ControlRequest::GetStatus));
         assert!(!ble_batches.iter().any(|b| {
             b.effects.iter().any(|e| {
@@ -2027,7 +2068,7 @@ mod tests {
                     e,
                     Effect::Reply {
                         channel: Channel::Ble,
-                        reply: Reply::Error { .. }
+                        reply: Reply::Status { .. }
                     }
                 )
             })
@@ -2039,32 +2080,32 @@ mod tests {
 
     #[test]
     fn same_command_on_usb_and_ble_replies_on_its_own_channel() {
-        // "USB/BLE 同一命令产生相同业务结果": the unsupported-command error
-        // (the pre-Step-3 stub) must reach whichever transport sent it, and
-        // only that transport.
+        // "USB/BLE 同一命令产生相同业务结果": GetStatus must produce the same
+        // Status payload on both transports, each delivered only to its own
+        // channel.
         let mut state = AppState::default();
         let usb_batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
         let ble_batches = update(&mut state, Event::BleCommand(ControlRequest::GetStatus));
-        let usb_err = usb_batches.iter().find_map(|b| {
+        let usb_status = usb_batches.iter().find_map(|b| {
             b.effects.iter().find_map(|e| match e {
                 Effect::Reply {
                     channel: Channel::Usb,
-                    reply: Reply::Error { message },
-                } => Some(message.clone()),
+                    reply: Reply::Status { .. },
+                } => Some(()),
                 _ => None,
             })
         });
-        let ble_err = ble_batches.iter().find_map(|b| {
+        let ble_status = ble_batches.iter().find_map(|b| {
             b.effects.iter().find_map(|e| match e {
                 Effect::Reply {
                     channel: Channel::Ble,
-                    reply: Reply::Error { message },
-                } => Some(message.clone()),
+                    reply: Reply::Status { .. },
+                } => Some(()),
                 _ => None,
             })
         });
-        assert_eq!(usb_err, ble_err, "same command -> same business result");
-        assert!(usb_err.is_some());
+        assert!(usb_status.is_some(), "USB GetStatus replies Status");
+        assert!(ble_status.is_some(), "BLE GetStatus replies Status");
         // No cross-channel leakage.
         assert!(!usb_batches.iter().any(|b| {
             b.effects.iter().any(|e| {
@@ -2126,6 +2167,89 @@ mod tests {
             state.pending_usb_reply.is_none(),
             "no slot taken on refusal"
         );
+    }
+
+    #[test]
+    fn boot_populates_status_visible_config_facts() {
+        let mut state = AppState::default();
+        let snapshot = BootSnapshot {
+            wake_cause: WakeCause::Other,
+            now: Some(dt(8, 0)),
+            rtc_alarm_flag: false,
+            rtc_alarm_interrupt_enabled: true,
+            alarms: vec![],
+            todos: vec![],
+            inbox: vec![],
+            config: DeviceConfig {
+                server_url: "https://server.example".into(),
+                auth_token: "sekrit".into(),
+            },
+            status: DeviceStatus {
+                wifi_ssid: Some("home-wifi".into()),
+                wifi_has_password: true,
+                timezone_offset_minutes: 480,
+            },
+        };
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(
+            state.config.server_url.as_deref(),
+            Some("https://server.example")
+        );
+        assert!(state.config.server_has_token);
+        assert_eq!(state.config.wifi_ssid.as_deref(), Some("home-wifi"));
+        assert!(state.config.wifi_has_password);
+        assert_eq!(state.config.timezone_offset_minutes, 480);
+        assert!(state.connectivity.wifi_configured);
+        assert!(state.connectivity.server_configured);
+    }
+
+    #[test]
+    fn get_status_replies_status_from_state_facts() {
+        let mut state = AppState::default();
+        state.config.wifi_ssid = Some("home-wifi".into());
+        state.config.wifi_has_password = true;
+        state.config.server_url = Some("https://server.example".into());
+        state.config.server_has_token = true;
+        state.config.timezone_offset_minutes = -300;
+        state.connectivity.wifi_connected = true;
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
+        let status_reply = batches.iter().find_map(|b| {
+            b.effects.iter().find_map(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply:
+                        Reply::Status {
+                            wifi_configured,
+                            server_configured,
+                            wifi_connected,
+                            wifi_ssid,
+                            wifi_has_password,
+                            server_url,
+                            server_has_token,
+                            timezone_offset_minutes,
+                        },
+                } => Some((
+                    *wifi_configured,
+                    *server_configured,
+                    *wifi_connected,
+                    wifi_ssid.clone(),
+                    *wifi_has_password,
+                    server_url.clone(),
+                    *server_has_token,
+                    *timezone_offset_minutes,
+                )),
+                _ => None,
+            })
+        });
+        let (wifi_cfg, server_cfg, wifi_conn, ssid, has_pw, url, has_tok, tz) =
+            status_reply.expect("GetStatus must reply Status");
+        assert!(wifi_cfg && server_cfg && wifi_conn);
+        assert_eq!(ssid.as_deref(), Some("home-wifi"));
+        assert!(has_pw);
+        assert_eq!(url.as_deref(), Some("https://server.example"));
+        assert!(has_tok);
+        assert_eq!(tz, -300);
+        assert!(state.pending_usb_reply.is_none(), "GetStatus takes no slot");
     }
 
     #[test]

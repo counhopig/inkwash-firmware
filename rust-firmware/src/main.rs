@@ -1138,6 +1138,14 @@ fn collect_boot_snapshot(
             auth_token: String::new(),
         });
     let wake_cause = power::wake_cause();
+    // Status-visible facts (no secrets) for GetStatus: the wi-fi SSID /
+    // password-presence, the timezone, and last-known connectivity.
+    let wifi = ctx.counters.wifi_creds().ok().flatten();
+    let status = inkwash_logic::app::DeviceStatus {
+        wifi_ssid: wifi.as_ref().map(|creds| creds.ssid.clone()),
+        wifi_has_password: wifi.is_some_and(|creds| !creds.password.is_empty()),
+        timezone_offset_minutes: ctx.counters.timezone_offset_minutes().unwrap_or(0),
+    };
     BootSnapshotResult {
         snapshot: inkwash_logic::app::BootSnapshot {
             wake_cause,
@@ -1148,6 +1156,7 @@ fn collect_boot_snapshot(
             todos,
             inbox,
             config,
+            status,
         },
         core_failed,
     }
