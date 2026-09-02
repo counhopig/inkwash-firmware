@@ -34,7 +34,7 @@ impl Pcf8563 {
 
     fn read_regs(&mut self, reg: u8, out: &mut [u8]) -> Result<()> {
         self.bus
-            .borrow_mut()
+            .lock()
             .write_read(self.addr, &[reg], out, I2C_TIMEOUT_TICKS)
             .map_err(|e| anyhow!("PCF8563 read regs 0x{reg:02x} failed: {e}"))
     }
@@ -51,7 +51,7 @@ impl Pcf8563 {
         buf[0] = start_reg;
         buf[1..=bytes.len()].copy_from_slice(bytes);
         self.bus
-            .borrow_mut()
+            .lock()
             .write(self.addr, &buf[..=bytes.len()], I2C_TIMEOUT_TICKS)
             .map_err(|e| anyhow!("PCF8563 write regs 0x{start_reg:02x} failed: {e}"))
     }

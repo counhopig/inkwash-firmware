@@ -69,12 +69,12 @@ impl NfcTag {
     /// read - the chip needs `READ_DELAY` to prepare the block internally.
     pub fn read_block(&mut self, block_addr: u8, out: &mut [u8; BLOCK_SIZE]) -> Result<()> {
         self.i2c
-            .borrow_mut()
+            .lock()
             .write(self.addr, &[block_addr], I2C_TIMEOUT_TICKS)
             .map_err(|e| anyhow!("NFC write block addr 0x{block_addr:02x} failed: {e}"))?;
         thread::sleep(READ_DELAY);
         self.i2c
-            .borrow_mut()
+            .lock()
             .read(self.addr, out, I2C_TIMEOUT_TICKS)
             .map_err(|e| anyhow!("NFC read block 0x{block_addr:02x} failed: {e}"))
     }

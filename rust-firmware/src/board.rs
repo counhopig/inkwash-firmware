@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::adc::attenuation::DB_12;
@@ -12,6 +11,7 @@ use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::i2s::{I2sDriver, I2sTx};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::units::Hertz;
+use parking_lot::Mutex;
 
 use crate::audio::{self, Es8311};
 use crate::button::Button;
@@ -25,7 +25,13 @@ pub type BoardAdc = AdcDriver<'static, esp_idf_svc::hal::adc::ADCU1>;
 /// GT23SC6699 NFC tag, so all three hold a clone of the same driver
 /// instance rather than each owning their own (only one `I2cDriver` may be
 /// installed per port).
-pub type SharedI2c = Rc<RefCell<I2cDriver<'static>>>;
+///
+/// The lock is `Arc<Mutex<..>>` (not `Rc<RefCell<..>>`) because the RTC
+/// executor runs on its own task and must take the same bus the main
+/// thread's audio codec uses. `parking_lot::Mutex` is used instead of
+/// `std::sync::Mutex` to match the rest of the crate (`epd_task.rs`) and
+/// because its guards need no `unwrap()` at every call site.
+pub type SharedI2c = Arc<Mutex<I2cDriver<'static>>>;
 
 /// eFuse curve-fitting calibration (ESP32-S3 three-point fit) instead of
 /// the uncalibrated linear `DirectConverter` fallback: without it the mV
@@ -259,7 +265,7 @@ impl Note4Board {
         let i2c_config = I2cConfig::new().baudrate(I2C_FREQUENCY);
         let i2c = I2cDriver::new(peripherals.i2c0, pins.gpio47, pins.gpio48, &i2c_config)
             .context("failed to install I2C0 driver on GPIO47/48")?;
-        let i2c_bus: SharedI2c = Rc::new(RefCell::new(i2c));
+        let i2c_bus: SharedI2c = Arc::new(Mutex::new(i2c));
         let mut rtc = Pcf8563::new(i2c_bus.clone(), PCF8563_ADDR);
         rtc.probe().context("PCF8563 not responding on I2C bus")?;
         // architecture requires the boot flow to read both AF and AIE

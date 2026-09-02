@@ -8,17 +8,16 @@
 //! fixed hardware configuration instead of the general multi-rate driver -
 //! this board never runs the codec at any other MCLK/sample-rate pair.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use esp_idf_svc::hal::gpio::{Output, PinDriver};
-use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::hal::i2s::config::{DataBitWidth, StdConfig};
 use esp_idf_svc::hal::i2s::{I2sDriver, I2sTx};
 use esp_idf_svc::sys::TickType_t;
+use parking_lot::Mutex;
 
 pub const ES8311_ADDR: u8 = 0x18;
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
@@ -69,7 +68,7 @@ mod coeff {
 const RESOLUTION_16BIT_SDP: u8 = 3 << 2;
 
 pub struct Es8311 {
-    i2c: Rc<RefCell<I2cDriver<'static>>>,
+    i2c: Arc<Mutex<esp_idf_svc::hal::i2c::I2cDriver<'static>>>,
     addr: u8,
     i2s: I2sDriver<'static, I2sTx>,
     pa_enable: PinDriver<'static, Output>,
@@ -77,7 +76,7 @@ pub struct Es8311 {
 
 impl Es8311 {
     pub fn new(
-        i2c: Rc<RefCell<I2cDriver<'static>>>,
+        i2c: Arc<Mutex<esp_idf_svc::hal::i2c::I2cDriver<'static>>>,
         addr: u8,
         i2s: I2sDriver<'static, I2sTx>,
         pa_enable: PinDriver<'static, Output>,
@@ -95,7 +94,7 @@ impl Es8311 {
     fn read_reg(&mut self, reg: u8) -> Result<u8> {
         let mut value = [0u8; 1];
         self.i2c
-            .borrow_mut()
+            .lock()
             .write_read(self.addr, &[reg], &mut value, I2C_TIMEOUT_TICKS)
             .map_err(|e| anyhow!("ES8311 read reg 0x{reg:02x} failed: {e}"))?;
         Ok(value[0])
@@ -103,7 +102,7 @@ impl Es8311 {
 
     fn write_reg(&mut self, reg: u8, value: u8) -> Result<()> {
         self.i2c
-            .borrow_mut()
+            .lock()
             .write(self.addr, &[reg, value], I2C_TIMEOUT_TICKS)
             .map_err(|e| anyhow!("ES8311 write reg 0x{reg:02x} failed: {e}"))
     }
