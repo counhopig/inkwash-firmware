@@ -257,13 +257,12 @@ impl DeviceContext<'_> {
         // Clone the shared runner out so `self` can be re-borrowed as the
         // driver context (no self-referential borrow).
         let runner = self.app_runner.clone();
-        let decode = {
-            let mut r = runner.borrow_mut();
-            r.dispatch(
-                inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
-                self,
-            )
-        };
+        let last_clock = runner.borrow().last_clock();
+        let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
+        let decode = runner.borrow_mut().dispatch(
+            inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
+            &mut executor,
+        );
         if decode.is_err() {
             log::warn!("Blocking page AppRunner RtcAlarmSnapshotReady dispatch failed");
             return false;
@@ -296,11 +295,13 @@ impl DeviceContext<'_> {
                 log::error!("ring_screen failed: {err}");
             }
             // ENTER press -> Firing -> WaitingForRearm.
+            let last_clock = runner.borrow().last_clock();
+            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
             let _ = runner.borrow_mut().dispatch(
                 inkwash_logic::app::Event::Button(
                     inkwash_logic::button_event::ButtonEvent::Pressed,
                 ),
-                self,
+                &mut executor,
             );
             // Route the dismiss render kick too.
             self.forward_kicks(&runner);

@@ -442,7 +442,8 @@ fn main() -> Result<()> {
                 ctx.app_runner_enabled = false;
                 log::error!("Core boot fact unavailable; AppRunner disabled for this boot");
             } else {
-                if let Err(err) = app_runner.borrow_mut().dispatch(
+                if let Err(err) = dispatch_app_runner(
+                    &app_runner,
                     inkwash_logic::app::Event::Boot(boot_result.snapshot),
                     &mut ctx,
                 ) {
@@ -471,7 +472,8 @@ fn main() -> Result<()> {
                 {
                     log::error!("Boot ring_screen failed: {err}");
                 }
-                let _ = app_runner.borrow_mut().dispatch(
+                let _ = dispatch_app_runner(
+                    &app_runner,
                     inkwash_logic::app::Event::Button(
                         inkwash_logic::button_event::ButtonEvent::Pressed,
                     ),
@@ -537,10 +539,11 @@ fn main() -> Result<()> {
                         // AppState has no alarm/NVS/config data and must
                         // not rearm or interpret anything from a Tick.
                         if app_runner_enabled {
-                            if let Err(err) = app_runner
-                                .borrow_mut()
-                                .dispatch(inkwash_logic::app::Event::Tick(dt), &mut ctx)
-                            {
+                            if let Err(err) = dispatch_app_runner(
+                                &app_runner,
+                                inkwash_logic::app::Event::Tick(dt),
+                                &mut ctx,
+                            ) {
                                 log::warn!("AppRunner Tick dispatch failed: {err}");
                             }
                             for kick in app_runner.borrow_mut().take_pending_kicks() {
@@ -621,7 +624,8 @@ fn main() -> Result<()> {
                             alarm_flag: true,
                             alarm_interrupt_enabled: aie,
                         };
-                        if let Err(err) = app_runner.borrow_mut().dispatch(
+                        if let Err(err) = dispatch_app_runner(
+                            &app_runner,
                             inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
                             &mut ctx,
                         ) {
@@ -644,7 +648,8 @@ fn main() -> Result<()> {
                             }
                             // Dismiss press dispatches ENTER as a state
                             // machine event; Firing -> WaitingForRearm.
-                            let _ = app_runner.borrow_mut().dispatch(
+                            let _ = dispatch_app_runner(
+                                &app_runner,
                                 inkwash_logic::app::Event::Button(
                                     inkwash_logic::button_event::ButtonEvent::Pressed,
                                 ),
@@ -746,10 +751,9 @@ fn main() -> Result<()> {
                             completion.kind
                         ))
                     });
-                    if let Err(err) = {
-                        let mut ar = app_runner.borrow_mut();
-                        feed_completion_back(&mut ar, &mut ctx, kick, output, failure)
-                    } {
+                    if let Err(err) =
+                        feed_completion_back(&app_runner, &mut ctx, kick, output, failure)
+                    {
                         log::warn!("AppRunner EPD completion feed failed: {err}");
                     }
                 }
@@ -1141,6 +1145,24 @@ fn collect_boot_snapshot(
     }
 }
 
+/// Dispatches an event through AppRunner using a fresh per-batch
+/// `EffectRunner` borrowing `ctx`. Captures the runner's last_clock
+/// first so the `Rc<RefCell<AppRunner>>` and `ctx` borrows do not
+/// conflict (the executor holds `&mut ctx`, which `dispatch` also
+/// needs).
+fn dispatch_app_runner(
+    runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
+    event: inkwash_logic::app::Event,
+    ctx: &mut DeviceContext<'_>,
+) -> anyhow::Result<()> {
+    let last_clock = runner.borrow().last_clock();
+    let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
+    runner
+        .borrow_mut()
+        .dispatch(event, &mut executor)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// Records one in-flight render into the shared `pending_renders`
 /// registry so the matching `EpdCompletion` (by request_id) can be fed
 /// back to the state machine, regardless of which entry point (main
@@ -1176,11 +1198,16 @@ fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
 /// consumed (removed from `pending_renders` by the caller before this is
 /// called) so the generation / op id line up.
 fn feed_completion_back(
-    runner: &mut app_runner::AppRunner,
+    runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     ctx: &mut DeviceContext<'_>,
     kick: app_runner::AsyncKick,
     output: inkwash_logic::app::EffectOutput,
     failure: Option<inkwash_logic::app::EffectError>,
 ) -> anyhow::Result<()> {
-    runner.feed_render_completion(kick, output, failure, ctx)
+    let last_clock = runner.borrow().last_clock();
+    let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
+    runner
+        .borrow_mut()
+        .feed_render_completion(kick, output, failure, &mut executor)
+        .map_err(|e| anyhow::anyhow!(e))
 }

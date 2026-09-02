@@ -1,292 +1,44 @@
-//! AppRunner: the firmware-side driver of `inkwash_logic::app::update`.
+//! Firmware-side `EffectExecutor` for the host-testable runner.
 //!
-//! Migration step 2 (see `docs/firmware-architecture.md` §迁移边界) wires the
-//! boot, home, RTC alarm, and sleep flows through a single state machine +
-//! event loop. The state machine itself lives in
-//! `inkwash_logic::app` (host-testable, no ESP-IDF) and only deals in pure
-//! data; this module is the bridge that:
+//! The application-state driving engine (batch execution, EffectId
+//! allocation, AbortBatch semantics, completion feedback, async-kick
+//! collection, render-completion routing) lives in
+//! `inkwash_logic::runner` and is host-testable with a fake executor.
+//! This module provides the *real* executor: `EffectRunner` runs each
+//! `Effect` against `DeviceContext`'s drivers (RTC, NVS stores, audio,
+//! display, USB/BLE), plus the render/reply helpers it needs.
 //!
-//! - owns the `AppState` (one business-state owner; per architecture §应用
-//!   状态机);
-//! - drives `update(state, event) -> Vec<EffectBatch>` for every event the
-//!   firmware collects;
-//! - runs each returned `EffectBatch` against the existing drivers via the
-//!   `EffectRunner` helper, producing `EffectCompleted` / `EffectFailed`
-//!   events that are fed back into the state machine.
-//!
-//! Per-category error mapping (P1 #4): each `Effect` variant maps its
-//! `anyhow::Error` to the matching `EffectError` variant so the state
-//! machine schedules the correct retry path. FailurePolicy::AbortBatch
-//! is honoured (P1 #5): the first failure stops the rest of the batch
-//! without rolling back successful writes. EffectIds are assigned in
-//! declared order inside each batch (P1 #5): the same `Effect` always
-//! carries the same id within one batch, so completion/failure events
-//! correlate precisely.
+//! `AppRunner`, `AsyncKick`, `EffectOutcome`, `EffectCategory` and
+//! `err_for_category` are re-exported from `inkwash_logic::runner` so
+//! the firmware call sites (`main.rs`) are unchanged in spelling.
 
 use anyhow::Result;
 
-use inkwash_logic::app::{
-    self, AppState, Effect, EffectBatchId, EffectCompletion, EffectError, EffectFailure, EffectId,
-    EffectOutput, Event, FailurePolicy, OperationId, RenderGeneration, RenderRequest,
-};
+use inkwash_logic::app::{Effect, EffectOutput, RenderRequest};
 use inkwash_logic::protocol::ControlReply;
+use inkwash_logic::runner::{EffectCategory, EffectExecutor, EffectOutcome};
+
+pub use inkwash_logic::runner::{AppRunner, AsyncKick};
 
 use crate::alarms::AlarmStore;
 use crate::control::{self, Reply};
 use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
 
-/// Owns the application's `AppState` and drives every event through the
-/// pure transition function.
-pub struct AppRunner {
-    state: AppState,
-    /// Most recent RTC read - threaded into `Effect::Render` so the home
-    /// screen does not need a fresh I2C transaction for each refresh.
-    last_clock: Option<DateTime>,
-    /// In-flight kicks returned by `dispatch`. The main loop drains them
-    /// and tracks each render so the matching EPD completion can be fed
-    /// back as `EffectCompleted(RenderDone)`.
-    pending_kicks: Vec<AsyncKick>,
-}
-
-impl AppRunner {
-    pub fn new() -> Self {
-        Self {
-            state: AppState::default(),
-            last_clock: None,
-            pending_kicks: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn from_state(state: AppState) -> Self {
-        Self {
-            state,
-            last_clock: None,
-            pending_kicks: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn state(&self) -> &AppState {
-        &self.state
-    }
-
-    #[allow(dead_code)]
-    pub fn state_mut(&mut self) -> &mut AppState {
-        &mut self.state
-    }
-
-    pub fn set_last_clock(&mut self, clock: Option<DateTime>) {
-        self.last_clock = clock;
-    }
-
-    /// Dispatch a single event through the state machine and run every
-    /// returned effect batch against the existing drivers. Asynchronous
-    /// kicks are stashed in `self.pending_kicks`; callers drain them via
-    /// `take_pending_kicks`.
-    pub fn dispatch(&mut self, event: Event, ctx: &mut DeviceContext<'_>) -> Result<()> {
-        let batches = app::update(&mut self.state, event);
-        for batch in batches {
-            self.run_batch(batch, ctx)?;
-        }
-        Ok(())
-    }
-
-    /// Drain the queue of in-flight asynchronous kicks accumulated by
-    /// the most recent `dispatch` / `on_effect_completed` /
-    /// `on_effect_failed` calls.
-    pub fn take_pending_kicks(&mut self) -> Vec<AsyncKick> {
-        std::mem::take(&mut self.pending_kicks)
-    }
-
-    fn run_batch(&mut self, batch: app::EffectBatch, ctx: &mut DeviceContext<'_>) -> Result<()> {
-        let mut runner = EffectRunner {
-            ctx,
-            last_clock: self.last_clock,
-        };
-        // EffectId allocation: stable, position-based within the batch so
-        // completion/failure events correlate precisely (P1 #5). The
-        // `batch.failure_policy` decides whether to keep going after a
-        // failure: `AbortBatch` stops the rest of the batch on the first
-        // failure; `Continue` runs every effect regardless.
-        for (idx, effect) in batch.effects.iter().cloned().enumerate() {
-            let effect_id = EffectId(idx as u64 + 1);
-            let outcome = runner.run(&effect);
-            // End the runner's borrow before re-borrowing `self` / `ctx`
-            // for the recursive `run_batch` call below. We shadow the
-            // variable (rather than `drop(runner)`) because
-            // `EffectRunner` has no `Drop` impl - clippy flags
-            // `std::mem::drop` on non-`Drop` types as a no-op.
-            let _ = runner;
-            match outcome {
-                Ok(EffectOutcome::Completed(output)) => {
-                    let completion = EffectCompletion {
-                        batch_id: batch.id,
-                        effect_id,
-                        operation_id: batch.operation_id,
-                        render_generation: batch.render_generation,
-                        output,
-                    };
-                    let chained = app::update(&mut self.state, Event::EffectCompleted(completion));
-                    for next in chained {
-                        self.run_batch(next, ctx)?;
-                    }
-                }
-                Ok(EffectOutcome::AsyncWithId(request_id)) => self.pending_kicks.push(AsyncKick {
-                    batch_id: batch.id,
-                    effect_id,
-                    operation_id: batch.operation_id,
-                    render_generation: batch.render_generation,
-                    effect,
-                    request_id: Some(request_id),
-                }),
-                Ok(EffectOutcome::Async) => self.pending_kicks.push(AsyncKick {
-                    batch_id: batch.id,
-                    effect_id,
-                    operation_id: batch.operation_id,
-                    render_generation: batch.render_generation,
-                    effect,
-                    request_id: None,
-                }),
-                Err((category, msg)) => {
-                    let failure = EffectFailure {
-                        batch_id: batch.id,
-                        effect_id,
-                        operation_id: batch.operation_id,
-                        render_generation: batch.render_generation,
-                        error: err_for_category(category, &msg),
-                    };
-                    let chained = app::update(&mut self.state, Event::EffectFailed(failure));
-                    for next in chained {
-                        self.run_batch(next, ctx)?;
-                    }
-                    if batch.failure_policy == FailurePolicy::AbortBatch {
-                        break;
-                    }
-                }
-            }
-            // Re-establish the runner for the next effect in this batch.
-            runner = EffectRunner {
-                ctx,
-                last_clock: self.last_clock,
-            };
-        }
-        Ok(())
-    }
-
-    /// Feed an externally-observed completion back into the state machine.
-    #[allow(dead_code)]
-    pub fn on_effect_completed(
-        &mut self,
-        completion: EffectCompletion,
-        ctx: &mut DeviceContext<'_>,
-    ) -> Result<()> {
-        let batches = app::update(&mut self.state, Event::EffectCompleted(completion));
-        for batch in batches {
-            self.run_batch(batch, ctx)?;
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn on_effect_failed(
-        &mut self,
-        failure: EffectFailure,
-        ctx: &mut DeviceContext<'_>,
-    ) -> Result<()> {
-        let batches = app::update(&mut self.state, Event::EffectFailed(failure));
-        for batch in batches {
-            self.run_batch(batch, ctx)?;
-        }
-        Ok(())
-    }
-
-    /// Feed a render completion (success or failure) back into the state
-    /// machine via the matching in-flight `AsyncKick`. Returns
-    /// immediately if the kick carries a non-render effect.
-    pub fn feed_render_completion(
-        &mut self,
-        kick: AsyncKick,
-        output: EffectOutput,
-        failure: Option<EffectError>,
-        ctx: &mut DeviceContext<'_>,
-    ) -> Result<()> {
-        if !matches!(kick.effect, Effect::Render(_)) {
-            return Ok(());
-        }
-        let chained = match failure {
-            Some(err) => {
-                let failure = EffectFailure {
-                    batch_id: kick.batch_id,
-                    effect_id: kick.effect_id,
-                    operation_id: kick.operation_id,
-                    render_generation: kick.render_generation,
-                    error: err,
-                };
-                app::update(&mut self.state, Event::EffectFailed(failure))
-            }
-            None => {
-                let completion = EffectCompletion {
-                    batch_id: kick.batch_id,
-                    effect_id: kick.effect_id,
-                    operation_id: kick.operation_id,
-                    render_generation: kick.render_generation,
-                    output,
-                };
-                app::update(&mut self.state, Event::EffectCompleted(completion))
-            }
-        };
-        for batch in chained {
-            self.run_batch(batch, ctx)?;
-        }
-        Ok(())
-    }
-}
-
-impl Default for AppRunner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A side-effect request the dispatch could not complete synchronously.
-#[derive(Clone)]
-pub struct AsyncKick {
-    pub batch_id: EffectBatchId,
-    pub effect_id: EffectId,
-    pub operation_id: OperationId,
-    pub render_generation: Option<RenderGeneration>,
-    pub effect: Effect,
-    /// EPD request id echoed by the matching `EpdCompletion`, when the
-    /// kick is a Render whose panel refresh already started.
-    pub request_id: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EffectCategory {
-    Ack,
-    Persist,
-    Rtc,
-    Render,
-    Sync,
-    Tone,
-    Sleep,
-}
-
-enum EffectOutcome {
-    Completed(EffectOutput),
-    Async,
-    AsyncWithId(u64),
-}
-
-/// Executes one `Effect` against the existing drivers.
-struct EffectRunner<'a, 'ctx> {
+/// Executes one `Effect` against the existing drivers, reporting the
+/// outcome back to `inkwash_logic::runner::AppRunner`.
+pub struct EffectRunner<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     last_clock: Option<DateTime>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
+    pub fn new(ctx: &'a mut DeviceContext<'ctx>, last_clock: Option<DateTime>) -> Self {
+        Self { ctx, last_clock }
+    }
+}
+
+impl EffectExecutor for EffectRunner<'_, '_> {
     fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
         match effect {
             // ---- synchronous effects ---------------------------------------
@@ -419,18 +171,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
                 crate::power::enter_deep_sleep_with_wakeups(plan.maintenance);
             }
         }
-    }
-}
-
-fn err_for_category(category: EffectCategory, msg: &str) -> EffectError {
-    match category {
-        EffectCategory::Ack => EffectError::Ack(msg.to_string()),
-        EffectCategory::Persist => EffectError::Persist(msg.to_string()),
-        EffectCategory::Rtc => EffectError::Rtc(msg.to_string()),
-        EffectCategory::Render => EffectError::Render(msg.to_string()),
-        EffectCategory::Sync => EffectError::Sync(msg.to_string()),
-        EffectCategory::Tone => EffectError::Tone(msg.to_string()),
-        EffectCategory::Sleep => EffectError::Sleep(msg.to_string()),
     }
 }
 
