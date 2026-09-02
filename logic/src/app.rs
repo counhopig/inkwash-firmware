@@ -1299,34 +1299,17 @@ fn transition_command(
         // it here; keep the transition a no-op rather than strand a reply
         // slot that nothing will resolve.
         ControlRequest::SyncNow => vec![],
-        ControlRequest::SetServer { url, token } => {
-            // Persist the server endpoint (no network verification needed;
-            // the URL is hard to validate without a request). The client is
-            // told once the write confirms. Clearing the stale ETag rides
-            // the same transition (sync-metadata side effect) so the old
-            // endpoint's conditional-request state cannot survive a server
-            // change.
-            let op = state.next_operation_id();
-            // Update the status-visible facts immediately (URL presence);
-            // the token itself is only carried to the persistence effect.
-            state.config.server_url = Some(url.clone());
-            state.config.server_has_token = !token.is_empty();
-            let cfg = DeviceConfig {
-                server_url: url,
-                auth_token: token,
-            };
-            let pending_request = ControlRequest::SetServer {
-                url: cfg.server_url.clone(),
-                token: cfg.auth_token.clone(),
-            };
-            set_pending_reply(state, channel, op, pending_request, vec![op]);
-            vec![batch(
-                state,
-                op,
-                FailurePolicy::AbortBatch,
-                vec![Effect::PersistConfig(cfg)],
-            )]
-        }
+        // SetServer's stale-ETag-clear side effect (NVS sync-metadata
+        // bookkeeping) migrates with the sync-metadata state; the firmware
+        // keeps routing it on the legacy path until then. If it ever does
+        // reach the runner, refuse loudly rather than hang the transport.
+        ControlRequest::SetServer { .. } => vec![reply_batch(
+            state,
+            channel,
+            Reply::Error {
+                message: "command not yet migrated to the state machine".into(),
+            },
+        )],
         ControlRequest::ClearAlarms => {
             // Empty the local list (authoritative NVS source) and disarm the
             // RTC slot. Two confirmable ops; the reply waits for both, and a
@@ -2108,9 +2091,14 @@ mod tests {
     }
 
     #[test]
-    fn set_server_persists_then_replies_ok_on_the_sending_channel() {
+    fn set_server_refuses_until_migrated_with_sync_metadata() {
+        // SetServer is not yet routed to the runner: its stale-ETag-clear
+        // side effect depends on sync-metadata state that migrates with the
+        // SyncCompleted increment. Until then the state machine refuses it
+        // loudly (the firmware keeps it on the legacy path, so this branch
+        // only guards against a future mis-routing that would otherwise
+        // hang the transport).
         let mut state = AppState::default();
-        // USB sends SetServer; it must occupy only the USB slot.
         let batches = update(
             &mut state,
             Event::UsbCommand(ControlRequest::SetServer {
@@ -2118,154 +2106,26 @@ mod tests {
                 token: "secret".into(),
             }),
         );
-        assert!(state.pending_usb_reply.is_some());
-        assert!(state.pending_ble_reply.is_none());
-        // The transition must request a PersistConfig carrying the new cfg.
-        let persist_batch = batches
-            .iter()
-            .find(|b| {
-                b.effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::PersistConfig(_)))
-            })
-            .expect("SetServer must emit a PersistConfig effect");
-        let op = persist_batch.operation_id;
-        // No reply yet: the command awaits its confirmable persist.
-        assert!(!batches
-            .iter()
-            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::Reply { .. })) }));
-        // The persist confirms -> the final Ok reply goes to USB only.
-        let confirm_batches = update(
-            &mut state,
-            Event::EffectCompleted(EffectCompletion {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op,
-                render_generation: None,
-                output: EffectOutput::Persisted(PersistTarget::Config),
-            }),
-        );
-        assert!(confirm_batches.iter().any(|b| {
+        assert!(!batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistConfig(_)))
+        }));
+        assert!(batches.iter().any(|b| {
             b.effects.iter().any(|e| {
                 matches!(
                     e,
                     Effect::Reply {
                         channel: Channel::Usb,
-                        reply: Reply::Ok
+                        reply: Reply::Error { .. }
                     }
                 )
             })
         }));
-        // The slot is released (command done).
-        assert!(state.pending_usb_reply.is_none());
-        // Status-visible config facts updated.
-        assert_eq!(
-            state.config.server_url.as_deref(),
-            Some("https://sync.example")
-        );
-        assert!(state.config.server_has_token);
-    }
-
-    #[test]
-    fn set_server_persist_failure_replies_error_and_releases_slot() {
-        let mut state = AppState::default();
-        let batches = update(
-            &mut state,
-            Event::BleCommand(ControlRequest::SetServer {
-                url: "https://sync.example".into(),
-                token: String::new(),
-            }),
-        );
-        let op = batches
-            .iter()
-            .find(|b| {
-                b.effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::PersistConfig(_)))
-            })
-            .expect("SetServer must emit PersistConfig")
-            .operation_id;
-        let fail_batches = update(
-            &mut state,
-            Event::EffectFailed(EffectFailure {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op,
-                render_generation: None,
-                error: EffectError::Persist("nvs write failed".into()),
-            }),
-        );
-        let error_seen = fail_batches.iter().any(|b| {
-            b.effects.iter().any(|e| match e {
-                Effect::Reply {
-                    channel: Channel::Ble,
-                    reply: Reply::Error { message },
-                } => message.contains("nvs write failed"),
-                _ => false,
-            })
-        });
-        assert!(error_seen);
         assert!(
-            state.pending_ble_reply.is_none(),
-            "slot released on failure"
+            state.pending_usb_reply.is_none(),
+            "no slot taken on refusal"
         );
-    }
-
-    #[test]
-    fn set_server_does_not_reply_until_all_awaited_ops_complete() {
-        let mut state = AppState::default();
-        // Two awaited ops (simulating a multi-step command): one completes,
-        // the reply must wait for the other.
-        let op1 = state.next_operation_id();
-        let op2 = state.next_operation_id();
-        set_pending_reply(
-            &mut state,
-            Channel::Usb,
-            op1,
-            ControlRequest::SetServer {
-                url: "x".into(),
-                token: "".into(),
-            },
-            vec![op1, op2],
-        );
-        let mid = update(
-            &mut state,
-            Event::EffectCompleted(EffectCompletion {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op1,
-                render_generation: None,
-                output: EffectOutput::Persisted(PersistTarget::Config),
-            }),
-        );
-        assert!(
-            !mid.iter()
-                .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))),
-            "reply must wait for the final awaited op"
-        );
-        assert!(state.pending_usb_reply.is_some(), "slot stays until done");
-        let done = update(
-            &mut state,
-            Event::EffectCompleted(EffectCompletion {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op2,
-                render_generation: None,
-                output: EffectOutput::RtcProgrammed,
-            }),
-        );
-        assert!(done.iter().any(|b| {
-            b.effects.iter().any(|e| {
-                matches!(
-                    e,
-                    Effect::Reply {
-                        channel: Channel::Usb,
-                        reply: Reply::Ok
-                    }
-                )
-            })
-        }));
-        assert!(state.pending_usb_reply.is_none());
     }
 
     #[test]

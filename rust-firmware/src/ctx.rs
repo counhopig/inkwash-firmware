@@ -28,7 +28,7 @@ use anyhow::Result;
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
 use crate::board::Note4Board;
-use crate::control::{self, Command, Reply};
+use crate::control::{self, Channel, Command, Reply};
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::{PersistedCounters, WifiCreds};
@@ -127,6 +127,77 @@ pub struct DeviceContext<'a> {
 /// using `crate::ctx::BackgroundOutcome`.
 pub use inkwash_logic::background_outcome::BackgroundOutcome;
 
+/// True when `cmd` has been migrated into the state machine (Stage 3):
+/// these run through the runner instead of the legacy `control::dispatch`.
+/// SetServer is deliberately NOT here yet: clearing the stale sync ETag on
+/// a server change is NVS sync-metadata bookkeeping that only migrates
+/// with the sync-metadata state (the SyncCompleted increment); until then
+/// the legacy path preserves that side effect exactly.
+pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::ClearAlarms)
+}
+
+/// Dispatches one migrated command into the shared state-machine runner.
+/// Mirrors `control::dispatch`'s dedup contract: a client resend with the
+/// same id + command replays the cached reply instead of re-executing.
+/// Returns the reply the state machine produced for the channel that sent
+/// the frame (if any). The caller writes it to the transport so the reply
+/// is written exactly once.
+pub(crate) fn dispatch_migrated_command(
+    ctx: &mut DeviceContext<'_>,
+    runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
+    event: inkwash_logic::app::Event,
+    request: Command,
+    id: Option<&str>,
+) -> Option<Reply> {
+    let channel = match &event {
+        inkwash_logic::app::Event::UsbCommand(_) => Channel::Usb,
+        inkwash_logic::app::Event::BleCommand(_) => Channel::Ble,
+        _ => return None,
+    };
+    // Dedup: a resent duplicate of the exact (id, Command) replays the
+    // cached reply rather than running the command again.
+    if let Some(id) = id {
+        if let Some((last_id, last_cmd, last_reply)) = &ctx.last_command {
+            if last_id == id && *last_cmd == request {
+                return Some(last_reply.clone());
+            }
+        }
+    }
+    let last_clock = runner.borrow().last_clock();
+    let mut reply_for_channel = None;
+    {
+        let mut executor = crate::app_runner::EffectRunner::new(ctx, last_clock);
+        let mut runtime = runner.borrow_mut();
+        runtime.push(event);
+        if let Err(err) = runtime.pump(&mut executor) {
+            log::warn!("Command dispatch through state machine failed: {err}");
+        }
+        for (reply_channel, reply) in executor.take_replies() {
+            if reply_channel == channel && reply_for_channel.is_none() {
+                reply_for_channel = Some(reply);
+            }
+        }
+    }
+    for kick in runner.borrow_mut().take_kicks() {
+        let mut reg = ctx.pending_renders.borrow_mut();
+        if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+            reg.register(kick);
+        } else {
+            log::warn!(
+                "AppRunner async kick {:?} (op {:?}) not wired; dropped",
+                kick.effect,
+                kick.operation_id
+            );
+        }
+    }
+    // Update the dedup cache with the real result (like control::dispatch).
+    if let (Some(id), Some(reply)) = (id, &reply_for_channel) {
+        ctx.last_command = Some((id.to_string(), request, reply.clone()));
+    }
+    reply_for_channel
+}
+
 impl DeviceContext<'_> {
     /// Services one queued USB command from any UI loop. Returns
     /// `(visible_change, activity)`: `visible_change` is true when a
@@ -140,6 +211,19 @@ impl DeviceContext<'_> {
             return (false, false);
         };
         let changes_visible_state = !matches!(cmd, Command::GetStatus);
+        // Migrated commands run through the state machine (Stage 3): the
+        // runner's effects (persist/RTC) execute and its Reply effect is
+        // written back to USB with the frame's correlation id.
+        if is_migrated_command(&cmd) {
+            let event = inkwash_logic::app::Event::UsbCommand(cmd.clone());
+            let runner = self.app_runner.clone();
+            let reply = dispatch_migrated_command(self, &runner, event, cmd, id.as_deref());
+            if let Some(reply) = &reply {
+                crate::usb_console::write_reply(reply, id.as_deref());
+            }
+            let changed = matches!(reply, Some(Reply::Ok));
+            return (changes_visible_state && changed, true);
+        }
         let fresh_now = self.rtc.read_time().ok();
         let reply = control::dispatch(
             self,

@@ -617,19 +617,32 @@ fn main() -> Result<()> {
         let mut ble_changed = false;
         if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command()) {
             let needs_full_redraw = matches!(cmd, control::Command::SyncNow);
-            let reply = control::dispatch(
-                &mut ctx,
-                control::Channel::Ble,
-                id.as_deref(),
-                cmd,
-                clock.as_ref(),
-            );
-            if needs_full_redraw && matches!(reply, control::Reply::Ok) {
-                dirty.push(FULL_SCREEN_RECT);
-                ble_changed = true;
-            }
-            if let Some(ble) = ctx.ble_control.as_ref() {
-                ble.write_reply(&reply, id.as_deref());
+            let reply = if ctx::is_migrated_command(&cmd) {
+                let runner = app_runner.clone();
+                ctx::dispatch_migrated_command(
+                    &mut ctx,
+                    &runner,
+                    inkwash_logic::app::Event::BleCommand(cmd.clone()),
+                    cmd,
+                    id.as_deref(),
+                )
+            } else {
+                Some(control::dispatch(
+                    &mut ctx,
+                    control::Channel::Ble,
+                    id.as_deref(),
+                    cmd,
+                    clock.as_ref(),
+                ))
+            };
+            if let Some(reply) = reply {
+                if needs_full_redraw && matches!(reply, control::Reply::Ok) {
+                    dirty.push(FULL_SCREEN_RECT);
+                    ble_changed = true;
+                }
+                if let Some(ble) = ctx.ble_control.as_ref() {
+                    ble.write_reply(&reply, id.as_deref());
+                }
             }
         }
 
@@ -1165,6 +1178,7 @@ fn dispatch_app_runner(
     }
     Ok(())
 }
+
 /// surfaced with a log and dropped - their transports aren't wired yet.
 fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
     let mut reg = ctx.pending_renders.borrow_mut();

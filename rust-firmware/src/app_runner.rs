@@ -16,14 +16,12 @@
 use anyhow::Result;
 
 use inkwash_logic::app::{Effect, EffectOutput, RenderIntent, RenderRequest};
-use inkwash_logic::protocol::ControlReply;
 use inkwash_logic::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 
 pub use inkwash_logic::runner::AsyncKick;
 pub use inkwash_logic::runtime::Runtime as AppRunner;
 
 use crate::alarms::AlarmStore;
-use crate::control::{self, Reply};
 use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
 
@@ -32,11 +30,34 @@ use crate::rtc::DateTime;
 pub struct EffectRunner<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     last_clock: Option<DateTime>,
+    /// Control replies the state machine emitted during this pump, in
+    /// order, tagged with their target channel. The caller (main loop /
+    /// blocking page) drains them after the pump and writes each to its
+    /// transport with the correlation id of the frame that triggered it.
+    replies: Vec<(
+        inkwash_logic::protocol::Channel,
+        inkwash_logic::protocol::Reply,
+    )>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     pub fn new(ctx: &'a mut DeviceContext<'ctx>, last_clock: Option<DateTime>) -> Self {
-        Self { ctx, last_clock }
+        Self {
+            ctx,
+            last_clock,
+            replies: Vec::new(),
+        }
+    }
+
+    /// Drain the replies emitted by the state machine during the last
+    /// pump, in emission order.
+    pub fn take_replies(
+        &mut self,
+    ) -> Vec<(
+        inkwash_logic::protocol::Channel,
+        inkwash_logic::protocol::Reply,
+    )> {
+        std::mem::take(&mut self.replies)
     }
 }
 
@@ -130,20 +151,11 @@ impl EffectExecutor for EffectRunner<'_, '_> {
             }
             // ---- asynchronous / out-of-band effects -------------------------
             Effect::Reply { channel, reply } => {
-                // Write the reply to exactly the transport the request came
-                // from: USB and BLE have independent pending-reply slots, so
-                // a response must never leak to the other channel.
-                let raw = reply_from_control_reply(reply);
-                match channel {
-                    inkwash_logic::protocol::Channel::Usb => {
-                        crate::usb_console::write_reply(&raw, None);
-                    }
-                    inkwash_logic::protocol::Channel::Ble => {
-                        if let Some(ble) = self.ctx.ble_control.as_ref() {
-                            ble.write_reply(&raw, None);
-                        }
-                    }
-                }
+                // Record the reply for the caller to write after the pump:
+                // only the caller knows the correlation id of the frame that
+                // triggered it, and the reply must go to exactly one
+                // transport (USB and BLE have independent pending slots).
+                self.replies.push((*channel, reply.clone()));
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::Render(req) => match render_home_into(self.ctx, self.last_clock, req) {
@@ -179,36 +191,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 crate::power::enter_deep_sleep_with_wakeups(plan.maintenance);
             }
         }
-    }
-}
-
-fn reply_from_control_reply(reply: &ControlReply) -> control::Reply {
-    match reply {
-        ControlReply::Ok => Reply::Ok,
-        ControlReply::Busy => Reply::Busy,
-        ControlReply::Pending => Reply::Pending,
-        ControlReply::Status {
-            wifi_configured,
-            server_configured,
-            wifi_connected,
-            wifi_ssid,
-            wifi_has_password,
-            server_url,
-            server_has_token,
-            timezone_offset_minutes,
-        } => Reply::Status {
-            wifi_configured: *wifi_configured,
-            server_configured: *server_configured,
-            wifi_connected: *wifi_connected,
-            wifi_ssid: wifi_ssid.clone(),
-            wifi_has_password: *wifi_has_password,
-            server_url: server_url.clone(),
-            server_has_token: *server_has_token,
-            timezone_offset_minutes: *timezone_offset_minutes,
-        },
-        ControlReply::Error { message } => Reply::Error {
-            message: message.clone(),
-        },
     }
 }
 
