@@ -1844,6 +1844,59 @@ mod tests {
         assert!(state.pending_ble_reply.is_none());
     }
 
+    #[test]
+    fn same_command_on_usb_and_ble_replies_on_its_own_channel() {
+        // "USB/BLE 同一命令产生相同业务结果": the unsupported-command error
+        // (the pre-Step-3 stub) must reach whichever transport sent it, and
+        // only that transport.
+        let mut state = AppState::default();
+        let usb_batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
+        let ble_batches = update(&mut state, Event::BleCommand(ControlRequest::GetStatus));
+        let usb_err = usb_batches.iter().find_map(|b| {
+            b.effects.iter().find_map(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => Some(message.clone()),
+                _ => None,
+            })
+        });
+        let ble_err = ble_batches.iter().find_map(|b| {
+            b.effects.iter().find_map(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Ble,
+                    reply: Reply::Error { message },
+                } => Some(message.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(usb_err, ble_err, "same command -> same business result");
+        assert!(usb_err.is_some());
+        // No cross-channel leakage.
+        assert!(!usb_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        ..
+                    }
+                )
+            })
+        }));
+        assert!(!ble_batches.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        ..
+                    }
+                )
+            })
+        }));
+    }
+
     // ---- review round 2 findings -----------------------------------------
 
     #[test]
