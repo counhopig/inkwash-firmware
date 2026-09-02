@@ -238,10 +238,16 @@ impl AlarmHost for FakeHostAdapter<'_> {
     }
     fn snapshot_ready(&mut self, snapshot: crate::app::RtcAlarmSnapshot) -> bool {
         self.host.dispatches += 1;
-        self.harness
+        // New-ringing detection: this snapshot must transition the state
+        // machine INTO AlarmRinging. If it was already ringing (a stale
+        // / duplicate edge), the state machine ignores it and we must
+        // not report a fresh ring.
+        let was_ringing = self.harness.ringing();
+        let ok = self
+            .harness
             .dispatch(Event::RtcAlarmSnapshotReady(snapshot))
-            .is_ok()
-            && self.harness.ringing()
+            .is_ok();
+        ok && self.harness.ringing() && !was_ringing
     }
     fn dismiss(&mut self) {
         let _ = self
@@ -308,6 +314,38 @@ impl Harness {
 
     pub fn alarm_exit(&self) -> bool {
         self.alarm_poll.alarm_exit()
+    }
+
+    /// Drive one full alarm lifecycle through the shared `AlarmPoll`
+    /// orchestration the firmware runs: AF edge -> snapshot -> dispatch
+    /// -> ring -> dismiss -> drain kicks. After this the state machine is
+    /// back on Home in `WaitingForRearm` (both commits were
+    /// auto-completed by the fake), and the AF edge is consumed. Callers
+    /// then clear AF and advance the minute to rearm before the next
+    /// source.
+    pub fn complete_alarm_lifecycle(&mut self, host: &mut FakeAlarmHost) {
+        assert!(
+            self.poll_alarm(host),
+            "AlarmPoll must ring on a fresh AF edge"
+        );
+        assert!(self.ringing(), "state machine entered AlarmRinging");
+        // Dismiss: Firing -> WaitingForRearm.
+        let mut poll = std::mem::take(&mut self.alarm_poll);
+        let mut adapter = FakeHostAdapter {
+            harness: self,
+            host,
+        };
+        poll.ring_dismiss(&mut adapter);
+        self.alarm_poll = poll;
+        self.drain_kicks();
+        assert_eq!(self.screen(), &Screen::Home, "dismiss restores Home");
+        assert!(
+            matches!(
+                self.state().alarm_runtime,
+                crate::app::AlarmRuntimeState::WaitingForRearm { .. }
+            ),
+            "dismiss -> WaitingForRearm"
+        );
     }
 
     /// Feed an EPD completion for `request_id` back into the runner.
@@ -761,12 +799,28 @@ mod tests {
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         assert!(h.poll_alarm(&mut host));
-        // AF clears (ack) then re-asserts -> a fresh edge rings again.
+        // AF clears (ack): the edge resets; polling with AF low is a
+        // no-op (not a fresh ring).
         host.af = false;
         assert!(!h.poll_alarm(&mut host));
+        // Dismiss back to Home; the state machine leaves Firing.
+        let mut poll = std::mem::take(&mut h.alarm_poll);
+        let mut adapter = FakeHostAdapter {
+            harness: &mut h,
+            host: &mut host,
+        };
+        poll.ring_dismiss(&mut adapter);
+        h.alarm_poll = poll;
+        assert_eq!(h.screen(), &Screen::Home);
+        assert!(h.take_alarm_exit());
+        // The edge was consumed by the first ring; AF re-asserting after
+        // the clear is a *new* edge, so the dispatcher is called again
+        // (the state machine sees no due alarm at 9:01 -> residue ACK,
+        // not a ring - that is correct: re-ring needs a due minute).
         host.set(true, snapshot(dt(9, 1), true, true));
-        assert!(h.poll_alarm(&mut host));
-        assert_eq!(host.dispatches, 2);
+        let _ = h.poll_alarm(&mut host);
+        assert_eq!(host.dispatches, 2, "new AF edge re-dispatches");
+        assert!(!h.ringing(), "no due alarm at 9:01, residue only");
     }
 
     // ---- shared reminder orchestration (firmware's reminders::poll) -----
@@ -933,23 +987,50 @@ mod tests {
         .unwrap();
     }
 
-    fn fire_home_alarm(h: &mut Harness) {
+    /// Start a fresh AF edge for the next alarm at `minute`.
+    fn fresh_edge(h: &mut Harness, host: &mut FakeAlarmHost, minute: u8) {
+        host.af = false;
+        assert!(!h.poll_alarm(host), "AF clear resets the edge");
+        host.set(true, snapshot(dt(minute, 0), true, true));
+    }
+
+    /// After `complete_alarm_lifecycle`, advance the minute so the Daily
+    /// alarm re-arms (WaitingForRearm -> Armed) and the next source can
+    /// start from a clean armed state.
+    fn rearm_after_dismiss(h: &mut Harness) {
+        // Commits were auto-completed by the fake; advance the minute.
+        h.dispatch(Event::Tick(dt(10, 0))).unwrap();
+        assert!(matches!(
+            h.state().alarm_runtime,
+            crate::app::AlarmRuntimeState::Armed { .. }
+        ));
+    }
+
+    /// Home alarm: full lifecycle, then the root consumes the flag at once.
+    fn home_alarm_lifecycle(h: &mut Harness) {
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
-        assert!(h.poll_alarm(&mut host));
+        h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_exit(), "AlarmPoll sets the flag on ring");
-        // Home is the root: consume immediately.
+        // Home is the root: consume immediately via the shared policy.
         assert!(h.alarm_poll.consume_for(AlarmSource::Home));
         assert!(!h.alarm_exit(), "Home alarm flag cleared at once");
+        // AF clear + rearm for the next source.
+        fresh_edge(h, &mut host, 9);
+        rearm_after_dismiss(h);
     }
 
     #[test]
     fn home_alarm_consumes_exit_flag_immediately() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        fire_home_alarm(&mut h);
-        // Next Navigation/Settings entry sees no pending alarm.
-        assert!(!h.alarm_exit(), "no sticky flag leaked to next page");
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        h.complete_alarm_lifecycle(&mut host);
+        assert!(h.alarm_exit(), "AlarmPoll sets the flag on ring");
+        assert!(h.alarm_poll.consume_for(AlarmSource::Home));
+        assert!(!h.alarm_exit(), "Home alarm flag cleared at once");
+        assert_eq!(h.screen(), &Screen::Home);
     }
 
     #[test]
@@ -958,7 +1039,7 @@ mod tests {
         boot_clean(&mut h);
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
-        assert!(h.poll_alarm(&mut host));
+        h.complete_alarm_lifecycle(&mut host);
         // Blocking source: flag stays for the caller chain.
         assert!(h.alarm_poll.consume_for(AlarmSource::BlockingPage));
         assert!(h.alarm_exit(), "blocking alarm keeps flag pending");
@@ -971,21 +1052,16 @@ mod tests {
     fn home_then_blocking_do_not_leak_flags() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        // A Home alarm consumes its flag immediately.
-        fire_home_alarm(&mut h);
-        // A later blocking-page alarm (AF cleared then re-asserted) sets a
-        // fresh flag that must NOT be cleared by the Home policy.
-        let mut host = FakeAlarmHost {
-            af: false,
-            ..FakeAlarmHost::default()
-        };
-        assert!(!h.poll_alarm(&mut host), "AF clear resets the edge");
-        host.set(true, snapshot(dt(9, 1), true, true));
-        assert!(h.poll_alarm(&mut host));
+        home_alarm_lifecycle(&mut h);
+        // Fresh edge for the blocking alarm after the Home lifecycle
+        // cleared AF and rearmed.
+        let mut host = FakeAlarmHost::default();
+        fresh_edge(&mut h, &mut host, 9);
+        h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_exit(), "blocking alarm flag set after Home alarm");
-        // main consumes once; a duplicate consume is a no-op.
+        assert!(h.alarm_poll.consume_for(AlarmSource::BlockingPage));
+        assert!(h.alarm_exit(), "blocking keeps flag until main consumes");
         assert!(h.take_alarm_exit());
-        assert!(!h.take_alarm_exit());
         assert!(!h.alarm_exit());
     }
 
@@ -993,19 +1069,17 @@ mod tests {
     fn blocking_then_home_do_not_leak_flags() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        // Blocking alarm: flag pending.
+        // Blocking alarm lifecycle.
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
-        assert!(h.poll_alarm(&mut host));
+        h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_exit());
-        // main consumes (stack unwound).
-        assert!(h.take_alarm_exit());
+        assert!(h.take_alarm_exit(), "main consumes after stack unwinds");
         assert!(!h.alarm_exit());
-        // A Home alarm afterwards (AF cleared then re-asserted) consumes
-        // its own flag immediately and leaves nothing pending.
-        host.af = false;
-        assert!(!h.poll_alarm(&mut host), "AF clear resets the edge");
-        fire_home_alarm(&mut h);
+        // Clean AF + rearm, then a Home alarm.
+        fresh_edge(&mut h, &mut host, 9);
+        rearm_after_dismiss(&mut h);
+        home_alarm_lifecycle(&mut h);
         assert!(!h.alarm_exit());
     }
 
@@ -1013,14 +1087,16 @@ mod tests {
     fn full_route_home_alarm_then_navigation_entry() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        // Home alarm fires and is consumed at the root.
-        fire_home_alarm(&mut h);
-        // User opens Navigation/Settings: the page entry check
-        // (alarm_exit_pending) must be false, so it does not immediately
-        // return. Simulate that check.
+        // Home alarm fires, full ring/dismiss lifecycle, root consumes.
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        h.complete_alarm_lifecycle(&mut host);
+        assert!(h.alarm_poll.consume_for(AlarmSource::Home));
+        assert!(!h.alarm_exit(), "no sticky flag leaked");
+        assert_eq!(h.screen(), &Screen::Home);
+        // Navigation/Settings entry check (alarm_exit_pending) is false.
         assert!(!h.alarm_exit(), "Navigation entry sees no pending alarm");
-        // And a reminder in that page, dismissed, propagates VisibleChanged
-        // for the redraw without any alarm involvement.
+        // A reminder in that page, dismissed, propagates VisibleChanged.
         use crate::reminder_flow::{run_reminders, ReminderHost};
         struct NoAlarm;
         impl ReminderHost for NoAlarm {
@@ -1035,5 +1111,33 @@ mod tests {
             run_reminders(&mut NoAlarm),
             BackgroundOutcome::VisibleChanged
         );
+    }
+
+    #[test]
+    fn blocking_route_alarm_unwind_then_epd_completion() {
+        let mut h = Harness::new();
+        boot_clean(&mut h);
+        // Blocking page alarm: full lifecycle.
+        let mut host = FakeAlarmHost::default();
+        host.set(true, snapshot(dt(9, 0), true, true));
+        h.complete_alarm_lifecycle(&mut host);
+        assert!(h.alarm_exit(), "blocking alarm pending for page unwind");
+        // Page stack unwinds: consume via the shared policy.
+        assert!(h.alarm_poll.consume_for(AlarmSource::BlockingPage));
+        assert!(h.alarm_exit());
+        assert!(h.take_alarm_exit());
+        assert!(!h.alarm_exit());
+        // The dismiss produced render kicks; complete them through the
+        // EPD registry path (each request id gets one terminal).
+        for rid in h
+            .pending_renders
+            .iter()
+            .filter_map(|k| k.request_id)
+            .collect::<Vec<_>>()
+        {
+            assert!(h.complete_render(rid, true).unwrap());
+        }
+        assert!(h.pending_renders.is_empty(), "no render left in flight");
+        assert_eq!(h.screen(), &Screen::Home);
     }
 }

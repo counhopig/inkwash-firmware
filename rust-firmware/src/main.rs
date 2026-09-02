@@ -569,6 +569,9 @@ fn main() -> Result<()> {
                             // reminder already unwound. Clear the sticky
                             // exit flag so a later navigation does not see
                             // this historical alarm as its own exit reason.
+                            let _ = ctx
+                                .alarm_poll
+                                .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
                             let _ = ctx.alarm_poll.take_alarm_exit();
                             dirty.push(FULL_SCREEN_RECT);
                         }
@@ -601,8 +604,12 @@ fn main() -> Result<()> {
             // historical alarm as its own exit reason and return at once
             // (round-22 P1). Blocking-page / reminder paths keep the
             // flag set for their caller chains and main consumes it when
-            // they return (see the open_navigation handlers).
-            let _ = ctx.alarm_poll.take_alarm_exit();
+            // they return (see the open_navigation handlers). The
+            // consume-for-source policy is the shared production code the
+            // host harness drives.
+            let _ = ctx
+                .alarm_poll
+                .consume_for(inkwash_logic::alarm_flow::AlarmSource::Home);
         }
         // Poll USB console for incoming commands, dispatch them, and send replies.
         let (usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
@@ -777,7 +784,11 @@ fn main() -> Result<()> {
                     // old page on screen but keys already route to Home.
                     // The alarm flag only marks WHY the stack unwound and
                     // is cleared here so it does not leak into the next
-                    // page.
+                    // page. The consume-for-source policy is the shared
+                    // production code the host harness drives.
+                    let _ = ctx
+                        .alarm_poll
+                        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
                     let _ = ctx.alarm_poll.take_alarm_exit();
                     dirty.push(FULL_SCREEN_RECT);
                 }
