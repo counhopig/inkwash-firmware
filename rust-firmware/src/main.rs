@@ -558,8 +558,20 @@ fn main() -> Result<()> {
                     // 30 s boundary, gated once/day anyway). Ordinary menu
                     // loops service this same scheduler through
                     // DeviceContext.
-                    if ctx.poll_runtime(&dt) != crate::ctx::BackgroundOutcome::NoChange {
-                        dirty.push(FULL_SCREEN_RECT);
+                    match ctx.poll_runtime(&dt) {
+                        crate::ctx::BackgroundOutcome::AlarmHandled => {
+                            // An alarm rang from a reminder during the
+                            // minute poll: AppRunner rendered Home and the
+                            // reminder already unwound. Clear the sticky
+                            // exit flag so a later navigation does not see
+                            // this historical alarm as its own exit reason.
+                            ctx.app_runner_alarm_exit = false;
+                            dirty.push(FULL_SCREEN_RECT);
+                        }
+                        crate::ctx::BackgroundOutcome::VisibleChanged => {
+                            dirty.push(FULL_SCREEN_RECT);
+                        }
+                        crate::ctx::BackgroundOutcome::NoChange => {}
                     }
                 }
                 Err(err) => log::warn!("PCF8563 read_time failed: {err}"),

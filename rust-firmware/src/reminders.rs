@@ -23,13 +23,15 @@ const URGENT_RING_MAX_SECS: u64 = 120;
 /// An alarm short-circuits the chain: no further reminder class runs after
 /// one.
 pub fn poll(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> crate::ctx::BackgroundOutcome {
-    match remind_urgent_inbox(ctx) {
-        crate::ctx::BackgroundOutcome::AlarmHandled => {
-            return crate::ctx::BackgroundOutcome::AlarmHandled;
-        }
-        other => other,
-    };
-    remind_due_todos(ctx, now)
+    let urgent_outcome = remind_urgent_inbox(ctx);
+    // An alarm short-circuits the chain: no further reminder class runs.
+    if urgent_outcome == crate::ctx::BackgroundOutcome::AlarmHandled {
+        return crate::ctx::BackgroundOutcome::AlarmHandled;
+    }
+    let todo_outcome = remind_due_todos(ctx, now);
+    // Merge by stable priority so a plain urgent dismissal (VisibleChanged)
+    // is not lost when no todo reminder ran.
+    urgent_outcome.merge(todo_outcome)
 }
 
 fn remind_due_todos(

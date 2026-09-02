@@ -136,6 +136,25 @@ pub enum BackgroundOutcome {
     NoChange,
 }
 
+impl BackgroundOutcome {
+    /// Merges two outcomes by stable priority:
+    /// AlarmHandled > VisibleChanged > NoChange. Used wherever two
+    /// independent background sources (reminder chain, scheduled sync,
+    /// USB, runtime) contribute to one page-level outcome, so a plain
+    /// reminder dismissal is never lost behind a NoChange.
+    pub fn merge(self, other: BackgroundOutcome) -> BackgroundOutcome {
+        match (self, other) {
+            (BackgroundOutcome::AlarmHandled, _) | (_, BackgroundOutcome::AlarmHandled) => {
+                BackgroundOutcome::AlarmHandled
+            }
+            (BackgroundOutcome::VisibleChanged, _) | (_, BackgroundOutcome::VisibleChanged) => {
+                BackgroundOutcome::VisibleChanged
+            }
+            _ => BackgroundOutcome::NoChange,
+        }
+    }
+}
+
 impl DeviceContext<'_> {
     /// Services one queued USB command from any UI loop. Returns
     /// `(visible_change, activity)`: `visible_change` is true when a
@@ -349,17 +368,16 @@ impl DeviceContext<'_> {
     /// it did before AppRunner existed; the legacy alarm branch is
     /// gone so the two paths cannot race for the same AF.
     pub fn poll_runtime(&mut self, now: &DateTime) -> BackgroundOutcome {
-        let sync_changed = self.poll_scheduled_sync(now);
-        // An alarm preempted a reminder: surface it so the caller can
-        // unwind to main.
-        if self.poll_reminders(now) == BackgroundOutcome::AlarmHandled {
-            return BackgroundOutcome::AlarmHandled;
-        }
-        if sync_changed {
+        let sync_outcome = if self.poll_scheduled_sync(now) {
             BackgroundOutcome::VisibleChanged
         } else {
             BackgroundOutcome::NoChange
-        }
+        };
+        // A reminder's outcome (AlarmHandled / VisibleChanged / NoChange)
+        // merges with the sync outcome by stable priority; a plain
+        // reminder dismissal stays VisibleChanged even when no sync ran.
+        let reminder_outcome = self.poll_reminders(now);
+        sync_outcome.merge(reminder_outcome)
     }
 
     /// Services reminders only. BLE pairing uses this variant because
