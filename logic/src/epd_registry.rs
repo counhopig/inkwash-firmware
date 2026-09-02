@@ -92,6 +92,22 @@ impl RenderRegistry {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// Request id of the first pending render kick (tests use it to
+    /// drive completions).
+    pub fn first_request_id(&self) -> Option<u64> {
+        self.pending.iter().find_map(|k| k.request_id)
+    }
+
+    /// All pending request ids (tests drain completions by id).
+    pub fn request_ids(&self) -> Vec<u64> {
+        self.pending.iter().filter_map(|k| k.request_id).collect()
+    }
+
+    /// Take all pending kicks out (tests that need the raw kicks).
+    pub fn drain_all(&mut self) -> Vec<AsyncKick> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 #[cfg(test)]

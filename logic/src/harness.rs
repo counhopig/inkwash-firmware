@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use crate::alarm_flow::{AlarmHost, AlarmPoll};
 use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, Screen};
 use crate::background_outcome::BackgroundOutcome;
-use crate::runner::{AppRunner, AsyncKick, EffectCategory, EffectExecutor, EffectOutcome};
+use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
+use crate::runner::{AppRunner, EffectCategory, EffectExecutor, EffectOutcome};
 
 /// Counts how many times each effect variant ran. Keyed by a stable
 /// string label so the harness can assert "ACK ran exactly once".
@@ -266,9 +267,9 @@ impl AlarmHost for FakeHostAdapter<'_> {
 pub struct Harness {
     pub runner: AppRunner,
     pub executor: FakeExecutor,
-    /// In-flight render kicks (request_id -> kick), matching the
-    /// firmware `pending_renders` registry.
-    pub pending_renders: Vec<AsyncKick>,
+    /// Shared render-request registry (the same type the firmware uses),
+    /// so EPD completion tests exercise `RenderRegistry::register/feed`.
+    pub pending_renders: RenderRegistry,
     /// Shared alarm-poll state; `poll_alarm` runs the same `AlarmPoll`
     /// orchestration the firmware runs.
     pub alarm_poll: AlarmPoll,
@@ -285,11 +286,11 @@ impl Harness {
         Ok(())
     }
 
-    /// Move newly-issued render kicks into `pending_renders`.
+    /// Move newly-issued render kicks into the shared `RenderRegistry`.
     pub fn drain_kicks(&mut self) {
         for kick in self.runner.take_pending_kicks() {
             if kick.is_render() {
-                self.pending_renders.push(kick);
+                self.pending_renders.register(kick);
             }
         }
     }
@@ -348,33 +349,35 @@ impl Harness {
         );
     }
 
-    /// Feed an EPD completion for `request_id` back into the runner.
-    /// `ok=false` produces `EffectFailed(Render)`. Returns true when a
-    /// matching kick existed and was consumed.
+    /// Feed an EPD completion for `request_id` back into the runner via
+    /// the shared `RenderRegistry::feed` (the same type the firmware
+    /// uses). Completed/Failed feed the returned kick back; Superseded
+    /// only terminates it; Ignored (stale/duplicate) does nothing.
+    /// Returns true when a matching kick existed and reached a terminal.
     pub fn complete_render(&mut self, request_id: u64, ok: bool) -> Result<bool, String> {
-        let Some(idx) = self
-            .pending_renders
-            .iter()
-            .position(|k| k.request_id == Some(request_id))
-        else {
-            // A completion with no matching kick (stale / superseded) is
-            // observed but not fed back - mirrors firmware behaviour.
-            return Ok(false);
-        };
-        let kick = self.pending_renders.remove(idx);
-        let failure = if ok {
-            None
-        } else {
-            Some(EffectError::Render("epd failed".into()))
-        };
-        self.runner.feed_render_completion(
-            kick,
-            EffectOutput::RenderDone,
-            failure,
-            &mut self.executor,
-        )?;
-        self.drain_kicks();
-        Ok(true)
+        let outcome = self.pending_renders.feed(request_id, ok, false);
+        match outcome {
+            FeedOutcome::Matched(_kick, RenderTerminal::Superseded) => {
+                // Superseded: only terminate (never fed as RenderDone).
+                Ok(true)
+            }
+            FeedOutcome::Matched(kick, terminal) => {
+                let failure = if terminal == RenderTerminal::Failed {
+                    Some(EffectError::Render("epd failed".into()))
+                } else {
+                    None
+                };
+                self.runner.feed_render_completion(
+                    kick,
+                    EffectOutput::RenderDone,
+                    failure,
+                    &mut self.executor,
+                )?;
+                self.drain_kicks();
+                Ok(true)
+            }
+            FeedOutcome::Ignored => Ok(false),
+        }
     }
 
     pub fn screen(&self) -> &Screen {
@@ -683,7 +686,10 @@ mod tests {
         .unwrap();
         // One render kick is pending with the fake's request id.
         assert_eq!(h.pending_renders.len(), 1);
-        let rid = h.pending_renders[0].request_id.expect("render kick has id");
+        let rid = h
+            .pending_renders
+            .first_request_id()
+            .expect("render kick has id");
 
         // A stale/unknown completion (no matching kick) is ignored.
         assert!(!h.complete_render(rid + 999, true).unwrap());
@@ -898,15 +904,15 @@ mod tests {
             vec![alarm(1, 9, 0)],
         )))
         .unwrap();
-        let rid = h.pending_renders[0].request_id.unwrap();
+        let rid = h.pending_renders.first_request_id().unwrap();
         // Simulate the EPD single-slot: a newer render supersedes the
         // pending one. Both must end with exactly one terminal each.
-        let (h2, reg) = (Harness::new(), RenderRegistry::new());
-        let _ = h2;
-        let mut reg = reg;
-        reg.register(h.pending_renders[0].clone());
+        let mut reg = RenderRegistry::new();
+        let pending_kicks = h.pending_renders.drain_all();
+        let first = pending_kicks[0].clone();
+        reg.register(first);
         let replacement = {
-            let mut k = h.pending_renders[0].clone();
+            let mut k = pending_kicks[0].clone();
             k.request_id = Some(rid + 1);
             k
         };
@@ -927,7 +933,7 @@ mod tests {
     #[test]
     fn epd_registry_each_id_one_terminal() {
         let mut reg = RenderRegistry::new();
-        let k = AsyncKick {
+        let k = crate::runner::AsyncKick {
             batch_id: crate::app::EffectBatchId(0),
             effect_id: crate::app::EffectId(1),
             operation_id: crate::app::OperationId(1),
@@ -1128,13 +1134,8 @@ mod tests {
         assert!(h.take_alarm_exit());
         assert!(!h.alarm_exit());
         // The dismiss produced render kicks; complete them through the
-        // EPD registry path (each request id gets one terminal).
-        for rid in h
-            .pending_renders
-            .iter()
-            .filter_map(|k| k.request_id)
-            .collect::<Vec<_>>()
-        {
+        // shared RenderRegistry path (each request id gets one terminal).
+        for rid in h.pending_renders.request_ids() {
             assert!(h.complete_render(rid, true).unwrap());
         }
         assert!(h.pending_renders.is_empty(), "no render left in flight");

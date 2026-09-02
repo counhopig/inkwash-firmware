@@ -805,6 +805,11 @@ fn main() -> Result<()> {
                 ButtonEvent::LongPressed => {
                     log::info!("DOWN long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
+                    // Same consume-for-source sequence as the UP path:
+                    // report the blocking-page exit then consume it once.
+                    let _ = ctx
+                        .alarm_poll
+                        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
                     let _ = ctx.alarm_poll.take_alarm_exit();
                     dirty.push(FULL_SCREEN_RECT);
                 }
