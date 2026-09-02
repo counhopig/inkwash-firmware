@@ -22,16 +22,30 @@ const URGENT_RING_MAX_SECS: u64 = 120;
 /// alarm that preempted a reminder from an ordinary reminder dismissal.
 /// An alarm short-circuits the chain: no further reminder class runs after
 /// one.
+///
+/// The ordering and short-circuit are shared production orchestration in
+/// `inkwash-logic::reminder_flow::run_reminders`; this entry runs that
+/// exact code through a [`CtxReminderHost`] adapter, so the host harness
+/// tests the same flow the firmware executes.
 pub fn poll(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> crate::ctx::BackgroundOutcome {
-    let urgent_outcome = remind_urgent_inbox(ctx);
-    // An alarm short-circuits the chain: no further reminder class runs.
-    if urgent_outcome == crate::ctx::BackgroundOutcome::AlarmHandled {
-        return crate::ctx::BackgroundOutcome::AlarmHandled;
+    let mut host = CtxReminderHost { ctx, now };
+    inkwash_logic::reminder_flow::run_reminders(&mut host)
+}
+
+/// `ReminderHost` adapter over `DeviceContext`, delegating each reminder
+/// class to the existing show/dismiss implementations.
+struct CtxReminderHost<'a, 'ctx> {
+    ctx: &'a mut crate::ctx::DeviceContext<'ctx>,
+    now: &'a DateTime,
+}
+
+impl inkwash_logic::reminder_flow::ReminderHost for CtxReminderHost<'_, '_> {
+    fn urgent(&mut self) -> crate::ctx::BackgroundOutcome {
+        remind_urgent_inbox(self.ctx)
     }
-    let todo_outcome = remind_due_todos(ctx, now);
-    // Merge by stable priority so a plain urgent dismissal (VisibleChanged)
-    // is not lost when no todo reminder ran.
-    urgent_outcome.merge(todo_outcome)
+    fn todo(&mut self) -> crate::ctx::BackgroundOutcome {
+        remind_due_todos(self.ctx, self.now)
+    }
 }
 
 fn remind_due_todos(

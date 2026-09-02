@@ -733,8 +733,14 @@ mod tests {
             snapshot_error: true,
             ..FakeAlarmHost::default()
         };
-        // First read fails: edge not consumed.
+        // First read fails: edge not consumed, error recorded for the
+        // caller to log.
         assert!(!h.poll_alarm(&mut host));
+        assert!(
+            h.alarm_poll.take_error().is_some(),
+            "read failure must surface an error for logging"
+        );
+        assert_eq!(h.alarm_poll.take_error(), None, "error consumed once");
         // Retry with a good snapshot: rings.
         host.snapshot_error = false;
         host.snapshot = Some(snapshot(dt(9, 0), true, true));
@@ -857,10 +863,10 @@ mod tests {
             FeedOutcome::Ignored,
             "superseded id already terminal"
         );
-        assert_eq!(
+        assert!(matches!(
             reg.feed(rid + 1, true, false),
-            FeedOutcome::Matched(RenderTerminal::Completed)
-        );
+            FeedOutcome::Matched(_, RenderTerminal::Completed)
+        ));
         assert_eq!(reg.len(), 0);
     }
 
@@ -878,10 +884,10 @@ mod tests {
             request_id: Some(5),
         };
         reg.register(k);
-        assert_eq!(
+        assert!(matches!(
             reg.feed(5, false, false),
-            FeedOutcome::Matched(RenderTerminal::Failed)
-        );
+            FeedOutcome::Matched(_, RenderTerminal::Failed)
+        ));
         assert_eq!(
             reg.feed(5, true, true),
             FeedOutcome::Ignored,

@@ -52,6 +52,9 @@ pub struct AlarmPoll {
     /// Set when an alarm interrupted the current page; `main` consumes
     /// it exactly once.
     alarm_exit: bool,
+    /// Last read error (AF or snapshot), for the caller to log. Cleared
+    /// by `take_error`.
+    last_error: Option<String>,
 }
 
 impl AlarmPoll {
@@ -64,8 +67,12 @@ impl AlarmPoll {
     /// when ringing. Returns true when the state machine entered
     /// `AlarmRinging` (the page should unwind).
     pub fn poll<H: AlarmHost>(&mut self, host: &mut H) -> bool {
-        let Ok(af) = host.alarm_flag() else {
-            return false;
+        let af = match host.alarm_flag() {
+            Ok(af) => af,
+            Err(err) => {
+                self.last_error = Some(err);
+                return false;
+            }
         };
         if !af {
             self.edge_consumed = false;
@@ -77,8 +84,9 @@ impl AlarmPoll {
         }
         let snapshot = match host.read_snapshot() {
             Ok(s) => s,
-            Err(_) => {
+            Err(err) => {
                 // Read failure: keep the edge retryable (do not consume).
+                self.last_error = Some(err);
                 return false;
             }
         };
@@ -110,6 +118,12 @@ impl AlarmPoll {
         let v = self.alarm_exit;
         self.alarm_exit = false;
         v
+    }
+
+    /// The last read error (if any), consumed once by the caller so it
+    /// can log it (the firmware warns on RTC/I2C failures).
+    pub fn take_error(&mut self) -> Option<String> {
+        self.last_error.take()
     }
 }
 

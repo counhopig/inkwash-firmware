@@ -103,7 +103,8 @@ pub struct DeviceContext<'a> {
     /// Unified registry of in-flight AppRunner render kicks, shared by the
     /// main loop and every blocking page so an EPD completion can always
     /// find its kick by `request_id`, regardless of who dispatched it.
-    pub pending_renders: std::rc::Rc<std::cell::RefCell<Vec<crate::app_runner::AsyncKick>>>,
+    pub pending_renders:
+        std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
     /// Disabled after a core boot fact failure. Shared by the main loop
     /// *and* every blocking page so no entry can dispatch to a default
     /// AppState after a corrupt boot. Set by `main` from its own
@@ -244,6 +245,9 @@ impl DeviceContext<'_> {
             pending_renders,
         };
         let firing = poll.poll(&mut host);
+        if let Some(err) = poll.take_error() {
+            log::warn!("Blocking page RTC alarm snapshot read failed; stays retryable: {err}");
+        }
         self.alarm_poll = poll;
         if firing {
             // Drive the blocking ring/dismiss loop right here so the alarm
@@ -601,7 +605,7 @@ fn reply_for_outcome(outcome: &Result<SyncOutcome>) -> Reply {
 struct CtxAlarmHost<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
-    pending_renders: std::rc::Rc<std::cell::RefCell<Vec<crate::app_runner::AsyncKick>>>,
+    pending_renders: std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
 }
 
 impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
@@ -662,7 +666,7 @@ impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
         for kick in self.runner.borrow_mut().take_pending_kicks() {
             let mut reg = self.pending_renders.borrow_mut();
             if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                reg.push(kick);
+                reg.register(kick);
             } else {
                 log::warn!(
                     "AppRunner async kick {:?} (op {:?}) not wired; dropped",

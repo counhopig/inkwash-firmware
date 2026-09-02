@@ -26,11 +26,13 @@ pub enum RenderTerminal {
     Superseded,
 }
 
-/// Outcome of feeding one EPD completion into the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Outcome of feeding one EPD completion into the registry: the matched
+/// kick (so the caller can `feed_completion_back` it) plus its terminal
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedOutcome {
-    /// A matching kick was found and consumed with this terminal state.
-    Matched(RenderTerminal),
+    /// A matching kick was found, consumed, and terminated.
+    Matched(AsyncKick, RenderTerminal),
     /// No matching kick (stale / duplicate / never registered); ignored.
     Ignored,
 }
@@ -63,7 +65,7 @@ impl RenderRegistry {
         else {
             return FeedOutcome::Ignored;
         };
-        self.pending.remove(idx);
+        let kick = self.pending.remove(idx);
         let terminal = if superseded {
             RenderTerminal::Superseded
         } else if ok {
@@ -71,7 +73,7 @@ impl RenderRegistry {
         } else {
             RenderTerminal::Failed
         };
-        FeedOutcome::Matched(terminal)
+        FeedOutcome::Matched(kick, terminal)
     }
 
     /// A newer request replaced an older pending one in the EPD's single
@@ -116,10 +118,10 @@ mod tests {
         let mut reg = RenderRegistry::new();
         reg.register(kick(1));
         // First completion matches -> terminal; second (duplicate) ignored.
-        assert_eq!(
+        assert!(matches!(
             reg.feed(1, true, false),
-            FeedOutcome::Matched(RenderTerminal::Completed)
-        );
+            FeedOutcome::Matched(_, RenderTerminal::Completed)
+        ));
         assert_eq!(reg.feed(1, true, false), FeedOutcome::Ignored);
         assert_eq!(reg.len(), 0);
     }
@@ -134,10 +136,10 @@ mod tests {
         // 1 has its terminal; a late completion for it is ignored.
         assert_eq!(reg.feed(1, true, false), FeedOutcome::Ignored);
         // 2 completes normally.
-        assert_eq!(
+        assert!(matches!(
             reg.feed(2, true, false),
-            FeedOutcome::Matched(RenderTerminal::Completed)
-        );
+            FeedOutcome::Matched(_, RenderTerminal::Completed)
+        ));
         assert_eq!(reg.len(), 0);
     }
 
@@ -145,10 +147,10 @@ mod tests {
     fn failed_completion_is_terminal() {
         let mut reg = RenderRegistry::new();
         reg.register(kick(7));
-        assert_eq!(
+        assert!(matches!(
             reg.feed(7, false, false),
-            FeedOutcome::Matched(RenderTerminal::Failed)
-        );
+            FeedOutcome::Matched(_, RenderTerminal::Failed)
+        ));
         assert_eq!(reg.len(), 0);
     }
 

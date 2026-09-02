@@ -363,7 +363,9 @@ fn main() -> Result<()> {
         pending_wifi_op: None,
         last_command: None,
         app_runner: app_runner.clone(),
-        pending_renders: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        pending_renders: std::rc::Rc::new(std::cell::RefCell::new(
+            inkwash_logic::epd_registry::RenderRegistry::new(),
+        )),
         alarm_poll: inkwash_logic::alarm_flow::AlarmPoll::new(),
         // Mirrors the `app_runner_enabled` local below; kept in lockstep
         // on boot (a core_failed snapshot sets both false) so blocking
@@ -379,7 +381,6 @@ fn main() -> Result<()> {
     // DeviceContext scheduling.
     app_runner.borrow_mut().set_last_clock(clock);
     let mut boot_dispatched = false;
-    let mut last_rtc_alarm_flag = false;
     // True when AppRunner may process runtime events. Set false when the
     // BootSnapshot reports a core fact failure, meaning the state machine
     // has no trustworthy alarm/NVS/config data and must NOT interpret any
@@ -582,98 +583,21 @@ fn main() -> Result<()> {
         }
 
         // AppRunner is the sole alarm owner from step 2 onwards. The
-        // low -> high AF edge drives a `RtcAlarmSnapshotReady` event
-        // through the state machine; the state machine then emits
-        // AcknowledgeRtcAlarm + PersistAlarms + StartTone + Render. After
-        // dispatch, if the state machine entered `Firing`, the main loop
-        // drives `alarms::ring_screen` for the blocking ring/dismiss UI;
-        // ENTER press dispatches `Event::Button(Enter/Pressed)` back into
-        // the state machine which transitions to `WaitingForRearm`.
-        //
-        // The legacy `poll_alarm` ringing branch is skipped entirely:
-        // AppRunner owns ACK, persist, ring start, and rearm scheduling.
-        if ctx.board.rtc.alarm_flag().unwrap_or(false) {
-            if !last_rtc_alarm_flag {
-                // Read a *consistent* (time, AF, AIE) snapshot first. The
-                // edge is only consumed (last_rtc_alarm_flag = true) after
-                // ALL three reads succeed and the snapshot is built: a
-                // failure keeps the edge retryable so the next loop
-                // iteration retries instead of silently swallowing this
-                // alarm forever. AIE read errors are propagated (not
-                // masked as false) - a false AIE would make the state
-                // machine treat a real alarm as residue and ACK it off.
-                let read_result = (|| -> anyhow::Result<(DateTime, bool)> {
-                    let dt = ctx.board.rtc.read_time()?;
-                    let aie = ctx.board.rtc.alarm_interrupt_enabled()?;
-                    Ok((dt, aie))
-                })();
-                match read_result {
-                    Ok((dt, aie)) => {
-                        last_rtc_alarm_flag = true;
-                        if !app_runner_enabled {
-                            // AppRunner is disabled (core boot fact
-                            // failure): do not interpret the AF. Move on;
-                            // the edge stays consumed so the next loop
-                            // iteration does not re-read a snapshot that
-                            // would go nowhere.
-                            dirty.push(FULL_SCREEN_RECT);
-                            continue;
-                        }
-                        let snapshot = inkwash_logic::app::RtcAlarmSnapshot {
-                            now: dt,
-                            alarm_flag: true,
-                            alarm_interrupt_enabled: aie,
-                        };
-                        if let Err(err) = dispatch_app_runner(
-                            &app_runner,
-                            inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot),
-                            &mut ctx,
-                        ) {
-                            log::warn!("AppRunner RtcAlarmSnapshotReady dispatch failed: {err}");
-                        }
-                        for kick in app_runner.borrow_mut().take_pending_kicks() {
-                            track_kick_shared(&ctx, kick);
-                        }
-                        if matches!(
-                            app_runner.borrow().state().screen,
-                            inkwash_logic::app::Screen::AlarmRinging
-                        ) {
-                            log::info!("RTC alarm fired; entering ring screen");
-                            if let Err(err) = alarms::ring_screen(
-                                ctx.board,
-                                ctx.usb_console,
-                                ctx.ble_control.as_mut(),
-                            ) {
-                                log::error!("ring_screen failed: {err}");
-                            }
-                            // Dismiss press dispatches ENTER as a state
-                            // machine event; Firing -> WaitingForRearm.
-                            let _ = dispatch_app_runner(
-                                &app_runner,
-                                inkwash_logic::app::Event::Button(
-                                    inkwash_logic::button_event::ButtonEvent::Pressed,
-                                ),
-                                &mut ctx,
-                            );
-                            for kick in app_runner.borrow_mut().take_pending_kicks() {
-                                track_kick_shared(&ctx, kick);
-                            }
-                            dirty.push(FULL_SCREEN_RECT);
-                        }
-                    }
-                    Err(err) => {
-                        // Edge left unlocked - the next loop iteration
-                        // retries the snapshot read.
-                        log::warn!(
-                            "RTC alarm snapshot read failed; AF edge stays retryable: {err:#}"
-                        );
-                    }
-                }
-            }
-        } else {
-            last_rtc_alarm_flag = false;
+        // low -> high AF edge is resolved by the *shared* `AlarmPoll`
+        // orchestration (the same code `DeviceContext::poll_alarm_snapshot`
+        // runs for blocking pages): AF edge -> consistent snapshot ->
+        // dispatch `RtcAlarmSnapshotReady` -> ring screen -> dismiss ->
+        // sticky exit flag. `main` consumes the exit flag below; the
+        // edge / retry / firing semantics are identical on Home and every
+        // blocking page.
+        if ctx.poll_alarm_snapshot() {
+            // The state machine entered Firing and `poll_alarm_snapshot`
+            // already drove ring_screen + dismiss; force a Home repaint.
+            dirty.push(FULL_SCREEN_RECT);
         }
-
+        // `main` consumes the sticky alarm-exit flag exactly once after a
+        // blocking screen returns (see the open_navigation handlers); an
+        // alarm raised here leaves it set for that path.
         // Poll USB console for incoming commands, dispatch them, and send replies.
         let (usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
         if usb_changed {
@@ -717,45 +641,53 @@ fn main() -> Result<()> {
             // AppRunner render is fed back. Legacy dirty-rect / ring /
             // boot refreshes carry ids with no matching kick and are
             // observed but not fed back.
-            let matched_kick = {
+            // The shared `RenderRegistry` implements the per-request
+            // terminal rule; this loop drives it and feeds Completed /
+            // Failed back through the returned kick.
+            let outcome = {
                 let mut reg = ctx.pending_renders.borrow_mut();
-                let idx = reg
-                    .iter()
-                    .position(|kick| kick.request_id == Some(completion.request_id));
-                idx.map(|i| reg.remove(i))
+                reg.feed(completion.request_id, completion.ok, completion.superseded)
             };
-            if let Some(kick) = matched_kick {
-                if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                    if completion.superseded {
-                        // The request was replaced before its command ran
-                        // (EPD latest-wins). It must NOT be reported as
-                        // RenderDone - its pixels never reached the panel.
-                        // The replacement request carries its own request_id
-                        // and will complete (or fail) on its own; we simply
-                        // clear this in-flight entry so the registry does
-                        // not leak, and let the replacement's completion be
-                        // the one fed to the state machine. Once RenderPlan
-                        // (step 5) tracks generations precisely, this keeps
-                        // the "entered queue" vs "displayed on panel"
-                        // distinction honest.
-                        log::warn!(
-                            "AppRunner render (op {:?}) superseded before panel display",
-                            kick.operation_id
-                        );
-                        continue;
+            match outcome {
+                inkwash_logic::epd_registry::FeedOutcome::Matched(kick, terminal) => {
+                    match terminal {
+                        inkwash_logic::epd_registry::RenderTerminal::Superseded => {
+                            // The request was replaced before its command
+                            // ran (EPD latest-wins). It must NOT be
+                            // reported as RenderDone - its pixels never
+                            // reached the panel. The replacement request
+                            // carries its own request_id and will complete
+                            // (or fail) on its own; we simply terminate
+                            // this in-flight entry here.
+                            log::warn!(
+                                "AppRunner render (op {:?}) superseded before panel display",
+                                kick.operation_id
+                            );
+                        }
+                        terminal => {
+                            let output = inkwash_logic::app::EffectOutput::RenderDone;
+                            let failure = if terminal
+                                == inkwash_logic::epd_registry::RenderTerminal::Failed
+                            {
+                                Some(inkwash_logic::app::EffectError::Render(format!(
+                                    "epd refresh failed: {:?}",
+                                    completion.kind
+                                )))
+                            } else {
+                                None
+                            };
+                            if let Err(err) =
+                                feed_completion_back(&app_runner, &mut ctx, kick, output, failure)
+                            {
+                                log::warn!("AppRunner EPD completion feed failed: {err}");
+                            }
+                        }
                     }
-                    let output = inkwash_logic::app::EffectOutput::RenderDone;
-                    let failure = (!completion.ok).then(|| {
-                        inkwash_logic::app::EffectError::Render(format!(
-                            "epd refresh failed: {:?}",
-                            completion.kind
-                        ))
-                    });
-                    if let Err(err) =
-                        feed_completion_back(&app_runner, &mut ctx, kick, output, failure)
-                    {
-                        log::warn!("AppRunner EPD completion feed failed: {err}");
-                    }
+                }
+                inkwash_logic::epd_registry::FeedOutcome::Ignored => {
+                    // No matching kick: legacy dirty-rect / ring / boot
+                    // refresh, or a duplicate for an already-terminated
+                    // request. Observed but not fed back.
                 }
             }
             match completion {
@@ -1171,7 +1103,7 @@ fn dispatch_app_runner(
 fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
     let mut reg = ctx.pending_renders.borrow_mut();
     match &kick.effect {
-        inkwash_logic::app::Effect::Render(_) => reg.push(kick),
+        inkwash_logic::app::Effect::Render(_) => reg.register(kick),
         inkwash_logic::app::Effect::StartSync(_) => {
             log::warn!(
                 "AppRunner StartSync kick not yet wired to sync task (op {:?}); dropped",
