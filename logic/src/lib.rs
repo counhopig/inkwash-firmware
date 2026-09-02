@@ -20,6 +20,7 @@
 pub mod alarm_regs;
 pub mod alarm_schedule;
 pub mod app;
+pub mod background_outcome;
 pub mod button_event;
 pub mod datetime;
 pub mod device_config;

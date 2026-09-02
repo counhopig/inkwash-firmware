@@ -119,41 +119,10 @@ pub struct DeviceContext<'a> {
     pub app_runner_enabled: bool,
 }
 
-/// Result of a blocking page's background poll, so a page can distinguish
-/// "an alarm interrupted the page" (must exit to the unified router /
-/// main loop) from ordinary visible changes (redraw / refresh data, keep
-/// the page). Previously this collapsed to a bool, which made every
-/// successful sync / reminder / USB frame look like a user cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackgroundOutcome {
-    /// An RTC alarm fired and AppRunner rang over the page. The page must
-    /// unwind back to main, which re-renders per the current `Screen`.
-    AlarmHandled,
-    /// Something visible changed (sync receipt, reminder, USB command,
-    /// clock minute) - redraw / refresh data but stay in the page.
-    VisibleChanged,
-    /// Nothing happened.
-    NoChange,
-}
-
-impl BackgroundOutcome {
-    /// Merges two outcomes by stable priority:
-    /// AlarmHandled > VisibleChanged > NoChange. Used wherever two
-    /// independent background sources (reminder chain, scheduled sync,
-    /// USB, runtime) contribute to one page-level outcome, so a plain
-    /// reminder dismissal is never lost behind a NoChange.
-    pub fn merge(self, other: BackgroundOutcome) -> BackgroundOutcome {
-        match (self, other) {
-            (BackgroundOutcome::AlarmHandled, _) | (_, BackgroundOutcome::AlarmHandled) => {
-                BackgroundOutcome::AlarmHandled
-            }
-            (BackgroundOutcome::VisibleChanged, _) | (_, BackgroundOutcome::VisibleChanged) => {
-                BackgroundOutcome::VisibleChanged
-            }
-            _ => BackgroundOutcome::NoChange,
-        }
-    }
-}
+/// Background-poll outcome vocabulary lives in `inkwash-logic` (pure,
+/// host-testable); re-exported here so every firmware call site keeps
+/// using `crate::ctx::BackgroundOutcome`.
+pub use inkwash_logic::background_outcome::BackgroundOutcome;
 
 impl DeviceContext<'_> {
     /// Services one queued USB command from any UI loop. Returns
