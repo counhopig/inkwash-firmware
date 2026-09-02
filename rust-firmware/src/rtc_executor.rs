@@ -191,9 +191,11 @@ fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
     }
     log::info!("RTC executor started (sole PCF8563 owner)");
 
-    // Duplicate-snapshot latch: the last consistent read while AF stayed
-    // asserted. `None` means no latch held (AF clear or released).
-    let mut latched: Option<LatchedSnapshot> = None;
+    // Duplicate-snapshot latch (host-testable logic in
+    // `inkwash-logic::rtc_latch`): while AF stays asserted and no
+    // ACK/disable has released it, snapshot requests are answered from the
+    // cached consistent read instead of touching the bus.
+    let mut latch = inkwash_logic::rtc_latch::RtcSnapshotLatch::new();
 
     loop {
         let cmd = match rx.recv_timeout(IDLE_DRAIN) {
@@ -208,13 +210,10 @@ fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
         };
         match cmd {
             RtcCommand::ReadTime { reply } => {
+                // A plain time read does not carry AF, so it cannot update
+                // the latch itself; AF is observed through AlarmStatus /
+                // Snapshot reads and released by ACK/disable.
                 let result = rtc.read_time();
-                if result.is_ok() {
-                    // A successful time read also refreshes the latch fact
-                    // source: if AF has since cleared, release the latch so
-                    // the next asserted edge is a fresh snapshot.
-                    release_latch_if_clear(&mut rtc, &mut latched);
-                }
                 let _ = reply.send(result);
             }
             RtcCommand::WriteTime { dt, reply } => {
@@ -223,23 +222,27 @@ fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
             }
             RtcCommand::AlarmStatus { reply } => {
                 let result = read_alarm_status(&mut rtc);
+                if let Ok(status) = &result {
+                    latch.observe_alarm_flag(status.alarm_flag);
+                }
                 let _ = reply.send(result);
             }
             RtcCommand::Snapshot { reply } => {
-                let result = snapshot_or_latch(&mut rtc, &mut latched);
+                let result = snapshot_or_latch(&mut rtc, &mut latch);
                 let _ = reply.send(result);
             }
             RtcCommand::Acknowledge { reply } => {
                 let result = rtc.ack_alarm();
                 if result.is_ok() {
-                    latched = None; // AF cleared: release the duplicate latch.
+                    // AF cleared: release the duplicate latch.
+                    latch.on_ack_or_disable_success();
                 }
                 let _ = reply.send(result);
             }
             RtcCommand::Disable { reply } => {
                 let result = rtc.clear_alarm();
                 if result.is_ok() {
-                    latched = None;
+                    latch.on_ack_or_disable_success();
                 }
                 let _ = reply.send(result);
             }
@@ -253,11 +256,6 @@ fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
     }
 }
 
-/// The consistent read cached while AF stays asserted.
-struct LatchedSnapshot {
-    snapshot: RtcAlarmSnapshot,
-}
-
 fn read_alarm_status(rtc: &mut Pcf8563) -> Result<AlarmStatus> {
     let af = rtc.alarm_flag()?;
     let aie = rtc.alarm_interrupt_enabled()?;
@@ -267,17 +265,20 @@ fn read_alarm_status(rtc: &mut Pcf8563) -> Result<AlarmStatus> {
     })
 }
 
-/// Returns the consistent snapshot, honoring the duplicate latch: while AF
-/// is asserted and no ACK/disable has released it, repeated requests are
-/// answered from the same read.
+/// Returns the consistent snapshot, honoring the duplicate latch (pure
+/// logic in `inkwash-logic::rtc_latch`): while AF is asserted and no
+/// ACK/disable has released it, repeated requests are answered from the
+/// cached read without a fresh bus transaction.
 fn snapshot_or_latch(
     rtc: &mut Pcf8563,
-    latched: &mut Option<LatchedSnapshot>,
+    latch: &mut inkwash_logic::rtc_latch::RtcSnapshotLatch,
 ) -> Result<RtcAlarmSnapshot> {
-    // A held latch answers directly - no fresh bus transaction for a
-    // repeat request during the same asserted AF.
-    if let Some(held) = latched.as_ref() {
-        return Ok(held.snapshot.clone());
+    if latch.action() == inkwash_logic::rtc_latch::SnapshotAction::UseCached {
+        // A held latch answers directly - no fresh bus transaction for a
+        // repeat request during the same asserted AF.
+        if let Some(cached) = latch.cached() {
+            return Ok(cached.clone());
+        }
     }
     let now = rtc.read_time()?;
     let af = rtc.alarm_flag()?;
@@ -287,25 +288,6 @@ fn snapshot_or_latch(
         alarm_flag: af,
         alarm_interrupt_enabled: aie,
     };
-    if af {
-        *latched = Some(LatchedSnapshot {
-            snapshot: snapshot.clone(),
-        });
-    }
+    latch.observe_snapshot(snapshot.clone());
     Ok(snapshot)
-}
-
-/// After a non-snapshot read, if AF has cleared, drop any held latch so
-/// the next low edge is treated as a fresh trigger.
-fn release_latch_if_clear(rtc: &mut Pcf8563, latched: &mut Option<LatchedSnapshot>) {
-    if latched.is_none() {
-        return;
-    }
-    match rtc.alarm_flag() {
-        Ok(false) => *latched = None,
-        // Read failure: keep the latch (the edge may still be asserted);
-        // a later ACK/disable or successful read releases it.
-        Ok(true) => {}
-        Err(err) => log::warn!("RTC latch refresh read failed (latch kept): {err}"),
-    }
 }

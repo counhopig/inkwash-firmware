@@ -32,6 +32,7 @@ pub mod inbox_item;
 pub mod protocol;
 pub mod reminder_dedup;
 pub mod reminder_flow;
+pub mod rtc_latch;
 pub mod runner;
 pub mod runtime;
 pub mod scheduler;
