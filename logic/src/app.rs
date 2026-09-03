@@ -470,17 +470,12 @@ pub enum Effect {
     StopBlePairing,
     EnterLightSleep(LightSleepPlan),
     EnterDeepSleep(WakeupPlan),
-    /// The user pressed ENTER on a Settings row whose action is still a
-    /// legacy blocking screen (Sync Now / Sync Interval / BLE Pairing /
-    /// Sleep). The state machine stays on `Screen::Settings` while the
-    /// executor runs the wedge (deferred post-pump, like the other deferred
-    /// wedges); a Full Settings render is re-issued when the wedge returns.
-    OpenSettingsItem {
-        /// Index into the fixed four-row Settings list in firmware row
-        /// order: 0 = Sync Now, 1 = Sync Interval, 2 = BLE Pairing,
-        /// 3 = Sleep.
-        item: usize,
-    },
+    /// The user pressed ENTER on the Settings BLE PAIRING row (index 2) -
+    /// the last row still behind a legacy blocking radio screen. The state
+    /// machine stays on `Screen::Settings` while the executor runs the wedge
+    /// (deferred post-pump); a Full Settings render is re-issued when the
+    /// wedge returns.
+    OpenBlePairingScreen,
     /// The user opened an inbox item (ENTER on an Inbox row). Fire-and-forget
     /// local persistence of the read mark: the executor marks `seq` read and
     /// adds it to the pending-read set (two-way sync uploads it later). The
@@ -1512,7 +1507,8 @@ fn nav_origin_screen(_origin: NavOrigin) -> Screen {
 /// the origin, and ENTER selects a destination. Every destination
 /// (HOME/CALENDAR/INBOX/ALARMS/TODOS/SETTINGS) is a state-machine screen
 /// now; a drawer over a screen highlights that screen's row, so a no-move
-/// ENTER stays there. Settings row actions emit `OpenSettingsItem`; the
+/// ENTER stays there. The Settings BLE Pairing row emits
+/// `OpenBlePairingScreen`; the
 /// Settings screen itself stays current while the executor wedge runs.
 fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     match &state.screen {
@@ -1715,7 +1711,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                                 state,
                                 OperationId(0),
                                 FailurePolicy::Continue,
-                                vec![Effect::OpenSettingsItem { item: cur }],
+                                vec![Effect::OpenBlePairingScreen],
                             ),
                             render_batch_with_intent(state, RenderIntent::Full),
                         ]
@@ -4949,7 +4945,7 @@ mod tests {
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 2 })));
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
         // The SM stays on Settings (the executor runs the wedge and returns;
         // main re-renders Settings).
         assert_eq!(state.screen, Screen::Settings { selected: 2 });
@@ -4993,7 +4989,7 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         // Sleep is an SM effect now (deep sleep with the maintenance wake);
-        // no legacy OpenSettingsItem wedge for the Sleep row.
+        // no legacy wedge for the Sleep row.
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
@@ -5001,7 +4997,7 @@ mod tests {
         assert!(!batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 3 })));
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
     }
 
     #[test]
@@ -5071,7 +5067,7 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         // Move to row 1 (SYNC INTERVAL) and ENTER: opens the SM picker, not
-        // a legacy OpenSettingsItem wedge.
+        // a legacy wedge.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
@@ -5084,7 +5080,7 @@ mod tests {
         assert!(!batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 1 })));
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
@@ -5230,7 +5226,7 @@ mod tests {
         );
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
         // ENTER on row 0 (SYNC NOW): starts the SM sync engine (Running) and
-        // emits StartSync - no legacy OpenSettingsItem wedge.
+        // emits StartSync - no legacy wedge.
         let batches = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
@@ -5243,7 +5239,7 @@ mod tests {
         assert!(!batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 0 })));
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
         // The SM stays on Settings.
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
     }

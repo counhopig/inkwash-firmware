@@ -135,7 +135,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::StartSync(_) => "StartSync",
         Effect::StartSetWifi(_) => "StartSetWifi",
         Effect::StartBlePairing(_) => "StartBlePairing",
-        Effect::OpenSettingsItem { .. } => "OpenSettingsItem",
+        Effect::OpenBlePairingScreen => "OpenBlePairingScreen",
         Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
         Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
         Effect::MarkInboxRead { .. } => "MarkInboxRead",
@@ -166,7 +166,7 @@ impl EffectExecutor for FakeExecutor {
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
-            Effect::OpenSettingsItem { .. } => EffectCategory::Render,
+            Effect::OpenBlePairingScreen => EffectCategory::Render,
             Effect::MarkInboxRead { .. } | Effect::SetSyncInterval { .. } => {
                 EffectCategory::Persist
             }
@@ -228,9 +228,7 @@ impl EffectExecutor for FakeExecutor {
             | Effect::StartSetWifi(_)
             | Effect::StartBlePairing(_)
             | Effect::StopBlePairing => Ok(EffectOutcome::Async),
-            Effect::OpenSettingsItem { .. } => {
-                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
-            }
+            Effect::OpenBlePairingScreen => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::PersistAlarmToggle { .. } => Ok(EffectOutcome::Completed(
                 EffectOutput::Persisted(crate::app::PersistTarget::Alarms),
             )),

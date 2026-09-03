@@ -1338,8 +1338,10 @@ fn dispatch_app_runner(
     Ok(deferred)
 }
 
-/// Legacy blocking-page wedges deferred out of a pump: Settings row items
-/// (`OpenSettingsItem`). The main loop runs each after the pump.
+/// Legacy blocking-page wedges deferred out of a pump: the Settings BLE
+/// PAIRING wedge (deferred through the executor's settings-item buffer,
+/// which now only ever carries the BLE pairing row). The main loop runs it
+/// after the pump.
 #[derive(Default)]
 struct DeferredNav {
     settings_items: Vec<usize>,

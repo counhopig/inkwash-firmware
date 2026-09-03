@@ -211,16 +211,16 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             // ---- asynchronous / out-of-band effects -------------------------
-            Effect::OpenSettingsItem { item } => {
-                // Settings row actions (Sync Now / Sync Interval / BLE
-                // pairing / Sleep) are still legacy blocking screens and
-                // must not run inside a pump - they dispatch RTC alarm
-                // snapshots / button events through the same shared Runtime,
-                // which would re-enter `borrow_mut` on the RefCell the outer
-                // pump is holding and panic. Defer the open to the caller:
-                // the main loop drains this buffer after the pump (borrow
-                // released) and runs the wedge, then re-renders Settings.
-                self.deferred_settings_items.push(*item);
+            Effect::OpenBlePairingScreen => {
+                // The Settings BLE PAIRING row is still a legacy blocking
+                // radio screen and must not run inside a pump - it dispatches
+                // RTC alarm snapshots / button events through the same shared
+                // Runtime, which would re-enter `borrow_mut` on the RefCell
+                // the outer pump is holding and panic. Defer the open to the
+                // caller: the main loop drains this flag after the pump
+                // (borrow released) and runs the wedge, then re-renders
+                // Settings.
+                self.deferred_settings_items.push(2);
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::MarkInboxRead { seq } => {
