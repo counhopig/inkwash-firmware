@@ -2855,15 +2855,32 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
             };
             state.schedule_retry(degraded_action, now_minute);
         }
-        // All other failure kinds (render, sync, tone, ble, sleep) are
+        // All other failure kinds (render, sync, tone, sleep) are
         // surfaced but do not alter the alarm commit state in step 1.
         _ => {}
+    }
+    // A StartBlePairing failure (EffectError::Ble) while a pairing session
+    // is current must not leave the SM stranded on the pairing screen with
+    // no radio: exit back to the Settings BLE PAIRING row.
+    if matches!(failure.error, EffectError::Ble(_)) && matches!(state.screen, Screen::BlePairing(_))
+    {
+        state.screen = Screen::Settings {
+            selected: SETTINGS_BLE_PAIRING_ROW,
+        };
+        state.render_generation = state.render_generation.next();
     }
     // A command's confirmable effect failed: error the client on the
     // transport that sent the command and clear the slot. This is separate
     // from the alarm-internal retry logic above - a control command is not
     // auto-retried (the client resends).
     let mut batches = Vec::new();
+    // If a StartBlePairing failure exited the pairing screen above, emit
+    // the render of the restored Settings surface.
+    if let Screen::Settings { .. } = state.screen {
+        if matches!(failure.error, EffectError::Ble(_)) {
+            batches.push(render_batch(state));
+        }
+    }
     let error_message = match &failure.error {
         EffectError::Persist(msg)
         | EffectError::Rtc(msg)
@@ -5649,6 +5666,46 @@ mod tests {
                 phase: BlePairingPhase::Waiting,
                 ..Default::default()
             })
+        );
+    }
+
+    #[test]
+    fn ble_start_failure_exits_the_pairing_screen() {
+        // A StartBlePairing failure while a pairing session is current must
+        // not strand the SM on the pairing screen with no radio: it returns
+        // to the Settings BLE PAIRING row and renders the restored surface.
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        state.screen = Screen::BlePairing(BlePairingState {
+            phase: BlePairingPhase::Waiting,
+            ..Default::default()
+        });
+        // Fail the StartBlePairing effect (op 0, the pairing-entry batch).
+        let batches = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(1),
+                operation_id: OperationId(0),
+                render_generation: None,
+                error: EffectError::Ble("radio init failed".into()),
+            }),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            }
+        );
+        assert!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
+            "the restored Settings surface must render"
         );
     }
 
