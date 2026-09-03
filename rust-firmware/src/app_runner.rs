@@ -49,10 +49,6 @@ pub struct EffectRunner<'a, 'ctx> {
     /// wedge (AlarmList screen). Deferred post-pump; when it returns the
     /// caller dispatches `Event::AlarmStoreChanged` with the reloaded list.
     deferred_add_alarm: bool,
-    /// The state machine asked to open a legacy inbox item-detail wedge
-    /// (InboxList screen). Deferred post-pump; when it returns the caller
-    /// dispatches `Event::InboxStoreChanged` with the reloaded list.
-    deferred_inbox_item: Option<usize>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -63,7 +59,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             replies: Vec::new(),
             deferred_settings_items: Vec::new(),
             deferred_add_alarm: false,
-            deferred_inbox_item: None,
         }
     }
 
@@ -88,12 +83,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     /// wedge during the last pump.
     pub fn take_deferred_add_alarm(&mut self) -> bool {
         std::mem::take(&mut self.deferred_add_alarm)
-    }
-
-    /// The inbox item-detail wedge the state machine asked to open during
-    /// the last pump (None when no row was opened).
-    pub fn take_deferred_inbox_item(&mut self) -> Option<usize> {
-        self.deferred_inbox_item.take()
     }
 }
 
@@ -253,13 +242,16 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.deferred_add_alarm = true;
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
-            Effect::OpenInboxItem { index } => {
-                // Same deferral: the item-detail wedge (marks read + shows
-                // the body) runs after the pump. The main loop dispatches
-                // Event::InboxStoreChanged with the reloaded list so the SM
-                // adopts the read mark.
-                self.deferred_inbox_item = Some(*index);
-                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            Effect::MarkInboxRead { seq } => {
+                // Fire-and-forget local persist of the read mark: the
+                // executor marks `seq` read + adds it to the pending-read
+                // set (two-way sync uploads later). The SM already set the
+                // item's read flag optimistically; nothing to track.
+                if let Err(err) = self.ctx.inbox_store.mark_read(*seq) {
+                    Err((EffectCategory::Persist, format!("{err:#}")))
+                } else {
+                    Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+                }
             }
             Effect::PersistAlarmToggle { alarms, toggled_id } => {
                 // The AlarmList screen's confirmable enabled-toggle: save the
@@ -428,9 +420,9 @@ fn render_view_into(
                 height: 264,
             })
         }
-        // WeekView never partial-refreshes (open/close are Full); keep the
-        // exhaustiveness explicit.
-        (RenderView::WeekView { .. }, RenderIntent::Partial) => {
+        // WeekView / InboxItem never partial-refresh (open/close are Full);
+        // keep the exhaustiveness explicit.
+        (RenderView::WeekView { .. } | RenderView::InboxItem { .. }, RenderIntent::Partial) => {
             ctx.board.display.refresh_partial(crate::canvas::Rect {
                 x: 0,
                 y: 36,
@@ -473,6 +465,9 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::Inbox { selected } => {
             crate::screens::draw_inbox_list(ctx.board, ctx.inbox_store, selected);
+        }
+        RenderView::InboxItem { index } => {
+            crate::screens::draw_inbox_item_detail(ctx, index, clock.as_ref());
         }
         RenderView::Calendar { selected_day, .. } => {
             // The grid always renders the current clock month (matching the

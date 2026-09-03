@@ -1284,21 +1284,6 @@ pub(crate) fn draw_inbox_list(board: &mut Note4Board, store: &InboxStore, select
     render_inbox_page(board, store, selected);
 }
 
-/// Runs the legacy inbox item-detail wedge for the state-machine InboxList
-/// screen (Stage 4, slice 5). Post-pump (the detail screen is a blocking
-/// page that dispatches alarm/button events through the shared Runtime). It
-/// marks the item read (store change) and shows the body; the caller then
-/// dispatches `Event::InboxStoreChanged` with the reloaded list so the SM
-/// adopts the read mark. Returns `true` when an alarm unwound the detail.
-pub(crate) fn open_sm_inbox_item(
-    ctx: &mut DeviceContext,
-    now: Option<&DateTime>,
-    index: usize,
-) -> bool {
-    open_inbox_item(ctx, now, index);
-    ctx.alarm_exit_pending()
-}
-
 fn render_inbox_page(board: &mut Note4Board, store: &InboxStore, selected: usize) {
     let items: Vec<String> = store
         .load()
@@ -1315,16 +1300,19 @@ fn render_inbox_page(board: &mut Note4Board, store: &InboxStore, selected: usize
     footer(&mut canvas, "ENTER OPEN   HOLD UP/DOWN PAGE");
 }
 
-/// Opens an inbox item's detail (title + body) and marks it read locally.
-fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: usize) {
+/// Draws the state-machine InboxItem screen (Stage 4, slice 7): the opened
+/// item's title + body from the store (carries only the index). The SM owns
+/// open/close and the optimistic read-mark; the executor draws from state.
+pub(crate) fn draw_inbox_item_detail(
+    ctx: &mut DeviceContext,
+    selected: usize,
+    now: Option<&DateTime>,
+) {
     let list = ctx.inbox_store.load().unwrap_or_default();
     let Some(item) = list.get(selected).cloned() else {
         return;
     };
-    if let Err(err) = ctx.inbox_store.mark_read(item.id) {
-        log::warn!("Failed to mark inbox item read: {err}");
-    }
-
+    let _ = now;
     let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
     header(&mut canvas, "INBOX");
@@ -1361,6 +1349,22 @@ fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: us
     }
     footer(&mut canvas, "ENTER / HOLD ENTER CLOSE");
     drop(canvas);
+}
+
+/// Legacy inbox item-detail screen (SM-disabled safe-mode browse_page):
+/// marks the item read locally then shows the detail and waits for any
+/// button. The SM path renders Screen::InboxItem through
+/// draw_inbox_item_detail and owns the read-mark; this wrapper stays only
+/// for the legacy page stack.
+fn open_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: usize) {
+    let list = ctx.inbox_store.load().unwrap_or_default();
+    let Some(item) = list.get(selected).cloned() else {
+        return;
+    };
+    if let Err(err) = ctx.inbox_store.mark_read(item.id) {
+        log::warn!("Failed to mark inbox item read: {err}");
+    }
+    draw_inbox_item_detail(ctx, selected, now);
     ctx.board.display.refresh_full_best_effort();
     loop {
         match ctx.poll_background(now) {
