@@ -47,6 +47,10 @@ pub struct EffectRunner<'a, 'ctx> {
     /// pump (Sync Now / Sync Interval / BLE pairing / Sleep). Same
     /// deferral rationale as `deferred_nav`.
     deferred_settings_items: Vec<usize>,
+    /// The state machine asked to open the legacy "+ ADD ALARM" editor
+    /// wedge (AlarmList screen). Deferred post-pump; when it returns the
+    /// caller dispatches `Event::AlarmStoreChanged` with the reloaded list.
+    deferred_add_alarm: bool,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -57,6 +61,7 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             replies: Vec::new(),
             deferred_nav: Vec::new(),
             deferred_settings_items: Vec::new(),
+            deferred_add_alarm: false,
         }
     }
 
@@ -81,6 +86,12 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     /// last pump. The caller runs each wedge after the pump.
     pub fn take_deferred_settings(&mut self) -> Vec<usize> {
         std::mem::take(&mut self.deferred_settings_items)
+    }
+
+    /// Whether the state machine asked to open the "+ ADD ALARM" editor
+    /// wedge during the last pump.
+    pub fn take_deferred_add_alarm(&mut self) -> bool {
+        std::mem::take(&mut self.deferred_add_alarm)
     }
 }
 
@@ -243,6 +254,34 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.deferred_settings_items.push(*item);
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
+            Effect::OpenAddAlarm => {
+                // Same deferral: "+ ADD ALARM" runs the legacy editor wedge
+                // after the pump. The wedge persists to the alarm store; the
+                // main loop dispatches Event::AlarmStoreChanged with the
+                // reloaded list so the SM adopts the new alarm.
+                self.deferred_add_alarm = true;
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
+            Effect::PersistAlarmToggle { alarms, toggled_id } => {
+                // The AlarmList screen's confirmable enabled-toggle: save the
+                // list and mark the row dirty (two-way sync contract). The
+                // completion feeds back as Persisted(Alarms), which releases
+                // the machine's one-at-a-time toggle gate and re-programs
+                // the RTC slot.
+                match (
+                    AlarmStore::save(self.ctx.alarm_store, alarms),
+                    self.ctx.alarm_store.mark_dirty(*toggled_id),
+                ) {
+                    (Ok(()), Ok(())) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                        inkwash_logic::app::PersistTarget::Alarms,
+                    ))),
+                    (Err(err), _) => Err((EffectCategory::Persist, format!("{err:#}"))),
+                    (Ok(()), Err(err)) => Err((
+                        EffectCategory::Persist,
+                        format!("dirty mark failed: {err:#}"),
+                    )),
+                }
+            }
             Effect::Reply { channel, reply } => {
                 // Record the reply for the caller to write after the pump:
                 // only the caller knows the correlation id of the frame that
@@ -347,9 +386,9 @@ fn render_view_into(
             .board
             .display
             .refresh_partial(crate::screens::NAV_BAR_RECT),
-        // Settings row moves redraw the whole list region (the rows share
+        // Settings / AlarmList row moves redraw the list region (rows share
         // one chrome block; a per-row diff is a Stage-5 RenderPlan concern).
-        (RenderView::Settings { .. }, RenderIntent::Partial) => {
+        (RenderView::Settings { .. } | RenderView::AlarmList { .. }, RenderIntent::Partial) => {
             ctx.board.display.refresh_partial(crate::canvas::Rect {
                 x: 8,
                 y: 34,
@@ -363,10 +402,10 @@ fn render_view_into(
 
 /// Renders the visible surface named by `view` into the shared canvas.
 /// Home is always drawn first (the drawer opens over it from Home); the
-/// Navigation view then overlays the GO TO bar, and the Settings view draws
-/// the settings list instead. Shared with main's legacy dirty-path redraws
-/// so the canvas always matches the SM's current screen (a dirty full
-/// redraw while the drawer is open must keep the overlay).
+/// Navigation view then overlays the GO TO bar, and the Settings / AlarmList
+/// views draw their own lists instead. Shared with main's legacy dirty-path
+/// redraws so the canvas always matches the SM's current screen (a dirty
+/// full redraw while the drawer is open must keep the overlay).
 pub(crate) fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -382,6 +421,9 @@ pub(crate) fn draw_sm_surface(
         RenderView::Settings { selected } => {
             let mut canvas = ctx.board.display.canvas_mut();
             crate::screens::draw_settings(&mut canvas, selected);
+        }
+        RenderView::AlarmList { selected } => {
+            crate::screens::draw_alarm_list(ctx.board, ctx.alarm_store, selected);
         }
     }
 }

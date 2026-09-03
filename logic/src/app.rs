@@ -1628,6 +1628,12 @@ fn transition_alarm_store_changed(
     alarms: Vec<StoredAlarm>,
 ) -> Vec<EffectBatch> {
     state.alarms.alarms = alarms;
+    let mut batches = Vec::new();
+    // The stored list changed: re-point the RTC slot (arm the new nearest
+    // alarm / disable when empty), matching a confirmed AlarmList toggle.
+    if let Some(now) = state.clock.now {
+        batches.extend(program_alarm_for(state, &now));
+    }
     state.render_generation = state.render_generation.next();
     // Clamp the selection to the (possibly shorter/longer) list.
     if let Screen::AlarmList { selected } = &mut state.screen {
@@ -1636,7 +1642,8 @@ fn transition_alarm_store_changed(
             *selected = len;
         }
     }
-    vec![render_batch_with_intent(state, RenderIntent::Full)]
+    batches.push(render_batch_with_intent(state, RenderIntent::Full));
+    batches
 }
 
 fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {

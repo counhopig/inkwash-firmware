@@ -784,16 +784,18 @@ fn main() -> Result<()> {
                 inkwash_logic::app::Screen::Home
                     | inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
+                    | inkwash_logic::app::Screen::AlarmList { .. }
             );
         if sm_screen_is_sm {
             // Feed every debounced button event through the state machine.
             // The SM renders its own screen changes (drawer open/close/move,
-            // Settings row moves, Home/Settings transitions) as
+            // Settings / AlarmList row moves, screen transitions) as
             // Effect::Render kicks. A legacy action selected while pumping
-            // (drawer destination on a not-yet-migrated page, or a Settings
-            // row action) comes back deferred and is opened below after the
-            // pump releases the Runtime borrow (the legacy pages dispatch
-            // through the shared Runtime themselves).
+            // (drawer destination on a not-yet-migrated page, a Settings
+            // row action, or the "+ ADD ALARM" editor) comes back deferred
+            // and is opened below after the pump releases the Runtime
+            // borrow (the legacy pages dispatch through the shared Runtime
+            // themselves).
             let enter_event = ctx.board.key_enter.poll();
             let up_event = ctx.board.key_up.poll();
             let down_event = ctx.board.key_down.poll();
@@ -831,6 +833,30 @@ fn main() -> Result<()> {
                     // redraw (the wedge drew over it).
                     if open_deferred_settings_item(&mut ctx, clock.as_ref(), item) {
                         dismiss_full_refresh = true;
+                    } else {
+                        dirty.push(FULL_SCREEN_RECT);
+                    }
+                }
+                if deferred.add_alarm {
+                    // "+ ADD ALARM" editor wedge on the AlarmList screen.
+                    // Post-pump: the editor is a blocking screen that
+                    // dispatches alarm/button events through the shared
+                    // Runtime. When a new alarm was persisted, reload the SM
+                    // list (Event::AlarmStoreChanged): its Full render is the
+                    // authoritative redraw, so no dirty push follows. When
+                    // the user cancelled, force an AlarmList redraw to clear
+                    // the editor's pixels.
+                    let changed = open_deferred_add_alarm(&mut ctx, clock.as_ref());
+                    if changed {
+                        let reloaded = ctx.alarm_store.load().unwrap_or_default();
+                        if let Err(err) = dispatch_app_runner(
+                            &app_runner,
+                            inkwash_logic::app::Event::AlarmStoreChanged(reloaded),
+                            &mut ctx,
+                        ) {
+                            log::warn!("AlarmStoreChanged dispatch failed: {err}");
+                            dirty.push(FULL_SCREEN_RECT);
+                        }
                     } else {
                         dirty.push(FULL_SCREEN_RECT);
                     }
@@ -1023,17 +1049,19 @@ fn main() -> Result<()> {
         let rtc_plan_confirmed =
             !app_runner_enabled || app_runner.borrow().state().rtc_alarm_plan_confirmed();
         // The state machine is the screen owner for Home, the Navigation
-        // drawer and the Settings list (Stage 4): while one of those is
-        // current the main loop is the screen's only input host, so an idle
-        // device must stay awake (light sleep, not deep sleep) until the
-        // screen returns to the plain Home state that the deep-sleep path
-        // may sleep from. (Legacy behavior was the same: Settings and the
-        // drawer were blocking screens that never deep-slept.)
+        // drawer, the Settings list and the alarm list (Stage 4): while one
+        // of those is current the main loop is the screen's only input
+        // host, so an idle device must stay awake (light sleep, not deep
+        // sleep) until the screen returns to the plain Home state that the
+        // deep-sleep path may sleep from. (Legacy behavior was the same:
+        // Settings, the drawer and the alarm page were blocking screens
+        // that never deep-slept.)
         let sm_screen_blocks_deep_sleep = app_runner_enabled
             && matches!(
                 app_runner.borrow().state().screen,
                 inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
+                    | inkwash_logic::app::Screen::AlarmList { .. }
             );
         if idle
             && !usb_host_connected
@@ -1128,6 +1156,23 @@ fn open_deferred_settings_item(
         .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
     let _ = ctx.alarm_poll.take_alarm_exit();
     alarm_interrupted
+}
+
+/// Runs the "+ ADD ALARM" editor wedge for the state-machine AlarmList
+/// screen (Stage 4, slice 3). Post-pump (the editor is a blocking screen).
+/// Returns `true` when a new alarm was persisted (the caller dispatches
+/// `Event::AlarmStoreChanged` so the SM adopts the store). An alarm-unwound
+/// editor leaves the exit flag set for the caller to consume once.
+fn open_deferred_add_alarm(ctx: &mut DeviceContext, now: Option<&DateTime>) -> bool {
+    let changed = screens::open_sm_add_alarm(ctx, now);
+    // Same unwind bookkeeping as the other deferred wedges: report the
+    // blocking-page exit then consume it once so it does not leak into the
+    // next page entry.
+    let _ = ctx
+        .alarm_poll
+        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+    let _ = ctx.alarm_poll.take_alarm_exit();
+    changed
 }
 
 /// Renders the idle/background screen with a freshly-loaded next-alarm
@@ -1354,6 +1399,7 @@ fn dispatch_app_runner(
         DeferredNav {
             destinations: executor.take_deferred_nav(),
             settings_items: executor.take_deferred_settings(),
+            add_alarm: executor.take_deferred_add_alarm(),
         }
     };
     for kick in runner.borrow_mut().take_kicks() {
@@ -1363,12 +1409,14 @@ fn dispatch_app_runner(
 }
 
 /// Legacy blocking-page actions deferred out of a pump: drawer
-/// destinations (`OpenNavigationDestination`) and Settings row items
-/// (`OpenSettingsItem`). The main loop opens each after the pump.
+/// destinations (`OpenNavigationDestination`), Settings row items
+/// (`OpenSettingsItem`) and the "+ ADD ALARM" editor
+/// (`OpenAddAlarm`). The main loop opens each after the pump.
 #[derive(Default)]
 struct DeferredNav {
     destinations: Vec<usize>,
     settings_items: Vec<usize>,
+    add_alarm: bool,
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.

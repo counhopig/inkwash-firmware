@@ -363,11 +363,12 @@ pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
 /// pages dispatch alarm/button events through the shared Runtime, which is
 /// why main opens them only after the pump released the borrow.
 pub fn open_sm_destination(ctx: &mut DeviceContext, now: Option<&DateTime>, destination: usize) {
-    if let 1..=4 = destination {
+    // Home (0), ALARMS (3) and SETTINGS (5) are SM screens and never reach
+    // this router; 1/2/4 still run legacy blocking pages.
+    if let 1..=2 | 4 = destination {
         let page = match destination {
             1 => Page::Calendar,
             2 => Page::Inbox,
-            3 => Page::Alarms,
             _ => Page::Todos,
         };
         browse_page(ctx, page, now);
@@ -1091,6 +1092,43 @@ fn render_alarm_page(board: &mut Note4Board, store: &AlarmStore, selected: usize
     let mut canvas = board.display.canvas_mut();
     draw_rows(&mut canvas, "ALARMS", &items, selected);
     footer(&mut canvas, "UP/DOWN MOVE   ENTER OK   HOLD UP/DOWN PAGE");
+}
+
+/// Draws the state-machine AlarmList screen (Stage 4, slice 3): stored
+/// alarm rows (from the store; the SM owns toggling, the executor renders)
+/// plus the trailing "+ ADD ALARM" row. Same layout the legacy alarm page
+/// used, so the SM-drawn list is pixel-consistent.
+pub(crate) fn draw_alarm_list(board: &mut Note4Board, store: &AlarmStore, selected: usize) {
+    render_alarm_page(board, store, selected);
+}
+
+/// Runs the legacy "+ ADD ALARM" editor wedge for the state-machine
+/// AlarmList screen (Stage 4, slice 3). Post-pump (never inside a pump -
+/// the editor is a blocking screen that dispatches alarm events through the
+/// shared Runtime). When the user completes an alarm the wedge persists the
+/// merged list + marks it dirty; the caller then dispatches
+/// `Event::AlarmStoreChanged` with the reloaded list so the SM adopts the
+/// new alarm and re-programs the RTC slot through its own confirmable
+/// path. Returns `true` when the list actually changed.
+pub(crate) fn open_sm_add_alarm(ctx: &mut DeviceContext, now: Option<&DateTime>) -> bool {
+    let mut list = ctx.alarm_store.load().unwrap_or_default();
+    match add_alarm_screen(ctx, now, &list) {
+        AlarmEditOutcome::Added(alarm) => {
+            list.push(alarm);
+            if let Err(err) = ctx.alarm_store.save(&list) {
+                log::warn!("ADD ALARM: failed to save alarms: {err}");
+                return false;
+            }
+            true
+        }
+        AlarmEditOutcome::Cancelled => false,
+        AlarmEditOutcome::AlarmInterrupted => {
+            // Alarm rang over the editor: unwind to the caller (main),
+            // which routes the alarm through the shared Runtime.
+            ctx.alarm_poll.mark_exit();
+            false
+        }
+    }
 }
 
 fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: usize) {
