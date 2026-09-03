@@ -378,6 +378,10 @@ pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {
 /// (rows 0-2), main re-renders Settings. Row 3 (Sleep) never returns (it
 /// deep-sleeps).
 pub(crate) fn open_sm_settings_item(ctx: &mut DeviceContext, now: Option<&DateTime>, item: usize) {
+    // Rows 0-2 (Sync Now / Sync Interval / BLE pairing) are still legacy
+    // blocking network/radio screens run post-pump. Row 3 (SLEEP) is an SM
+    // effect now (Effect::EnterDeepSleep, logic ecb35b5) and never reaches
+    // this wedge.
     match item {
         0 => sync_now_screen(ctx, now),
         1 => {
@@ -387,21 +391,6 @@ pub(crate) fn open_sm_settings_item(ctx: &mut DeviceContext, now: Option<&DateTi
             // on the Settings screen itself - nothing to propagate here.
         }
         2 => ble_pairing_screen(ctx, now),
-        3 => {
-            show_message(
-                ctx.board,
-                "SLEEP",
-                &["GOING TO SLEEP"],
-                std::time::Duration::from_millis(500),
-            );
-            let maintenance_wake = now.and_then(|dt| {
-                ctx.alarm_store
-                    .load()
-                    .ok()
-                    .and_then(|alarms| alarms::maintenance_wakeup_delay(&alarms, dt))
-            });
-            crate::power::enter_deep_sleep_with_wakeups(maintenance_wake);
-        }
         _ => {}
     }
 }

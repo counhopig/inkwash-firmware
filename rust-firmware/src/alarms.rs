@@ -168,11 +168,6 @@ fn ring_until_dismissed(
     }
 }
 
-            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
-        }
-    }
-}
-
 /// Reprograms the PCF8563's single hardware alarm slot to whichever stored
 /// alarm is nearest, or clears it if none are enabled. All RTC I2C goes
 /// through the executor client (`rtc_executor::RtcExecutor`) — the only
