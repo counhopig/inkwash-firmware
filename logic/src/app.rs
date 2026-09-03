@@ -1283,9 +1283,17 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 _ => None,
             };
             if let Some(next) = next_screen {
+                // A still-drawer move only changes the overlay (cheap
+                // NAV_BAR partial refresh); closing the drawer to Home
+                // clears the whole overlay, so it is a Full render.
+                let still_in_drawer = matches!(next, Screen::Navigation { .. });
                 state.screen = next;
                 state.render_generation = state.render_generation.next();
-                vec![render_batch_with_intent(state, RenderIntent::Full)]
+                if still_in_drawer {
+                    vec![render_batch(state)]
+                } else {
+                    vec![render_batch_with_intent(state, RenderIntent::Full)]
+                }
             } else {
                 vec![]
             }
@@ -3586,6 +3594,94 @@ mod tests {
             e,
             Effect::Render(RenderRequest {
                 view: RenderView::Home,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn drawer_open_is_full_move_is_partial_close_is_full() {
+        // Refresh policy for the on-panel overlay: opening the drawer and
+        // closing it clear/reveal the whole overlay (Full), while a move
+        // inside the drawer only changes the bar (Partial -> the executor
+        // refreshes just the NAV_BAR rect). This is the intent contract the
+        // executor's view-aware partial relies on.
+        let mut state = AppState::default();
+
+        // Open: Full.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert!(
+            batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+                e,
+                Effect::Render(RenderRequest {
+                    intent: RenderIntent::Full,
+                    ..
+                })
+            )),
+            "drawer open must be a Full render"
+        );
+
+        // Move: Partial.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert!(
+            batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+                e,
+                Effect::Render(RenderRequest {
+                    intent: RenderIntent::Partial,
+                    ..
+                })
+            )),
+            "drawer move must be a Partial render (NAV_BAR refresh only)"
+        );
+        assert!(!batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                ..
+            })
+        )));
+
+        // Long ENTER cancels back to Home: Full.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert!(
+            batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+                e,
+                Effect::Render(RenderRequest {
+                    intent: RenderIntent::Full,
+                    ..
+                })
+            )),
+            "drawer close (cancel) must be a Full render"
+        );
+
+        // Reopen, move to a non-Home destination, ENTER selects: the drawer
+        // closes to Home with a Full render plus the deferred destination
+        // effect.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
                 ..
             })
         )));

@@ -15,7 +15,7 @@
 
 use anyhow::Result;
 
-use inkwash_logic::app::{Effect, EffectOutput, RenderIntent, RenderRequest};
+use inkwash_logic::app::{Effect, EffectOutput, RenderIntent, RenderRequest, RenderView};
 use inkwash_logic::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 
 pub use inkwash_logic::runner::AsyncKick;
@@ -38,6 +38,11 @@ pub struct EffectRunner<'a, 'ctx> {
         inkwash_logic::protocol::Channel,
         inkwash_logic::protocol::Reply,
     )>,
+    /// Legacy navigation destinations the state machine selected while
+    /// running this pump. Opening them is deferred to the caller (after
+    /// the pump releases the Runtime borrow) because the pages block and
+    /// dispatch alarm/button events back through the same Runtime.
+    deferred_nav: Vec<usize>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -46,6 +51,7 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             ctx,
             last_clock,
             replies: Vec::new(),
+            deferred_nav: Vec::new(),
         }
     }
 
@@ -58,6 +64,12 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
         inkwash_logic::protocol::Reply,
     )> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// Drain the legacy navigation destinations the state machine selected
+    /// during the last pump. The caller opens each page after the pump.
+    pub fn take_deferred_nav(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.deferred_nav)
     }
 }
 
@@ -198,12 +210,17 @@ impl EffectExecutor for EffectRunner<'_, '_> {
             }
             // ---- asynchronous / out-of-band effects -------------------------
             Effect::OpenNavigationDestination { destination } => {
-                // Transitional: the executor opens the legacy destination
-                // page. Wired when the main loop routes drawer buttons
-                // through the state machine (the Stage-4 nav slice); until
-                // then the firmware opens pages on its own key handling, so
-                // this effect does not fire in practice.
-                log::warn!("OpenNavigationDestination({destination}) effect not wired; ignored");
+                // The executor NEVER opens a legacy blocking page inside a
+                // pump: a blocking page dispatches RTC alarm snapshots /
+                // button events through the same shared Runtime, which would
+                // re-enter `borrow_mut` on the RefCell the outer pump is
+                // holding and panic. Defer the open to the caller: the main
+                // loop drains this buffer after the pump (borrow released)
+                // and opens the page there, mirroring the legacy inline
+                // `open_navigation` dispatch structure. The state machine
+                // already transitioned to the target screen before the
+                // effect ran, so the page opens onto the correct state.
+                self.deferred_nav.push(*destination);
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::Reply { channel, reply } => {
@@ -214,7 +231,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.replies.push((*channel, reply.clone()));
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
-            Effect::Render(req) => match render_home_into(self.ctx, self.last_clock, req) {
+            Effect::Render(req) => match render_view_into(self.ctx, self.last_clock, req) {
                 Ok(request_id) => {
                     // The panel refresh is in flight and its EPD completion
                     // will carry `request_id`. Return async *with* the id so
@@ -272,17 +289,55 @@ impl EffectExecutor for EffectRunner<'_, '_> {
     }
 }
 
-/// Re-renders Home and submits the refresh requested by the state machine.
-/// Minute ticks use a partial CLOCK_RECT refresh; alarm dismiss uses a full
-/// refresh so the ALARM frame is replaced in one panel operation.
+/// Draws the current SM screen's canvas and submits the refresh the state
+/// machine requested. The renderer is state-driven (Stage-4/5): the request
+/// names the surface to draw - Home, or Home plus the GO TO drawer overlay -
+/// so the executor draws the SM screen instead of a call-site rectangle.
+///
+/// Home canvases are always fully re-rendered before the refresh (a minute
+/// tick re-draws Home then partial-refreshes only the clock rect). The
+/// drawer overlay is drawn on top of the same Home canvas; a Partial
+/// refresh of the Navigation view updates only the overlay rect (cheap
+/// selection moves on the drawer), while open/close/select stay Full.
 ///
 /// Returns the EPD request id so the caller can correlate the eventual
 /// `EpdCompletion` back to this render's `AsyncKick`.
-fn render_home_into(
+fn render_view_into(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
     req: &RenderRequest,
 ) -> Result<u64> {
+    draw_sm_surface(ctx, clock, req.view);
+    let request_id = match (req.view, req.intent) {
+        (_, RenderIntent::Full) => ctx.board.display.refresh_full(),
+        (RenderView::Home, RenderIntent::Partial) => {
+            ctx.board.display.refresh_partial(crate::canvas::Rect {
+                x: 16,
+                y: 36,
+                width: 368,
+                height: 92,
+            })
+        }
+        // Navigation view partials redraw just the GO TO bar (selection
+        // moves); the rest of the Home canvas stays put on the panel.
+        (RenderView::Navigation { .. }, RenderIntent::Partial) => ctx
+            .board
+            .display
+            .refresh_partial(crate::screens::NAV_BAR_RECT),
+    };
+    request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
+}
+
+/// Renders the visible surface named by `view` into the shared canvas.
+/// Home is always drawn first (the drawer opens over it from Home); the
+/// Navigation view then overlays the GO TO bar. Shared with main's legacy
+/// dirty-path redraws so the canvas always matches the SM's current screen
+/// (a dirty full redraw while the drawer is open must keep the overlay).
+pub(crate) fn draw_sm_surface(
+    ctx: &mut DeviceContext<'_>,
+    clock: Option<DateTime>,
+    view: RenderView,
+) {
     let next_alarm = clock
         .as_ref()
         .and_then(|dt| crate::screens::next_alarm_label(ctx.alarm_store, dt));
@@ -307,14 +362,8 @@ fn render_home_into(
         battery_percent,
         charge,
     );
-    let request_id = match req.intent {
-        RenderIntent::Partial => ctx.board.display.refresh_partial(crate::canvas::Rect {
-            x: 16,
-            y: 36,
-            width: 368,
-            height: 92,
-        }),
-        RenderIntent::Full => ctx.board.display.refresh_full(),
-    };
-    request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
+    if let RenderView::Navigation { selected } = view {
+        let mut canvas = ctx.board.display.canvas_mut();
+        crate::screens::draw_navigation_bar(&mut canvas, selected);
+    }
 }

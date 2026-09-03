@@ -54,8 +54,10 @@ pub fn truncate_prop(text: &str, max_width: usize) -> String {
 /// recurses into whichever screen the user picks, returning once they back
 /// all the way out to Home. Always leaves the caller (Home) to redraw its
 /// own full screen afterwards - none of these screens know how to render
-/// the home screen themselves.
-pub fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
+/// the home screen themselves. `pub(crate)` so main's deferred
+/// `OpenNavigationDestination` router (SM drawer selecting SETTINGS) can
+/// open it after the pump.
+pub(crate) fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
     let items = [
         "SYNC NOW".to_string(),
         "SYNC INTERVAL".to_string(),
@@ -192,7 +194,7 @@ pub enum Page {
 /// exactly to the home screen's left card border (x=192), so the covered
 /// content ends at a clean boundary instead of leaving an orphaned sliver
 /// of card outline.
-const NAV_BAR_RECT: Rect = Rect {
+pub(crate) const NAV_BAR_RECT: Rect = Rect {
     x: 16,
     y: 34,
     width: 176,
@@ -211,7 +213,7 @@ const NAV_DESTINATIONS: [&str; 6] = ["HOME", "CALENDAR", "INBOX", "ALARMS", "TOD
 /// chrome every other row in the app uses; since the bar opens pre-selected
 /// on the current page, that highlighted row doubles as the "you are here"
 /// marker.
-fn draw_navigation_bar(canvas: &mut Canvas, selected: usize) {
+pub(crate) fn draw_navigation_bar(canvas: &mut Canvas, selected: usize) {
     // Solid white fill hides whatever page content sits underneath the bar
     // cleanly (no half-covered text), which is what makes it read as an
     // overlay instead of a chopped-up screen.
@@ -350,6 +352,31 @@ pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
             }
             _ => {}
         }
+    }
+}
+
+/// Opens one navigation-drawer destination picked through the state-machine
+/// drawer (Stage 4): the SM closed the drawer back to Home and emitted
+/// `Effect::OpenNavigationDestination`; main's post-pump router calls this
+/// for every destination that still lives behind a legacy blocking page
+/// (1..=5). The pages dispatch alarm/button events through the shared
+/// Runtime, which is why main opens them only after the pump released the
+/// borrow.
+pub fn open_sm_destination(ctx: &mut DeviceContext, now: Option<&DateTime>, destination: usize) {
+    match destination {
+        1..=4 => {
+            let page = match destination {
+                1 => Page::Calendar,
+                2 => Page::Inbox,
+                3 => Page::Alarms,
+                _ => Page::Todos,
+            };
+            browse_page(ctx, page, now);
+        }
+        5 => {
+            open_menu(ctx, now);
+        }
+        _ => {}
     }
 }
 

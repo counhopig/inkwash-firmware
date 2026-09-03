@@ -457,7 +457,9 @@ fn main() -> Result<()> {
                     &app_runner,
                     inkwash_logic::app::Event::Boot(boot_result.snapshot),
                     &mut ctx,
-                ) {
+                )
+                .map(|_| ())
+                {
                     log::warn!("Runtime Boot dispatch failed: {err}");
                 }
             }
@@ -488,7 +490,8 @@ fn main() -> Result<()> {
                         ),
                     ),
                     &mut ctx,
-                );
+                )
+                .map(|_| ());
                 dismiss_full_refresh = true;
             }
         }
@@ -543,7 +546,9 @@ fn main() -> Result<()> {
                                 &app_runner,
                                 inkwash_logic::app::Event::Tick(dt),
                                 &mut ctx,
-                            ) {
+                            )
+                            .map(|_| ())
+                            {
                                 log::warn!("Runtime Tick dispatch failed: {err}");
                             }
                         }
@@ -762,80 +767,133 @@ fn main() -> Result<()> {
             }
         }
 
-        // Home has no single-key action: ENTER is root (no-op), long UP or
-        // DOWN opens the navigation drawer. Any event counts as activity.
+        // The Home loop hosts the state-machine screens (Stage 4): when the
+        // runtime is enabled and its screen is Home or the Navigation drawer
+        // (an SM-owned screen), every debounced button event is fed to the
+        // state machine as Event::Button. The SM owns what the keys mean
+        // there: long UP/DOWN opens the drawer from Home; inside the drawer
+        // UP/DOWN move the selection, ENTER selects a destination, long
+        // ENTER cancels. Selecting a not-yet-migrated destination emits
+        // `OpenNavigationDestination`, whose legacy page this loop opens
+        // below (post-pump). When the runtime is disabled (core boot fact
+        // failure) the legacy Home nav stays available without the SM.
         let mut key_changed = false;
-        if let Some(event) = ctx.board.key_enter.poll() {
-            key_changed = true;
-            match event {
-                ButtonEvent::Pressed(ButtonId::Enter) => {
-                    // Home has no primary action. Settings is reached only
-                    // through the long-UP/DOWN navigation drawer.
-                }
-                ButtonEvent::LongPressed(ButtonId::Enter) => {
-                    // Home is the root screen, so "back" stays on Home.
-                    log::info!("ENTER long pressed on Home; already at root");
-                }
-                ButtonEvent::Released(ButtonId::Enter) => {}
-                other => log::debug!("unexpected key_enter event: {other:?}"),
-            }
-        }
-        if let Some(event) = ctx.board.key_up.poll() {
-            key_changed = true;
-            match event {
-                ButtonEvent::Pressed(ButtonId::Up) => {
-                    // Home has no vertical selection.
-                }
-                ButtonEvent::LongPressed(ButtonId::Up) => {
-                    log::info!("UP long pressed; opening navigation");
-                    screens::open_navigation(&mut ctx, clock.as_ref());
-                    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
-                    // Always restore Home after the navigation stack: a
-                    // normal cancel or selecting Home leaves the drawer /
-                    // old page on screen but keys already route to Home.
-                    // The alarm flag only marks WHY the stack unwound and
-                    // is cleared here so it does not leak into the next
-                    // page. The consume-for-source policy is the shared
-                    // production code the host harness drives.
-                    let _ = ctx
-                        .alarm_poll
-                        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
-                    let _ = ctx.alarm_poll.take_alarm_exit();
-                    if !alarm_interrupted {
-                        dirty.push(FULL_SCREEN_RECT);
-                    } else {
+        let sm_screen_is_sm = app_runner_enabled
+            && matches!(
+                app_runner.borrow().state().screen,
+                inkwash_logic::app::Screen::Home | inkwash_logic::app::Screen::Navigation { .. }
+            );
+        if sm_screen_is_sm {
+            // Feed every debounced button event through the state machine.
+            // The SM renders its own screen changes (drawer open/close/move)
+            // as Effect::Render kicks; a destination selection on a
+            // not-yet-migrated page comes back as a deferred destination,
+            // opened below after that event's pump releases the Runtime
+            // borrow (the legacy pages dispatch through the shared Runtime
+            // themselves).
+            let enter_event = ctx.board.key_enter.poll();
+            let up_event = ctx.board.key_up.poll();
+            let down_event = ctx.board.key_down.poll();
+            for event in [enter_event, up_event, down_event].into_iter().flatten() {
+                key_changed = true;
+                let destinations = match dispatch_app_runner(
+                    &app_runner,
+                    inkwash_logic::app::Event::Button(event),
+                    &mut ctx,
+                ) {
+                    Ok(destinations) => destinations,
+                    Err(err) => {
+                        log::warn!("SM button dispatch failed: {err}");
+                        continue;
+                    }
+                };
+                for dest in destinations {
+                    // Legacy page for a drawer destination selected through
+                    // the SM drawer. Post-pump: the blocking page dispatches
+                    // alarm/button events through the shared Runtime itself.
+                    // An alarm-unwound page means the dismiss Home render is
+                    // already issued - drop dirty rects instead of pushing a
+                    // second full Home redraw.
+                    if open_deferred_destination(&mut ctx, clock.as_ref(), dest) {
                         dismiss_full_refresh = true;
+                    } else {
+                        dirty.push(FULL_SCREEN_RECT);
                     }
                 }
-                ButtonEvent::Released(ButtonId::Up) => {}
-                other => log::debug!("unexpected key_up event: {other:?}"),
             }
-        }
+        } else {
+            if let Some(event) = ctx.board.key_enter.poll() {
+                key_changed = true;
+                match event {
+                    ButtonEvent::Pressed(ButtonId::Enter) => {
+                        // Home has no primary action. Settings is reached
+                        // only through the long-UP/DOWN navigation drawer.
+                    }
+                    ButtonEvent::LongPressed(ButtonId::Enter) => {
+                        // Home is the root screen, so "back" stays on Home.
+                        log::info!("ENTER long pressed on Home; already at root");
+                    }
+                    ButtonEvent::Released(ButtonId::Enter) => {}
+                    other => log::debug!("unexpected key_enter event: {other:?}"),
+                }
+            }
+            if let Some(event) = ctx.board.key_up.poll() {
+                key_changed = true;
+                match event {
+                    ButtonEvent::Pressed(ButtonId::Up) => {
+                        // Home has no vertical selection.
+                    }
+                    ButtonEvent::LongPressed(ButtonId::Up) => {
+                        log::info!("UP long pressed; opening navigation");
+                        screens::open_navigation(&mut ctx, clock.as_ref());
+                        let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+                        // Always restore Home after the navigation stack: a
+                        // normal cancel or selecting Home leaves the drawer /
+                        // old page on screen but keys already route to Home.
+                        // The alarm flag only marks WHY the stack unwound and
+                        // is cleared here so it does not leak into the next
+                        // page. The consume-for-source policy is the shared
+                        // production code the host harness drives.
+                        let _ = ctx
+                            .alarm_poll
+                            .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+                        let _ = ctx.alarm_poll.take_alarm_exit();
+                        if !alarm_interrupted {
+                            dirty.push(FULL_SCREEN_RECT);
+                        } else {
+                            dismiss_full_refresh = true;
+                        }
+                    }
+                    ButtonEvent::Released(ButtonId::Up) => {}
+                    other => log::debug!("unexpected key_up event: {other:?}"),
+                }
+            }
 
-        if let Some(event) = ctx.board.key_down.poll() {
-            key_changed = true;
-            match event {
-                ButtonEvent::Pressed(ButtonId::Down) => {
-                    // Home has no vertical selection.
-                }
-                ButtonEvent::LongPressed(ButtonId::Down) => {
-                    log::info!("DOWN long pressed; opening navigation");
-                    screens::open_navigation(&mut ctx, clock.as_ref());
-                    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
-                    // Same consume-for-source sequence as the UP path:
-                    // report the blocking-page exit then consume it once.
-                    let _ = ctx
-                        .alarm_poll
-                        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
-                    let _ = ctx.alarm_poll.take_alarm_exit();
-                    if !alarm_interrupted {
-                        dirty.push(FULL_SCREEN_RECT);
-                    } else {
-                        dismiss_full_refresh = true;
+            if let Some(event) = ctx.board.key_down.poll() {
+                key_changed = true;
+                match event {
+                    ButtonEvent::Pressed(ButtonId::Down) => {
+                        // Home has no vertical selection.
                     }
+                    ButtonEvent::LongPressed(ButtonId::Down) => {
+                        log::info!("DOWN long pressed; opening navigation");
+                        screens::open_navigation(&mut ctx, clock.as_ref());
+                        let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+                        // Same consume-for-source sequence as the UP path:
+                        // report the blocking-page exit then consume it once.
+                        let _ = ctx
+                            .alarm_poll
+                            .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+                        let _ = ctx.alarm_poll.take_alarm_exit();
+                        if !alarm_interrupted {
+                            dirty.push(FULL_SCREEN_RECT);
+                        } else {
+                            dismiss_full_refresh = true;
+                        }
+                    }
+                    ButtonEvent::Released(ButtonId::Down) => {}
+                    other => log::debug!("unexpected key_down event: {other:?}"),
                 }
-                ButtonEvent::Released(ButtonId::Down) => {}
-                other => log::debug!("unexpected key_down event: {other:?}"),
             }
         }
 
@@ -854,14 +912,32 @@ fn main() -> Result<()> {
             ));
         }
         if !dirty.is_empty() {
-            last_home_fp = Some(render_home_now(
-                ctx.board,
-                ctx.counters,
-                ctx.alarm_store,
-                ctx.todo_store,
-                ctx.inbox_store,
-                clock.as_ref(),
-            ));
+            // The dirty path draws whatever screen the state machine is on
+            // (Stage 4): a full redraw while the Navigation drawer is open
+            // must keep the overlay, and every dirty Home redraw must match
+            // the SM's current screen. When the runtime is enabled we render
+            // through the shared surface painter; the legacy path (runtime
+            // disabled) keeps `render_home_now`.
+            if app_runner_enabled {
+                last_home_fp = Some(home_data_fingerprint(
+                    ctx.counters,
+                    ctx.alarm_store,
+                    ctx.todo_store,
+                    ctx.inbox_store,
+                    clock.as_ref(),
+                ));
+                let view = app_runner.borrow().state().screen.render_view();
+                app_runner::draw_sm_surface(&mut ctx, clock, view);
+            } else {
+                last_home_fp = Some(render_home_now(
+                    ctx.board,
+                    ctx.counters,
+                    ctx.alarm_store,
+                    ctx.todo_store,
+                    ctx.inbox_store,
+                    clock.as_ref(),
+                ));
+            }
             if dirty
                 .iter()
                 .any(|rect| rect.width == 400 && rect.height == 300)
@@ -931,10 +1007,21 @@ fn main() -> Result<()> {
         // a later migration stage.
         let rtc_plan_confirmed =
             !app_runner_enabled || app_runner.borrow().state().rtc_alarm_plan_confirmed();
+        // The state machine is the screen owner for Home / the Navigation
+        // drawer (Stage 4): while one of those is current the main loop is
+        // the drawer's only input host, so an idle device must stay awake
+        // (light sleep, not deep sleep) until the drawer is closed back to
+        // the plain Home state that the deep-sleep path may sleep from.
+        let sm_screen_blocks_deep_sleep = app_runner_enabled
+            && matches!(
+                app_runner.borrow().state().screen,
+                inkwash_logic::app::Screen::Navigation { .. }
+            );
         if idle
             && !usb_host_connected
             && ctx.pending_wifi_op.is_none()
             && rtc_plan_confirmed
+            && !sm_screen_blocks_deep_sleep
             && deep_sleep_since.is_some_and(|since| now.duration_since(since) >= DEEP_SLEEP_AFTER)
         {
             // The wake interval is the *minimum* of the
@@ -973,6 +1060,33 @@ fn main() -> Result<()> {
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
         }
     }
+}
+
+/// Opens one legacy navigation-destination page selected through the
+/// state-machine drawer (Stage 4). Called strictly after the dispatch pump
+/// has released the Runtime borrow: the blocking pages (browse_page /
+/// open_menu) dispatch RTC alarm snapshots / button events back through the
+/// shared Runtime, which must not be re-entered from inside a pump.
+///
+/// Returns `true` when an alarm unwound the page (the SM already issued the
+/// dismiss Home render; the caller must drop dirty rects instead of pushing
+/// a second full Home redraw). Mirrors the legacy `open_navigation` caller
+/// contract.
+fn open_deferred_destination(
+    ctx: &mut DeviceContext,
+    now: Option<&DateTime>,
+    destination: usize,
+) -> bool {
+    screens::open_sm_destination(ctx, now, destination);
+    // Same unwind bookkeeping the legacy open_navigation path performed:
+    // the page stack may have been unwound by an alarm; consume the sticky
+    // exit flag here so it does not leak into the next page entry.
+    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+    let _ = ctx
+        .alarm_poll
+        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+    let _ = ctx.alarm_poll.take_alarm_exit();
+    alarm_interrupted
 }
 
 /// Renders the idle/background screen with a freshly-loaded next-alarm
@@ -1174,24 +1288,34 @@ fn collect_boot_snapshot(
 /// the state machine; render kicks registered during the pump are routed
 /// to the shared EPD registry here, so call sites never drain kicks by
 /// hand.
+///
+/// Returns the legacy navigation destinations the state machine selected
+/// while pumping this event (drawer ENTER on a not-yet-migrated page). The
+/// caller opens each page AFTER this returns - never inside a pump - because
+/// the blocking pages dispatch alarm/button events back through the same
+/// shared Runtime, which would re-enter `borrow_mut` on the RefCell this
+/// function held during the pump.
 fn dispatch_app_runner(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<usize>> {
     let last_clock = runner.borrow().last_clock();
-    {
+    let deferred_nav = {
         let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
-        let mut runtime = runner.borrow_mut();
-        runtime.push(event);
-        runtime
-            .pump(&mut executor)
-            .map_err(|e| anyhow::anyhow!(e))?;
-    }
+        {
+            let mut runtime = runner.borrow_mut();
+            runtime.push(event);
+            runtime
+                .pump(&mut executor)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        executor.take_deferred_nav()
+    };
     for kick in runner.borrow_mut().take_kicks() {
         track_kick_shared(ctx, kick);
     }
-    Ok(())
+    Ok(deferred_nav)
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.
@@ -1247,5 +1371,5 @@ fn feed_completion_back(
             output,
         }),
     };
-    dispatch_app_runner(runner, event, ctx)
+    dispatch_app_runner(runner, event, ctx).map(|_| ())
 }
