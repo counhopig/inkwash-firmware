@@ -194,11 +194,10 @@ impl Screen {
                 stage: *stage,
                 value: *value,
             },
-            Screen::Home
-            | Screen::AlarmEdit(_)
-            | Screen::AlarmRinging
-            | Screen::Reminder(_)
-            | Screen::BlePairing(_) => RenderView::Home,
+            Screen::BlePairing(_) => RenderView::BlePairing,
+            Screen::Home | Screen::AlarmEdit(_) | Screen::AlarmRinging | Screen::Reminder(_) => {
+                RenderView::Home
+            }
         }
     }
 }
@@ -548,6 +547,12 @@ pub enum RenderView {
     /// The SYNC INTERVAL picker list (Stage 4): five fixed options, row
     /// cursor moved by the SM, ENTER confirms. Carries the selected row.
     SyncInterval { selected: usize },
+    /// The BLE pairing session (Stage 4): the pairing-instructions screen.
+    /// The SM owns the lifecycle (events drive the phase; any button exits
+    /// back to Settings); the executor draws the instructions canvas. The
+    /// phase-specific visuals stay with the radio layer until the NimBLE
+    /// event wiring lands (the SM phase transitions are locked regardless).
+    BlePairing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7097,7 +7102,7 @@ mod tests {
                 Screen::BlePairing(BlePairingState {
                     phase: BlePairingPhase::Waiting,
                 }),
-                RenderView::Home,
+                RenderView::BlePairing,
             ),
         ];
         for (screen, view) in cases {
@@ -8000,7 +8005,7 @@ mod tests {
                 Screen::BlePairing(BlePairingState {
                     phase: BlePairingPhase::Waiting,
                 }),
-                RenderView::Home,
+                RenderView::BlePairing,
             ),
         ];
         for (screen, expected_view) in screens {
