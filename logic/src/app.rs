@@ -2449,11 +2449,14 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
 /// markers) are time-sensitive; the list screens may show data a sync just
 /// changed. Pure read-only sub-screens (a week view, an item detail, a
 /// picker, the pairing session, the ADD-ALARM editor) have no time-driven
-/// content, so a minute tick would only burn an unnecessary e-ink refresh.
+/// content, and AlarmRinging is drawn over by the legacy ring screen - a
+/// minute tick on any of these would only burn an unnecessary e-ink
+/// refresh.
 fn tick_refreshes_current_screen(screen: &Screen) -> bool {
     !matches!(
         screen,
-        Screen::WeekView { .. }
+        Screen::AlarmRinging
+            | Screen::WeekView { .. }
             | Screen::InboxItem { .. }
             | Screen::AlarmAdd(_)
             | Screen::SyncIntervalPick { .. }
@@ -8002,8 +8005,10 @@ mod tests {
             );
         }
 
-        // Pure read-only sub-screens skip the minute render entirely.
+        // Pure read-only sub-screens (and the legacy ring overlay) skip
+        // the minute render entirely.
         let skip_screens = [
+            Screen::AlarmRinging,
             Screen::WeekView {
                 year: 2026,
                 month: 8,
