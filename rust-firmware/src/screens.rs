@@ -415,6 +415,16 @@ pub(crate) fn open_sm_settings_item(ctx: &mut DeviceContext, now: Option<&DateTi
 
 /// Runs one peer content page. Long UP/DOWN opens the navigation overlay;
 /// cancelling that overlay restores this page.
+///
+/// SM-disabled safe-mode ONLY (Stage 4 audit, round 29): this blocking
+/// browse loop (and the pages it drives - Calendar / Alarms / Todos /
+/// Inbox / open_menu's Settings) is reachable only through
+/// `open_navigation`, which main calls solely in the `app_runner_enabled
+/// == false` fallback (core boot fact failure). With the AppRunner enabled
+/// every destination is a state-machine screen. It reads the same stores
+/// the failed boot snapshot saw; it is an intentional degraded fallback.
+/// Retiring it requires a product decision on safe mode (device-level
+/// verification needed).
 fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) {
     let mut live_now = now.copied();
     let mut rtc_poll_ticks = 0u8;
