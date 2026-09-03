@@ -473,9 +473,11 @@ impl DeviceContext<'_> {
             self.sync_scheduler.last_urgent_boundary =
                 inkwash_logic::scheduler::boundary_index(unix, 30);
             log::info!("Aligned sync due (interval {interval} min); dispatching");
-            if let Err(err) = self.start_sync(*now) {
-                log::warn!("Failed to dispatch scheduled sync: {err}");
-            }
+            // The state machine owns the start decision (single-flight
+            // arbitration); the event only reports that the boundary fired.
+            // The executor's StartSync effect performs the real dispatch.
+            let runner = self.app_runner.clone();
+            self.dispatch_sync_boundary(&runner);
             return false;
         }
 
@@ -747,6 +749,38 @@ impl DeviceContext<'_> {
             }
         }
         reply_for_channel
+    }
+
+    /// Pushes one `SyncBoundaryDue` into the runner and pumps. The state
+    /// machine decides whether a scheduled sync may start (single-flight +
+    /// configured); if it emits StartSync, the executor performs the real
+    /// dispatch inside the pump. No reply is expected (scheduled syncs have
+    /// no transport slot).
+    fn dispatch_sync_boundary(
+        &mut self,
+        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
+    ) {
+        let last_clock = runner.borrow().last_clock();
+        {
+            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
+            let mut runtime = runner.borrow_mut();
+            runtime.push(inkwash_logic::app::Event::SyncBoundaryDue);
+            if let Err(err) = runtime.pump(&mut executor) {
+                log::warn!("SyncBoundaryDue dispatch through state machine failed: {err}");
+            }
+        }
+        for kick in runner.borrow_mut().take_kicks() {
+            let mut reg = self.pending_renders.borrow_mut();
+            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+                reg.register(kick);
+            } else {
+                log::warn!(
+                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
+                    kick.effect,
+                    kick.operation_id
+                );
+            }
+        }
     }
 
     /// Pushes one `SyncCompleted` into the runner, pumps, and returns the

@@ -484,6 +484,10 @@ pub enum Event {
     /// A `StartSetWifi` verification+save finished (Ok when the credentials
     /// were verified and persisted; Err carries the failure message).
     SetWifiCompleted(Result<(), String>),
+    /// The wall-clock full-sync boundary is due (the event-collection layer
+    /// detected the minute crossed the interval boundary; it only reports
+    /// the fact - the state machine decides whether a sync may start).
+    SyncBoundaryDue,
     DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
@@ -772,10 +776,37 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::BleCommand(request) => transition_command(state, Channel::Ble, request),
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
+        Event::SyncBoundaryDue => transition_sync_boundary_due(state),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
     }
+}
+
+/// The wall-clock full-sync boundary is due. The event-collection layer
+/// reported the fact; the machine decides whether a sync may start: it
+/// must be idle (single network op) and wifi + server must be configured.
+/// A scheduled sync has no transport pending reply - its completion feeds
+/// back through `SyncCompleted` and applies the merged data with no reply
+/// to send.
+fn transition_sync_boundary_due(state: &mut AppState) -> Vec<EffectBatch> {
+    if state.sync != SyncState::Idle {
+        return vec![];
+    }
+    if !state.connectivity.wifi_configured || !state.connectivity.server_configured {
+        return vec![];
+    }
+    let Some(now) = state.clock.now else {
+        return vec![];
+    };
+    let op = state.next_operation_id();
+    state.sync = SyncState::Running { request_id: op };
+    vec![batch(
+        state,
+        op,
+        FailurePolicy::Continue,
+        vec![Effect::StartSync(SyncRequest { now })],
+    )]
 }
 
 /// A completed network sync resolves the running sync (single-flight
@@ -3181,6 +3212,49 @@ mod tests {
         assert_eq!(state.sync, SyncState::Idle);
         assert!(state.pending_usb_reply.is_none());
         assert!(state.pending_ble_reply.is_none());
+    }
+
+    #[test]
+    fn sync_boundary_due_starts_when_idle_and_configured() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.wifi_ssid = Some("home-wifi".into());
+        state.config.server_url = Some("https://server.example".into());
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let batches = update(&mut state, Event::SyncBoundaryDue);
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        assert!(batches
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::StartSync(_))) }));
+        // No transport slot is taken for a scheduled sync.
+        assert!(state.pending_usb_reply.is_none());
+        assert!(state.pending_ble_reply.is_none());
+    }
+
+    #[test]
+    fn sync_boundary_due_is_noop_while_a_sync_is_running() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.wifi_ssid = Some("home-wifi".into());
+        state.config.server_url = Some("https://server.example".into());
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let _ = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        let batches = update(&mut state, Event::SyncBoundaryDue);
+        assert!(batches.is_empty(), "single-flight: no second sync");
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+    }
+
+    #[test]
+    fn sync_boundary_due_is_noop_when_not_configured() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        // No wifi / server configured.
+        let batches = update(&mut state, Event::SyncBoundaryDue);
+        assert!(batches.is_empty());
+        assert_eq!(state.sync, SyncState::Idle);
     }
 
     #[test]
