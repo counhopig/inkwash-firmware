@@ -1654,7 +1654,34 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     vec![render_batch_with_intent(state, RenderIntent::Full)]
                 }
                 ButtonEvent::Pressed(ButtonId::Enter) => {
-                    if cur == SETTINGS_SYNC_INTERVAL_ROW {
+                    if cur == SETTINGS_SYNC_NOW_ROW {
+                        // SYNC NOW (row 0): start a background sync through
+                        // the SM sync engine (same gate as the scheduled
+                        // SyncBoundaryDue - idle + wifi/server configured +
+                        // clock). The SM stays on Settings; the completion
+                        // adopts + persists data through the existing
+                        // SyncCompleted path. A busy / unconfigured / no
+                        // clock start is a no-op (nothing to sync).
+                        let mut batches = Vec::new();
+                        if state.sync == SyncState::Idle
+                            && state.connectivity.wifi_configured
+                            && state.connectivity.server_configured
+                        {
+                            if let Some(now) = state.clock.now {
+                                let op = state.next_operation_id();
+                                state.sync = SyncState::Running { request_id: op };
+                                batches.push(batch(
+                                    state,
+                                    op,
+                                    FailurePolicy::Continue,
+                                    vec![Effect::StartSync(SyncRequest { now })],
+                                ));
+                            }
+                        }
+                        state.render_generation = state.render_generation.next();
+                        batches.push(render_batch_with_intent(state, RenderIntent::Full));
+                        batches
+                    } else if cur == SETTINGS_SYNC_INTERVAL_ROW {
                         // SYNC INTERVAL (row 1): open the SM interval picker.
                         state.screen = Screen::SyncIntervalPick { selected: 0 };
                         state.render_generation = state.render_generation.next();
@@ -1678,10 +1705,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                             render_batch_with_intent(state, RenderIntent::Full),
                         ]
                     } else {
-                        // Other row action: deferred to the executor (the
-                        // row's action/screen is still a legacy blocking
-                        // page - Sync Now / Sync Interval / BLE pairing).
-                        // The SM stays on Settings; the executor returns
+                        // BLE pairing (row 2): deferred to the executor
+                        // (still a legacy blocking radio screen). The SM
+                        // stays on Settings; the executor returns
                         // after the wedge and main re-renders Settings.
                         state.render_generation = state.render_generation.next();
                         vec![
@@ -1737,6 +1763,8 @@ pub const SETTINGS_ROW_COUNT: usize = 4;
 pub const SETTINGS_SLEEP_ROW: usize = 3;
 /// Index of the SYNC INTERVAL row in the Settings list.
 pub const SETTINGS_SYNC_INTERVAL_ROW: usize = 1;
+/// Index of the SYNC NOW row in the Settings list.
+pub const SETTINGS_SYNC_NOW_ROW: usize = 0;
 
 /// SyncIntervalPick screen (Stage 4): a five-option list picker owned by
 /// the state machine (rows 0..=4 = 1/5/10/30/60 minutes). UP/DOWN move the
@@ -5171,6 +5199,112 @@ mod tests {
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::SetSyncInterval { .. })));
+    }
+
+    #[test]
+    fn settings_sync_now_row_starts_sm_sync() {
+        let mut state = AppState::default();
+        // Boot with wifi + server configured so the sync gate passes.
+        let mut snap = boot_snapshot(vec![], Some(dt(8, 0)), false, true);
+        snap.config = DeviceConfig {
+            server_url: "https://example.com".into(),
+            auth_token: "t".into(),
+        };
+        snap.status = DeviceStatus {
+            wifi_ssid: Some("net".into()),
+            wifi_has_password: true,
+            timezone_offset_minutes: 0,
+        };
+        let _ = update(&mut state, Event::Boot(snap));
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        // ENTER on row 0 (SYNC NOW): starts the SM sync engine (Running) and
+        // emits StartSync - no legacy OpenSettingsItem wedge.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StartSync(_))));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 0 })));
+        // The SM stays on Settings.
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+    }
+
+    #[test]
+    fn settings_sync_now_unconfigured_or_busy_is_noop() {
+        let mut state = AppState::default();
+        // No wifi/server configured.
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // No StartSync; sync stays Idle.
+        assert_eq!(state.sync, SyncState::Idle);
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StartSync(_))));
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+
+        // Busy (a scheduled sync is running): row-0 ENTER is a no-op too.
+        let mut snap = boot_snapshot(vec![], Some(dt(8, 0)), false, true);
+        snap.config = DeviceConfig {
+            server_url: "https://example.com".into(),
+            auth_token: "t".into(),
+        };
+        snap.status = DeviceStatus {
+            wifi_ssid: Some("net".into()),
+            wifi_has_password: true,
+            timezone_offset_minutes: 0,
+        };
+        let _ = update(&mut state, Event::Boot(snap));
+        state.sync = SyncState::Running {
+            request_id: OperationId(99),
+        };
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StartSync(_))));
     }
 
     #[test]
