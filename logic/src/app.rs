@@ -358,14 +358,6 @@ impl ConfigState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct PowerState {
-    /// Next idle-deadline target (unix seconds) computed by the business
-    /// layer; the event-collection layer only compares current time against
-    /// it, never interprets its meaning.
-    pub next_idle_deadline: Option<u64>,
-}
-
 /// Sync state: at most one network operation at a time.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum SyncState {
@@ -737,7 +729,6 @@ pub enum Event {
     SyncBoundaryDue,
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
-    IdleDeadlineReached,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -871,7 +862,6 @@ pub struct AppState {
     /// Wi-Fi password) are never stored in `AppState` - the firmware keeps
     /// them in NVS and only reports booleans.
     pub config: ConfigState,
-    pub power: PowerState,
     pub pending_usb_reply: Option<PendingReply>,
     pub pending_ble_reply: Option<PendingReply>,
     op_counter: u64,
@@ -938,7 +928,6 @@ impl Default for AppState {
             sync: SyncState::Idle,
             connectivity: ConnectivityState::default(),
             config: ConfigState::default(),
-            power: PowerState::default(),
             pending_usb_reply: None,
             pending_ble_reply: None,
             pending_residue_ack: None,
@@ -1066,9 +1055,6 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::BlePairingSucceeded(result) => transition_ble_pairing_succeeded(state, result),
         Event::BlePairingFailed(failure) => transition_ble_pairing_failed(state, failure),
         Event::BleDisconnected => transition_ble_disconnected(state),
-        // Remaining events are wired in later migration steps. They leave
-        // state unchanged rather than guessing.
-        _ => vec![],
     }
 }
 

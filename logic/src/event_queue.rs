@@ -59,8 +59,7 @@ pub fn priority(event: &Event) -> Priority {
         | Event::SyncBoundaryDue
         | Event::SetWifiCompleted(_)
         | Event::EffectCompleted(_)
-        | Event::EffectFailed(_)
-        | Event::IdleDeadlineReached => Priority::High,
+        | Event::EffectFailed(_) => Priority::High,
     }
 }
 
@@ -261,14 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn idle_deadline_and_sync_completion_are_high_priority() {
+    fn sync_completion_is_high_priority() {
         let mut q = EventQueue::new();
-        q.push(Event::IdleDeadlineReached);
         q.push(Event::SyncCompleted(crate::app::SyncResult::Failed(
             "timeout".into(),
         )));
-        assert_eq!(q.high_len(), 2);
-        assert_eq!(q.pop(), Some(Event::IdleDeadlineReached));
+        assert_eq!(q.high_len(), 1);
         assert_eq!(
             q.pop(),
             Some(Event::SyncCompleted(crate::app::SyncResult::Failed(
