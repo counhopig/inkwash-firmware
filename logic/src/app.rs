@@ -543,6 +543,12 @@ pub struct RenderRequest {
     /// RenderPlan; `view` stays as the renderer's "what screen am I
     /// drawing" input until every screen is SM-drawn.
     pub view: RenderView,
+    /// The visible-state snapshot this request was projected from
+    /// (Stage 5). The renderer compares it with its privately-held previous
+    /// ViewModel via `plan_render` to decide Noop / Partial / Full; it is
+    /// NOT a rendering payload (the executor draws from the stores), only
+    /// the diff input.
+    pub view_model: crate::render_plan::ViewModel,
 }
 
 /// Refresh mode requested by a state transition. The render intent is kept
@@ -3284,6 +3290,7 @@ fn render_batch_with_intent(state: &mut AppState, intent: RenderIntent) -> Effec
             generation: state.render_generation,
             intent,
             view,
+            view_model: crate::render_plan::ViewModel::from_state(state),
         })],
         failure_policy: FailurePolicy::Continue,
     }

@@ -126,6 +126,7 @@ mod tests {
                 generation: RenderGeneration(1),
                 intent: RenderIntent::Partial,
                 view: crate::app::RenderView::Home,
+                view_model: crate::render_plan::ViewModel::home(RenderGeneration(1)),
             }),
             request_id: Some(id),
         }

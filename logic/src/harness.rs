@@ -1059,6 +1059,7 @@ mod tests {
                 generation: crate::app::RenderGeneration(1),
                 intent: crate::app::RenderIntent::Partial,
                 view: crate::app::RenderView::Home,
+                view_model: crate::render_plan::ViewModel::home(crate::app::RenderGeneration(1)),
             }),
             request_id: Some(5),
         };

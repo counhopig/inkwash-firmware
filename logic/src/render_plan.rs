@@ -110,6 +110,18 @@ pub enum Overlay {
 pub const PARTIAL_MAINTENANCE_LIMIT: u32 = 200;
 
 impl ViewModel {
+    /// A bare Home ViewModel with no clock and no data - for fixtures and
+    /// for "nothing known yet" renderer caches.
+    pub fn home(generation: RenderGeneration) -> Self {
+        ViewModel {
+            generation,
+            view: RenderView::Home,
+            clock_minute: None,
+            overlay: Overlay::None,
+            data_fingerprint: 0,
+        }
+    }
+
     /// Project the visible state of an `AppState` into a comparable
     /// ViewModel. This is the host-testable projection; the firmware uses
     /// the same construction from the facts it draws from.
