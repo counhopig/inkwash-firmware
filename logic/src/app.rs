@@ -6631,4 +6631,77 @@ mod tests {
             state.alarm_runtime
         );
     }
+
+    /// An alarm ringing over an SM content screen must dismiss back to that
+    /// screen (Stage-4 semantics: `screen_before_ring` captures the current
+    /// SM screen, not just Home).
+    #[test]
+    fn alarm_ringing_over_sm_screens_restores_them_on_dismiss() {
+        // Each SM screen, current over a boot that armed a 9:00 Daily alarm.
+        let screens = [
+            Screen::Settings { selected: 2 },
+            Screen::AlarmList { selected: 1 },
+            Screen::TodoList { selected: 0 },
+            Screen::Inbox { selected: 0 },
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 15,
+            }),
+        ];
+        for screen in screens {
+            let mut state = AppState::default();
+            let _ = update(
+                &mut state,
+                Event::Boot(boot_snapshot(
+                    vec![alarm(1, 9, 0)],
+                    Some(dt(8, 0)),
+                    false,
+                    true,
+                )),
+            );
+            // Jump straight to the content screen (the SM owns the screen
+            // field; only the ring preemption below exercises it).
+            state.screen = screen.clone();
+            let before = state.screen.clone();
+            // The 9:00 Daily alarm fires.
+            let _ring_batches = update(
+                &mut state,
+                Event::RtcAlarmSnapshotReady(RtcAlarmSnapshot {
+                    now: dt(9, 0),
+                    alarm_flag: true,
+                    alarm_interrupt_enabled: true,
+                }),
+            );
+            assert_eq!(
+                state.screen,
+                Screen::AlarmRinging,
+                "{screen:?} must be preempted into AlarmRinging"
+            );
+            // Dismiss with ENTER.
+            let dismiss_batches = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+            );
+            assert_eq!(
+                state.screen, before,
+                "dismiss from {screen:?} must restore the pre-ring screen"
+            );
+            assert!(dismiss_batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::StopTone)));
+            // The restored screen is re-rendered with its own view (Full).
+            assert!(dismiss_batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(
+                    e,
+                    Effect::Render(RenderRequest {
+                        intent: RenderIntent::Full,
+                        ..
+                    })
+                )));
+        }
+    }
 }
