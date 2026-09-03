@@ -220,7 +220,7 @@ impl RenderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Effect, RenderGeneration, RenderIntent, RenderRequest};
+    use crate::app::{Effect, RenderGeneration, RenderRequest};
     use crate::runner::AsyncKick;
 
     fn kick(id: u64) -> AsyncKick {
@@ -231,7 +231,6 @@ mod tests {
             render_generation: Some(RenderGeneration(1)),
             effect: Effect::Render(RenderRequest {
                 generation: RenderGeneration(1),
-                intent: RenderIntent::Partial,
                 view: crate::app::RenderView::Home,
                 view_model: crate::render_plan::ViewModel::home(RenderGeneration(1)),
             }),

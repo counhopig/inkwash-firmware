@@ -538,10 +538,10 @@ pub enum RenderView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderRequest {
     pub generation: RenderGeneration,
-    pub intent: RenderIntent,
-    /// The surface to draw. Stage-5 will replace `intent` with a diffed
-    /// RenderPlan; `view` stays as the renderer's "what screen am I
-    /// drawing" input until every screen is SM-drawn.
+    /// The surface to draw. Stage-5: `view` stays as the renderer's "what
+    /// screen am I drawing" input until every screen is SM-drawn; the
+    /// refresh plan (Noop/Partial/Full) is derived from the ViewModel diff,
+    /// never chosen by the caller.
     pub view: RenderView,
     /// The visible-state snapshot this request was projected from
     /// (Stage 5). The renderer compares it with its privately-held previous
@@ -549,16 +549,6 @@ pub struct RenderRequest {
     /// NOT a rendering payload (the executor draws from the stores), only
     /// the diff input.
     pub view_model: crate::render_plan::ViewModel,
-}
-
-/// Refresh mode requested by a state transition. The render intent is kept
-/// in the host-testable request so the firmware executor can preserve cheap
-/// clock updates while making alarm-dismiss transitions atomic on the panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum RenderIntent {
-    #[default]
-    Partial,
-    Full,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1113,7 +1103,7 @@ fn transition_ble_pairing_started(state: &mut AppState) -> Vec<EffectBatch> {
         st.phase = BlePairingPhase::Pairing;
     }
     state.render_generation = state.render_generation.next();
-    vec![render_batch_with_intent(state, RenderIntent::Full)]
+    vec![render_batch(state)]
 }
 
 fn transition_ble_pairing_succeeded(
@@ -1135,7 +1125,7 @@ fn transition_ble_pairing_succeeded(
             FailurePolicy::Continue,
             vec![Effect::StopBlePairing],
         ),
-        render_batch_with_intent(state, RenderIntent::Full),
+        render_batch(state),
     ]
 }
 
@@ -1157,7 +1147,7 @@ fn transition_ble_pairing_failed(
             FailurePolicy::Continue,
             vec![Effect::StopBlePairing],
         ),
-        render_batch_with_intent(state, RenderIntent::Full),
+        render_batch(state),
     ]
 }
 
@@ -1169,7 +1159,7 @@ fn transition_ble_disconnected(state: &mut AppState) -> Vec<EffectBatch> {
         st.phase = BlePairingPhase::Waiting;
     }
     state.render_generation = state.render_generation.next();
-    vec![render_batch_with_intent(state, RenderIntent::Full)]
+    vec![render_batch(state)]
 }
 
 /// BlePairing screen buttons (Stage 4): any press closes the pairing
@@ -1194,7 +1184,7 @@ fn transition_ble_pairing_button(state: &mut AppState, button: ButtonEvent) -> V
                     FailurePolicy::Continue,
                     vec![Effect::StopBlePairing],
                 ),
-                render_batch_with_intent(state, RenderIntent::Full),
+                render_batch(state),
             ]
         }
         _ => vec![],
@@ -1534,7 +1524,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
                 FailurePolicy::Continue,
                 vec![Effect::StopTone],
             ),
-            render_batch_with_intent(state, RenderIntent::Full),
+            render_batch(state),
         ]
     } else if matches!(
         state.screen,
@@ -1634,7 +1624,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         0 => {
                             state.screen = nav_origin_screen(origin);
                             state.render_generation = state.render_generation.next();
-                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                            vec![render_batch(state)]
                         }
                         1 => {
                             // Open the calendar grid: always the current
@@ -1651,27 +1641,27 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                                 selected_day: day.min(days_in_month(year, month)).max(1),
                             });
                             state.render_generation = state.render_generation.next();
-                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                            vec![render_batch(state)]
                         }
                         2 => {
                             state.screen = Screen::Inbox { selected: 0 };
                             state.render_generation = state.render_generation.next();
-                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                            vec![render_batch(state)]
                         }
                         3 => {
                             state.screen = Screen::AlarmList { selected: 0 };
                             state.render_generation = state.render_generation.next();
-                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                            vec![render_batch(state)]
                         }
                         4 => {
                             state.screen = Screen::TodoList { selected: 0 };
                             state.render_generation = state.render_generation.next();
-                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                            vec![render_batch(state)]
                         }
                         5 => {
                             state.screen = Screen::Settings { selected: 0 };
                             state.render_generation = state.render_generation.next();
-                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                            vec![render_batch(state)]
                         }
                         _ => unreachable!(),
                     };
@@ -1679,17 +1669,13 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 _ => None,
             };
             if let Some(next) = next_screen {
-                // A still-drawer move only changes the overlay (cheap
-                // NAV_BAR partial refresh); leaving the drawer to a full
-                // screen clears the whole overlay, so it is a Full render.
-                let still_in_drawer = matches!(next, Screen::Navigation { .. });
+                // The renderer derives the refresh plan from the ViewModel
+                // diff: a still-drawer move (same NavBar surface) is a
+                // NAV_BAR partial, leaving the drawer (surface change) is a
+                // Full. The SM only signals "the visible state changed".
                 state.screen = next;
                 state.render_generation = state.render_generation.next();
-                if still_in_drawer {
-                    vec![render_batch(state)]
-                } else {
-                    vec![render_batch_with_intent(state, RenderIntent::Full)]
-                }
+                vec![render_batch(state)]
             } else {
                 vec![]
             }
@@ -1716,7 +1702,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         origin: NavOrigin::Home,
                     };
                     state.render_generation = state.render_generation.next();
-                    vec![render_batch_with_intent(state, RenderIntent::Full)]
+                    vec![render_batch(state)]
                 }
                 ButtonEvent::Pressed(ButtonId::Up) => {
                     state.screen = Screen::Settings {
@@ -1736,7 +1722,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     // Back out of Settings to the root Home.
                     state.screen = Screen::Home;
                     state.render_generation = state.render_generation.next();
-                    vec![render_batch_with_intent(state, RenderIntent::Full)]
+                    vec![render_batch(state)]
                 }
                 ButtonEvent::Pressed(ButtonId::Enter) => {
                     if cur == SETTINGS_SYNC_NOW_ROW {
@@ -1764,13 +1750,13 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                             }
                         }
                         state.render_generation = state.render_generation.next();
-                        batches.push(render_batch_with_intent(state, RenderIntent::Full));
+                        batches.push(render_batch(state));
                         batches
                     } else if cur == SETTINGS_SYNC_INTERVAL_ROW {
                         // SYNC INTERVAL (row 1): open the SM interval picker.
                         state.screen = Screen::SyncIntervalPick { selected: 0 };
                         state.render_generation = state.render_generation.next();
-                        vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        vec![render_batch(state)]
                     } else if cur == SETTINGS_SLEEP_ROW {
                         // SLEEP (row 3): an SM-owned effect - deep sleep with
                         // the maintenance wake needed for a far-future
@@ -1787,7 +1773,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                                 FailurePolicy::Continue,
                                 vec![Effect::EnterDeepSleep(WakeupPlan { maintenance })],
                             ),
-                            render_batch_with_intent(state, RenderIntent::Full),
+                            render_batch(state),
                         ]
                     } else {
                         // BLE pairing (row 2): deferred to the executor
@@ -1802,7 +1788,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                                 FailurePolicy::Continue,
                                 vec![Effect::OpenBlePairingScreen],
                             ),
-                            render_batch_with_intent(state, RenderIntent::Full),
+                            render_batch(state),
                         ]
                     }
                 }
@@ -1832,7 +1818,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     origin: NavOrigin::Home,
                 };
                 state.render_generation = state.render_generation.next();
-                vec![render_batch_with_intent(state, RenderIntent::Full)]
+                vec![render_batch(state)]
             } else {
                 vec![]
             }
@@ -1870,7 +1856,7 @@ fn transition_sync_interval_pick_button(
                 selected: SETTINGS_SYNC_INTERVAL_ROW,
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             state.screen = Screen::SyncIntervalPick {
@@ -1906,7 +1892,7 @@ fn transition_sync_interval_pick_button(
                     FailurePolicy::Continue,
                     vec![Effect::SetSyncInterval { minutes }],
                 ),
-                render_batch_with_intent(state, RenderIntent::Full),
+                render_batch(state),
             ]
         }
         _ => vec![],
@@ -1936,13 +1922,13 @@ fn transition_alarm_list_button(
                 origin: NavOrigin::AlarmList,
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
             // Back out of the alarm list to root Home.
             state.screen = Screen::Home;
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             state.screen = Screen::AlarmList {
@@ -1968,7 +1954,7 @@ fn transition_alarm_list_button(
                 // cancel returns to it.
                 state.screen = Screen::AlarmAdd(AlarmAddState::default());
                 state.render_generation = state.render_generation.next();
-                vec![render_batch_with_intent(state, RenderIntent::Full)]
+                vec![render_batch(state)]
             } else if state.pending_alarm_list_edit.is_some() {
                 // One toggle at a time: while a persist is in flight a
                 // second row ENTER is ignored (its completion/rollback
@@ -2000,7 +1986,7 @@ fn transition_alarm_list_button(
                             toggled_id,
                         }],
                     ),
-                    render_batch_with_intent(state, RenderIntent::Full),
+                    render_batch(state),
                 ]
             }
         }
@@ -2027,7 +2013,7 @@ fn transition_alarm_add_button(state: &mut AppState, button: ButtonEvent) -> Vec
                 selected: state.alarms.alarms.len(),
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             let (min, max) = range_for_stage(stage);
@@ -2096,7 +2082,7 @@ fn transition_alarm_add_button(state: &mut AppState, button: ButtonEvent) -> Vec
                         FailurePolicy::AbortBatch,
                         vec![Effect::PersistAlarms(list)],
                     ),
-                    render_batch_with_intent(state, RenderIntent::Full),
+                    render_batch(state),
                 ]
             }
         },
@@ -2133,7 +2119,7 @@ fn transition_todo_list_button(
                 origin: NavOrigin::TodoList,
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             state.screen = Screen::TodoList {
@@ -2198,7 +2184,7 @@ fn transition_todo_list_button(
                         edited_id,
                     }],
                 ),
-                render_batch_with_intent(state, RenderIntent::Full),
+                render_batch(state),
             ]
         }
         _ => vec![],
@@ -2224,13 +2210,13 @@ fn transition_inbox_list_button(
                 origin: NavOrigin::Inbox,
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
             // Back out of the inbox list to root Home.
             state.screen = Screen::Home;
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             state.screen = Screen::Inbox {
@@ -2279,7 +2265,7 @@ fn transition_inbox_list_button(
             }
             state.screen = Screen::InboxItem { index };
             state.render_generation = state.render_generation.next();
-            batches.push(render_batch_with_intent(state, RenderIntent::Full));
+            batches.push(render_batch(state));
             batches
         }
         _ => vec![],
@@ -2303,7 +2289,7 @@ fn transition_inbox_item_button(state: &mut AppState, button: ButtonEvent) -> Ve
         | ButtonEvent::LongPressed(ButtonId::Down) => {
             state.screen = Screen::Inbox { selected: index };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         _ => vec![],
     }
@@ -2327,13 +2313,13 @@ fn transition_calendar_button(state: &mut AppState, button: ButtonEvent) -> Vec<
                 origin: NavOrigin::Calendar,
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
             // Back out of the calendar to root Home.
             state.screen = Screen::Home;
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             cal.selected_day = cal.selected_day.saturating_sub(1).max(1);
@@ -2356,7 +2342,7 @@ fn transition_calendar_button(state: &mut AppState, button: ButtonEvent) -> Vec<
                 day,
             };
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         _ => vec![],
     }
@@ -2387,7 +2373,7 @@ fn transition_week_view_button(state: &mut AppState, button: ButtonEvent) -> Vec
                 selected_day: day,
             });
             state.render_generation = state.render_generation.next();
-            vec![render_batch_with_intent(state, RenderIntent::Full)]
+            vec![render_batch(state)]
         }
         _ => vec![],
     }
@@ -3276,11 +3262,11 @@ fn reply_batch(state: &mut AppState, channel: Channel, reply: ControlReply) -> E
     )
 }
 
+/// Emits a render request for the current visible state. The renderer
+/// derives the refresh plan (Noop / Partial / Full) by diffing the carried
+/// ViewModel against its private last-shown cache - the business layer only
+/// signals "the visible state may have changed".
 fn render_batch(state: &mut AppState) -> EffectBatch {
-    render_batch_with_intent(state, RenderIntent::Partial)
-}
-
-fn render_batch_with_intent(state: &mut AppState, intent: RenderIntent) -> EffectBatch {
     let view = state.screen.render_view();
     EffectBatch {
         id: state.next_batch_id(),
@@ -3288,7 +3274,6 @@ fn render_batch_with_intent(state: &mut AppState, intent: RenderIntent) -> Effec
         render_generation: Some(state.render_generation),
         effects: vec![Effect::Render(RenderRequest {
             generation: state.render_generation,
-            intent,
             view,
             view_model: crate::render_plan::ViewModel::from_state(state),
         })],
@@ -4775,7 +4760,6 @@ mod tests {
                     month: 8,
                     selected_day: 15,
                 },
-                intent: RenderIntent::Full,
                 ..
             })
         )));
@@ -4843,72 +4827,41 @@ mod tests {
     }
 
     #[test]
-    fn drawer_open_is_full_move_is_partial_close_is_full() {
-        // Refresh policy for the on-panel overlay: opening the drawer and
-        // closing it clear/reveal the whole overlay (Full), while a move
-        // inside the drawer only changes the bar (Partial -> the executor
-        // refreshes just the NAV_BAR rect). This is the intent contract the
-        // executor's view-aware partial relies on.
+    fn drawer_actions_each_emit_one_render() {
+        // Each drawer action emits a render request; whether that request
+        // is a NAV_BAR Partial or a Full is the renderer's decision from
+        // the ViewModel diff (open/close change the surface -> Full; a
+        // cursor move stays on the Navigation surface -> NAV_BAR partial),
+        // covered by the render_plan tests. The SM contract here is: every
+        // visible drawer transition produces exactly one render.
         let mut state = AppState::default();
 
-        // Open: Full.
-        let batches = update(
+        let renders = |b: &[EffectBatch]| -> usize {
+            b.iter()
+                .flat_map(|b| &b.effects)
+                .filter(|e| matches!(e, Effect::Render(RenderRequest { .. })))
+                .count()
+        };
+
+        // Open.
+        let b = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert!(
-            batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-                e,
-                Effect::Render(RenderRequest {
-                    intent: RenderIntent::Full,
-                    ..
-                })
-            )),
-            "drawer open must be a Full render"
-        );
-
-        // Move: Partial.
-        let batches = update(
+        assert_eq!(renders(&b), 1, "drawer open emits one render");
+        // Move.
+        let b = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert!(
-            batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-                e,
-                Effect::Render(RenderRequest {
-                    intent: RenderIntent::Partial,
-                    ..
-                })
-            )),
-            "drawer move must be a Partial render (NAV_BAR refresh only)"
-        );
-        assert!(!batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
-                ..
-            })
-        )));
-
-        // Long ENTER cancels back to Home: Full.
-        let batches = update(
+        assert_eq!(renders(&b), 1, "drawer move emits one render");
+        // Long ENTER cancels back to Home.
+        let b = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
         );
-        assert!(
-            batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-                e,
-                Effect::Render(RenderRequest {
-                    intent: RenderIntent::Full,
-                    ..
-                })
-            )),
-            "drawer close (cancel) must be a Full render"
-        );
-
-        // Reopen, move to a non-Home destination, ENTER selects: the drawer
-        // closes to Home with a Full render plus the deferred destination
-        // effect.
+        assert_eq!(renders(&b), 1, "drawer close (cancel) emits one render");
+        // Reopen + ENTER on a destination (still Home after cancel).
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
@@ -4917,17 +4870,11 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        let batches = update(
+        let b = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
-                ..
-            })
-        )));
+        assert_eq!(renders(&b), 1, "drawer select emits one render");
     }
 
     #[test]
@@ -4960,7 +4907,6 @@ mod tests {
             e,
             Effect::Render(RenderRequest {
                 view: RenderView::Settings { selected: 0 },
-                intent: RenderIntent::Full,
                 ..
             })
         )));
@@ -4992,7 +4938,7 @@ mod tests {
         }
         assert_eq!(state.screen, Screen::Settings { selected: 3 });
         // Down past the end clamps (no wrap).
-        let batches = update(
+        let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
@@ -5011,19 +4957,32 @@ mod tests {
             );
         }
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        // A clamped no-op leaves the visible state identical: the SM still
+        // emits a render request (it always signals "input may have changed
+        // the view") whose ViewModel is unchanged, so the renderer's diff
+        // resolves it to Noop (covered by the render_plan tests). The SM
+        // contract here is selection clamping only.
+        let clamp_batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        let renders: Vec<_> = clamp_batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .filter_map(|e| match e {
+                Effect::Render(RenderRequest { view_model, .. }) => Some(view_model.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!renders.is_empty(), "clamp still emits a render request");
+        let vm_now = crate::render_plan::ViewModel::from_state(&state);
         assert!(
-            batches.iter().all(|b| {
-                !b.effects.iter().any(|e| {
-                    matches!(
-                        e,
-                        Effect::Render(RenderRequest {
-                            intent: RenderIntent::Full,
-                            ..
-                        })
-                    )
-                })
-            }),
-            "Settings row moves are Partial (list region refresh)"
+            renders.iter().all(|vm| vm.view == vm_now.view
+                && vm.clock_minute == vm_now.clock_minute
+                && vm.overlay == vm_now.overlay
+                && vm.data_fingerprint == vm_now.data_fingerprint),
+            "clamp render request carries an unchanged ViewModel (renderer -> Noop)"
         );
     }
 
@@ -5197,7 +5156,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::SyncInterval { selected: 0 },
                 ..
             })
@@ -5437,13 +5395,10 @@ mod tests {
                 phase: BlePairingPhase::Pairing,
             })
         );
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
-                ..
-            })
-        )));
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
         // Succeeded -> Success + StopBlePairing.
         let batches = update(
             &mut state,
@@ -5563,7 +5518,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::Home,
                 ..
             })
@@ -5639,7 +5593,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::Settings { selected: 0 },
                 ..
             })
@@ -5713,7 +5666,6 @@ mod tests {
             e,
             Effect::Render(RenderRequest {
                 view: RenderView::AlarmList { selected: 0 },
-                intent: RenderIntent::Full,
                 ..
             })
         )));
@@ -5843,7 +5795,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::NumberPick {
                     stage: AddStage::Hour,
                     value: 0,
@@ -5922,13 +5873,10 @@ mod tests {
                 value: 59,
             })
         );
-        assert!(batches.iter().all(|b| b.effects.iter().all(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Partial,
-                ..
-            })
-        ))));
+        assert!(batches.iter().all(|b| b
+            .effects
+            .iter()
+            .all(|e| matches!(e, Effect::Render(RenderRequest { .. })))));
     }
 
     #[test]
@@ -6030,7 +5978,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::AlarmList { selected },
                 ..
             }) if *selected == before
@@ -6120,7 +6067,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::Home,
                 ..
             })
@@ -6405,7 +6351,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::Home,
                 ..
             })
@@ -6502,7 +6447,6 @@ mod tests {
             e,
             Effect::Render(RenderRequest {
                 view: RenderView::Inbox { selected: 0 },
-                intent: RenderIntent::Full,
                 ..
             })
         )));
@@ -6601,7 +6545,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::InboxItem { index: 0 },
                 ..
             })
@@ -6675,7 +6618,6 @@ mod tests {
             assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
                 e,
                 Effect::Render(RenderRequest {
-                    intent: RenderIntent::Full,
                     view: RenderView::Inbox { selected: 1 },
                     ..
                 })
@@ -6712,7 +6654,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::Home,
                 ..
             })
@@ -6838,7 +6779,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::WeekView {
                     year: 2026,
                     month: 8,
@@ -6867,7 +6807,6 @@ mod tests {
             .any(|e| matches!(
                 e,
                 Effect::Render(RenderRequest {
-                    intent: RenderIntent::Full,
                     view: RenderView::Calendar {
                         year: 2026,
                         month: 8,
@@ -6908,7 +6847,6 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
                 view: RenderView::Home,
                 ..
             })
@@ -7929,7 +7867,6 @@ mod tests {
                 .any(|e| matches!(
                     e,
                     Effect::Render(RenderRequest {
-                        intent: RenderIntent::Full,
                         view,
                         ..
                     }) if *view == expected_view
@@ -8000,7 +7937,6 @@ mod tests {
                     .any(|e| matches!(
                         e,
                         Effect::Render(RenderRequest {
-                            intent: RenderIntent::Partial,
                             view,
                             ..
                         }) if *view == expected_view

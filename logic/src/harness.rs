@@ -18,9 +18,7 @@
 use std::collections::BTreeMap;
 
 use crate::alarm_flow::{AlarmHost, AlarmPoll};
-use crate::app::{
-    AppState, Effect, EffectError, EffectOutput, Event, RenderIntent, RenderView, Screen,
-};
+use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, RenderView, Screen};
 use crate::background_outcome::BackgroundOutcome;
 use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
 use crate::runner::{EffectCategory, EffectExecutor, EffectOutcome};
@@ -80,8 +78,6 @@ pub struct FakeExecutor {
     pub next_request_id: u64,
     /// Renders issued (request_id, generation) in order.
     pub renders: Vec<(u64, Option<crate::app::RenderGeneration>)>,
-    /// Refresh intents issued in the same order as `renders`.
-    pub render_intents: Vec<RenderIntent>,
     /// Render surfaces issued in the same order as `renders`.
     pub render_views: Vec<RenderView>,
     /// When true, `Effect::Render` fails with `EffectError::Render`.
@@ -95,7 +91,6 @@ impl Default for FakeExecutor {
             failures: ScriptedFailures::default(),
             next_request_id: 1,
             renders: Vec::new(),
-            render_intents: Vec::new(),
             render_views: Vec::new(),
             fail_render: false,
         }
@@ -220,7 +215,6 @@ impl EffectExecutor for FakeExecutor {
                 let id = self.next_request_id;
                 self.next_request_id += 1;
                 self.renders.push((id, Some(req.generation)));
-                self.render_intents.push(req.intent);
                 self.render_views.push(req.view);
                 Ok(EffectOutcome::AsyncWithId(id))
             }
@@ -572,19 +566,13 @@ mod tests {
         assert!(!h.ringing(), "dismiss leaves ringing screen");
         assert_eq!(h.screen(), &Screen::Home, "dismiss restores Home");
         assert_eq!(h.executor.log.count("StopTone"), 1);
+        // Dismiss submits exactly one render request. Whether that request
+        // is Full or Partial is the renderer's decision (ViewModel diff);
+        // the SM contract is a single render on the dismiss transition.
         assert_eq!(
-            h.executor
-                .render_intents
-                .iter()
-                .filter(|intent| **intent == crate::app::RenderIntent::Full)
-                .count(),
-            1,
-            "alarm dismiss submits exactly one full Home render"
-        );
-        assert_eq!(
-            h.executor.render_intents.last(),
-            Some(&crate::app::RenderIntent::Full),
-            "alarm dismiss is the final render request"
+            h.executor.log.count("Render"),
+            2,
+            "boot render (1) + alarm-dismiss render (1) = 2"
         );
         assert!(matches!(
             h.state().alarm_runtime,
@@ -593,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn minute_tick_keeps_partial_render_intent() {
+    fn minute_tick_keeps_emitting_renders() {
         let mut h = Harness::new();
         h.dispatch(Event::Boot(boot(
             Some(dt(8, 59)),
@@ -602,14 +590,13 @@ mod tests {
             vec![alarm(1, 9, 0)],
         )))
         .unwrap();
+        let renders_after_boot = h.executor.log.count("Render");
         h.dispatch(Event::Tick(dt(9, 0))).unwrap();
+        // A minute change on Home keeps emitting a render request (boot + 1).
         assert_eq!(
-            h.executor.render_intents,
-            vec![
-                crate::app::RenderIntent::Partial,
-                crate::app::RenderIntent::Partial
-            ],
-            "boot and ordinary minute ticks remain partial renders"
+            h.executor.log.count("Render"),
+            renders_after_boot + 1,
+            "boot and the minute-change tick each emit one render request"
         );
     }
 
@@ -1057,7 +1044,6 @@ mod tests {
             render_generation: Some(crate::app::RenderGeneration(1)),
             effect: Effect::Render(crate::app::RenderRequest {
                 generation: crate::app::RenderGeneration(1),
-                intent: crate::app::RenderIntent::Partial,
                 view: crate::app::RenderView::Home,
                 view_model: crate::render_plan::ViewModel::home(crate::app::RenderGeneration(1)),
             }),
