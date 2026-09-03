@@ -671,32 +671,9 @@ fn main() -> Result<()> {
             // The shared `RenderRegistry` implements the per-request
             // terminal rule; this loop drives it and feeds Completed /
             // Failed back through the returned kick.
-            // Stage 5: after resolving the terminal, update the renderer's
-            // last-shown ViewModel cache (success + current generation only;
-            // failure invalidates; superseded leaves it untouched).
             let outcome = {
                 let mut reg = ctx.pending_renders.borrow_mut();
-                let current_generation = app_runner.borrow().state().render_generation;
-                let outcome = reg.feed(completion.request_id, completion.ok, completion.superseded);
-                if let inkwash_logic::epd_registry::FeedOutcome::Matched(kick, terminal) = &outcome
-                {
-                    match terminal {
-                        inkwash_logic::epd_registry::RenderTerminal::Superseded => {
-                            // Replaced before it ran: its pixels never
-                            // reached the panel; the replacement request
-                            // updates the cache on its own completion.
-                        }
-                        t => {
-                            let success =
-                                *t == inkwash_logic::epd_registry::RenderTerminal::Completed;
-                            let generation_is_current = kick
-                                .render_generation
-                                .is_some_and(|g| g == current_generation);
-                            reg.note_kick_terminal(kick, success, generation_is_current);
-                        }
-                    }
-                }
-                outcome
+                reg.feed(completion.request_id, completion.ok, completion.superseded)
             };
             match outcome {
                 inkwash_logic::epd_registry::FeedOutcome::Matched(kick, terminal) => {
