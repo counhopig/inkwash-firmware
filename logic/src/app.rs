@@ -7881,6 +7881,9 @@ mod tests {
                 hour: 8,
                 value: 30,
             }),
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Waiting,
+            }),
         ];
         for screen in screens {
             let mut state = AppState::default();
@@ -7992,6 +7995,12 @@ mod tests {
                     origin: NavOrigin::Home,
                 },
                 RenderView::Navigation { selected: 3 },
+            ),
+            (
+                Screen::BlePairing(BlePairingState {
+                    phase: BlePairingPhase::Waiting,
+                }),
+                RenderView::Home,
             ),
         ];
         for (screen, expected_view) in screens {
