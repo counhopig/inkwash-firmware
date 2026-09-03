@@ -566,23 +566,25 @@ fn main() -> Result<()> {
                         // Runtime Tick: feed the state machine on every
                         // minute boundary. The state machine uses Tick to
                         // rearm the RTC alarm slot at minute edges and to
-                        // fire scheduled syncs. Skipped when the runtime
-                        // is disabled (core boot fact failure): the
-                        // default AppState has no alarm/NVS/config data
-                        // and must not rearm or interpret anything from
-                        // a Tick.
-                        if app_runner_enabled {
-                            if let Err(err) = dispatch_app_runner(
-                                &app_runner,
-                                inkwash_logic::app::Event::Tick(dt),
-                                &mut ctx,
-                            )
-                            .map(|_| ())
-                            {
-                                log::warn!("Runtime Tick dispatch failed: {err}");
-                            }
+                        // fire scheduled syncs.
+                        //
+                        // Stage 5: the clock-region refresh is NOT pushed
+                        // here as a dirty rect. The Tick render emitted by
+                        // the SM (transition_tick -> render_batch) reaches
+                        // the executor, whose plan diff refreshes the Home
+                        // clock partial when the minute changed (and
+                        // correctly skips read-only sub-screens that show no
+                        // clock). A separate dirty.push(CLOCK_RECT) here
+                        // would double-refresh the clock every minute.
+                        if let Err(err) = dispatch_app_runner(
+                            &app_runner,
+                            inkwash_logic::app::Event::Tick(dt),
+                            &mut ctx,
+                        )
+                        .map(|_| ())
+                        {
+                            log::warn!("Runtime Tick dispatch failed: {err}");
                         }
-                        dirty.push(CLOCK_RECT);
                     }
                     // Cron-style sync decisions ride the fresh clock read:
                     // boundaries only fire once each, aligned to wall
