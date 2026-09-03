@@ -138,6 +138,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::OpenNavigationDestination { .. } => "OpenNavigationDestination",
         Effect::OpenSettingsItem { .. } => "OpenSettingsItem",
         Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
+        Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
         Effect::OpenAddAlarm => "OpenAddAlarm",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
@@ -169,7 +170,9 @@ impl EffectExecutor for FakeExecutor {
                 EffectCategory::Render
             }
             Effect::OpenSettingsItem { .. } => EffectCategory::Render,
-            Effect::PersistAlarmToggle { .. } => EffectCategory::Persist,
+            Effect::PersistAlarmToggle { .. } | Effect::PersistTodoEdit { .. } => {
+                EffectCategory::Persist
+            }
             Effect::EnterLightSleep(_) | Effect::EnterDeepSleep(_) => EffectCategory::Sleep,
         };
         self.record(effect, cat);
@@ -230,6 +233,9 @@ impl EffectExecutor for FakeExecutor {
             }
             Effect::PersistAlarmToggle { .. } => Ok(EffectOutcome::Completed(
                 EffectOutput::Persisted(crate::app::PersistTarget::Alarms),
+            )),
+            Effect::PersistTodoEdit { .. } => Ok(EffectOutcome::Completed(
+                EffectOutput::Persisted(crate::app::PersistTarget::Todos),
             )),
             Effect::OpenAddAlarm => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::EnterLightSleep(_) => {

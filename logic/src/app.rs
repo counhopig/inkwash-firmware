@@ -31,7 +31,7 @@ use crate::datetime::DateTime;
 use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
-use crate::todo::Todo;
+use crate::todo::{Importance, Todo};
 use crate::wake_cause::WakeCause;
 
 /// Monotonic version number of the *visible* state. Only incremented when a
@@ -98,6 +98,7 @@ pub enum NavOrigin {
     Home,
     Settings,
     AlarmList,
+    TodoList,
 }
 
 impl Screen {
@@ -134,10 +135,12 @@ impl Screen {
             Screen::AlarmList { selected } => RenderView::AlarmList {
                 selected: *selected,
             },
+            Screen::TodoList { selected } => RenderView::TodoList {
+                selected: *selected,
+            },
             Screen::Home
             | Screen::Calendar(_)
             | Screen::AlarmEdit(_)
-            | Screen::TodoList { .. }
             | Screen::Inbox { .. }
             | Screen::AlarmRinging
             | Screen::Reminder(_)
@@ -350,6 +353,15 @@ pub enum Effect {
         alarms: Vec<StoredAlarm>,
         toggled_id: u8,
     },
+    /// Confirmable single-todo edit from the TodoList screen (Stage 4):
+    /// save the new list and mark `edited_id` dirty (two-way sync
+    /// contract). Completions feed back as `Persisted(Todos)`; the
+    /// machine's pending-todo-list-edit gate matches the op id exactly, so
+    /// a stale completion cannot release a newer edit.
+    PersistTodoEdit {
+        todos: Vec<Todo>,
+        edited_id: u8,
+    },
     StartSync(SyncRequest),
     /// Ask the network executor to verify + save Wi-Fi credentials (it owns
     /// the Wi-Fi driver). Completes via `Event::SetWifiCompleted`.
@@ -418,6 +430,10 @@ pub enum RenderView {
     /// "+ ADD ALARM" row is a deferred executor wedge. Carries the selected
     /// row; the executor loads the rows from the store.
     AlarmList { selected: usize },
+    /// The todo list (Stage 4): rows browsed in the state machine; ENTER
+    /// toggles a row's done flag and long ENTER cycles its importance
+    /// (both confirmable SM edits). Carries the selected row.
+    TodoList { selected: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -787,7 +803,24 @@ pub struct AppState {
     /// value. One edit at a time: while this is Some, another row ENTER is
     /// ignored.
     pending_alarm_list_edit: Option<PendingAlarmListEdit>,
+    /// An in-flight TodoList row edit (Stage 4): ENTER toggled `done` or
+    /// long ENTER cycled `importance` optimistically. The matching
+    /// `Persisted(Todos)` completion confirms it (executor marked it
+    /// dirty); a failure rolls the row back to the captured previous
+    /// state. One edit at a time.
+    pending_todo_list_edit: Option<PendingTodoListEdit>,
     retries: Vec<RetryPending>,
+}
+
+/// An in-flight single-row edit from the TodoList screen. Captures the
+/// row's `done` + `importance` before the optimistic change so a failed
+/// persist can roll both back (the two edit kinds touch different fields).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingTodoListEdit {
+    operation_id: OperationId,
+    index: usize,
+    previous_done: bool,
+    previous_importance: Importance,
 }
 
 /// An in-flight single-row enabled-toggle from the AlarmList screen.
@@ -817,6 +850,7 @@ impl Default for AppState {
             pending_residue_ack: None,
             pending_residue_time: None,
             pending_alarm_list_edit: None,
+            pending_todo_list_edit: None,
             retries: Vec::new(),
             op_counter: 0,
             batch_counter: 0,
@@ -1307,6 +1341,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::Navigation { .. }
             | Screen::Settings { .. }
             | Screen::AlarmList { .. }
+            | Screen::TodoList { .. }
     ) {
         transition_nav_button(state, button)
     } else {
@@ -1325,6 +1360,8 @@ fn nav_home_index(origin: NavOrigin) -> usize {
         NavOrigin::Settings => NAV_DESTINATION_COUNT - 1,
         // The drawer over the alarm list highlights ALARMS (3).
         NavOrigin::AlarmList => 3,
+        // The drawer over the todo list highlights TODOS (4).
+        NavOrigin::TodoList => 4,
     }
 }
 
@@ -1335,7 +1372,9 @@ fn nav_home_index(origin: NavOrigin) -> usize {
 /// back-to-Home path).
 fn nav_origin_screen(origin: NavOrigin) -> Screen {
     match origin {
-        NavOrigin::Home | NavOrigin::Settings | NavOrigin::AlarmList => Screen::Home,
+        NavOrigin::Home | NavOrigin::Settings | NavOrigin::AlarmList | NavOrigin::TodoList => {
+            Screen::Home
+        }
     }
 }
 
@@ -1379,9 +1418,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 ButtonEvent::LongPressed(ButtonId::Enter) => Some(nav_origin_screen(origin)),
                 ButtonEvent::Pressed(ButtonId::Enter) => {
                     // Selecting a destination closes the drawer.
-                    // HOME (0), ALARMS (3) and SETTINGS (5) are SM screens;
-                    // the remaining destinations are opened by the executor
-                    // (legacy page) for now.
+                    // HOME (0), ALARMS (3), TODOS (4) and SETTINGS (5) are
+                    // SM screens; the remaining destinations are opened by
+                    // the executor (legacy page) for now.
                     return match cur {
                         0 => {
                             state.screen = nav_origin_screen(origin);
@@ -1390,6 +1429,11 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         }
                         3 => {
                             state.screen = Screen::AlarmList { selected: 0 };
+                            state.render_generation = state.render_generation.next();
+                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        }
+                        4 => {
+                            state.screen = Screen::TodoList { selected: 0 };
                             state.render_generation = state.render_generation.next();
                             vec![render_batch_with_intent(state, RenderIntent::Full)]
                         }
@@ -1495,6 +1539,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
             }
         }
         Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
+        Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
         Screen::Home => {
             // Long UP/DOWN opens the global navigation drawer from Home
             // (origin Home, highlighting HOME).
@@ -1615,6 +1660,100 @@ fn transition_alarm_list_button(
                     render_batch_with_intent(state, RenderIntent::Full),
                 ]
             }
+        }
+        _ => vec![],
+    }
+}
+
+/// TodoList screen (Stage 4): browse the stored todos; ENTER toggles a
+/// row's done flag, long ENTER cycles its importance (Low -> Medium ->
+/// High) - matching the legacy todos page, where long ENTER cycled
+/// importance and the only way out was the long-UP/DOWN drawer. Both row
+/// actions are optimistic confirmable SM edits (the executor persists the
+/// list + marks the row dirty); a failure rolls the row back. Long UP/DOWN
+/// opens the GO TO drawer (origin TodoList). An empty list has no rows to
+/// act on (moves clamp at 0).
+fn transition_todo_list_button(
+    state: &mut AppState,
+    selected: usize,
+    button: ButtonEvent,
+) -> Vec<EffectBatch> {
+    let count = state.todos.todos.len();
+    match button {
+        ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
+            // Open the GO TO drawer over the todo list (origin TodoList).
+            state.screen = Screen::Navigation {
+                selected: nav_home_index(NavOrigin::TodoList),
+                origin: NavOrigin::TodoList,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::Pressed(ButtonId::Up) => {
+            state.screen = Screen::TodoList {
+                selected: selected.saturating_sub(1),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Down) => {
+            // Clamp to the last row; an empty list stays at 0.
+            let max = count.saturating_sub(1);
+            state.screen = Screen::TodoList {
+                selected: (selected + 1).min(max),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        // ENTER toggles done; long ENTER cycles importance. Both go
+        // through the same confirmable-edit path (one at a time).
+        ButtonEvent::Pressed(ButtonId::Enter) | ButtonEvent::LongPressed(ButtonId::Enter) => {
+            if state.pending_todo_list_edit.is_some() {
+                // One edit at a time: while a persist is in flight another
+                // row action is ignored (completion/rollback releases it).
+                return vec![];
+            }
+            // Capture what the edit will change before borrowing the row.
+            let toggles_done = button == ButtonEvent::Pressed(ButtonId::Enter);
+            let op = state.next_operation_id();
+            let (previous_done, previous_importance, edited_id) = {
+                let Some(todo) = state.todos.todos.get_mut(selected) else {
+                    return vec![];
+                };
+                let previous_done = todo.done;
+                let previous_importance = todo.importance;
+                let edited_id = todo.id;
+                if toggles_done {
+                    todo.done = !todo.done;
+                } else {
+                    todo.importance = match todo.importance {
+                        Importance::Low => Importance::Medium,
+                        Importance::Medium => Importance::High,
+                        Importance::High => Importance::Low,
+                    };
+                }
+                (previous_done, previous_importance, edited_id)
+            };
+            state.pending_todo_list_edit = Some(PendingTodoListEdit {
+                operation_id: op,
+                index: selected,
+                previous_done,
+                previous_importance,
+            });
+            state.render_generation = state.render_generation.next();
+            let list = state.todos.todos.clone();
+            vec![
+                batch(
+                    state,
+                    op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::PersistTodoEdit {
+                        todos: list,
+                        edited_id,
+                    }],
+                ),
+                render_batch_with_intent(state, RenderIntent::Full),
+            ]
         }
         _ => vec![],
     }
@@ -1822,6 +1961,17 @@ fn transition_effect_completed(
                 }
             }
         }
+        EffectOutput::Persisted(PersistTarget::Todos) => {
+            // A TodoList row edit confirmed: release the one-at-a-time gate.
+            // The executor already saved the list and marked the row dirty.
+            if state
+                .pending_todo_list_edit
+                .as_ref()
+                .is_some_and(|edit| edit.operation_id == completion.operation_id)
+            {
+                state.pending_todo_list_edit = None;
+            }
+        }
         EffectOutput::AckDone => {
             if let Some(commit) = state.commit_for_operation(completion.operation_id) {
                 *commit = CommitState::Succeeded;
@@ -1940,6 +2090,24 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
             if let Some(index) = rollback_index {
                 if let Some(alarm) = state.alarms.alarms.get_mut(index) {
                     alarm.enabled = !alarm.enabled;
+                }
+                state.render_generation = state.render_generation.next();
+            }
+            // A TodoList row edit failed to persist: roll both the done
+            // flag and the importance back (NVS never changed), release the
+            // gate and re-render.
+            let todo_rollback = match state.pending_todo_list_edit.take() {
+                Some(edit) if edit.operation_id == failure.operation_id => Some(edit),
+                Some(edit) => {
+                    state.pending_todo_list_edit = Some(edit);
+                    None
+                }
+                None => None,
+            };
+            if let Some(edit) = todo_rollback {
+                if let Some(todo) = state.todos.todos.get_mut(edit.index) {
+                    todo.done = edit.previous_done;
+                    todo.importance = edit.previous_importance;
                 }
                 state.render_generation = state.render_generation.next();
             }
@@ -4629,6 +4797,311 @@ mod tests {
         )));
     }
 
+    // ---- TodoList screen (Stage 4) ---------------------------------------
+
+    fn todo(id: u8, text: &str, done: bool) -> Todo {
+        Todo {
+            id,
+            text: text.to_string(),
+            done,
+            importance: Importance::Medium,
+            due_date: None,
+            repeat: None,
+        }
+    }
+
+    fn boot_snapshot_todos(todos: Vec<Todo>, now: Option<DateTime>) -> BootSnapshot {
+        let mut snap = boot_snapshot(vec![], now, false, true);
+        snap.todos = todos;
+        snap
+    }
+
+    /// Boots with `todos`, then opens the TODOS drawer destination (index 4)
+    /// and selects it.
+    fn open_todo_list(state: &mut AppState, todos: Vec<Todo>) {
+        let _ = update(
+            state,
+            Event::Boot(boot_snapshot_todos(todos, Some(dt(9, 0)))),
+        );
+        let _ = update(state, Event::Button(ButtonEvent::LongPressed(ButtonId::Up)));
+        // Down four times: 0 -> 1 -> 2 -> 3 -> 4 (TODOS).
+        for _ in 0..4 {
+            let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        }
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 4,
+                origin: NavOrigin::Home
+            }
+        );
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+    }
+
+    #[test]
+    fn todo_list_browse_clamps_and_empty_stays_at_zero() {
+        let mut state = AppState::default();
+        open_todo_list(&mut state, vec![todo(1, "a", false), todo(2, "b", true)]);
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+        // Down to row 1 (last row).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::TodoList { selected: 1 });
+        // Down past the end clamps.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::TodoList { selected: 1 });
+        // Up to top.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+
+        // Empty list: opens at 0, Down clamps at 0.
+        let mut state = AppState::default();
+        open_todo_list(&mut state, vec![]);
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+    }
+
+    #[test]
+    fn todo_list_enter_toggles_done_confirmable() {
+        let mut state = AppState::default();
+        open_todo_list(&mut state, vec![todo(1, "a", false), todo(2, "b", true)]);
+        // Row 0 (id 1, not done).
+        assert!(!state.todos.todos[0].done);
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Optimistic flip.
+        assert!(state.todos.todos[0].done);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::PersistTodoEdit { todos, edited_id: 1 }
+                if todos.first().is_some_and(|t| t.done)
+        )));
+        // Gate is up; a second edit is ignored.
+        assert!(state.pending_todo_list_edit.is_some());
+        let mid = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(
+            mid.is_empty()
+                || !mid.iter().any(|b| b
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistTodoEdit { .. })))
+        );
+        // Confirm the persist.
+        let op = state
+            .pending_todo_list_edit
+            .map(|e| e.operation_id)
+            .expect("one edit in flight");
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Todos),
+            }),
+        );
+        assert!(state.pending_todo_list_edit.is_none());
+        assert!(state.todos.todos[0].done);
+    }
+
+    #[test]
+    fn todo_list_long_enter_cycles_importance_confirmable() {
+        let mut state = AppState::default();
+        // Row 0 starts Medium.
+        open_todo_list(&mut state, vec![todo(1, "a", false)]);
+        assert_eq!(state.todos.todos[0].importance, Importance::Medium);
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        // Medium -> High.
+        assert_eq!(state.todos.todos[0].importance, Importance::High);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::PersistTodoEdit { todos, edited_id: 1 }
+                if todos.first().is_some_and(|t| t.importance == Importance::High)
+        )));
+        let op = state
+            .pending_todo_list_edit
+            .map(|e| e.operation_id)
+            .expect("edit in flight");
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Todos),
+            }),
+        );
+        // High -> Low on the next cycle (confirm the persist so the gate
+        // releases before the next edit).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.todos.todos[0].importance, Importance::Low);
+        let op = state
+            .pending_todo_list_edit
+            .map(|e| e.operation_id)
+            .expect("edit in flight");
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Todos),
+            }),
+        );
+        // And Low -> Medium.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.todos.todos[0].importance, Importance::Medium);
+    }
+
+    #[test]
+    fn todo_list_edit_persist_failure_rolls_back_done_and_importance() {
+        let mut state = AppState::default();
+        open_todo_list(&mut state, vec![todo(1, "a", false)]);
+        // Toggle done.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(state.todos.todos[0].done);
+        let op = state
+            .pending_todo_list_edit
+            .map(|e| e.operation_id)
+            .unwrap();
+        // Fail the persist.
+        let _ = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Persist("nvs full".into()),
+            }),
+        );
+        assert!(
+            state.pending_todo_list_edit.is_none(),
+            "failed persist releases the gate"
+        );
+        assert!(!state.todos.todos[0].done, "done rolled back");
+        // Long-ENTER cycle then fail: importance rolls back too.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.todos.todos[0].importance, Importance::High);
+        let op = state
+            .pending_todo_list_edit
+            .map(|e| e.operation_id)
+            .unwrap();
+        let _ = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Persist("nvs full".into()),
+            }),
+        );
+        assert_eq!(
+            state.todos.todos[0].importance,
+            Importance::Medium,
+            "importance rolled back to pre-edit value"
+        );
+    }
+
+    #[test]
+    fn todo_list_drawer_is_todo_origin_and_exits_via_home() {
+        let mut state = AppState::default();
+        open_todo_list(&mut state, vec![todo(1, "a", false)]);
+        // Long UP/DOWN opens the drawer with TODOS highlighted (origin
+        // TodoList).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 4,
+                origin: NavOrigin::TodoList
+            }
+        );
+        // Select HOME (move Up 4 times: 4 -> 3 -> 2 -> 1 -> 0, or long UP
+        // jumps to 0).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Home,
+                ..
+            })
+        )));
+        // Re-enter TODOS, then select TODOS again (no-move ENTER) closes
+        // back to the list.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        // Long DOWN from Home-origin drawer: 0 -> last(5); up to 4.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+    }
+
     #[test]
     fn still_legacy_screens_project_to_home_surface_until_migrated() {
         // Stage-4 transitional projection: every screen still drawn through
@@ -4675,7 +5148,10 @@ mod tests {
                 Screen::AlarmEdit(AlarmEditState { editing: None }),
                 RenderView::Home,
             ),
-            (Screen::TodoList { selected: 0 }, RenderView::Home),
+            (
+                Screen::TodoList { selected: 0 },
+                RenderView::TodoList { selected: 0 },
+            ),
             (Screen::Inbox { selected: 0 }, RenderView::Home),
             (Screen::AlarmRinging, RenderView::Home),
             (
