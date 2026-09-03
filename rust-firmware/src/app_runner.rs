@@ -39,12 +39,6 @@ pub struct EffectRunner<'a, 'ctx> {
         inkwash_logic::protocol::Channel,
         inkwash_logic::protocol::Reply,
     )>,
-    /// Settings row actions the state machine selected while running this
-    /// pump (Sync Now / Sync Interval / BLE pairing / Sleep). The wedges
-    /// block and dispatch alarm/button events back through the same Runtime,
-    /// so opening them is deferred to the caller (after the pump releases
-    /// the Runtime borrow).
-    deferred_settings_items: Vec<usize>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -53,7 +47,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             ctx,
             last_clock,
             replies: Vec::new(),
-            deferred_settings_items: Vec::new(),
         }
     }
 
@@ -68,11 +61,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
         std::mem::take(&mut self.replies)
     }
 
-    /// Drain the Settings row actions the state machine selected during the
-    /// last pump. The caller runs each wedge after the pump.
-    pub fn take_deferred_settings(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.deferred_settings_items)
-    }
 }
 
 impl EffectExecutor for EffectRunner<'_, '_> {
@@ -211,18 +199,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             // ---- asynchronous / out-of-band effects -------------------------
-            Effect::OpenBlePairingScreen => {
-                // The Settings BLE PAIRING row is still a legacy blocking
-                // radio screen and must not run inside a pump - it dispatches
-                // RTC alarm snapshots / button events through the same shared
-                // Runtime, which would re-enter `borrow_mut` on the RefCell
-                // the outer pump is holding and panic. Defer the open to the
-                // caller: the main loop drains this flag after the pump
-                // (borrow released) and runs the wedge, then re-renders
-                // Settings.
-                self.deferred_settings_items.push(2);
-                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
-            }
             Effect::MarkInboxRead { seq } => {
                 // Fire-and-forget local persist of the read mark: the
                 // executor marks `seq` read + adds it to the pending-read
