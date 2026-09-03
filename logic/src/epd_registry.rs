@@ -81,12 +81,6 @@ impl RenderRegistry {
         )
     }
 
-    /// The submit side calls this after handing a Partial/Full to the EPD
-    /// task; Noop submits nothing. Bookkeeping is only committed on
-    /// completion (see `note_terminal`), so this is a no-op kept for
-    /// symmetry and documentation.
-    pub fn note_submitted(&mut self, _plan: &RenderPlan) {}
-
     /// Apply the terminal outcome of a render to the cache. `success` is
     /// true for a Completed (pixels reached the panel); false for Failed.
     /// `generation_is_current` is false when the request's render

@@ -14,7 +14,7 @@
 //! [`AlarmDispatcher`] as thin adapters over `board.rtc` and
 //! `app_runner`; the harness implements them with fakes.
 
-use crate::app::{Event, RtcAlarmSnapshot};
+use crate::app::RtcAlarmSnapshot;
 
 /// The full alarm-poll host: reads RTC facts and dispatches into the
 /// state machine. One trait (not two) so a firmware adapter can borrow
@@ -160,15 +160,4 @@ impl AlarmPoll {
     pub fn mark_exit(&mut self) {
         self.alarm_exit = true;
     }
-}
-
-/// The event dispatch used by `AlarmDispatcher` implementations.
-pub fn snapshot_event(snapshot: RtcAlarmSnapshot) -> Event {
-    Event::RtcAlarmSnapshotReady(snapshot)
-}
-
-pub fn dismiss_event() -> Event {
-    Event::Button(crate::button_event::ButtonEvent::Pressed(
-        crate::button_event::ButtonId::Enter,
-    ))
 }
