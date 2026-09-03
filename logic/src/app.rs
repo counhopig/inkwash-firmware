@@ -94,7 +94,6 @@ pub enum Screen {
     AlarmList {
         selected: usize,
     },
-    AlarmEdit(AlarmEditState),
     /// The ADD-ALARM editor (Stage 4): a two-stage number picker (hour,
     /// then minute) driven by the state machine - UP/DOWN step the value
     /// (wrapping within the stage's range), ENTER advances the stage,
@@ -115,7 +114,6 @@ pub enum Screen {
         index: usize,
     },
     AlarmRinging,
-    Reminder(ReminderState),
     BlePairing(BlePairingState),
 }
 
@@ -195,9 +193,7 @@ impl Screen {
                 value: *value,
             },
             Screen::BlePairing(_) => RenderView::BlePairing,
-            Screen::Home | Screen::AlarmEdit(_) | Screen::AlarmRinging | Screen::Reminder(_) => {
-                RenderView::Home
-            }
+            Screen::Home | Screen::AlarmRinging => RenderView::Home,
         }
     }
 }
@@ -216,11 +212,6 @@ pub struct CalendarState {
     /// The cursor day (1..=days_in_month(year, month)); ENTER opens that
     /// day's week view.
     pub selected_day: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlarmEditState {
-    pub editing: Option<u8>,
 }
 
 /// The ADD-ALARM editor's two picker stages.
@@ -249,17 +240,6 @@ impl Default for AlarmAddState {
             value: 0,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReminderState {
-    pub item: ReminderItem,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReminderItem {
-    Todo { id: u8, text: String },
-    Inbox { seq: u64, title: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7077,10 +7057,6 @@ mod tests {
                 RenderView::AlarmList { selected: 0 },
             ),
             (
-                Screen::AlarmEdit(AlarmEditState { editing: None }),
-                RenderView::Home,
-            ),
-            (
                 Screen::TodoList { selected: 0 },
                 RenderView::TodoList { selected: 0 },
             ),
@@ -7089,15 +7065,6 @@ mod tests {
                 RenderView::Inbox { selected: 0 },
             ),
             (Screen::AlarmRinging, RenderView::Home),
-            (
-                Screen::Reminder(ReminderState {
-                    item: ReminderItem::Todo {
-                        id: 1,
-                        text: String::new(),
-                    },
-                }),
-                RenderView::Home,
-            ),
             (
                 Screen::BlePairing(BlePairingState {
                     phase: BlePairingPhase::Waiting,
