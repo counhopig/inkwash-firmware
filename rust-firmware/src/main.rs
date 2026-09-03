@@ -444,15 +444,14 @@ fn main() -> Result<()> {
         if !boot_dispatched {
             boot_dispatched = true;
             let boot_result = collect_boot_snapshot(&mut ctx, clock);
-            // Injectable boot-fact failure hook (Stage 6): building with
-            // --cfg inkwash_force_safe_mode forces the minimum safe-mode
-            // entry on a *healthy* boot, so the safe path can be
-            // device-verified without destroying NVS/RTC. Not enabled in the
-            // normal build (see .cargo/config.toml test profile note).
-            #[cfg(inkwash_force_safe_mode)]
-            let forced_safe_mode = true;
-            #[cfg(not(inkwash_force_safe_mode))]
-            let forced_safe_mode = false;
+            // Injectable boot-fact failure hook (Stage 6): a binary built
+            // with INKWASH_FORCE_SAFE_MODE=1 in the build environment forces
+            // the minimum safe-mode entry on a *healthy* boot, so the safe
+            // path is device-verifiable without destroying NVS/RTC. The
+            // normal build never sets the env (build.rs only emits it when
+            // requested).
+            let forced_safe_mode =
+                option_env!("INKWASH_FORCE_SAFE_MODE").is_some_and(|v| v == "1");
             if boot_result.core_failed || forced_safe_mode {
                 // Architecture (firmware-architecture.md "启动失败与安全模
                 // 式"): a core boot fact failure must NOT run the normal App
@@ -463,7 +462,7 @@ fn main() -> Result<()> {
                 // diagnostics + watchdog + reset detect; no App/nav/network/
                 // BLE/sleep). It never returns - only reset/power-cycle.
                 let reason = if forced_safe_mode {
-                    "forced by inkwash_force_safe_mode cfg (test hook)".to_string()
+                    "forced by INKWASH_FORCE_SAFE_MODE=1 (test hook)".to_string()
                 } else {
                     boot_result.failure_reason.clone()
                 };

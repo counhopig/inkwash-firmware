@@ -1,11 +1,16 @@
 fn main() {
     embuild::espidf::sysenv::output();
 
-    // Declare the test-only cfg that forces the minimum safe-mode entry on a
-    // healthy boot (see main.rs run_safe_mode). Declaring it here silences
-    // "unexpected cfg condition" and lets a test build pass
-    // --cfg inkwash_force_safe_mode without warnings.
-    println!("cargo:rustc-check-cfg=cfg(inkwash_force_safe_mode)");
+    // Test-only safe-mode injection: when the build environment sets
+    // INKWASH_FORCE_SAFE_MODE=1, the compiled binary forces the minimum
+    // safe-mode entry on a healthy boot (see main.rs run_safe_mode) so the
+    // safe path is device-verifiable without destroying NVS/RTC. The normal
+    // build (unset) is unaffected. Implemented as a build-time env ->
+    // rustc-env so only the final crate rebuilds (a --cfg via RUSTFLAGS
+    // would invalidate every dependency).
+    if std::env::var("INKWASH_FORCE_SAFE_MODE").is_ok_and(|v| v == "1") {
+        println!("cargo:rustc-env=INKWASH_FORCE_SAFE_MODE=1");
+    }
 
     // Capture build-time epoch seconds so the firmware can seed PCF8563 on
     // first boot (when the coin cell is missing or drained and the VL bit is
