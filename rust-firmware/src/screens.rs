@@ -363,13 +363,12 @@ pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
 /// pages dispatch alarm/button events through the shared Runtime, which is
 /// why main opens them only after the pump released the borrow.
 pub fn open_sm_destination(ctx: &mut DeviceContext, now: Option<&DateTime>, destination: usize) {
-    // Home (0), ALARMS (3) and SETTINGS (5) are SM screens and never reach
-    // this router; 1/2/4 still run legacy blocking pages.
-    if let 1..=2 | 4 = destination {
+    // Home (0), ALARMS (3), TODOS (4) and SETTINGS (5) are SM screens and
+    // never reach this router; 1/2 still run legacy blocking pages.
+    if let 1..=2 = destination {
         let page = match destination {
             1 => Page::Calendar,
-            2 => Page::Inbox,
-            _ => Page::Todos,
+            _ => Page::Inbox,
         };
         browse_page(ctx, page, now);
     }
@@ -1163,6 +1162,19 @@ fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected:
             log::warn!("Failed to reprogram hardware alarm: {err}");
         }
     }
+}
+
+/// Draws the state-machine TodoList screen (Stage 4, slice 4): stored todo
+/// rows rendered from the store (with the due-today / repeat markers). The
+/// SM owns done-toggle / importance cycling; the executor renders. Same
+/// layout the legacy todos page used.
+pub(crate) fn draw_todo_list(
+    board: &mut Note4Board,
+    store: &TodoStore,
+    selected: usize,
+    now: Option<&DateTime>,
+) {
+    render_todo_page(board, store, selected, now);
 }
 
 fn render_todo_page(

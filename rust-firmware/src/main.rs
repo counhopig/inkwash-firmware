@@ -785,6 +785,7 @@ fn main() -> Result<()> {
                     | inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
+                    | inkwash_logic::app::Screen::TodoList { .. }
             );
         if sm_screen_is_sm {
             // Feed every debounced button event through the state machine.
@@ -1062,6 +1063,7 @@ fn main() -> Result<()> {
                 inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
+                    | inkwash_logic::app::Screen::TodoList { .. }
             );
         if idle
             && !usb_host_connected

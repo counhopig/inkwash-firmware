@@ -24,6 +24,7 @@ pub use inkwash_logic::runtime::Runtime as AppRunner;
 use crate::alarms::AlarmStore;
 use crate::ctx::DeviceContext;
 use crate::rtc::DateTime;
+use crate::todos::TodoStore;
 
 /// Executes one `Effect` against the existing drivers, reporting the
 /// outcome back to the `inkwash_logic::runtime::Runtime` consumer.
@@ -282,6 +283,25 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     )),
                 }
             }
+            Effect::PersistTodoEdit { todos, edited_id } => {
+                // The TodoList screen's confirmable done-toggle / importance
+                // cycle: save the list and mark the row dirty (two-way sync
+                // contract). The completion feeds back as Persisted(Todos),
+                // which releases the machine's one-at-a-time edit gate.
+                match (
+                    TodoStore::save(self.ctx.todo_store, todos),
+                    self.ctx.todo_store.mark_dirty(*edited_id),
+                ) {
+                    (Ok(()), Ok(())) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                        inkwash_logic::app::PersistTarget::Todos,
+                    ))),
+                    (Err(err), _) => Err((EffectCategory::Persist, format!("{err:#}"))),
+                    (Ok(()), Err(err)) => Err((
+                        EffectCategory::Persist,
+                        format!("dirty mark failed: {err:#}"),
+                    )),
+                }
+            }
             Effect::Reply { channel, reply } => {
                 // Record the reply for the caller to write after the pump:
                 // only the caller knows the correlation id of the frame that
@@ -386,16 +406,20 @@ fn render_view_into(
             .board
             .display
             .refresh_partial(crate::screens::NAV_BAR_RECT),
-        // Settings / AlarmList row moves redraw the list region (rows share
-        // one chrome block; a per-row diff is a Stage-5 RenderPlan concern).
-        (RenderView::Settings { .. } | RenderView::AlarmList { .. }, RenderIntent::Partial) => {
-            ctx.board.display.refresh_partial(crate::canvas::Rect {
-                x: 8,
-                y: 34,
-                width: 384,
-                height: 226,
-            })
-        }
+        // Settings / AlarmList / TodoList row moves redraw the list region
+        // (rows share one chrome block; a per-row diff is a Stage-5
+        // RenderPlan concern).
+        (
+            RenderView::Settings { .. }
+            | RenderView::AlarmList { .. }
+            | RenderView::TodoList { .. },
+            RenderIntent::Partial,
+        ) => ctx.board.display.refresh_partial(crate::canvas::Rect {
+            x: 8,
+            y: 34,
+            width: 384,
+            height: 226,
+        }),
     };
     request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
 }
@@ -403,9 +427,9 @@ fn render_view_into(
 /// Renders the visible surface named by `view` into the shared canvas.
 /// Home is always drawn first (the drawer opens over it from Home); the
 /// Navigation view then overlays the GO TO bar, and the Settings / AlarmList
-/// views draw their own lists instead. Shared with main's legacy dirty-path
-/// redraws so the canvas always matches the SM's current screen (a dirty
-/// full redraw while the drawer is open must keep the overlay).
+/// / TodoList views draw their own lists instead. Shared with main's legacy
+/// dirty-path redraws so the canvas always matches the SM's current screen
+/// (a dirty full redraw while the drawer is open must keep the overlay).
 pub(crate) fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -424,6 +448,9 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::AlarmList { selected } => {
             crate::screens::draw_alarm_list(ctx.board, ctx.alarm_store, selected);
+        }
+        RenderView::TodoList { selected } => {
+            crate::screens::draw_todo_list(ctx.board, ctx.todo_store, selected, clock.as_ref());
         }
     }
 }
