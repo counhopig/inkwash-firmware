@@ -153,6 +153,7 @@ pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
             | Command::SyncNow
             | Command::SetServer { .. }
             | Command::SetWifi { .. }
+            | Command::SetTimezone { .. }
     )
 }
 
@@ -162,10 +163,16 @@ pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
 /// Returns the reply the state machine produced for the channel that sent
 /// the frame (if any). The caller writes it to the transport so the reply
 /// is written exactly once.
+///
+/// `pre_event` (when `Some`) is pushed before the command in the same
+/// pump: the runtime processes it first, so a time-sensitive command can
+/// observe a just-collected fact (e.g. SetTimezone shifting the RTC needs
+/// the current clock, which a fresh `Tick` provides).
 pub(crate) fn dispatch_migrated_command(
     ctx: &mut DeviceContext<'_>,
     runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
+    pre_event: Option<inkwash_logic::app::Event>,
     request: Command,
     id: Option<&str>,
 ) -> Option<Reply> {
@@ -188,6 +195,9 @@ pub(crate) fn dispatch_migrated_command(
     {
         let mut executor = crate::app_runner::EffectRunner::new(ctx, last_clock);
         let mut runtime = runner.borrow_mut();
+        if let Some(pre) = pre_event {
+            runtime.push(pre);
+        }
         runtime.push(event);
         if let Err(err) = runtime.pump(&mut executor) {
             log::warn!("Command dispatch through state machine failed: {err}");
@@ -251,9 +261,22 @@ impl DeviceContext<'_> {
         // runner's effects (persist/RTC) execute and its Reply effect is
         // written back to USB with the frame's correlation id.
         if is_migrated_command(&cmd) {
+            // A time-sensitive migrated command (SetTimezone shifts the RTC
+            // by the offset delta from the current clock) needs a fresh
+            // time fact: push a Tick from the latest RTC read first so the
+            // state machine's clock is current when it computes the shift.
+            let pre_event = if matches!(cmd, Command::SetTimezone { .. }) {
+                self.rtc
+                    .read_time()
+                    .ok()
+                    .map(inkwash_logic::app::Event::Tick)
+            } else {
+                None
+            };
             let event = inkwash_logic::app::Event::UsbCommand(cmd.clone());
             let runner = self.app_runner.clone();
-            let reply = dispatch_migrated_command(self, &runner, event, cmd, id.as_deref());
+            let reply =
+                dispatch_migrated_command(self, &runner, event, pre_event, cmd, id.as_deref());
             if let Some(reply) = &reply {
                 crate::usb_console::write_reply(reply, id.as_deref());
             }

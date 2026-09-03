@@ -621,10 +621,19 @@ fn main() -> Result<()> {
             let needs_full_redraw = matches!(cmd, control::Command::SyncNow);
             let reply = if ctx::is_migrated_command(&cmd) {
                 let runner = app_runner.clone();
+                let pre_event = if matches!(cmd, control::Command::SetTimezone { .. }) {
+                    ctx.rtc
+                        .read_time()
+                        .ok()
+                        .map(inkwash_logic::app::Event::Tick)
+                } else {
+                    None
+                };
                 ctx::dispatch_migrated_command(
                     &mut ctx,
                     &runner,
                     inkwash_logic::app::Event::BleCommand(cmd.clone()),
+                    pre_event,
                     cmd,
                     id.as_deref(),
                 )
