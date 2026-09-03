@@ -5670,6 +5670,45 @@ mod tests {
     }
 
     #[test]
+    fn ble_pairing_disconnect_then_reconnect_cycles_phase() {
+        // The radio lifecycle channel delivers Connected / Disconnected as
+        // separate events; a session survives a drop and a fresh connect
+        // re-enters Pairing without leaving Screen::BlePairing.
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        state.screen = Screen::BlePairing(BlePairingState {
+            phase: BlePairingPhase::Pairing,
+            ..Default::default()
+        });
+        // Client drops mid-pairing -> Waiting (radio torn down on the
+        // other end; the screen stays so the user can retry).
+        let _ = update(&mut state, Event::BleDisconnected);
+        assert_eq!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Waiting,
+                ..Default::default()
+            })
+        );
+        // A fresh connect re-enters Pairing.
+        let batches = update(&mut state, Event::BlePairingStarted);
+        assert_eq!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Pairing,
+                ..Default::default()
+            })
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
+    }
+
+    #[test]
     fn ble_start_failure_exits_the_pairing_screen() {
         // A StartBlePairing failure while a pairing session is current must
         // not strand the SM on the pairing screen with no radio: it returns
