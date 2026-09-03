@@ -139,7 +139,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
         Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
         Effect::OpenAddAlarm => "OpenAddAlarm",
-        Effect::OpenInboxItem { .. } => "OpenInboxItem",
+        Effect::MarkInboxRead { .. } => "MarkInboxRead",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
         Effect::EnterDeepSleep(_) => "EnterDeepSleep",
@@ -166,9 +166,8 @@ impl EffectExecutor for FakeExecutor {
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
-            Effect::OpenAddAlarm
-            | Effect::OpenInboxItem { .. }
-            | Effect::OpenSettingsItem { .. } => EffectCategory::Render,
+            Effect::OpenAddAlarm | Effect::OpenSettingsItem { .. } => EffectCategory::Render,
+            Effect::MarkInboxRead { .. } => EffectCategory::Persist,
             Effect::PersistAlarmToggle { .. } | Effect::PersistTodoEdit { .. } => {
                 EffectCategory::Persist
             }
@@ -237,7 +236,7 @@ impl EffectExecutor for FakeExecutor {
                 EffectOutput::Persisted(crate::app::PersistTarget::Todos),
             )),
             Effect::OpenAddAlarm => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
-            Effect::OpenInboxItem { .. } => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
+            Effect::MarkInboxRead { .. } => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::EnterLightSleep(_) => {
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }

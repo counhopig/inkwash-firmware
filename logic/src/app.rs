@@ -94,6 +94,13 @@ pub enum Screen {
     Inbox {
         selected: usize,
     },
+    /// The inbox item detail (Stage 4): title + body of the selected item,
+    /// drawn by the executor from the store (carries only the index). ENTER
+    /// on an Inbox row opens it (and marks it read); any button closes it
+    /// back to the list.
+    InboxItem {
+        index: usize,
+    },
     AlarmRinging,
     Reminder(ReminderState),
     BlePairing(BlePairingState),
@@ -152,6 +159,7 @@ impl Screen {
             Screen::Inbox { selected } => RenderView::Inbox {
                 selected: *selected,
             },
+            Screen::InboxItem { index } => RenderView::InboxItem { index: *index },
             Screen::Calendar(CalendarState {
                 year,
                 month,
@@ -431,16 +439,14 @@ pub enum Effect {
     /// persists to the alarm store; when it returns, main dispatches
     /// `Event::AlarmStoreChanged` so the state machine reloads the list.
     OpenAddAlarm,
-    /// The user pressed ENTER on an InboxList row whose item detail is
-    /// still a legacy blocking screen (open_inbox_item marks the item read
-    /// and shows its body). The state machine stays on `Screen::Inbox`
-    /// while the executor runs the wedge (deferred post-pump, same as
-    /// `OpenAddAlarm`); when it returns, main dispatches
-    /// `Event::InboxStoreChanged` with the reloaded list so the machine
-    /// adopts the read marks.
-    OpenInboxItem {
-        /// Index into `state.inbox.items`.
-        index: usize,
+    /// The user opened an inbox item (ENTER on an Inbox row). Fire-and-forget
+    /// local persistence of the read mark: the executor marks `seq` read and
+    /// adds it to the pending-read set (two-way sync uploads it later). The
+    /// state machine optimistically set the item's `read` flag when the
+    /// detail screen opened; there is no confirmable completion to track.
+    MarkInboxRead {
+        /// The inbox item `seq` to mark read (from `state.inbox.items`).
+        seq: u64,
     },
 }
 
@@ -468,9 +474,14 @@ pub enum RenderView {
     /// (both confirmable SM edits). Carries the selected row.
     TodoList { selected: usize },
     /// The inbox list (Stage 4): rows browsed in the state machine, ENTER
-    /// opens an item's detail through a deferred legacy wedge. Carries the
-    /// selected row; the executor loads the rows from the store.
+    /// opens an item's detail (an SM screen). Carries the selected row; the
+    /// executor loads the rows from the store.
     Inbox { selected: usize },
+    /// The inbox item detail (Stage 4): title + body of the selected item,
+    /// drawn by the executor from the store (carries only the index). ENTER
+    /// on an Inbox row opens it (and marks it read); any button closes it
+    /// back to the list.
+    InboxItem { index: usize },
     /// The calendar month grid (Stage 4): a read-only grid of the current
     /// month with a day cursor the state machine moves; ENTER opens the
     /// day's week view through a deferred legacy wedge. Carries the year /
@@ -695,10 +706,6 @@ pub enum Event {
     /// NVS list (the executor reads the store; `update` never touches NVS),
     /// which the state machine adopts and re-renders.
     AlarmStoreChanged(Vec<StoredAlarm>),
-    /// The inbox store changed out-of-band (a legacy item-detail wedge
-    /// marked an item read). The event carries the reloaded authoritative
-    /// NVS list; the state machine adopts it and re-renders.
-    InboxStoreChanged(Vec<InboxItem>),
     DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
@@ -1023,7 +1030,6 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
         Event::AlarmStoreChanged(alarms) => transition_alarm_store_changed(state, alarms),
-        Event::InboxStoreChanged(items) => transition_inbox_store_changed(state, items),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
@@ -1399,6 +1405,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::AlarmList { .. }
             | Screen::TodoList { .. }
             | Screen::Inbox { .. }
+            | Screen::InboxItem { .. }
             | Screen::Calendar(_)
             | Screen::WeekView { .. }
     ) {
@@ -1610,6 +1617,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
         Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
         Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
         Screen::Inbox { selected } => transition_inbox_list_button(state, *selected, button),
+        Screen::InboxItem { .. } => transition_inbox_item_button(state, button),
         Screen::Calendar(_) => transition_calendar_button(state, button),
         Screen::WeekView { .. } => transition_week_view_button(state, button),
         Screen::Home => {
@@ -1833,11 +1841,9 @@ fn transition_todo_list_button(
 
 /// InboxList screen (Stage 4): browse the stored inbox items (read/unread
 /// markers from the executor's render); ENTER opens the selected item's
-/// detail through a deferred legacy wedge (`OpenInboxItem` - the detail
-/// marks the item read and shows its body). The SM stays on `Screen::Inbox`
-/// while the wedge runs; when it returns, main dispatches
-/// `Event::InboxStoreChanged` so the machine adopts the read marks. Long
-/// UP/DOWN opens the GO TO drawer (origin Inbox); long ENTER backs to Home.
+/// detail (an SM screen) and optimistically marks it read (fire-and-forget
+/// `MarkInboxRead` local persist). Long UP/DOWN opens the GO TO drawer
+/// (origin Inbox); long ENTER backs to Home.
 fn transition_inbox_list_button(
     state: &mut AppState,
     selected: usize,
@@ -1881,41 +1887,60 @@ fn transition_inbox_list_button(
                 // Nothing to open on an empty list.
                 return vec![];
             }
-            // Open the selected item's detail through the deferred legacy
-            // wedge. The SM stays on Inbox; main dispatches
-            // Event::InboxStoreChanged with the reloaded list after the
-            // wedge returns.
-            state.render_generation = state.render_generation.next();
-            vec![
-                batch(
+            let index = selected.min(count - 1);
+            // Open the item's detail (an SM screen). Optimistically mark it
+            // read in state and fire-and-forget the local read-mark persist
+            // (two-way sync uploads it later).
+            let unread_seq = {
+                let Some(item) = state.inbox.items.get_mut(index) else {
+                    return vec![];
+                };
+                if !item.read {
+                    item.read = true;
+                    Some(item.id)
+                } else {
+                    None
+                }
+            };
+            let mut batches = Vec::new();
+            if let Some(seq) = unread_seq {
+                batches.push(batch(
                     state,
                     OperationId(0),
                     FailurePolicy::Continue,
-                    vec![Effect::OpenInboxItem {
-                        index: selected.min(count - 1),
-                    }],
-                ),
-                render_batch_with_intent(state, RenderIntent::Full),
-            ]
+                    vec![Effect::MarkInboxRead { seq }],
+                ));
+            }
+            state.screen = Screen::InboxItem { index };
+            state.render_generation = state.render_generation.next();
+            batches.push(render_batch_with_intent(state, RenderIntent::Full));
+            batches
         }
         _ => vec![],
     }
 }
 
-/// The inbox store changed out-of-band (a legacy item-detail wedge marked
-/// items read; main dispatched this with the reloaded NVS list). Adopt the
-/// list and re-render the Inbox screen.
-fn transition_inbox_store_changed(state: &mut AppState, items: Vec<InboxItem>) -> Vec<EffectBatch> {
-    state.inbox.items = items;
-    state.render_generation = state.render_generation.next();
-    // Clamp the selection to the (possibly shorter/longer) list.
-    if let Screen::Inbox { selected } = &mut state.screen {
-        let len = state.inbox.items.len();
-        if *selected >= len {
-            *selected = len.saturating_sub(1);
+/// InboxItem screen (Stage 4): read-only title + body of the opened item.
+/// Any button closes it back to the Inbox list (legacy open_inbox_item
+/// semantics: "ENTER / HOLD ENTER CLOSE" - read-only).
+fn transition_inbox_item_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    let Screen::InboxItem { index } = &state.screen else {
+        return vec![];
+    };
+    let index = *index;
+    match button {
+        ButtonEvent::Pressed(ButtonId::Enter)
+        | ButtonEvent::LongPressed(ButtonId::Enter)
+        | ButtonEvent::Pressed(ButtonId::Up)
+        | ButtonEvent::Pressed(ButtonId::Down)
+        | ButtonEvent::LongPressed(ButtonId::Up)
+        | ButtonEvent::LongPressed(ButtonId::Down) => {
+            state.screen = Screen::Inbox { selected: index };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
         }
+        _ => vec![],
     }
-    vec![render_batch_with_intent(state, RenderIntent::Full)]
 }
 
 /// Calendar screen (Stage 4): a read-only grid of the current month with a
@@ -5476,7 +5501,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_enter_row_emits_open_inbox_item_and_stays() {
+    fn inbox_enter_row_opens_item_detail_marks_read() {
         let mut state = AppState::default();
         open_inbox(
             &mut state,
@@ -5487,22 +5512,50 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
         assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+        // Row 1 (id 2) is already read -> opening emits no read-mark effect.
         let batches = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
+        assert_eq!(state.screen, Screen::InboxItem { index: 1 });
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::MarkInboxRead { .. })));
+        // Close back to the list: the detail is read-only, any button.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+    }
+
+    #[test]
+    fn inbox_enter_unread_row_emits_mark_read_and_opens_detail() {
+        let mut state = AppState::default();
+        open_inbox(
+            &mut state,
+            vec![inbox_item(1, "a", false), inbox_item(2, "b", true)],
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+        // Row 0 (id 1) is unread: opening marks it read optimistically +
+        // fire-and-forgets the local read-mark persist, then shows the
+        // detail screen (Full render of its view).
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::InboxItem { index: 0 });
+        assert!(state.inbox.items[0].read, "opened item optimistically read");
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenInboxItem { index: 1 })));
-        // The SM stays on Inbox (the wedge marks read; main dispatches
-        // InboxStoreChanged to adopt).
-        assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+            .any(|e| matches!(e, Effect::MarkInboxRead { seq: 1 })));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
                 intent: RenderIntent::Full,
-                view: RenderView::Inbox { selected: 1 },
+                view: RenderView::InboxItem { index: 0 },
                 ..
             })
         )));
@@ -5520,37 +5573,67 @@ mod tests {
         assert!(!batches.iter().any(|b| b
             .effects
             .iter()
-            .any(|e| matches!(e, Effect::OpenInboxItem { .. }))));
+            .any(|e| matches!(e, Effect::MarkInboxRead { .. }))));
+        assert!(!batches.iter().any(|b| b.effects.iter().any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::InboxItem { .. },
+                ..
+            })
+        ))));
         assert_eq!(state.screen, Screen::Inbox { selected: 0 });
     }
 
     #[test]
-    fn inbox_store_changed_adopts_read_marks_and_clamps() {
+    fn inbox_item_detail_any_button_returns_to_list() {
         let mut state = AppState::default();
         open_inbox(
             &mut state,
             vec![inbox_item(1, "a", false), inbox_item(2, "b", true)],
         );
-        // Open row 1, then the wedge marks both read; main reloads.
+        // Open row 1 (already read).
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        let reloaded = vec![inbox_item(1, "a", true), inbox_item(2, "b", true)];
-        let batches = update(&mut state, Event::InboxStoreChanged(reloaded.clone()));
-        assert_eq!(state.inbox.items, reloaded);
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::InboxItem { index: 1 });
+        // Back to the list so each loop iteration starts from a clean open.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
         assert_eq!(state.screen, Screen::Inbox { selected: 1 });
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
-                view: RenderView::Inbox { selected: 1 },
-                ..
-            })
-        )));
-        // A reload to an empty list clamps selection to 0.
-        let _ = update(&mut state, Event::InboxStoreChanged(vec![]));
-        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+        // Any button closes back to the list with the row kept selected.
+        let closes = [
+            ButtonEvent::Pressed(ButtonId::Up),
+            ButtonEvent::Pressed(ButtonId::Down),
+            ButtonEvent::LongPressed(ButtonId::Up),
+            ButtonEvent::LongPressed(ButtonId::Down),
+            ButtonEvent::LongPressed(ButtonId::Enter),
+        ];
+        for close in closes {
+            // From the list (selection kept on row 1), open the detail.
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+            );
+            assert_eq!(state.screen, Screen::InboxItem { index: 1 });
+            // Any button closes back to the list with the row kept selected.
+            let batches = update(&mut state, Event::Button(close));
+            assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+            assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+                e,
+                Effect::Render(RenderRequest {
+                    intent: RenderIntent::Full,
+                    view: RenderView::Inbox { selected: 1 },
+                    ..
+                })
+            )));
+        }
     }
 
     #[test]
