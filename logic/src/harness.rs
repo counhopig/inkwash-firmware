@@ -141,6 +141,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
         Effect::OpenAddAlarm => "OpenAddAlarm",
         Effect::OpenInboxItem { .. } => "OpenInboxItem",
+        Effect::OpenCalendarDay { .. } => "OpenCalendarDay",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
         Effect::EnterDeepSleep(_) => "EnterDeepSleep",
@@ -169,7 +170,8 @@ impl EffectExecutor for FakeExecutor {
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
             Effect::OpenNavigationDestination { .. }
             | Effect::OpenAddAlarm
-            | Effect::OpenInboxItem { .. } => EffectCategory::Render,
+            | Effect::OpenInboxItem { .. }
+            | Effect::OpenCalendarDay { .. } => EffectCategory::Render,
             Effect::OpenSettingsItem { .. } => EffectCategory::Render,
             Effect::PersistAlarmToggle { .. } | Effect::PersistTodoEdit { .. } => {
                 EffectCategory::Persist
@@ -240,6 +242,9 @@ impl EffectExecutor for FakeExecutor {
             )),
             Effect::OpenAddAlarm => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::OpenInboxItem { .. } => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
+            Effect::OpenCalendarDay { .. } => {
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
             Effect::EnterLightSleep(_) => {
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }

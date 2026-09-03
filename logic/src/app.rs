@@ -27,7 +27,7 @@
 use crate::alarm_regs::AlarmRegs;
 use crate::alarm_schedule::{next_due, Repeat, StoredAlarm};
 use crate::button_event::{ButtonEvent, ButtonId};
-use crate::datetime::DateTime;
+use crate::datetime::{days_in_month, DateTime};
 use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
@@ -100,6 +100,7 @@ pub enum NavOrigin {
     AlarmList,
     TodoList,
     Inbox,
+    Calendar,
 }
 
 impl Screen {
@@ -142,8 +143,16 @@ impl Screen {
             Screen::Inbox { selected } => RenderView::Inbox {
                 selected: *selected,
             },
+            Screen::Calendar(CalendarState {
+                year,
+                month,
+                selected_day,
+            }) => RenderView::Calendar {
+                year: *year,
+                month: *month,
+                selected_day: *selected_day,
+            },
             Screen::Home
-            | Screen::Calendar(_)
             | Screen::AlarmEdit(_)
             | Screen::AlarmRinging
             | Screen::Reminder(_)
@@ -158,8 +167,14 @@ pub const NAV_DESTINATION_COUNT: usize = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalendarState {
+    /// Displayed year/month: always the *current* month (the grid has no
+    /// month navigation in v1 - it tracks the clock, like the legacy
+    /// browse_page). Refreshed on each cross-month Tick.
     pub year: u16,
     pub month: u8,
+    /// The cursor day (1..=days_in_month(year, month)); ENTER opens that
+    /// day's week view.
+    pub selected_day: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +438,15 @@ pub enum Effect {
         /// Index into `state.inbox.items`.
         index: usize,
     },
+    /// The user pressed ENTER on a Calendar day whose week view is still a
+    /// legacy blocking screen (week_view shows the opened week's todos).
+    /// The state machine stays on `Screen::Calendar` while the executor
+    /// runs the wedge (deferred post-pump, same as `OpenInboxItem`); when
+    /// it returns, main re-renders the calendar grid.
+    OpenCalendarDay {
+        /// The day the week view was opened from (1-based).
+        day: u8,
+    },
 }
 
 /// Which visible surface a render request targets. The renderer draws this
@@ -452,6 +476,16 @@ pub enum RenderView {
     /// opens an item's detail through a deferred legacy wedge. Carries the
     /// selected row; the executor loads the rows from the store.
     Inbox { selected: usize },
+    /// The calendar month grid (Stage 4): a read-only grid of the current
+    /// month with a day cursor the state machine moves; ENTER opens the
+    /// day's week view through a deferred legacy wedge. Carries the year /
+    /// month and selected day so the executor can draw the grid from state
+    /// (day marks are read from the todo store by the executor).
+    Calendar {
+        year: u16,
+        month: u8,
+        selected_day: u8,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1366,6 +1400,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::AlarmList { .. }
             | Screen::TodoList { .. }
             | Screen::Inbox { .. }
+            | Screen::Calendar(_)
     ) {
         transition_nav_button(state, button)
     } else {
@@ -1388,6 +1423,8 @@ fn nav_home_index(origin: NavOrigin) -> usize {
         NavOrigin::TodoList => 4,
         // The drawer over the inbox list highlights INBOX (2).
         NavOrigin::Inbox => 2,
+        // The drawer over the calendar grid highlights CALENDAR (1).
+        NavOrigin::Calendar => 1,
     }
 }
 
@@ -1442,14 +1479,29 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 }),
                 ButtonEvent::LongPressed(ButtonId::Enter) => Some(nav_origin_screen(origin)),
                 ButtonEvent::Pressed(ButtonId::Enter) => {
-                    // Selecting a destination closes the drawer.
-                    // HOME (0), INBOX (2), ALARMS (3), TODOS (4) and SETTINGS
-                    // (5) are SM screens; the remaining destination
-                    // (CALENDAR, 1) is opened by the executor (legacy page)
-                    // for now.
+                    // Selecting a destination closes the drawer. Every
+                    // destination is an SM screen now: HOME (0), CALENDAR
+                    // (1), INBOX (2), ALARMS (3), TODOS (4), SETTINGS (5).
                     return match cur {
                         0 => {
                             state.screen = nav_origin_screen(origin);
+                            state.render_generation = state.render_generation.next();
+                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        }
+                        1 => {
+                            // Open the calendar grid: always the current
+                            // month, cursor on today (matching the legacy
+                            // browse_page entry state).
+                            let (year, month, day) = state
+                                .clock
+                                .now
+                                .map(|dt| (dt.year, dt.month, dt.day))
+                                .unwrap_or((1970, 1, 1));
+                            state.screen = Screen::Calendar(CalendarState {
+                                year,
+                                month,
+                                selected_day: day.min(days_in_month(year, month)).max(1),
+                            });
                             state.render_generation = state.render_generation.next();
                             vec![render_batch_with_intent(state, RenderIntent::Full)]
                         }
@@ -1473,19 +1525,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                             state.render_generation = state.render_generation.next();
                             vec![render_batch_with_intent(state, RenderIntent::Full)]
                         }
-                        other => {
-                            state.screen = Screen::Home;
-                            state.render_generation = state.render_generation.next();
-                            vec![
-                                batch(
-                                    state,
-                                    OperationId(0),
-                                    FailurePolicy::Continue,
-                                    vec![Effect::OpenNavigationDestination { destination: other }],
-                                ),
-                                render_batch_with_intent(state, RenderIntent::Full),
-                            ]
-                        }
+                        _ => unreachable!(),
                     };
                 }
                 _ => None,
@@ -1572,6 +1612,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
         Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
         Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
         Screen::Inbox { selected } => transition_inbox_list_button(state, *selected, button),
+        Screen::Calendar(_) => transition_calendar_button(state, button),
         Screen::Home => {
             // Long UP/DOWN opens the global navigation drawer from Home
             // (origin Home, highlighting HOME).
@@ -1878,6 +1919,63 @@ fn transition_inbox_store_changed(state: &mut AppState, items: Vec<InboxItem>) -
     vec![render_batch_with_intent(state, RenderIntent::Full)]
 }
 
+/// Calendar screen (Stage 4): a read-only grid of the current month with a
+/// day cursor. UP/DOWN move the cursor within the month; ENTER opens the
+/// selected day's week view through a deferred legacy wedge (the SM stays
+/// on Calendar and main re-renders the grid when the wedge returns); long
+/// ENTER backs to Home; long UP/DOWN opens the GO TO drawer (origin
+/// Calendar). The grid tracks the clock (cross-month Ticks refresh it).
+fn transition_calendar_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    let Screen::Calendar(cal) = &mut state.screen else {
+        return vec![];
+    };
+    match button {
+        ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
+            // Open the GO TO drawer over the calendar (origin Calendar).
+            state.screen = Screen::Navigation {
+                selected: nav_home_index(NavOrigin::Calendar),
+                origin: NavOrigin::Calendar,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
+            // Back out of the calendar to root Home.
+            state.screen = Screen::Home;
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::Pressed(ButtonId::Up) => {
+            cal.selected_day = cal.selected_day.saturating_sub(1).max(1);
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Down) => {
+            let dim = days_in_month(cal.year, cal.month);
+            cal.selected_day = (cal.selected_day + 1).min(dim);
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Enter) => {
+            // Open the selected day's week view: deferred legacy wedge. The
+            // SM stays on Calendar; main re-renders the grid when the wedge
+            // returns.
+            let day = cal.selected_day;
+            state.render_generation = state.render_generation.next();
+            vec![
+                batch(
+                    state,
+                    OperationId(0),
+                    FailurePolicy::Continue,
+                    vec![Effect::OpenCalendarDay { day }],
+                ),
+                render_batch_with_intent(state, RenderIntent::Full),
+            ]
+        }
+        _ => vec![],
+    }
+}
+
 /// The alarm store changed out-of-band (a legacy ADD-ALARM editor wedge
 /// persisted a new alarm; main dispatched this with the reloaded NVS list).
 /// Adopt the list and re-render the AlarmList screen.
@@ -1919,6 +2017,19 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
         .unwrap_or(true);
     state.clock.now = Some(now);
     let current_minute = now.to_unix() / 60;
+
+    // The calendar grid always shows the current month: when the clock rolls
+    // into a new month while the Calendar screen is current, adopt the new
+    // year/month and clamp the day cursor (matching the legacy browse_page,
+    // which re-read the RTC each visible change and re-rendered the grid).
+    if let Screen::Calendar(cal) = &mut state.screen {
+        let dim = days_in_month(now.year, now.month);
+        if cal.year != now.year || cal.month != now.month {
+            cal.year = now.year;
+            cal.month = now.month;
+            cal.selected_day = cal.selected_day.min(dim).max(1);
+        }
+    }
 
     // A failed ACK/persist/RTC-program operation whose backoff window has
     // elapsed is retried first (a fresh op id re-arms the in-flight state).
@@ -4199,8 +4310,17 @@ mod tests {
     }
 
     #[test]
-    fn navigation_select_non_home_emits_open_destination() {
+    fn navigation_select_calendar_opens_sm_calendar_screen() {
         let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(
+                vec![],
+                Some(dt_full(9, 0, 1, 15)),
+                false,
+                true,
+            )),
+        );
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
@@ -4214,12 +4334,32 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert_eq!(state.screen, Screen::Home, "drawer closes to Home");
-        assert!(batches.iter().any(|b| {
+        // The calendar opens on the current month with the cursor on today.
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 15,
+            })
+        );
+        assert!(!batches.iter().any(|b| {
             b.effects
                 .iter()
-                .any(|e| matches!(e, Effect::OpenNavigationDestination { destination: 1 }))
+                .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
         }));
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Calendar {
+                    year: 2026,
+                    month: 8,
+                    selected_day: 15,
+                },
+                intent: RenderIntent::Full,
+                ..
+            })
+        )));
     }
 
     #[test]
@@ -5473,6 +5613,237 @@ mod tests {
         assert_eq!(state.screen, Screen::Inbox { selected: 0 });
     }
 
+    // ---- Calendar screen (Stage 4) ---------------------------------------
+
+    /// Boots at `day` and opens the CALENDAR drawer destination (index 1).
+    fn open_calendar(state: &mut AppState, day: u8) {
+        let _ = update(
+            state,
+            Event::Boot(boot_snapshot(
+                vec![],
+                Some(dt_full(9, 0, 1, day)),
+                false,
+                true,
+            )),
+        );
+        let _ = update(state, Event::Button(ButtonEvent::LongPressed(ButtonId::Up)));
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: day,
+            })
+        );
+    }
+
+    #[test]
+    fn calendar_day_moves_and_clamps_within_month() {
+        let mut state = AppState::default();
+        open_calendar(&mut state, 15);
+        // Up to day 1 clamps.
+        for _ in 0..20 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+            );
+        }
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 1,
+            })
+        );
+        // Down to the last day of August (31) clamps.
+        for _ in 0..40 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 31,
+            })
+        );
+    }
+
+    #[test]
+    fn calendar_enter_day_emits_open_calendar_day_and_stays() {
+        let mut state = AppState::default();
+        open_calendar(&mut state, 15);
+        // Move to day 17 then ENTER.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 17,
+            })
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenCalendarDay { day: 17 })));
+        // The SM stays on Calendar (main re-renders the grid when the week
+        // view wedge returns).
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 17,
+            })
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Calendar {
+                    year: 2026,
+                    month: 8,
+                    selected_day: 17,
+                },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn calendar_long_enter_backs_home_and_drawer_is_calendar_origin() {
+        let mut state = AppState::default();
+        open_calendar(&mut state, 15);
+        // Long UP opens the drawer with CALENDAR highlighted (origin
+        // Calendar).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 1,
+                origin: NavOrigin::Calendar
+            }
+        );
+        // Select HOME (long UP jumps to 0) -> Home.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Home,
+                ..
+            })
+        )));
+        // Re-enter CALENDAR: the grid re-opens with the cursor on today.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn calendar_follows_cross_month_tick() {
+        let mut state = AppState::default();
+        // Open on Aug 31.
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(
+                vec![],
+                Some(dt_full(23, 59, 1, 31)),
+                false,
+                true,
+            )),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 31,
+            })
+        );
+        // A tick into September refreshes year/month and clamps the day
+        // (the cursor was the 31st, which September lacks -> 30).
+        let _ = update(
+            &mut state,
+            Event::Tick(DateTime {
+                year: 2026,
+                month: 9,
+                day: 1,
+                weekday: 2,
+                hour: 0,
+                minute: 1,
+                second: 0,
+                voltage_low: false,
+            }),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 9,
+                selected_day: 30,
+            })
+        );
+    }
+
     #[test]
     fn still_legacy_screens_project_to_home_surface_until_migrated() {
         // Stage-4 transitional projection: every screen still drawn through
@@ -5508,8 +5879,13 @@ mod tests {
                 Screen::Calendar(CalendarState {
                     year: 2026,
                     month: 8,
+                    selected_day: 15,
                 }),
-                RenderView::Home,
+                RenderView::Calendar {
+                    year: 2026,
+                    month: 8,
+                    selected_day: 15,
+                },
             ),
             (
                 Screen::AlarmList { selected: 0 },

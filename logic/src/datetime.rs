@@ -59,6 +59,14 @@ pub fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+/// Days in `month` (1-based) of `year`, leap-aware. Single source of truth
+/// for calendar day counts in the logic crate (the month grid clamps the
+/// day cursor against it).
+pub fn days_in_month(year: u16, month: u8) -> u8 {
+    let m = (month as i64 - 1).clamp(0, 11) as usize;
+    month_lengths(year as i64)[m] as u8
+}
+
 /// Days per month for a given year (leap-aware). The single table every
 /// calendar computation in this crate reads from - see the module doc
 /// comment on why having more than one copy of this table is dangerous.
