@@ -2437,11 +2437,28 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
         batches.extend(program_alarm_for(state, &now));
     }
 
-    if changed {
+    if changed && tick_refreshes_current_screen(&state.screen) {
         state.render_generation = state.render_generation.next();
         batches.push(render_batch(state));
     }
     batches
+}
+
+/// Whether a minute-change Tick should re-render the current screen.
+/// Home (clock), the Calendar grid (dates) and the TodoList ("DUE TODAY"
+/// markers) are time-sensitive; the list screens may show data a sync just
+/// changed. Pure read-only sub-screens (a week view, an item detail, a
+/// picker, the pairing session, the ADD-ALARM editor) have no time-driven
+/// content, so a minute tick would only burn an unnecessary e-ink refresh.
+fn tick_refreshes_current_screen(screen: &Screen) -> bool {
+    !matches!(
+        screen,
+        Screen::WeekView { .. }
+            | Screen::InboxItem { .. }
+            | Screen::AlarmAdd(_)
+            | Screen::SyncIntervalPick { .. }
+            | Screen::BlePairing(_)
+    )
 }
 
 /// Arms only the rearm logic (marks the minute advanced and checks whether
@@ -7914,12 +7931,16 @@ mod tests {
     }
 
     /// The unified event loop keeps running while any SM screen is current:
-    /// a minute-change Tick on each content screen emits a Partial render of
-    /// that screen's own view (Stage-4 exit condition - no page blocks the
-    /// loop from ticking / re-rendering).
+    /// a minute-change Tick still drives the SM on every screen (Stage-4
+    /// exit condition - no page blocks the loop). Time-sensitive screens
+    /// (Home clock, list data, Calendar dates, TodoList due-today) re-render
+    /// their view Partial; pure read-only sub-screens (week view, item
+    /// detail, ADD picker, interval picker, pairing session) have no
+    /// time-driven content and skip the e-ink refresh.
     #[test]
     fn minute_tick_keeps_rendering_while_any_sm_screen_is_current() {
-        let screens = [
+        // (screen, expected partial-render view) - time-sensitive screens.
+        let refresh_screens = [
             (Screen::Home, RenderView::Home),
             (
                 Screen::Settings { selected: 0 },
@@ -7950,60 +7971,69 @@ mod tests {
                 },
             ),
             (
-                Screen::WeekView {
-                    year: 2026,
-                    month: 8,
-                    day: 17,
-                },
-                RenderView::WeekView {
-                    year: 2026,
-                    month: 8,
-                    day: 17,
-                },
-            ),
-            (
                 Screen::Navigation {
                     selected: 3,
                     origin: NavOrigin::Home,
                 },
                 RenderView::Navigation { selected: 3 },
             ),
-            (
-                Screen::BlePairing(BlePairingState {
-                    phase: BlePairingPhase::Waiting,
-                }),
-                RenderView::BlePairing,
-            ),
         ];
-        for (screen, expected_view) in screens {
+        for (screen, expected_view) in refresh_screens {
             let mut state = AppState::default();
             let _ = update(
                 &mut state,
-                Event::Boot(boot_snapshot(
-                    vec![alarm(1, 9, 0)],
-                    Some(dt(8, 0)),
-                    false,
-                    true,
-                )),
+                Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
             );
             state.screen = screen.clone();
-            // A minute-change Tick while the screen is current.
             let tick_batches = update(&mut state, Event::Tick(dt(8, 1)));
-            let renders_expected_view = tick_batches.iter().flat_map(|b| &b.effects).any(|e| {
-                matches!(e, Effect::Render(RenderRequest { view, .. }) if *view == expected_view)
-            });
-            let has_partial = tick_batches.iter().flat_map(|b| &b.effects).any(|e| {
-                matches!(
-                    e,
-                    Effect::Render(RenderRequest {
-                        intent: RenderIntent::Partial,
-                        ..
-                    })
-                )
-            });
             assert!(
-                renders_expected_view && has_partial,
+                tick_batches
+                    .iter()
+                    .flat_map(|b| &b.effects)
+                    .any(|e| matches!(
+                        e,
+                        Effect::Render(RenderRequest {
+                            intent: RenderIntent::Partial,
+                            view,
+                            ..
+                        }) if *view == expected_view
+                    )),
                 "tick on {screen:?} must Partial-render {expected_view:?}"
+            );
+        }
+
+        // Pure read-only sub-screens skip the minute render entirely.
+        let skip_screens = [
+            Screen::WeekView {
+                year: 2026,
+                month: 8,
+                day: 17,
+            },
+            Screen::InboxItem { index: 0 },
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Minute,
+                hour: 8,
+                value: 30,
+            }),
+            Screen::SyncIntervalPick { selected: 0 },
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Waiting,
+            }),
+        ];
+        for screen in skip_screens {
+            let mut state = AppState::default();
+            let _ = update(
+                &mut state,
+                Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+            );
+            state.screen = screen.clone();
+            let tick_batches = update(&mut state, Event::Tick(dt(8, 1)));
+            assert!(
+                !tick_batches.iter().any(|b| b
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Render(RenderRequest { .. })))),
+                "tick on read-only {screen:?} must not render"
             );
         }
     }
