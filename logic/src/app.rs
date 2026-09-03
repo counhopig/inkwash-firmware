@@ -76,6 +76,43 @@ pub enum Screen {
     BlePairing(BlePairingState),
 }
 
+impl Screen {
+    /// Which render surface this screen is drawn on.
+    ///
+    /// Stage-4/5 transitional projection: a `RenderRequest` must tell the
+    /// executor *what* to draw (and which panel rect to refresh), because
+    /// the executor draws from state, not from call-site rectangles. Until
+    /// the remaining content pages migrate to `Screen` states (Stage 4) and
+    /// the ViewModel diff replaces intents (Stage 5), every screen that
+    /// still renders through a legacy blocking page maps to the Home
+    /// surface, and only screens the executor can actually draw get their
+    /// own view:
+    ///
+    /// - `Home` - the idle home canvas (clock + cards).
+    /// - `Navigation` - Home canvas with the GO TO drawer overlay.
+    ///
+    /// `AlarmRinging` maps to Home: the ringing frame is owned by the
+    /// legacy `ring_screen`, which draws over whatever the SM render
+    /// produced before the EPD request lands.
+    pub fn render_view(&self) -> RenderView {
+        match self {
+            Screen::Navigation { selected } => RenderView::Navigation {
+                selected: *selected,
+            },
+            Screen::Home
+            | Screen::Settings { .. }
+            | Screen::Calendar(_)
+            | Screen::AlarmList { .. }
+            | Screen::AlarmEdit(_)
+            | Screen::TodoList { .. }
+            | Screen::Inbox { .. }
+            | Screen::AlarmRinging
+            | Screen::Reminder(_)
+            | Screen::BlePairing(_) => RenderView::Home,
+        }
+    }
+}
+
 /// Number of global navigation destinations (HOME/CALENDAR/INBOX/ALARMS/
 /// TODOS/SETTINGS - see the firmware's `NAV_DESTINATIONS`).
 pub const NAV_DESTINATION_COUNT: usize = 6;
@@ -301,10 +338,27 @@ pub enum Effect {
     },
 }
 
+/// Which visible surface a render request targets. The renderer draws this
+/// surface (not a call-site rectangle) and refreshes the panel rect the
+/// surface maps to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderView {
+    /// The idle home canvas (clock + cards), with no overlay.
+    Home,
+    /// Home canvas plus the GO TO drawer overlay (Stage 4, slice 1 - the
+    /// only SM-drawn overlay today). Carries the drawer's selected row so
+    /// the executor can draw the overlay from state.
+    Navigation { selected: usize },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderRequest {
     pub generation: RenderGeneration,
     pub intent: RenderIntent,
+    /// The surface to draw. Stage-5 will replace `intent` with a diffed
+    /// RenderPlan; `view` stays as the renderer's "what screen am I
+    /// drawing" input until every screen is SM-drawn.
+    pub view: RenderView,
 }
 
 /// Refresh mode requested by a state transition. The render intent is kept
@@ -2017,6 +2071,7 @@ fn render_batch(state: &mut AppState) -> EffectBatch {
 }
 
 fn render_batch_with_intent(state: &mut AppState, intent: RenderIntent) -> EffectBatch {
+    let view = state.screen.render_view();
     EffectBatch {
         id: state.next_batch_id(),
         operation_id: OperationId(0),
@@ -2024,6 +2079,7 @@ fn render_batch_with_intent(state: &mut AppState, intent: RenderIntent) -> Effec
         effects: vec![Effect::Render(RenderRequest {
             generation: state.render_generation,
             intent,
+            view,
         })],
         failure_policy: FailurePolicy::Continue,
     }
@@ -3366,6 +3422,15 @@ mod tests {
         assert!(batches
             .iter()
             .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::Render(_))) }));
+        // The request names the Navigation surface (executor draws the
+        // drawer overlay, not a call-site rectangle).
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Navigation { selected: 0 },
+                ..
+            })
+        )));
     }
 
     #[test]
@@ -3481,6 +3546,103 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
         }));
+    }
+
+    #[test]
+    fn render_request_view_tracks_screen_surface() {
+        // Home render requests draw the Home surface.
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(9, 0)), false, true)),
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Home,
+                ..
+            })
+        )));
+
+        // Opening the drawer requests the Navigation surface.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Navigation { selected: 0 },
+                ..
+            })
+        )));
+
+        // Selecting HOME closes the drawer and renders the Home surface.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Home,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn non_sm_screens_project_to_home_surface_until_migrated() {
+        // Stage-4 transitional projection: every screen still drawn through
+        // a legacy blocking page maps to the Home surface so the executor
+        // keeps rendering Home behind/around the legacy page. AlarmRinging
+        // is covered by the legacy ring screen, which draws over whatever
+        // the SM render produced.
+        let cases: Vec<(Screen, RenderView)> = vec![
+            (Screen::Home, RenderView::Home),
+            (
+                Screen::Navigation { selected: 0 },
+                RenderView::Navigation { selected: 0 },
+            ),
+            (
+                Screen::Navigation { selected: 3 },
+                RenderView::Navigation { selected: 3 },
+            ),
+            (Screen::Settings { selected: 0 }, RenderView::Home),
+            (
+                Screen::Calendar(CalendarState {
+                    year: 2026,
+                    month: 8,
+                }),
+                RenderView::Home,
+            ),
+            (Screen::AlarmList { selected: 0 }, RenderView::Home),
+            (
+                Screen::AlarmEdit(AlarmEditState { editing: None }),
+                RenderView::Home,
+            ),
+            (Screen::TodoList { selected: 0 }, RenderView::Home),
+            (Screen::Inbox { selected: 0 }, RenderView::Home),
+            (Screen::AlarmRinging, RenderView::Home),
+            (
+                Screen::Reminder(ReminderState {
+                    item: ReminderItem::Todo {
+                        id: 1,
+                        text: String::new(),
+                    },
+                }),
+                RenderView::Home,
+            ),
+            (
+                Screen::BlePairing(BlePairingState {
+                    phase: BlePairingPhase::Waiting,
+                }),
+                RenderView::Home,
+            ),
+        ];
+        for (screen, view) in cases {
+            assert_eq!(screen.render_view(), view, "screen {screen:?}");
+        }
     }
 
     #[test]

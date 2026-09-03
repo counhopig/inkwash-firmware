@@ -125,6 +125,7 @@ mod tests {
             effect: Effect::Render(RenderRequest {
                 generation: RenderGeneration(1),
                 intent: RenderIntent::Partial,
+                view: crate::app::RenderView::Home,
             }),
             request_id: Some(id),
         }

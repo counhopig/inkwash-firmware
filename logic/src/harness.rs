@@ -18,7 +18,9 @@
 use std::collections::BTreeMap;
 
 use crate::alarm_flow::{AlarmHost, AlarmPoll};
-use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, RenderIntent, Screen};
+use crate::app::{
+    AppState, Effect, EffectError, EffectOutput, Event, RenderIntent, RenderView, Screen,
+};
 use crate::background_outcome::BackgroundOutcome;
 use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
 use crate::runner::{EffectCategory, EffectExecutor, EffectOutcome};
@@ -80,6 +82,8 @@ pub struct FakeExecutor {
     pub renders: Vec<(u64, Option<crate::app::RenderGeneration>)>,
     /// Refresh intents issued in the same order as `renders`.
     pub render_intents: Vec<RenderIntent>,
+    /// Render surfaces issued in the same order as `renders`.
+    pub render_views: Vec<RenderView>,
     /// When true, `Effect::Render` fails with `EffectError::Render`.
     pub fail_render: bool,
 }
@@ -92,6 +96,7 @@ impl Default for FakeExecutor {
             next_request_id: 1,
             renders: Vec::new(),
             render_intents: Vec::new(),
+            render_views: Vec::new(),
             fail_render: false,
         }
     }
@@ -206,6 +211,7 @@ impl EffectExecutor for FakeExecutor {
                 self.next_request_id += 1;
                 self.renders.push((id, Some(req.generation)));
                 self.render_intents.push(req.intent);
+                self.render_views.push(req.view);
                 Ok(EffectOutcome::AsyncWithId(id))
             }
             Effect::StartSync(_)
@@ -1034,6 +1040,7 @@ mod tests {
             effect: Effect::Render(crate::app::RenderRequest {
                 generation: crate::app::RenderGeneration(1),
                 intent: crate::app::RenderIntent::Partial,
+                view: crate::app::RenderView::Home,
             }),
             request_id: Some(5),
         };
