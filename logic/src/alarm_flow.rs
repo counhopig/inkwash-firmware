@@ -168,5 +168,7 @@ pub fn snapshot_event(snapshot: RtcAlarmSnapshot) -> Event {
 }
 
 pub fn dismiss_event() -> Event {
-    Event::Button(crate::button_event::ButtonEvent::Pressed)
+    Event::Button(crate::button_event::ButtonEvent::Pressed(
+        crate::button_event::ButtonId::Enter,
+    ))
 }

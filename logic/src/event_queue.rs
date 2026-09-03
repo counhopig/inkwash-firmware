@@ -137,7 +137,7 @@ mod tests {
         EffectBatchId, EffectCompletion, EffectError, EffectFailure, EffectId, EffectOutput,
         OperationId,
     };
-    use crate::button_event::ButtonEvent;
+    use crate::button_event::{ButtonEvent, ButtonId};
     use crate::datetime::DateTime;
     use crate::protocol::Command;
     use crate::wake_cause::WakeCause;
@@ -209,7 +209,7 @@ mod tests {
         for minute in 0..64u8 {
             q.push(Event::Tick(dt(9, minute)));
             if minute == 8 {
-                q.push(Event::Button(ButtonEvent::Pressed));
+                q.push(Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
             }
             if minute == 16 {
                 q.push(Event::RtcAlarmSnapshotReady(crate::app::RtcAlarmSnapshot {
@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(q.mergeable_len(), 1);
         assert_eq!(
             q.pop(),
-            Some(Event::Button(ButtonEvent::Pressed)),
+            Some(Event::Button(ButtonEvent::Pressed(ButtonId::Enter))),
             "critical events pop in FIFO order, ahead of the merged tick"
         );
         assert_eq!(
@@ -292,7 +292,7 @@ mod tests {
         let mut q = EventQueue::new();
         q.push(Event::Tick(dt(9, 0)));
         assert!(q.has_pending_tick());
-        q.push(Event::Button(ButtonEvent::Released));
+        q.push(Event::Button(ButtonEvent::Released(ButtonId::Enter)));
         assert!(q.has_pending_tick());
         // Drain high first: the tick is what remains.
         assert!(matches!(q.pop(), Some(Event::Button(_))));

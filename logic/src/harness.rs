@@ -279,7 +279,9 @@ impl AlarmHost for FakeHostAdapter<'_> {
     fn dismiss(&mut self) {
         let _ = self
             .harness
-            .dispatch(Event::Button(crate::button_event::ButtonEvent::Pressed));
+            .dispatch(Event::Button(crate::button_event::ButtonEvent::Pressed(
+                crate::button_event::ButtonId::Enter,
+            )));
     }
     fn drain_kicks(&mut self) {
         self.harness.drain_kicks();
@@ -512,6 +514,7 @@ mod tests {
     use super::*;
     use crate::app::{AlarmRuntimeState, Event, Screen};
     use crate::button_event::ButtonEvent as Btn;
+    use crate::button_event::ButtonId;
     use crate::datetime::DateTime;
     use crate::runner::EffectCategory;
     use helpers::{alarm, boot, dt, snapshot};
@@ -535,7 +538,8 @@ mod tests {
         assert_eq!(h.executor.log.count("StartTone"), 1);
         assert_eq!(h.executor.log.count("Render"), 1);
 
-        h.dispatch(Event::Button(Btn::Pressed)).unwrap();
+        h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
+            .unwrap();
         assert!(!h.ringing(), "dismiss leaves ringing screen");
         assert_eq!(h.screen(), &Screen::Home, "dismiss restores Home");
         assert_eq!(h.executor.log.count("StopTone"), 1);
@@ -639,7 +643,8 @@ mod tests {
         // Dismiss. The fake auto-completed ACK + persist during boot, so
         // both commits are already Succeeded; only the minute advance is
         // needed for rearm.
-        h.dispatch(Event::Button(Btn::Pressed)).unwrap();
+        h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
+            .unwrap();
         assert!(matches!(
             h.state().alarm_runtime,
             AlarmRuntimeState::WaitingForRearm { .. }
@@ -733,7 +738,8 @@ mod tests {
         )))
         .unwrap();
         assert!(h.ringing());
-        h.dispatch(Event::Button(Btn::Pressed)).unwrap();
+        h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
+            .unwrap();
         assert_eq!(h.screen(), &Screen::Home);
     }
 
@@ -801,7 +807,8 @@ mod tests {
             vec![alarm(1, 9, 0)],
         )))
         .unwrap();
-        h.dispatch(Event::Button(Btn::Pressed)).unwrap();
+        h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
+            .unwrap();
         // Commits were auto-completed by the fake during boot; a minute
         // tick performs the rearm.
         h.dispatch(Event::Tick(dt(9, 1))).unwrap();

@@ -26,7 +26,7 @@
 
 use crate::alarm_regs::AlarmRegs;
 use crate::alarm_schedule::{next_due, Repeat, StoredAlarm};
-use crate::button_event::ButtonEvent;
+use crate::button_event::{ButtonEvent, ButtonId};
 use crate::datetime::DateTime;
 use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
@@ -1111,7 +1111,7 @@ fn transition_rtc_snapshot(state: &mut AppState, snapshot: RtcAlarmSnapshot) -> 
 /// state into `WaitingForRearm` so the background ack/persistence still
 /// advance and the rearm happens on a later minute.
 fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
-    if button == ButtonEvent::Pressed
+    if matches!(button, ButtonEvent::Pressed(ButtonId::Enter))
         && state.screen == Screen::AlarmRinging
         && matches!(&state.alarm_runtime, AlarmRuntimeState::Firing { .. })
     {
@@ -2282,7 +2282,10 @@ mod tests {
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
         update(&mut state, Event::Boot(snapshot));
         assert_eq!(state.screen, Screen::AlarmRinging);
-        let batches = update(&mut state, Event::Button(ButtonEvent::Pressed));
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
         assert!(matches!(
             state.alarm_runtime,
             AlarmRuntimeState::WaitingForRearm { .. }
@@ -2298,7 +2301,10 @@ mod tests {
         let mut state = AppState::default();
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
         update(&mut state, Event::Boot(snapshot));
-        update(&mut state, Event::Button(ButtonEvent::Pressed));
+        update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
 
         // Grab the two in-flight op ids from the WaitingForRearm state.
         let (ack_op, persist_op) = match &state.alarm_runtime {
@@ -3900,7 +3906,10 @@ mod tests {
         assert_eq!(persist_count, 1, "persist must fire exactly once on ring");
 
         // Dismiss via ENTER.
-        let dismiss_batches = update(&mut state, Event::Button(ButtonEvent::Pressed));
+        let dismiss_batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
         assert!(matches!(
             state.alarm_runtime,
             AlarmRuntimeState::WaitingForRearm { .. }

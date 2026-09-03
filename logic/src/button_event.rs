@@ -2,10 +2,21 @@
 //! (which re-exports it) so the host-testable application state machine can
 //! reference button transitions without the GPIO debounce driver.
 
-/// A single debounced button transition, emitted by the `Button` driver.
+/// Which physical button produced an event. The NOTE4 has three buttons;
+/// the state machine needs the identity to drive page navigation, not just
+/// "some key was pressed".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ButtonId {
+    Enter,
+    Up,
+    Down,
+}
+
+/// A single debounced button transition, emitted by the `Button` driver,
+/// tagged with the physical button that produced it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ButtonEvent {
-    Pressed,
-    Released,
-    LongPressed,
+    Pressed(ButtonId),
+    Released(ButtonId),
+    LongPressed(ButtonId),
 }

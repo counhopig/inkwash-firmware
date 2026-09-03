@@ -383,7 +383,9 @@ mod tests {
         rt.push(boot(vec![alarm(1, 9, 0)], Some(dt(8, 0)), false, true));
         rt.pump(&mut MidRunPusher).unwrap();
         // Now push while "busy" (a later pump) and confirm neither event
-        rt.push(Event::Button(crate::button_event::ButtonEvent::Pressed));
+        rt.push(Event::Button(crate::button_event::ButtonEvent::Pressed(
+            crate::button_event::ButtonId::Enter,
+        )));
         rt.push(Event::RtcAlarmSnapshotReady(crate::app::RtcAlarmSnapshot {
             now: dt(9, 0),
             alarm_flag: false,
@@ -410,7 +412,9 @@ mod tests {
     fn priority_classification_matches_event_queue() {
         assert_eq!(priority_of(&Event::Tick(dt(9, 0))), Priority::Mergeable);
         assert_eq!(
-            priority_of(&Event::Button(crate::button_event::ButtonEvent::Pressed)),
+            priority_of(&Event::Button(crate::button_event::ButtonEvent::Pressed(
+                crate::button_event::ButtonId::Enter
+            ))),
             Priority::High
         );
     }

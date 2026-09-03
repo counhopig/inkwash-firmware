@@ -1,13 +1,14 @@
 use anyhow::Result;
 use esp_idf_svc::hal::gpio::{AnyIOPin, Input, PinDriver, Pull};
 
-pub use inkwash_logic::button_event::ButtonEvent;
+pub use inkwash_logic::button_event::{ButtonEvent, ButtonId};
 
 pub const POLL_INTERVAL_MS: u32 = 20;
 const DEBOUNCE_SAMPLES: u32 = 4;
 const LONG_PRESS_POLLS: u32 = 50;
 
 pub struct Button {
+    id: ButtonId,
     pin: PinDriver<'static, Input>,
     debounced: bool,
     candidate: bool,
@@ -17,10 +18,11 @@ pub struct Button {
 }
 
 impl Button {
-    pub fn new(pin: AnyIOPin<'static>, pull: Pull) -> Result<Self> {
+    pub fn new(pin: AnyIOPin<'static>, pull: Pull, id: ButtonId) -> Result<Self> {
         let pin = PinDriver::input(pin, pull)?;
         let initial = pin.is_low();
         Ok(Self {
+            id,
             pin,
             debounced: initial,
             candidate: initial,
@@ -43,17 +45,17 @@ impl Button {
                         self.held_polls = 0;
                         self.long_pressed = false;
                     } else if self.long_pressed {
-                        event = Some(ButtonEvent::Released);
+                        event = Some(ButtonEvent::Released(self.id));
                     } else {
                         // Emit a short press on release. Otherwise every
                         // long press would trigger the short action first.
-                        event = Some(ButtonEvent::Pressed);
+                        event = Some(ButtonEvent::Pressed(self.id));
                     }
                 } else if self.debounced {
                     self.held_polls += 1;
                     if self.held_polls == LONG_PRESS_POLLS {
                         self.long_pressed = true;
-                        event = Some(ButtonEvent::LongPressed);
+                        event = Some(ButtonEvent::LongPressed(self.id));
                     }
                 }
             }

@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::board::Note4Board;
-use crate::button::{ButtonEvent, POLL_INTERVAL_MS};
+use crate::button::{ButtonEvent, ButtonId, POLL_INTERVAL_MS};
 use crate::canvas::Canvas;
 use crate::ctx::DeviceContext;
 use crate::display::Rect;
@@ -30,23 +30,23 @@ pub enum Nav {
 pub fn poll_nav(board: &mut Note4Board) -> Nav {
     if let Some(event) = board.key_enter.poll() {
         match event {
-            ButtonEvent::Pressed => return Nav::Enter,
-            ButtonEvent::LongPressed => return Nav::Cancel,
-            ButtonEvent::Released => {}
+            ButtonEvent::Pressed(ButtonId::Enter) => return Nav::Enter,
+            ButtonEvent::LongPressed(ButtonId::Enter) => return Nav::Cancel,
+            _ => {}
         }
     }
     if let Some(event) = board.key_up.poll() {
         match event {
-            ButtonEvent::Pressed => return Nav::Up,
-            ButtonEvent::LongPressed => return Nav::PageUp,
-            ButtonEvent::Released => {}
+            ButtonEvent::Pressed(ButtonId::Up) => return Nav::Up,
+            ButtonEvent::LongPressed(ButtonId::Up) => return Nav::PageUp,
+            _ => {}
         }
     }
     if let Some(event) = board.key_down.poll() {
         match event {
-            ButtonEvent::Pressed => return Nav::Down,
-            ButtonEvent::LongPressed => return Nav::PageDown,
-            ButtonEvent::Released => {}
+            ButtonEvent::Pressed(ButtonId::Down) => return Nav::Down,
+            ButtonEvent::LongPressed(ButtonId::Down) => return Nav::PageDown,
+            _ => {}
         }
     }
     Nav::None

@@ -884,7 +884,9 @@ impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
         let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
         let mut runtime = self.runner.borrow_mut();
         runtime.push(inkwash_logic::app::Event::Button(
-            inkwash_logic::button_event::ButtonEvent::Pressed,
+            inkwash_logic::button_event::ButtonEvent::Pressed(
+                inkwash_logic::button_event::ButtonId::Enter,
+            ),
         ));
         let _ = runtime.pump(&mut executor);
     }

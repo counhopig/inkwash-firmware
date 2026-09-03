@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use alarms::AlarmStore;
 use anyhow::Result;
 use board::Note4Board;
-use button::{ButtonEvent, POLL_INTERVAL_MS};
+use button::{ButtonEvent, ButtonId, POLL_INTERVAL_MS};
 use canvas::Rect;
 use ctx::{DeviceContext, SyncScheduler};
 use epd_task::EpdCompletion;
@@ -483,7 +483,9 @@ fn main() -> Result<()> {
                 let _ = dispatch_app_runner(
                     &app_runner,
                     inkwash_logic::app::Event::Button(
-                        inkwash_logic::button_event::ButtonEvent::Pressed,
+                        inkwash_logic::button_event::ButtonEvent::Pressed(
+                            inkwash_logic::button_event::ButtonId::Enter,
+                        ),
                     ),
                     &mut ctx,
                 );
@@ -766,24 +768,25 @@ fn main() -> Result<()> {
         if let Some(event) = ctx.board.key_enter.poll() {
             key_changed = true;
             match event {
-                ButtonEvent::Pressed => {
+                ButtonEvent::Pressed(ButtonId::Enter) => {
                     // Home has no primary action. Settings is reached only
                     // through the long-UP/DOWN navigation drawer.
                 }
-                ButtonEvent::LongPressed => {
+                ButtonEvent::LongPressed(ButtonId::Enter) => {
                     // Home is the root screen, so "back" stays on Home.
                     log::info!("ENTER long pressed on Home; already at root");
                 }
-                ButtonEvent::Released => {}
+                ButtonEvent::Released(ButtonId::Enter) => {}
+                other => log::debug!("unexpected key_enter event: {other:?}"),
             }
         }
         if let Some(event) = ctx.board.key_up.poll() {
             key_changed = true;
             match event {
-                ButtonEvent::Pressed => {
+                ButtonEvent::Pressed(ButtonId::Up) => {
                     // Home has no vertical selection.
                 }
-                ButtonEvent::LongPressed => {
+                ButtonEvent::LongPressed(ButtonId::Up) => {
                     log::info!("UP long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
                     let alarm_interrupted = ctx.alarm_poll.alarm_exit();
@@ -804,17 +807,18 @@ fn main() -> Result<()> {
                         dismiss_full_refresh = true;
                     }
                 }
-                ButtonEvent::Released => {}
+                ButtonEvent::Released(ButtonId::Up) => {}
+                other => log::debug!("unexpected key_up event: {other:?}"),
             }
         }
 
         if let Some(event) = ctx.board.key_down.poll() {
             key_changed = true;
             match event {
-                ButtonEvent::Pressed => {
+                ButtonEvent::Pressed(ButtonId::Down) => {
                     // Home has no vertical selection.
                 }
-                ButtonEvent::LongPressed => {
+                ButtonEvent::LongPressed(ButtonId::Down) => {
                     log::info!("DOWN long pressed; opening navigation");
                     screens::open_navigation(&mut ctx, clock.as_ref());
                     let alarm_interrupted = ctx.alarm_poll.alarm_exit();
@@ -830,7 +834,8 @@ fn main() -> Result<()> {
                         dismiss_full_refresh = true;
                     }
                 }
-                ButtonEvent::Released => {}
+                ButtonEvent::Released(ButtonId::Down) => {}
+                other => log::debug!("unexpected key_down event: {other:?}"),
             }
         }
 

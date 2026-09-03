@@ -119,12 +119,9 @@ fn show_due_todos(
         if let Some(ble) = ctx.ble_control.as_mut() {
             crate::ble_control::reject_pending_command(ble);
         }
-        if ctx
-            .board
-            .key_enter
-            .poll()
-            .is_some_and(|event| matches!(event, ButtonEvent::Pressed | ButtonEvent::LongPressed))
-        {
+        if ctx.board.key_enter.poll().is_some_and(|event| {
+            matches!(event, ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_))
+        }) {
             break;
         }
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));

@@ -236,9 +236,9 @@ impl Note4Board {
         let mut avdd_power = PinDriver::output(pins.gpio42)?;
         avdd_power.set_high()?;
 
-        let key_enter = Button::new(pins.gpio0.into(), Pull::Up)?;
-        let key_up = Button::new(pins.gpio39.into(), Pull::Up)?;
-        let key_down = Button::new(pins.gpio18.into(), Pull::Up)?;
+        let key_enter = Button::new(pins.gpio0.into(), Pull::Up, crate::button::ButtonId::Enter)?;
+        let key_up = Button::new(pins.gpio39.into(), Pull::Up, crate::button::ButtonId::Up)?;
+        let key_down = Button::new(pins.gpio18.into(), Pull::Up, crate::button::ButtonId::Down)?;
         // One-shot wake interrupts for the idle loop: a key press resumes
         // the main loop's 1 s idle wait immediately (see `wake.rs` for why
         // the sleep wake sources alone cannot do that).
