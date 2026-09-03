@@ -245,6 +245,20 @@ impl Default for AlarmAddState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlePairingState {
     pub phase: BlePairingPhase,
+    /// Absolute wall-clock second at which the pairing session times out
+    /// (Stage-5/6: the timeout is an event - the collection layer emits a
+    /// Tick past this deadline - never a blocking-loop timer). None when no
+    /// session deadline is armed (e.g. tests construct states directly).
+    pub pairing_deadline_unix: Option<u64>,
+}
+
+impl Default for BlePairingState {
+    fn default() -> Self {
+        Self {
+            phase: BlePairingPhase::Waiting,
+            pairing_deadline_unix: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2417,6 +2431,37 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
             cal.year = now.year;
             cal.month = now.month;
             cal.selected_day = cal.selected_day.min(dim).max(1);
+        }
+    }
+
+    // BLE pairing timeout (Stage 5/6): while a pairing session is current
+    // with an armed deadline, a Tick past it ends the session as a timeout -
+    // the timeout is an event (the collection layer emits Ticks; the SM owns
+    // the decision), never a blocking-loop timer.
+    if let Screen::BlePairing(st) = &state.screen {
+        if st.pairing_deadline_unix.is_some_and(|d| now.to_unix() >= d)
+            && matches!(
+                st.phase,
+                BlePairingPhase::Waiting | BlePairingPhase::Pairing
+            )
+        {
+            if let Screen::BlePairing(st) = &mut state.screen {
+                st.phase = BlePairingPhase::Failure("pairing timeout".into());
+                st.pairing_deadline_unix = None;
+            }
+            // End the session: stop the radio and return to the Settings
+            // BLE row, rendering the restored Settings surface (Full).
+            state.screen = Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            };
+            state.render_generation = state.render_generation.next();
+            batches.push(batch(
+                state,
+                OperationId(0),
+                FailurePolicy::Continue,
+                vec![Effect::StopBlePairing],
+            ));
+            batches.push(render_batch(state));
         }
     }
 
@@ -5536,6 +5581,7 @@ mod tests {
         );
         state.screen = Screen::BlePairing(BlePairingState {
             phase: BlePairingPhase::Waiting,
+            ..Default::default()
         });
         // Started -> Pairing.
         let batches = update(&mut state, Event::BlePairingStarted);
@@ -5543,6 +5589,7 @@ mod tests {
             state.screen,
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Pairing,
+                ..Default::default()
             })
         );
         assert!(batches
@@ -5560,6 +5607,7 @@ mod tests {
             state.screen,
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Success,
+                ..Default::default()
             })
         );
         assert!(batches
@@ -5577,6 +5625,7 @@ mod tests {
             state.screen,
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Failure("timeout".into()),
+                ..Default::default()
             })
         );
         assert!(batches
@@ -5589,6 +5638,7 @@ mod tests {
             state.screen,
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Waiting,
+                ..Default::default()
             })
         );
     }
@@ -5605,6 +5655,49 @@ mod tests {
         let batches = update(&mut state, Event::BlePairingStarted);
         assert_eq!(state.screen, Screen::Home);
         assert!(batches.iter().all(|b| b.effects.is_empty()));
+    }
+
+    #[test]
+    fn ble_pairing_deadline_tick_times_out_and_exits_to_settings() {
+        // Stage-5/6: the pairing timeout is an event - a Tick past the armed
+        // deadline ends the session (Failure("pairing timeout") + radio
+        // teardown) and returns to the Settings BLE row. No blocking-loop
+        // timer involved.
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        state.screen = Screen::BlePairing(BlePairingState {
+            phase: BlePairingPhase::Pairing,
+            pairing_deadline_unix: Some(dt(8, 1).to_unix()),
+        });
+        // Tick before the deadline: session continues.
+        let batches = update(&mut state, Event::Tick(dt(8, 0)));
+        assert!(matches!(state.screen, Screen::BlePairing(_)));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopBlePairing)));
+        // Tick at/after the deadline: timeout.
+        let batches = update(&mut state, Event::Tick(dt(8, 1)));
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            }
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopBlePairing)));
+        assert!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
+            "timeout exits must render the restored Settings surface"
+        );
     }
 
     #[test]
@@ -5625,6 +5718,7 @@ mod tests {
             );
             state.screen = Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Pairing,
+                ..Default::default()
             });
             let batches = update(&mut state, Event::Button(b));
             assert_eq!(
@@ -7175,6 +7269,7 @@ mod tests {
             (
                 Screen::BlePairing(BlePairingState {
                     phase: BlePairingPhase::Waiting,
+                    ..Default::default()
                 }),
                 RenderView::BlePairing,
             ),
@@ -7962,6 +8057,7 @@ mod tests {
             }),
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Waiting,
+                ..Default::default()
             }),
         ];
         for screen in screens {
@@ -8113,6 +8209,7 @@ mod tests {
             Screen::SyncIntervalPick { selected: 0 },
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Waiting,
+                ..Default::default()
             }),
         ];
         for screen in skip_screens {
