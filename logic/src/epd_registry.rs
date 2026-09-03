@@ -132,6 +132,29 @@ impl RenderRegistry {
         self.partials_since_maintenance = 0;
     }
 
+    /// Apply a completed render kick's terminal outcome to the cache.
+    /// Called by the EPD completion path after `feed` matched a kick. The
+    /// plan is recomputed from the kick's own ViewModel against the cache
+    /// (with the single EPD slot, a matched non-superseded kick is the
+    /// current submission, so the recomputed plan equals the one decided at
+    /// submit time).
+    ///
+    /// `generation_is_current` is false when the kick's render generation is
+    /// older than the current visible state - its pixels are out of date and
+    /// must not become the cache.
+    pub fn note_kick_terminal(
+        &mut self,
+        kick: &AsyncKick,
+        success: bool,
+        generation_is_current: bool,
+    ) {
+        let crate::app::Effect::Render(req) = &kick.effect else {
+            return;
+        };
+        let plan = self.plan_for(&req.view_model);
+        self.note_terminal(&req.view_model, &plan, success, generation_is_current);
+    }
+
     /// Register an in-flight render kick.
     pub fn register(&mut self, kick: AsyncKick) {
         self.pending.push(kick);

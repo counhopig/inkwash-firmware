@@ -15,7 +15,7 @@
 
 use anyhow::Result;
 
-use inkwash_logic::app::{Effect, EffectOutput, RenderIntent, RenderRequest, RenderView};
+use inkwash_logic::app::{Effect, EffectOutput, RenderView};
 use inkwash_logic::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 
 pub use inkwash_logic::runner::AsyncKick;
@@ -291,16 +291,37 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.replies.push((*channel, reply.clone()));
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
-            Effect::Render(req) => match render_view_into(self.ctx, self.last_clock, req) {
-                Ok(request_id) => {
-                    // The panel refresh is in flight and its EPD completion
-                    // will carry `request_id`. Return async *with* the id so
-                    // the caller can correlate the eventual completion to
-                    // this kick.
-                    Ok(EffectOutcome::AsyncWithId(request_id))
+            Effect::Render(req) => {
+                // Stage 5: the refresh plan is derived by diffing the
+                // request's ViewModel against the renderer's cached
+                // last-shown ViewModel (plan_render in logic). Noop renders
+                // nothing to the panel and completes synchronously; Partial
+                // and Full draw the requested surface and submit an EPD
+                // refresh, returning async so the completion correlates by
+                // request id.
+                let renders = self.ctx.pending_renders.clone();
+                let plan = renders.borrow().plan_for(&req.view_model);
+                match plan {
+                    inkwash_logic::render_plan::RenderPlan::Noop => {
+                        Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+                    }
+                    inkwash_logic::render_plan::RenderPlan::Partial { region, .. } => {
+                        draw_sm_surface(self.ctx, self.last_clock, req.view);
+                        let rect = partial_region_rect(region);
+                        match self.ctx.board.display.refresh_partial(rect) {
+                            Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
+                            Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
+                        }
+                    }
+                    inkwash_logic::render_plan::RenderPlan::Full { .. } => {
+                        draw_sm_surface(self.ctx, self.last_clock, req.view);
+                        match self.ctx.board.display.refresh_full() {
+                            Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
+                            Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
+                        }
+                    }
                 }
-                Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
-            },
+            }
             Effect::StartSync(req) => {
                 // The sync task owns Wi-Fi; this only dispatches the
                 // request. `Ok(true)` = dispatched (async, receipt later);
@@ -349,86 +370,38 @@ impl EffectExecutor for EffectRunner<'_, '_> {
     }
 }
 
-/// Draws the current SM screen's canvas and submits the refresh the state
-/// machine requested. The renderer is state-driven (Stage-4/5): the request
-/// names the surface to draw - Home, the GO TO drawer overlay, or the
-/// Settings list - so the executor draws the SM screen instead of a
-/// call-site rectangle.
-///
-/// Home canvases are always fully re-rendered before the refresh (a minute
-/// tick re-draws Home then partial-refreshes only the clock rect). The
-/// drawer overlay is drawn on top of the same Home canvas; a Partial
-/// refresh of the Navigation view updates only the overlay rect (cheap
-/// selection moves on the drawer), while open/close/select stay Full.
-/// Settings is a full screen: its Partial updates are full list redraws
-/// (the list region; cheap enough on a list that redraws as one block).
-///
-/// Returns the EPD request id so the caller can correlate the eventual
-/// `EpdCompletion` back to this render's `AsyncKick`.
-fn render_view_into(
-    ctx: &mut DeviceContext<'_>,
-    clock: Option<DateTime>,
-    req: &RenderRequest,
-) -> Result<u64> {
-    draw_sm_surface(ctx, clock, req.view);
-    let request_id = match (req.view, req.intent) {
-        (_, RenderIntent::Full) => ctx.board.display.refresh_full(),
-        (RenderView::Home, RenderIntent::Partial) => {
-            ctx.board.display.refresh_partial(crate::canvas::Rect {
-                x: 16,
-                y: 36,
-                width: 368,
-                height: 92,
-            })
-        }
-        // Navigation view partials redraw just the GO TO bar (selection
-        // moves); the rest of the Home canvas stays put on the panel.
-        (RenderView::Navigation { .. }, RenderIntent::Partial) => ctx
-            .board
-            .display
-            .refresh_partial(crate::screens::NAV_BAR_RECT),
-        // Settings / AlarmList / TodoList / Inbox row moves redraw the list
-        // region (rows share one chrome block; a per-row diff is a Stage-5
-        // RenderPlan concern).
-        (
-            RenderView::Settings { .. }
-            | RenderView::SyncInterval { .. }
-            | RenderView::AlarmList { .. }
-            | RenderView::TodoList { .. }
-            | RenderView::Inbox { .. },
-            RenderIntent::Partial,
-        ) => ctx.board.display.refresh_partial(crate::canvas::Rect {
+/// Maps a Stage-5 `PartialRegion` to the panel rectangle that region
+/// occupies. The region already encodes the *kind* of local change (Home
+/// clock, drawer bar, list block, calendar grid, or a whole-surface repaint
+/// for read-only pages); the refresh is submitted for exactly that rect.
+fn partial_region_rect(region: inkwash_logic::render_plan::PartialRegion) -> crate::canvas::Rect {
+    match region {
+        inkwash_logic::render_plan::PartialRegion::Clock => crate::canvas::Rect {
+            x: 16,
+            y: 36,
+            width: 368,
+            height: 92,
+        },
+        inkwash_logic::render_plan::PartialRegion::NavBar => crate::screens::NAV_BAR_RECT,
+        inkwash_logic::render_plan::PartialRegion::List => crate::canvas::Rect {
             x: 8,
             y: 34,
             width: 384,
             height: 226,
-        }),
-        // Calendar day moves redraw the grid region (below the header).
-        (RenderView::Calendar { .. }, RenderIntent::Partial) => {
-            ctx.board.display.refresh_partial(crate::canvas::Rect {
-                x: 0,
-                y: 36,
-                width: 400,
-                height: 264,
-            })
-        }
-        // WeekView / InboxItem / NumberPick never partial-refresh (open/
-        // close and picker moves are Full); keep the exhaustiveness
-        // explicit.
-        (
-            RenderView::WeekView { .. }
-            | RenderView::InboxItem { .. }
-            | RenderView::NumberPick { .. }
-            | RenderView::BlePairing,
-            RenderIntent::Partial,
-        ) => ctx.board.display.refresh_partial(crate::canvas::Rect {
+        },
+        inkwash_logic::render_plan::PartialRegion::CalendarGrid => crate::canvas::Rect {
             x: 0,
             y: 36,
             width: 400,
             height: 264,
-        }),
-    };
-    request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
+        },
+        inkwash_logic::render_plan::PartialRegion::Surface => crate::canvas::Rect {
+            x: 0,
+            y: 36,
+            width: 400,
+            height: 264,
+        },
+    }
 }
 
 /// Renders the visible surface named by `view` into the shared canvas.
