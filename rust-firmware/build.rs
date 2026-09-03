@@ -8,6 +8,9 @@ fn main() {
     // build (unset) is unaffected. Implemented as a build-time env ->
     // rustc-env so only the final crate rebuilds (a --cfg via RUSTFLAGS
     // would invalidate every dependency).
+    // Cargo reruns build.rs when this env toggles, so a normal build (env
+    // unset) reliably drops the flag after a force-safe-mode test build.
+    println!("cargo:rerun-if-env-changed=INKWASH_FORCE_SAFE_MODE");
     if std::env::var("INKWASH_FORCE_SAFE_MODE").is_ok_and(|v| v == "1") {
         println!("cargo:rustc-env=INKWASH_FORCE_SAFE_MODE=1");
     }
