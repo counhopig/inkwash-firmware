@@ -135,7 +135,6 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::StartSync(_) => "StartSync",
         Effect::StartSetWifi(_) => "StartSetWifi",
         Effect::StartBlePairing(_) => "StartBlePairing",
-        Effect::OpenNavigationDestination { .. } => "OpenNavigationDestination",
         Effect::OpenSettingsItem { .. } => "OpenSettingsItem",
         Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
         Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
@@ -168,11 +167,10 @@ impl EffectExecutor for FakeExecutor {
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
-            Effect::OpenNavigationDestination { .. }
-            | Effect::OpenAddAlarm
+            Effect::OpenAddAlarm
             | Effect::OpenInboxItem { .. }
-            | Effect::OpenCalendarDay { .. } => EffectCategory::Render,
-            Effect::OpenSettingsItem { .. } => EffectCategory::Render,
+            | Effect::OpenCalendarDay { .. }
+            | Effect::OpenSettingsItem { .. } => EffectCategory::Render,
             Effect::PersistAlarmToggle { .. } | Effect::PersistTodoEdit { .. } => {
                 EffectCategory::Persist
             }
@@ -231,7 +229,7 @@ impl EffectExecutor for FakeExecutor {
             | Effect::StartSetWifi(_)
             | Effect::StartBlePairing(_)
             | Effect::StopBlePairing => Ok(EffectOutcome::Async),
-            Effect::OpenNavigationDestination { .. } | Effect::OpenSettingsItem { .. } => {
+            Effect::OpenSettingsItem { .. } => {
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::PersistAlarmToggle { .. } => Ok(EffectOutcome::Completed(

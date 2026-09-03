@@ -400,21 +400,11 @@ pub enum Effect {
     StopBlePairing,
     EnterLightSleep(LightSleepPlan),
     EnterDeepSleep(WakeupPlan),
-    /// The user selected a navigation-drawer destination (Enter). In this
-    /// migration slice only Home (destination 0) and Settings (destination
-    /// 5) are fully state-machine screens; the other destinations are
-    /// opened by the executor through the legacy blocking page until those
-    /// pages migrate to Screen states (Stage 4). The effect is data -
-    /// `update` never opens a page itself.
-    OpenNavigationDestination {
-        destination: usize,
-    },
     /// The user pressed ENTER on a Settings row whose action is still a
     /// legacy blocking screen (Sync Now / Sync Interval / BLE Pairing /
     /// Sleep). The state machine stays on `Screen::Settings` while the
-    /// executor runs the wedge (deferred post-pump, same as
-    /// `OpenNavigationDestination`); a Full Settings render is re-issued
-    /// when the wedge returns.
+    /// executor runs the wedge (deferred post-pump, like the other deferred
+    /// wedges); a Full Settings render is re-issued when the wedge returns.
     OpenSettingsItem {
         /// Index into the fixed four-row Settings list in firmware row
         /// order: 0 = Sync Now, 1 = Sync Interval, 2 = BLE Pairing,
@@ -1444,13 +1434,11 @@ fn nav_origin_screen(_origin: NavOrigin) -> Screen {
 /// drawer from a state-machine screen (Home, or Settings once that screen
 /// exists); inside the drawer, UP/DOWN move the selection (wrapping), long
 /// UP/DOWN jump to the first/last destination, long ENTER cancels back to
-/// the origin, and ENTER selects a destination. HOME (0) and SETTINGS (5)
-/// are state-machine screens (a drawer over Settings highlights SETTINGS so
-/// a no-move ENTER stays there); CALENDAR/INBOX/ALARMS/TODOS emit
-/// `OpenNavigationDestination` for the executor to open through the legacy
-/// page until those pages migrate. Settings row actions emit
-/// `OpenSettingsItem`; the Settings screen itself stays current while the
-/// executor wedge runs.
+/// the origin, and ENTER selects a destination. Every destination
+/// (HOME/CALENDAR/INBOX/ALARMS/TODOS/SETTINGS) is a state-machine screen
+/// now; a drawer over a screen highlights that screen's row, so a no-move
+/// ENTER stays there. Settings row actions emit `OpenSettingsItem`; the
+/// Settings screen itself stays current while the executor wedge runs.
 fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     match &state.screen {
         Screen::Navigation { selected, origin } => {
@@ -4297,16 +4285,11 @@ mod tests {
             Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
         );
         assert!(matches!(state.screen, Screen::Navigation { .. }));
-        let batches = update(
+        let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         assert_eq!(state.screen, Screen::Home);
-        assert!(!batches.iter().any(|b| {
-            b.effects
-                .iter()
-                .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
-        }));
     }
 
     #[test]
@@ -4343,11 +4326,6 @@ mod tests {
                 selected_day: 15,
             })
         );
-        assert!(!batches.iter().any(|b| {
-            b.effects
-                .iter()
-                .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
-        }));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
@@ -4373,16 +4351,11 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        let batches = update(
+        let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
         );
         assert_eq!(state.screen, Screen::Home);
-        assert!(!batches.iter().any(|b| {
-            b.effects
-                .iter()
-                .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
-        }));
     }
 
     #[test]
@@ -4542,10 +4515,6 @@ mod tests {
         );
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
         // No destination effect: Settings is an SM screen now.
-        assert!(!batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
@@ -4717,15 +4686,11 @@ mod tests {
             }
         );
         // A no-move ENTER selects HOME: back to Home.
-        let batches = update(
+        let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         assert_eq!(state.screen, Screen::Home);
-        assert!(!batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
 
         // Re-enter Settings, then long-UP/DOWN -> drawer -> select
         // SETTINGS -> Settings again.
@@ -4828,10 +4793,6 @@ mod tests {
         );
         assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
         // ALARMS is an SM screen: no destination effect.
-        assert!(!batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
@@ -5427,10 +5388,6 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         assert_eq!(state.screen, Screen::Inbox { selected: 0 });
-        assert!(!batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
