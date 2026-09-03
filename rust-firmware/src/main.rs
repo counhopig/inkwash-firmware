@@ -645,10 +645,11 @@ fn main() -> Result<()> {
                 .consume_for(inkwash_logic::alarm_flow::AlarmSource::Home);
         }
         // Poll USB console for incoming commands, dispatch them, and send replies.
-        let (usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
-        if usb_changed {
-            dirty.push(FULL_SCREEN_RECT);
-        }
+        // Stage 5: the redraw is NOT pushed here - state-changing commands
+        // (ClearAlarms / SetWifi / SetTimezone / SyncNow) emit their own
+        // render from the state machine at the point the visible state
+        // changes; the renderer diff decides Noop vs refresh.
+        let (_usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
 
         // Poll BLE for incoming commands (if BLE is active), dispatch them, and send replies.
         // `poll_command` returns an owned `(id, Command)`, ending the borrow
@@ -656,7 +657,6 @@ fn main() -> Result<()> {
         // shape `ble_pairing_screen` uses.
         let mut ble_changed = false;
         if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command()) {
-            let needs_full_redraw = matches!(cmd, control::Command::SyncNow);
             let runner = app_runner.clone();
             let pre_event = if matches!(cmd, control::Command::SetTimezone { .. }) {
                 ctx.rtc
@@ -675,8 +675,10 @@ fn main() -> Result<()> {
                 id.as_deref(),
             );
             if let Some(reply) = reply {
-                if needs_full_redraw && matches!(reply, control::Reply::Ok) {
-                    dirty.push(FULL_SCREEN_RECT);
+                // Stage 5: no manual redraw for a SyncNow - the sync adoption
+                // render (logic 52ba98f / e648dd4) covers the data change;
+                // `ble_changed` only tracks activity for idle/deep-sleep.
+                if matches!(reply, control::Reply::Ok) {
                     ble_changed = true;
                 }
                 if let Some(ble) = ctx.ble_control.as_ref() {
