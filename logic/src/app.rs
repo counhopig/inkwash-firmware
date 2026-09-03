@@ -88,6 +88,12 @@ pub enum Screen {
         selected: usize,
     },
     AlarmEdit(AlarmEditState),
+    /// The ADD-ALARM editor (Stage 4): a two-stage number picker (hour,
+    /// then minute) driven by the state machine - UP/DOWN step the value
+    /// (wrapping within the stage's range), ENTER advances the stage,
+    /// long ENTER cancels back to the AlarmList ADD row. Completing the
+    /// minute stage appends the new Daily alarm (confirmable persist).
+    AlarmAdd(AlarmAddState),
     TodoList {
         selected: usize,
     },
@@ -174,6 +180,10 @@ impl Screen {
                 month: *month,
                 day: *day,
             },
+            Screen::AlarmAdd(AlarmAddState { stage, value, .. }) => RenderView::NumberPick {
+                stage: *stage,
+                value: *value,
+            },
             Screen::Home
             | Screen::AlarmEdit(_)
             | Screen::AlarmRinging
@@ -202,6 +212,34 @@ pub struct CalendarState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlarmEditState {
     pub editing: Option<u8>,
+}
+
+/// The ADD-ALARM editor's two picker stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddStage {
+    Hour,
+    Minute,
+}
+
+/// The ADD-ALARM editor cursor (Stage 4): which stage is active, the
+/// currently stepped value (0-23 for Hour, 0-59 for Minute), and the hour
+/// locked in when the Hour stage completed (so the Minute stage can finish
+/// with both).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlarmAddState {
+    pub stage: AddStage,
+    pub hour: u8,
+    pub value: u8,
+}
+
+impl Default for AlarmAddState {
+    fn default() -> Self {
+        Self {
+            stage: AddStage::Hour,
+            hour: 0,
+            value: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,12 +471,6 @@ pub enum Effect {
         /// 3 = Sleep.
         item: usize,
     },
-    /// The user pressed ENTER on the "+ ADD ALARM" row of the state-machine
-    /// AlarmList screen (Stage 4). Adding an alarm runs through the legacy
-    /// blocking editor wedge (post-pump, like `OpenSettingsItem`), which
-    /// persists to the alarm store; when it returns, main dispatches
-    /// `Event::AlarmStoreChanged` so the state machine reloads the list.
-    OpenAddAlarm,
     /// The user opened an inbox item (ENTER on an Inbox row). Fire-and-forget
     /// local persistence of the read mark: the executor marks `seq` read and
     /// adds it to the pending-read set (two-way sync uploads it later). The
@@ -496,6 +528,10 @@ pub enum RenderView {
     /// one column per day with each day's open todos read from the todo
     /// store by the executor. Full refresh on open/close.
     WeekView { year: u16, month: u8, day: u8 },
+    /// The ADD-ALARM number picker (Stage 4): a big digit stepped by
+    /// UP/DOWN (wrapping). Carries the active stage (the executor maps it
+    /// to the title + range) and the current value.
+    NumberPick { stage: AddStage, value: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -701,11 +737,6 @@ pub enum Event {
     /// detected the minute crossed the interval boundary; it only reports
     /// the fact - the state machine decides whether a sync may start).
     SyncBoundaryDue,
-    /// The alarm store changed out-of-band (a legacy ADD-ALARM editor wedge
-    /// persisted a new alarm). The event carries the reloaded authoritative
-    /// NVS list (the executor reads the store; `update` never touches NVS),
-    /// which the state machine adopts and re-renders.
-    AlarmStoreChanged(Vec<StoredAlarm>),
     DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
@@ -865,6 +896,10 @@ pub struct AppState {
     /// value. One edit at a time: while this is Some, another row ENTER is
     /// ignored.
     pending_alarm_list_edit: Option<PendingAlarmListEdit>,
+    /// An in-flight ADD-ALARM append (Stage 4): the new alarm is appended
+    /// optimistically and the list persists confirmably (one add in flight
+    /// at a time). A failed persist pops the appended alarm back.
+    pending_alarm_add: Option<OperationId>,
     /// An in-flight TodoList row edit (Stage 4): ENTER toggled `done` or
     /// long ENTER cycled `importance` optimistically. The matching
     /// `Persisted(Todos)` completion confirms it (executor marked it
@@ -912,6 +947,7 @@ impl Default for AppState {
             pending_residue_ack: None,
             pending_residue_time: None,
             pending_alarm_list_edit: None,
+            pending_alarm_add: None,
             pending_todo_list_edit: None,
             retries: Vec::new(),
             op_counter: 0,
@@ -1029,7 +1065,6 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
-        Event::AlarmStoreChanged(alarms) => transition_alarm_store_changed(state, alarms),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
@@ -1403,6 +1438,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::Navigation { .. }
             | Screen::Settings { .. }
             | Screen::AlarmList { .. }
+            | Screen::AlarmAdd(_)
             | Screen::TodoList { .. }
             | Screen::Inbox { .. }
             | Screen::InboxItem { .. }
@@ -1615,6 +1651,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
             }
         }
         Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
+        Screen::AlarmAdd(_) => transition_alarm_add_button(state, button),
         Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
         Screen::Inbox { selected } => transition_inbox_list_button(state, *selected, button),
         Screen::InboxItem { .. } => transition_inbox_item_button(state, button),
@@ -1648,8 +1685,8 @@ pub const SETTINGS_ROW_COUNT: usize = 4;
 /// The "+ ADD ALARM" row is the list length (rows 0..len are stored alarms).
 /// AlarmList screen (Stage 4): browse the stored alarm rows (toggle
 /// enabled on ENTER, an SM-owned confirmable edit) plus the trailing
-/// "+ ADD ALARM" row (a deferred legacy editor wedge; the store changes,
-/// so the caller dispatches `Event::AlarmStoreChanged` to reload).
+/// "+ ADD ALARM" row, which opens the SM two-stage picker
+/// (`Screen::AlarmAdd`).
 fn transition_alarm_list_button(
     state: &mut AppState,
     selected: usize,
@@ -1692,20 +1729,12 @@ fn transition_alarm_list_button(
         }
         ButtonEvent::Pressed(ButtonId::Enter) => {
             if selected == alarm_count {
-                // "+ ADD ALARM": deferred legacy editor wedge. The SM stays
-                // on AlarmList; the caller (main) dispatches
-                // Event::AlarmStoreChanged with the reloaded list after the
-                // wedge returns.
+                // "+ ADD ALARM": open the SM two-stage picker (hour, then
+                // minute). The list's ADD-row stays selected underneath so a
+                // cancel returns to it.
+                state.screen = Screen::AlarmAdd(AlarmAddState::default());
                 state.render_generation = state.render_generation.next();
-                vec![
-                    batch(
-                        state,
-                        OperationId(0),
-                        FailurePolicy::Continue,
-                        vec![Effect::OpenAddAlarm],
-                    ),
-                    render_batch_with_intent(state, RenderIntent::Full),
-                ]
+                vec![render_batch_with_intent(state, RenderIntent::Full)]
             } else if state.pending_alarm_list_edit.is_some() {
                 // One toggle at a time: while a persist is in flight a
                 // second row ENTER is ignored (its completion/rollback
@@ -1745,7 +1774,110 @@ fn transition_alarm_list_button(
     }
 }
 
-/// TodoList screen (Stage 4): browse the stored todos; ENTER toggles a
+/// AlarmAdd editor (Stage 4): a two-stage number picker owned by the state
+/// machine. UP/DOWN step `value` (wrapping within the stage range); ENTER
+/// advances Hour -> Minute -> complete; long ENTER cancels back to the
+/// AlarmList ADD row. Completing appends a new Daily alarm (id via
+/// `next_id`) optimistically and persists the list through a confirmable
+/// `PersistAlarms` (one add in flight at a time); a failed persist rolls
+/// the appended alarm back.
+fn transition_alarm_add_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    let Screen::AlarmAdd(AlarmAddState { stage, hour, .. }) = &mut state.screen else {
+        return vec![];
+    };
+    let (stage, hour) = (*stage, *hour);
+    match button {
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
+            // Cancel back to the AlarmList (the ADD row stays selected).
+            state.screen = Screen::AlarmList {
+                selected: state.alarms.alarms.len(),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::Pressed(ButtonId::Up) => {
+            let (min, max) = range_for_stage(stage);
+            let Screen::AlarmAdd(add) = &mut state.screen else {
+                return vec![];
+            };
+            add.value = if add.value == min { max } else { add.value - 1 };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Down) => {
+            let (min, max) = range_for_stage(stage);
+            let Screen::AlarmAdd(add) = &mut state.screen else {
+                return vec![];
+            };
+            add.value = if add.value == max { min } else { add.value + 1 };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Enter) => match stage {
+            AddStage::Hour => {
+                // Lock the hour and advance to the minute stage.
+                let Screen::AlarmAdd(add) = &mut state.screen else {
+                    return vec![];
+                };
+                add.hour = add.value;
+                add.stage = AddStage::Minute;
+                add.value = 0;
+                state.render_generation = state.render_generation.next();
+                vec![render_batch(state)]
+            }
+            AddStage::Minute => {
+                // Complete: append a new Daily alarm (id via next_id) and
+                // persist confirmably. One add in flight at a time.
+                if state.pending_alarm_add.is_some() {
+                    return vec![];
+                }
+                let minute = {
+                    let Screen::AlarmAdd(add) = &state.screen else {
+                        return vec![];
+                    };
+                    add.value
+                };
+                // All 256 ids in use: leave the list unchanged (no id to
+                // allocate) - extremely unlikely, but degenerate safely.
+                let Some(id) = crate::alarm_schedule::next_id(&state.alarms.alarms) else {
+                    return vec![];
+                };
+                let new_alarm = StoredAlarm {
+                    id,
+                    hour,
+                    minute,
+                    repeat: Repeat::Daily,
+                    enabled: true,
+                    label: String::new(),
+                };
+                state.alarms.alarms.push(new_alarm);
+                let op = state.next_operation_id();
+                state.pending_alarm_add = Some(op);
+                state.render_generation = state.render_generation.next();
+                let list = state.alarms.alarms.clone();
+                vec![
+                    batch(
+                        state,
+                        op,
+                        FailurePolicy::AbortBatch,
+                        vec![Effect::PersistAlarms(list)],
+                    ),
+                    render_batch_with_intent(state, RenderIntent::Full),
+                ]
+            }
+        },
+        _ => vec![],
+    }
+}
+
+/// The picker range for an ADD-ALARM stage: hour 0-23, minute 0-59.
+fn range_for_stage(stage: AddStage) -> (u8, u8) {
+    match stage {
+        AddStage::Hour => (0, 23),
+        AddStage::Minute => (0, 59),
+    }
+}
+
 /// row's done flag, long ENTER cycles its importance (Low -> Medium ->
 /// High) - matching the legacy todos page, where long ENTER cycled
 /// importance and the only way out was the long-UP/DOWN drawer. Both row
@@ -2027,32 +2159,6 @@ fn transition_week_view_button(state: &mut AppState, button: ButtonEvent) -> Vec
     }
 }
 
-/// The alarm store changed out-of-band (a legacy ADD-ALARM editor wedge
-/// persisted a new alarm; main dispatched this with the reloaded NVS list).
-/// Adopt the list and re-render the AlarmList screen.
-fn transition_alarm_store_changed(
-    state: &mut AppState,
-    alarms: Vec<StoredAlarm>,
-) -> Vec<EffectBatch> {
-    state.alarms.alarms = alarms;
-    let mut batches = Vec::new();
-    // The stored list changed: re-point the RTC slot (arm the new nearest
-    // alarm / disable when empty), matching a confirmed AlarmList toggle.
-    if let Some(now) = state.clock.now {
-        batches.extend(program_alarm_for(state, &now));
-    }
-    state.render_generation = state.render_generation.next();
-    // Clamp the selection to the (possibly shorter/longer) list.
-    if let Screen::AlarmList { selected } = &mut state.screen {
-        let len = state.alarms.alarms.len();
-        if *selected > len {
-            *selected = len;
-        }
-    }
-    batches.push(render_batch_with_intent(state, RenderIntent::Full));
-    batches
-}
-
 fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
     let mut batches = Vec::new();
     let changed = state
@@ -2241,6 +2347,14 @@ fn transition_effect_completed(
                     batches.extend(program_alarm_for(state, &now));
                 }
             }
+            // An ADD-ALARM append confirmed: release the one-at-a-time add
+            // gate and re-point the RTC slot at the new nearest alarm.
+            if state.pending_alarm_add == Some(completion.operation_id) {
+                state.pending_alarm_add = None;
+                if let Some(now) = state.clock.now {
+                    batches.extend(program_alarm_for(state, &now));
+                }
+            }
         }
         EffectOutput::Persisted(PersistTarget::Todos) => {
             // A TodoList row edit confirmed: release the one-at-a-time gate.
@@ -2385,11 +2499,20 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
                 }
                 None => None,
             };
-            if let Some(edit) = todo_rollback {
-                if let Some(todo) = state.todos.todos.get_mut(edit.index) {
-                    todo.done = edit.previous_done;
-                    todo.importance = edit.previous_importance;
+            if let Some(rollback) = todo_rollback {
+                if let Some(todo) = state.todos.todos.get_mut(rollback.index) {
+                    todo.done = rollback.previous_done;
+                    todo.importance = rollback.previous_importance;
                 }
+                state.render_generation = state.render_generation.next();
+            }
+            // An ADD-ALARM append failed to persist: pop the optimistically
+            // appended alarm back (NVS never changed), release the gate and
+            // re-render. The SM screen is AlarmAdd (Minute stage); the
+            // appended alarm is the last element.
+            if state.pending_alarm_add == Some(failure.operation_id) {
+                state.pending_alarm_add = None;
+                state.alarms.alarms.pop();
                 state.render_generation = state.render_generation.next();
             }
         }
@@ -4961,10 +5084,11 @@ mod tests {
     }
 
     #[test]
-    fn alarm_list_enter_on_add_row_emits_open_add_alarm() {
+    fn alarm_list_enter_on_add_row_opens_sm_picker() {
         let mut state = AppState::default();
         open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
-        // Move to the ADD row (index 1).
+        // Move to the ADD row (index 1) and ENTER: the SM two-stage picker
+        // opens (no deferred wedge / persist effect yet).
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
@@ -4974,27 +5098,58 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert!(batches
+        assert_eq!(
+            state.screen,
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Hour,
+                hour: 0,
+                value: 0,
+            })
+        );
+        assert!(!batches.iter().any(|b| b
+            .effects
             .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenAddAlarm)));
-        // The SM stays on the AlarmList (main dispatches AlarmStoreChanged
-        // when the wedge returns).
-        assert_eq!(state.screen, Screen::AlarmList { selected: 1 });
-        assert!(!batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::PersistAlarmToggle { .. })));
+            .any(|e| matches!(e, Effect::PersistAlarmToggle { .. }))));
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::NumberPick {
+                    stage: AddStage::Hour,
+                    value: 0,
+                },
+                ..
+            })
+        )));
     }
 
     #[test]
-    fn alarm_store_changed_reloads_and_clamps_selection() {
+    fn alarm_add_hour_minute_step_and_advance() {
         let mut state = AppState::default();
-        open_alarm_list(
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        // Open the ADD picker (ADD row index 1).
+        let _ = update(
             &mut state,
-            vec![alarm(1, 8, 0), alarm(2, 22, 30), alarm(3, 6, 15)],
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        // Move to the ADD row (index 3).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Step UP wraps 0 -> 23 on the hour stage.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Hour,
+                hour: 0,
+                value: 23,
+            })
+        );
+        // Step DOWN twice: 23 -> 0 -> 1.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
@@ -5003,41 +5158,203 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Hour,
+                hour: 0,
+                value: 1,
+            })
+        );
+        // ENTER locks the hour (1) and advances to the minute stage (0).
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Minute,
+                hour: 1,
+                value: 0,
+            })
+        );
+        // Minute UP wraps 0 -> 59.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Minute,
+                hour: 1,
+                value: 59,
+            })
+        );
+        assert!(batches.iter().all(|b| b.effects.iter().all(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Partial,
+                ..
+            })
+        ))));
+    }
+
+    #[test]
+    fn alarm_add_complete_appends_and_confirms() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert_eq!(state.screen, Screen::AlarmList { selected: 3 });
-        // A wedge added one alarm (now 4 rows: 0..3 alarms + ADD at 4);
-        // reload keeps selection at 3 (still a valid alarm row).
-        let reloaded = vec![
-            alarm(1, 8, 0),
-            alarm(2, 22, 30),
-            alarm(3, 6, 15),
-            alarm(9, 7, 45),
-        ];
-        let batches = update(&mut state, Event::AlarmStoreChanged(reloaded.clone()));
-        assert_eq!(state.alarms.alarms, reloaded);
-        assert_eq!(state.screen, Screen::AlarmList { selected: 3 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Hour: 8 (alarm id 1 uses 8:00; next_id picks a fresh id).
+        for _ in 0..8 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Minute,
+                hour: 8,
+                value: 0,
+            })
+        );
+        // Minute: 30.
+        for _ in 0..30 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        let before = state.alarms.alarms.len();
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.alarms.alarms.len(), before + 1, "appended");
+        let appended = state.alarms.alarms.last().unwrap().clone();
+        assert_eq!((appended.hour, appended.minute), (8, 30));
+        assert!(appended.enabled);
+        // One confirmable PersistAlarms for the full list.
+        assert!(batches
+            .iter()
+            .any(|b| matches!(b.effects.first(), Some(Effect::PersistAlarms(_)))));
+        assert!(state.pending_alarm_add.is_some(), "add in flight");
+        // Confirm the persist: releases the add gate and re-arms the RTC.
+        let op = state.pending_alarm_add.unwrap();
+        let confirm = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Alarms),
+            }),
+        );
+        assert!(state.pending_alarm_add.is_none());
+        assert!(confirm.iter().any(|b| matches!(
+            b.effects.first(),
+            Some(Effect::ProgramRtcAlarm(_)) | Some(Effect::DisableRtcAlarm)
+        )));
+    }
+
+    #[test]
+    fn alarm_add_cancel_returns_to_list() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Long ENTER cancels back to the ADD row (no alarm appended).
+        let before = state.alarms.alarms.len();
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.alarms.alarms.len(), before);
+        assert_eq!(
+            state.screen,
+            Screen::AlarmList {
+                selected: before, // the ADD row index
+            }
+        );
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
                 intent: RenderIntent::Full,
-                view: RenderView::AlarmList { selected: 3 },
+                view: RenderView::AlarmList { selected },
                 ..
-            })
+            }) if *selected == before
         )));
-        // A reload to an empty list clamps selection to 0 (the ADD row).
-        let batches = update(&mut state, Event::AlarmStoreChanged(vec![]));
-        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
-                view: RenderView::AlarmList { selected: 0 },
-                ..
-            })
-        )));
+    }
+
+    #[test]
+    fn alarm_add_persist_failure_pops_appended_alarm() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Hour 8.
+        for _ in 0..8 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Minute 0 -> ENTER completes (appends).
+        let before = state.alarms.alarms.len();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.alarms.alarms.len(),
+            before + 1,
+            "optimistically appended"
+        );
+        let op = state.pending_alarm_add.unwrap();
+        // Fail the persist: the appended alarm pops back.
+        let _ = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Persist("nvs full".into()),
+            }),
+        );
+        assert!(state.pending_alarm_add.is_none());
+        assert_eq!(state.alarms.alarms.len(), before, "rollback popped");
     }
 
     #[test]
@@ -6003,6 +6320,28 @@ mod tests {
                 },
             ),
             (
+                Screen::AlarmAdd(AlarmAddState {
+                    stage: AddStage::Minute,
+                    hour: 8,
+                    value: 30,
+                }),
+                RenderView::NumberPick {
+                    stage: AddStage::Minute,
+                    value: 30,
+                },
+            ),
+            (
+                Screen::AlarmAdd(AlarmAddState {
+                    stage: AddStage::Minute,
+                    hour: 8,
+                    value: 30,
+                }),
+                RenderView::NumberPick {
+                    stage: AddStage::Minute,
+                    value: 30,
+                },
+            ),
+            (
                 Screen::AlarmList { selected: 0 },
                 RenderView::AlarmList { selected: 0 },
             ),
@@ -6811,6 +7150,11 @@ mod tests {
                 month: 8,
                 day: 17,
             },
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Minute,
+                hour: 8,
+                value: 30,
+            }),
         ];
         for screen in screens {
             let mut state = AppState::default();
