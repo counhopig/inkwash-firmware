@@ -1081,6 +1081,10 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
+        Event::BlePairingStarted => transition_ble_pairing_started(state),
+        Event::BlePairingSucceeded(result) => transition_ble_pairing_succeeded(state, result),
+        Event::BlePairingFailed(failure) => transition_ble_pairing_failed(state, failure),
+        Event::BleDisconnected => transition_ble_disconnected(state),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
@@ -1111,6 +1115,107 @@ fn transition_sync_boundary_due(state: &mut AppState) -> Vec<EffectBatch> {
         FailurePolicy::Continue,
         vec![Effect::StartSync(SyncRequest { now })],
     )]
+}
+
+/// BLE pairing phase transitions (Stage 4 wiring of the pre-existing model):
+/// the firmware's radio layer reports pairing lifecycle facts through these
+/// events while a `Screen::BlePairing` session is current. Each updates the
+/// session phase and re-renders; reaching a terminal phase also stops the
+/// radio (the executor owns the BLE driver teardown).
+fn transition_ble_pairing_started(state: &mut AppState) -> Vec<EffectBatch> {
+    if !matches!(state.screen, Screen::BlePairing(_)) {
+        return vec![];
+    }
+    if let Screen::BlePairing(st) = &mut state.screen {
+        st.phase = BlePairingPhase::Pairing;
+    }
+    state.render_generation = state.render_generation.next();
+    vec![render_batch_with_intent(state, RenderIntent::Full)]
+}
+
+fn transition_ble_pairing_succeeded(
+    state: &mut AppState,
+    result: BlePairingResult,
+) -> Vec<EffectBatch> {
+    if !matches!(state.screen, Screen::BlePairing(_)) {
+        return vec![];
+    }
+    if let Screen::BlePairing(st) = &mut state.screen {
+        st.phase = BlePairingPhase::Success;
+    }
+    let _ = result;
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StopBlePairing],
+        ),
+        render_batch_with_intent(state, RenderIntent::Full),
+    ]
+}
+
+fn transition_ble_pairing_failed(
+    state: &mut AppState,
+    failure: BlePairingFailure,
+) -> Vec<EffectBatch> {
+    if !matches!(state.screen, Screen::BlePairing(_)) {
+        return vec![];
+    }
+    if let Screen::BlePairing(st) = &mut state.screen {
+        st.phase = BlePairingPhase::Failure(failure.message);
+    }
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StopBlePairing],
+        ),
+        render_batch_with_intent(state, RenderIntent::Full),
+    ]
+}
+
+fn transition_ble_disconnected(state: &mut AppState) -> Vec<EffectBatch> {
+    if !matches!(state.screen, Screen::BlePairing(_)) {
+        return vec![];
+    }
+    if let Screen::BlePairing(st) = &mut state.screen {
+        st.phase = BlePairingPhase::Waiting;
+    }
+    state.render_generation = state.render_generation.next();
+    vec![render_batch_with_intent(state, RenderIntent::Full)]
+}
+
+/// BlePairing screen buttons (Stage 4): any press closes the pairing
+/// session back to the Settings BLE PAIRING row (mirroring the legacy
+/// modal's "HOLD ENTER BACK"). Releases are ignored.
+fn transition_ble_pairing_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    match button {
+        ButtonEvent::Pressed(ButtonId::Enter)
+        | ButtonEvent::LongPressed(ButtonId::Enter)
+        | ButtonEvent::Pressed(ButtonId::Up)
+        | ButtonEvent::Pressed(ButtonId::Down)
+        | ButtonEvent::LongPressed(ButtonId::Up)
+        | ButtonEvent::LongPressed(ButtonId::Down) => {
+            state.screen = Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![
+                batch(
+                    state,
+                    OperationId(0),
+                    FailurePolicy::Continue,
+                    vec![Effect::StopBlePairing],
+                ),
+                render_batch_with_intent(state, RenderIntent::Full),
+            ]
+        }
+        _ => vec![],
+    }
 }
 
 /// A completed network sync resolves the running sync (single-flight
@@ -1461,6 +1566,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::InboxItem { .. }
             | Screen::Calendar(_)
             | Screen::WeekView { .. }
+            | Screen::BlePairing(_)
     ) {
         transition_nav_button(state, button)
     } else {
@@ -1730,6 +1836,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
         Screen::InboxItem { .. } => transition_inbox_item_button(state, button),
         Screen::Calendar(_) => transition_calendar_button(state, button),
         Screen::WeekView { .. } => transition_week_view_button(state, button),
+        Screen::BlePairing(_) => transition_ble_pairing_button(state, button),
         Screen::Home => {
             // Long UP/DOWN opens the global navigation drawer from Home
             // (origin Home, highlighting HOME).
@@ -1757,6 +1864,8 @@ pub const SETTINGS_ROW_COUNT: usize = 4;
 /// Index of the SLEEP row in the Settings list (0=Sync Now, 1=Sync
 /// Interval, 2=BLE Pairing, 3=Sleep).
 pub const SETTINGS_SLEEP_ROW: usize = 3;
+/// Index of the BLE PAIRING row in the Settings list.
+pub const SETTINGS_BLE_PAIRING_ROW: usize = 2;
 /// Index of the SYNC INTERVAL row in the Settings list.
 pub const SETTINGS_SYNC_INTERVAL_ROW: usize = 1;
 /// Index of the SYNC NOW row in the Settings list.
@@ -5301,6 +5410,125 @@ mod tests {
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StartSync(_))));
+    }
+
+    #[test]
+    fn ble_pairing_events_drive_phase_and_stop_effects() {
+        // With a BlePairing screen current (after boot), the pairing
+        // lifecycle facts the radio reports drive the phase and issue the
+        // StopBlePairing teardown on terminal outcomes.
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        state.screen = Screen::BlePairing(BlePairingState {
+            phase: BlePairingPhase::Waiting,
+        });
+        // Started -> Pairing.
+        let batches = update(&mut state, Event::BlePairingStarted);
+        assert_eq!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Pairing,
+            })
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                ..
+            })
+        )));
+        // Succeeded -> Success + StopBlePairing.
+        let batches = update(
+            &mut state,
+            Event::BlePairingSucceeded(BlePairingResult {
+                name: "photon".into(),
+            }),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Success,
+            })
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopBlePairing)));
+        // Failed -> Failure(message) + StopBlePairing.
+        let batches = update(
+            &mut state,
+            Event::BlePairingFailed(BlePairingFailure {
+                message: "timeout".into(),
+            }),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Failure("timeout".into()),
+            })
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopBlePairing)));
+        // Disconnected -> Waiting.
+        let _ = update(&mut state, Event::BleDisconnected);
+        assert_eq!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Waiting,
+            })
+        );
+    }
+
+    #[test]
+    fn ble_pairing_events_are_ignored_off_screen() {
+        // When no pairing session is current these facts leave state alone.
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        let batches = update(&mut state, Event::BlePairingStarted);
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches.iter().all(|b| b.effects.is_empty()));
+    }
+
+    #[test]
+    fn ble_pairing_any_button_exits_to_settings() {
+        // Any button press closes the session back to the Settings BLE row
+        // and tears down the radio.
+        let buttons = [
+            ButtonEvent::Pressed(ButtonId::Enter),
+            ButtonEvent::LongPressed(ButtonId::Up),
+            ButtonEvent::Pressed(ButtonId::Down),
+            ButtonEvent::LongPressed(ButtonId::Enter),
+        ];
+        for b in buttons {
+            let mut state = AppState::default();
+            let _ = update(
+                &mut state,
+                Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+            );
+            state.screen = Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Pairing,
+            });
+            let batches = update(&mut state, Event::Button(b));
+            assert_eq!(
+                state.screen,
+                Screen::Settings {
+                    selected: SETTINGS_BLE_PAIRING_ROW,
+                }
+            );
+            assert!(batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::StopBlePairing)));
+        }
     }
 
     #[test]
