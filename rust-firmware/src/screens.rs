@@ -394,13 +394,11 @@ pub(crate) fn draw_sync_interval(canvas: &mut Canvas, selected: usize) {
 /// (rows 0-2), main re-renders Settings. Row 3 (Sleep) never returns (it
 /// deep-sleeps).
 pub(crate) fn open_sm_settings_item(ctx: &mut DeviceContext, now: Option<&DateTime>, item: usize) {
-    // Rows 0 and 2 (Sync Now / BLE pairing) are still legacy blocking
-    // network/radio screens run post-pump. Rows 1 (SYNC INTERVAL) and 3
-    // (SLEEP) are SM screens/effects now and never reach this wedge.
-    match item {
-        0 => sync_now_screen(ctx, now),
-        2 => ble_pairing_screen(ctx, now),
-        _ => {}
+    // Only row 2 (BLE pairing) is still a legacy blocking radio screen run
+    // post-pump. Rows 0 (SYNC NOW), 1 (SYNC INTERVAL) and 3 (SLEEP) are SM
+    // screens/effects now and never reach this wedge.
+    if item == 2 {
+        ble_pairing_screen(ctx, now);
     }
 }
 
