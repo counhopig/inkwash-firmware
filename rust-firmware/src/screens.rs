@@ -369,6 +369,22 @@ pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {
     footer(canvas, "UP/DOWN MOVE   ENTER OK   HOLD ENTER BACK");
 }
 
+/// The SYNC INTERVAL options in row order (mirrors logic
+/// SYNC_INTERVAL_MINUTES).
+const SYNC_INTERVAL_OPTIONS: [&str; 5] = ["1 MIN", "5 MIN", "10 MIN", "30 MIN", "60 MIN"];
+
+/// Draws the state-machine SYNC INTERVAL picker (Stage 4, slice 11): the
+/// five fixed interval options with the SM row cursor. Same layout the
+/// legacy sync_interval_screen list used.
+pub(crate) fn draw_sync_interval(canvas: &mut Canvas, selected: usize) {
+    let items: Vec<String> = SYNC_INTERVAL_OPTIONS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    draw_rows(canvas, "SYNC INTERVAL", &items, selected);
+    footer(canvas, "UP/DOWN MOVE   ENTER OK   HOLD ENTER BACK");
+}
+
 /// Opens one Settings row action selected through the state-machine
 /// Settings screen (Stage 4, slice 2): rows 0-3 are still legacy blocking
 /// actions/screens (Sync Now, Sync Interval picker, BLE pairing screen,
@@ -378,18 +394,11 @@ pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {
 /// (rows 0-2), main re-renders Settings. Row 3 (Sleep) never returns (it
 /// deep-sleeps).
 pub(crate) fn open_sm_settings_item(ctx: &mut DeviceContext, now: Option<&DateTime>, item: usize) {
-    // Rows 0-2 (Sync Now / Sync Interval / BLE pairing) are still legacy
-    // blocking network/radio screens run post-pump. Row 3 (SLEEP) is an SM
-    // effect now (Effect::EnterDeepSleep, logic ecb35b5) and never reaches
-    // this wedge.
+    // Rows 0 and 2 (Sync Now / BLE pairing) are still legacy blocking
+    // network/radio screens run post-pump. Rows 1 (SYNC INTERVAL) and 3
+    // (SLEEP) are SM screens/effects now and never reach this wedge.
     match item {
         0 => sync_now_screen(ctx, now),
-        1 => {
-            let _nav = sync_interval_screen(ctx, now);
-            // The legacy picker reports a long-UP/DOWN nav request upward;
-            // with the SM owning navigation, the drawer is opened by the SM
-            // on the Settings screen itself - nothing to propagate here.
-        }
         2 => ble_pairing_screen(ctx, now),
         _ => {}
     }

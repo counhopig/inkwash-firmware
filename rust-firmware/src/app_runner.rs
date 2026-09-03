@@ -234,6 +234,16 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
                 }
             }
+            Effect::SetSyncInterval { minutes } => {
+                // Fire-and-forget persistence of the SYNC INTERVAL picker
+                // choice: the executor writes the NVS counters the sync
+                // scheduler reads for its cadence.
+                if let Err(err) = self.ctx.counters.set_sync_interval_minutes(*minutes) {
+                    Err((EffectCategory::Persist, format!("{err:#}")))
+                } else {
+                    Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+                }
+            }
             Effect::PersistAlarmToggle { alarms, toggled_id } => {
                 // The AlarmList screen's confirmable enabled-toggle: save the
                 // list and mark the row dirty (two-way sync contract). The
@@ -382,6 +392,7 @@ fn render_view_into(
         // RenderPlan concern).
         (
             RenderView::Settings { .. }
+            | RenderView::SyncInterval { .. }
             | RenderView::AlarmList { .. }
             | RenderView::TodoList { .. }
             | RenderView::Inbox { .. },
@@ -441,6 +452,10 @@ pub(crate) fn draw_sm_surface(
         RenderView::Settings { selected } => {
             let mut canvas = ctx.board.display.canvas_mut();
             crate::screens::draw_settings(&mut canvas, selected);
+        }
+        RenderView::SyncInterval { selected } => {
+            let mut canvas = ctx.board.display.canvas_mut();
+            crate::screens::draw_sync_interval(&mut canvas, selected);
         }
         RenderView::AlarmList { selected } => {
             crate::screens::draw_alarm_list(ctx.board, ctx.alarm_store, selected);

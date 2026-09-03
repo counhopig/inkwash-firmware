@@ -783,6 +783,7 @@ fn main() -> Result<()> {
                 inkwash_logic::app::Screen::Home
                     | inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
+                    | inkwash_logic::app::Screen::SyncIntervalPick { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
                     | inkwash_logic::app::Screen::AlarmAdd(_)
                     | inkwash_logic::app::Screen::TodoList { .. }
@@ -1029,6 +1030,7 @@ fn main() -> Result<()> {
                 app_runner.borrow().state().screen,
                 inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
+                    | inkwash_logic::app::Screen::SyncIntervalPick { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
                     | inkwash_logic::app::Screen::AlarmAdd(_)
                     | inkwash_logic::app::Screen::TodoList { .. }
