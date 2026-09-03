@@ -1271,6 +1271,11 @@ fn transition_set_wifi_completed(
                 state.config.wifi_has_password = !creds.password.is_empty();
                 state.connectivity.wifi_configured = state.config.wifi_configured();
                 batches.push(reply_batch(state, found_channel, Reply::Ok));
+                // Stage 5: the applied wifi facts may show on Home's status
+                // card / GetStatus-driven UI - emit a render (renderer diff
+                // Noops if nothing visible changed).
+                state.render_generation = state.render_generation.next();
+                batches.push(render_batch(state));
             }
             Err(message) => {
                 let msg = format!("Connection verification failed: {message}");
@@ -2659,6 +2664,10 @@ fn transition_effect_completed(
             for channel in [Channel::Usb, Channel::Ble] {
                 apply_confirmed_timezone(state, completion.operation_id, channel);
             }
+            // Stage 5: the clock display may shift with the new offset -
+            // emit a render (renderer diff Noops if nothing visible changed).
+            state.render_generation = state.render_generation.next();
+            batches.push(render_batch(state));
         }
         _ => {}
     }
@@ -2963,7 +2972,12 @@ fn transition_command(
                 ControlRequest::ClearAlarms,
                 vec![persist_op, rtc_op],
             );
+            // Stage 5: clearing the list is an immediate visible change (an
+            // AlarmList shown right now empties), so emit a render right away
+            // - the renderer diff Noops if no screen shows the list.
+            state.render_generation = state.render_generation.next();
             vec![
+                render_batch(state),
                 batch(
                     state,
                     persist_op,
@@ -3986,6 +4000,93 @@ mod tests {
             })
         }));
         assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn state_changing_commands_emit_a_render_on_visible_change() {
+        // Stage 5: ClearAlarms (optimistic clear at receipt), SetWifi
+        // (facts applied on Ok completion) and SetTimezone (offset applied
+        // on persist confirm) each emit a render - the business no longer
+        // relies on the firmware's manual dirty-path redraw for these.
+        // ClearAlarms on the AlarmList screen.
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.screen = Screen::AlarmList { selected: 0 };
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::ClearAlarms));
+        assert!(state.alarms.alarms.is_empty());
+        assert!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
+            "ClearAlarms must emit a render (list visibly empties)"
+        );
+        // SetWifi completion applies facts -> render.
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetWifi {
+                ssid: "net".into(),
+                password: "pw".into(),
+            }),
+        );
+        let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
+        assert_eq!(state.config.wifi_ssid.as_deref(), Some("net"));
+        assert!(
+            done.iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
+            "SetWifi Ok must emit a render (wifi facts visible)"
+        );
+    }
+
+    #[test]
+    fn set_timezone_confirm_emits_a_render() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.timezone_offset_minutes = 0;
+        let _ = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetTimezone {
+                offset_minutes: 120,
+            }),
+        );
+        // Drive both confirmations (RTC write + timezone persist); the
+        // timezone persist applies the offset and must emit a render.
+        let (time_op, tz_op) = {
+            let slot = state.pending_usb_reply.as_ref().expect("slot taken");
+            (slot.awaiting_ops[0], slot.awaiting_ops[1])
+        };
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: time_op,
+                render_generation: None,
+                output: EffectOutput::RtcTimeWritten,
+            }),
+        );
+        let batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: tz_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Timezone),
+            }),
+        );
+        assert_eq!(state.config.timezone_offset_minutes, 120);
+        assert!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
+            "SetTimezone persist confirm must emit a render (clock offset visible)"
+        );
     }
 
     #[test]
