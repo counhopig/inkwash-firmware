@@ -681,24 +681,6 @@ pub(crate) fn draw_calendar_grid(
     );
 }
 
-/// Runs the legacy week-view wedge for the state-machine Calendar screen
-/// (Stage 4, slice 6): ENTER on a day opens that day's week view (a
-/// blocking screen). Post-pump - it dispatches alarm/button events through
-/// the shared Runtime. Returns `true` when an alarm unwound the view.
-pub(crate) fn open_sm_week_view(
-    ctx: &mut DeviceContext,
-    now: Option<&DateTime>,
-    year: u16,
-    month: u8,
-    day: u8,
-) -> bool {
-    if now.is_none() {
-        return false;
-    }
-    week_view(ctx, year, month, day, now);
-    ctx.alarm_exit_pending()
-}
-
 /// Per-day cell marker for the month grid: the importance of a todo due
 /// that day, if any. Alarms don't get a month-grid mark - see the ENTER ->
 /// week view flow below for schedule detail.
@@ -889,6 +871,41 @@ fn wrap_text_prop(text: &str, max_width: usize) -> Vec<String> {
 /// pressed) the view was opened for. Any button closes it - read-only,
 /// there's nothing further to drill into.
 fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option<&DateTime>) {
+    draw_week_view(ctx, year, month, day, now);
+    ctx.board.display.refresh_full_best_effort();
+    loop {
+        // An alarm unwinds to the unified router; a visible background
+        // change (e.g. a full-screen reminder just covered this view)
+        // returns to the caller, which redraws the page.
+        match ctx.poll_background(now) {
+            crate::ctx::BackgroundOutcome::AlarmHandled => {
+                ctx.alarm_poll.mark_exit();
+                return;
+            }
+            crate::ctx::BackgroundOutcome::VisibleChanged => return,
+            crate::ctx::BackgroundOutcome::NoChange => {}
+        }
+        match poll_nav(ctx.board) {
+            Nav::None => {}
+            _ => return,
+        }
+        tick();
+    }
+}
+
+/// Draws the state-machine WeekView screen (Stage 4, slice 6): the Sun-Sat
+/// week containing `day` - one column per day with each day's open todo
+/// text read from the todo store. The SM owns open/close (ENTER on a
+/// Calendar day opens it; any button closes back to the grid); the executor
+/// draws from state. Same layout the legacy week_view used, so the two
+/// paths are pixel-consistent.
+pub(crate) fn draw_week_view(
+    ctx: &mut DeviceContext,
+    year: u16,
+    month: u8,
+    day: u8,
+    now: Option<&DateTime>,
+) {
     let todos = ctx.todo_store.load().unwrap_or_default();
     let start = alarms::days_since_epoch(year, month, day) - weekday_of(year, month, day) as i64;
     let (_, sm, sd) = alarms::date_from_days(start);
@@ -998,26 +1015,6 @@ fn week_view(ctx: &mut DeviceContext, year: u16, month: u8, day: u8, now: Option
         }
     }
     drop(canvas);
-
-    ctx.board.display.refresh_full_best_effort();
-    loop {
-        // An alarm unwinds to the unified router; a visible background
-        // change (e.g. a full-screen reminder just covered this view)
-        // returns to the caller, which redraws the page.
-        match ctx.poll_background(now) {
-            crate::ctx::BackgroundOutcome::AlarmHandled => {
-                ctx.alarm_poll.mark_exit();
-                return;
-            }
-            crate::ctx::BackgroundOutcome::VisibleChanged => return,
-            crate::ctx::BackgroundOutcome::NoChange => {}
-        }
-        match poll_nav(ctx.board) {
-            Nav::None => {}
-            _ => return,
-        }
-        tick();
-    }
 }
 
 fn days_in_month(year: u16, month: u8) -> u8 {
