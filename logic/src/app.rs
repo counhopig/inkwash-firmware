@@ -8042,4 +8042,77 @@ mod tests {
             );
         }
     }
+
+    /// USB/BLE commands arriving while any SM screen is current must be
+    /// handled without disturbing the screen (Stage-4 test-matrix item: the
+    /// unified loop services protocol commands on every screen).
+    #[test]
+    fn commands_are_serviced_while_any_sm_screen_is_current() {
+        let screens = [
+            Screen::Home,
+            Screen::Settings { selected: 0 },
+            Screen::AlarmList { selected: 0 },
+            Screen::TodoList { selected: 0 },
+            Screen::Inbox { selected: 0 },
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 15,
+            }),
+            Screen::WeekView {
+                year: 2026,
+                month: 8,
+                day: 17,
+            },
+            Screen::AlarmAdd(AlarmAddState {
+                stage: AddStage::Hour,
+                hour: 0,
+                value: 9,
+            }),
+            Screen::SyncIntervalPick { selected: 0 },
+            Screen::InboxItem { index: 0 },
+        ];
+        for screen in screens {
+            let mut state = AppState::default();
+            // Configured wifi + server so a SyncNow may start.
+            let mut snap = boot_snapshot(vec![], Some(dt(8, 0)), false, true);
+            snap.config = DeviceConfig {
+                server_url: "https://example.com".into(),
+                auth_token: "t".into(),
+            };
+            snap.status = DeviceStatus {
+                wifi_ssid: Some("net".into()),
+                wifi_has_password: true,
+                timezone_offset_minutes: 0,
+            };
+            let _ = update(&mut state, Event::Boot(snap));
+            state.screen = screen.clone();
+
+            // GetStatus: a pure read - replies and leaves the screen as-is.
+            let batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
+            assert!(
+                batches.iter().any(|b| b.effects.iter().any(|e| matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Status { .. }
+                    }
+                ))),
+                "GetStatus on {screen:?} must reply"
+            );
+            assert_eq!(state.screen, screen, "screen must not change");
+
+            // SyncNow: starts the SM sync engine and takes the transport's
+            // pending slot; the screen stays current.
+            let batches = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+            assert!(
+                batches
+                    .iter()
+                    .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))),
+                "SyncNow on {screen:?} must start a sync"
+            );
+            assert!(state.pending_usb_reply.is_some(), "transport slot taken");
+            assert_eq!(state.screen, screen, "screen must not change");
+        }
+    }
 }
