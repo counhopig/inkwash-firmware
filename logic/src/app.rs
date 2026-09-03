@@ -64,16 +64,39 @@ pub struct EffectId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Screen {
     Home,
-    Navigation { selected: usize },
-    Settings { selected: usize },
+    Navigation {
+        selected: usize,
+        /// Which screen the drawer was opened from: cancelling the drawer
+        /// (long ENTER) restores it, and selecting a still-legacy
+        /// destination returns to it after the executor's page wedge.
+        origin: NavOrigin,
+    },
+    Settings {
+        selected: usize,
+    },
     Calendar(CalendarState),
-    AlarmList { selected: usize },
+    AlarmList {
+        selected: usize,
+    },
     AlarmEdit(AlarmEditState),
-    TodoList { selected: usize },
-    Inbox { selected: usize },
+    TodoList {
+        selected: usize,
+    },
+    Inbox {
+        selected: usize,
+    },
     AlarmRinging,
     Reminder(ReminderState),
     BlePairing(BlePairingState),
+}
+
+/// The screen a navigation drawer was opened from. Every drawer origin is
+/// itself a state-machine screen (content pages are still legacy wedges and
+/// cannot host a drawer yet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavOrigin {
+    Home,
+    Settings,
 }
 
 impl Screen {
@@ -90,17 +113,21 @@ impl Screen {
     ///
     /// - `Home` - the idle home canvas (clock + cards).
     /// - `Navigation` - Home canvas with the GO TO drawer overlay.
+    /// - `Settings` - the settings list (rows browsed in the state
+    ///   machine; row actions are deferred executor wedges).
     ///
     /// `AlarmRinging` maps to Home: the ringing frame is owned by the
     /// legacy `ring_screen`, which draws over whatever the SM render
     /// produced before the EPD request lands.
     pub fn render_view(&self) -> RenderView {
         match self {
-            Screen::Navigation { selected } => RenderView::Navigation {
+            Screen::Navigation { selected, .. } => RenderView::Navigation {
+                selected: *selected,
+            },
+            Screen::Settings { selected } => RenderView::Settings {
                 selected: *selected,
             },
             Screen::Home
-            | Screen::Settings { .. }
             | Screen::Calendar(_)
             | Screen::AlarmList { .. }
             | Screen::AlarmEdit(_)
@@ -329,12 +356,25 @@ pub enum Effect {
     EnterLightSleep(LightSleepPlan),
     EnterDeepSleep(WakeupPlan),
     /// The user selected a navigation-drawer destination (Enter). In this
-    /// migration slice only Home (destination 0) is a fully state-machine
-    /// screen; the other destinations are opened by the executor through
-    /// the legacy blocking page until those pages migrate to Screen states
-    /// (Stage 4). The effect is data - `update` never opens a page itself.
+    /// migration slice only Home (destination 0) and Settings (destination
+    /// 5) are fully state-machine screens; the other destinations are
+    /// opened by the executor through the legacy blocking page until those
+    /// pages migrate to Screen states (Stage 4). The effect is data -
+    /// `update` never opens a page itself.
     OpenNavigationDestination {
         destination: usize,
+    },
+    /// The user pressed ENTER on a Settings row whose action is still a
+    /// legacy blocking screen (Sync Now / Sync Interval / BLE Pairing /
+    /// Sleep). The state machine stays on `Screen::Settings` while the
+    /// executor runs the wedge (deferred post-pump, same as
+    /// `OpenNavigationDestination`); a Full Settings render is re-issued
+    /// when the wedge returns.
+    OpenSettingsItem {
+        /// Index into the fixed four-row Settings list in firmware row
+        /// order: 0 = Sync Now, 1 = Sync Interval, 2 = BLE Pairing,
+        /// 3 = Sleep.
+        item: usize,
     },
 }
 
@@ -349,6 +389,9 @@ pub enum RenderView {
     /// only SM-drawn overlay today). Carries the drawer's selected row so
     /// the executor can draw the overlay from state.
     Navigation { selected: usize },
+    /// The settings list (Stage 4): rows browsed in the state machine,
+    /// row actions deferred to executor wedges. Carries the selected row.
+    Settings { selected: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1210,38 +1253,55 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             ),
             render_batch_with_intent(state, RenderIntent::Full),
         ]
-    } else if matches!(state.screen, Screen::Home | Screen::Navigation { .. }) {
+    } else if matches!(
+        state.screen,
+        Screen::Home | Screen::Navigation { .. } | Screen::Settings { .. }
+    ) {
         transition_nav_button(state, button)
     } else {
         vec![]
     }
 }
 
-/// Navigation-drawer state machine (Stage 4, slice 1): a long UP/DOWN
-/// opens the drawer from Home; inside the drawer, UP/DOWN move the
-/// selection (wrapping), long UP/DOWN jump to the first/last destination,
-/// long ENTER cancels back to the pre-drawer screen, and ENTER selects.
-/// Destination 0 (HOME) is fully state-machine; selecting any other
-/// destination emits `OpenNavigationDestination` for the executor to open
-/// through the legacy page until that page migrates.
+/// Returns the drawer's home-destination index for `origin` (the row
+/// highlighted when the drawer opens = "you are here", matching the legacy
+/// pick_navigation pre-selection).
+fn nav_home_index(origin: NavOrigin) -> usize {
+    match origin {
+        NavOrigin::Home => 0,
+        // The drawer over Settings highlights SETTINGS (5), so a no-move
+        // ENTER stays on Settings (legacy pick_navigation behavior).
+        NavOrigin::Settings => NAV_DESTINATION_COUNT - 1,
+    }
+}
+
+/// The screen a closed drawer leaves behind when the selection does not
+/// open a sub-screen destination (cancel, HOME, or the origin's own row).
+/// With every origin a state-machine screen, closing the drawer returns to
+/// the plain root of the navigation tree: Home (Settings keeps its own
+/// back-to-Home path).
+fn nav_origin_screen(origin: NavOrigin) -> Screen {
+    match origin {
+        NavOrigin::Home | NavOrigin::Settings => Screen::Home,
+    }
+}
+
+/// Navigation-drawer state machine (Stage 4): a long UP/DOWN opens the
+/// drawer from a state-machine screen (Home, or Settings once that screen
+/// exists); inside the drawer, UP/DOWN move the selection (wrapping), long
+/// UP/DOWN jump to the first/last destination, long ENTER cancels back to
+/// the origin, and ENTER selects a destination. HOME (0) and SETTINGS (5)
+/// are state-machine screens (a drawer over Settings highlights SETTINGS so
+/// a no-move ENTER stays there); CALENDAR/INBOX/ALARMS/TODOS emit
+/// `OpenNavigationDestination` for the executor to open through the legacy
+/// page until those pages migrate. Settings row actions emit
+/// `OpenSettingsItem`; the Settings screen itself stays current while the
+/// executor wedge runs.
 fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     match &state.screen {
-        Screen::Home => {
-            // Long UP/DOWN opens the global navigation drawer, preselected
-            // on HOME.
-            if matches!(
-                button,
-                ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down)
-            ) {
-                state.screen = Screen::Navigation { selected: 0 };
-                state.render_generation = state.render_generation.next();
-                vec![render_batch_with_intent(state, RenderIntent::Full)]
-            } else {
-                vec![]
-            }
-        }
-        Screen::Navigation { selected } => {
+        Screen::Navigation { selected, origin } => {
             let cur = *selected;
+            let origin = *origin;
             let next_screen = match button {
                 ButtonEvent::Pressed(ButtonId::Up) => Some(Screen::Navigation {
                     selected: if cur == 0 {
@@ -1249,43 +1309,58 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     } else {
                         cur - 1
                     },
+                    origin,
                 }),
                 ButtonEvent::Pressed(ButtonId::Down) => Some(Screen::Navigation {
                     selected: (cur + 1) % NAV_DESTINATION_COUNT,
+                    origin,
                 }),
-                ButtonEvent::LongPressed(ButtonId::Up) => Some(Screen::Navigation { selected: 0 }),
+                ButtonEvent::LongPressed(ButtonId::Up) => Some(Screen::Navigation {
+                    selected: 0,
+                    origin,
+                }),
                 ButtonEvent::LongPressed(ButtonId::Down) => Some(Screen::Navigation {
                     selected: NAV_DESTINATION_COUNT - 1,
+                    origin,
                 }),
-                ButtonEvent::LongPressed(ButtonId::Enter) => Some(Screen::Home),
+                ButtonEvent::LongPressed(ButtonId::Enter) => Some(nav_origin_screen(origin)),
                 ButtonEvent::Pressed(ButtonId::Enter) => {
-                    // Selecting a destination: HOME is an SM screen; the
-                    // others are opened by the executor (legacy page) for
-                    // now. Either way the drawer closes back to Home.
-                    return if cur == 0 {
-                        state.screen = Screen::Home;
-                        state.render_generation = state.render_generation.next();
-                        vec![render_batch_with_intent(state, RenderIntent::Full)]
-                    } else {
-                        state.screen = Screen::Home;
-                        state.render_generation = state.render_generation.next();
-                        vec![
-                            batch(
-                                state,
-                                OperationId(0),
-                                FailurePolicy::Continue,
-                                vec![Effect::OpenNavigationDestination { destination: cur }],
-                            ),
-                            render_batch_with_intent(state, RenderIntent::Full),
-                        ]
+                    // Selecting a destination closes the drawer.
+                    // HOME (0) and SETTINGS (5) are SM screens; the
+                    // remaining destinations are opened by the executor
+                    // (legacy page) for now.
+                    return match cur {
+                        0 => {
+                            state.screen = nav_origin_screen(origin);
+                            state.render_generation = state.render_generation.next();
+                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        }
+                        5 => {
+                            state.screen = Screen::Settings { selected: 0 };
+                            state.render_generation = state.render_generation.next();
+                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        }
+                        other => {
+                            state.screen = Screen::Home;
+                            state.render_generation = state.render_generation.next();
+                            vec![
+                                batch(
+                                    state,
+                                    OperationId(0),
+                                    FailurePolicy::Continue,
+                                    vec![Effect::OpenNavigationDestination { destination: other }],
+                                ),
+                                render_batch_with_intent(state, RenderIntent::Full),
+                            ]
+                        }
                     };
                 }
                 _ => None,
             };
             if let Some(next) = next_screen {
                 // A still-drawer move only changes the overlay (cheap
-                // NAV_BAR partial refresh); closing the drawer to Home
-                // clears the whole overlay, so it is a Full render.
+                // NAV_BAR partial refresh); leaving the drawer to a full
+                // screen clears the whole overlay, so it is a Full render.
                 let still_in_drawer = matches!(next, Screen::Navigation { .. });
                 state.screen = next;
                 state.render_generation = state.render_generation.next();
@@ -1298,9 +1373,93 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 vec![]
             }
         }
+        Screen::Settings { selected } => {
+            // Settings is a state-machine list screen: UP/DOWN move the
+            // row; ENTER selects the row's action (a deferred executor
+            // wedge until that action's screen migrates); long ENTER backs
+            // out to Home; long UP/DOWN opens the GO TO drawer.
+            //
+            // The drawer's overlay canvas is always Home (the executor's
+            // Navigation view draws Home + the bar), and the legacy
+            // Settings flow closed Settings when the drawer opened (the
+            // long-UP/DOWN nav request returned out of open_menu). So
+            // opening the drawer from Settings leaves Settings behind a
+            // Home-origin drawer: cancel/select-HOME lands on Home, and
+            // selecting SETTINGS re-enters Settings.
+            let cur = *selected;
+            match button {
+                ButtonEvent::LongPressed(ButtonId::Up)
+                | ButtonEvent::LongPressed(ButtonId::Down) => {
+                    state.screen = Screen::Navigation {
+                        selected: nav_home_index(NavOrigin::Home),
+                        origin: NavOrigin::Home,
+                    };
+                    state.render_generation = state.render_generation.next();
+                    vec![render_batch_with_intent(state, RenderIntent::Full)]
+                }
+                ButtonEvent::Pressed(ButtonId::Up) => {
+                    state.screen = Screen::Settings {
+                        selected: cur.saturating_sub(1),
+                    };
+                    state.render_generation = state.render_generation.next();
+                    vec![render_batch(state)]
+                }
+                ButtonEvent::Pressed(ButtonId::Down) => {
+                    state.screen = Screen::Settings {
+                        selected: (cur + 1).min(SETTINGS_ROW_COUNT - 1),
+                    };
+                    state.render_generation = state.render_generation.next();
+                    vec![render_batch(state)]
+                }
+                ButtonEvent::LongPressed(ButtonId::Enter) => {
+                    // Back out of Settings to the root Home.
+                    state.screen = Screen::Home;
+                    state.render_generation = state.render_generation.next();
+                    vec![render_batch_with_intent(state, RenderIntent::Full)]
+                }
+                ButtonEvent::Pressed(ButtonId::Enter) => {
+                    // Row action: deferred to the executor (the row's
+                    // action/screen is still a legacy blocking page). The
+                    // SM stays on Settings; the executor returns after the
+                    // wedge and main re-renders Settings.
+                    state.render_generation = state.render_generation.next();
+                    vec![
+                        batch(
+                            state,
+                            OperationId(0),
+                            FailurePolicy::Continue,
+                            vec![Effect::OpenSettingsItem { item: cur }],
+                        ),
+                        render_batch_with_intent(state, RenderIntent::Full),
+                    ]
+                }
+                _ => vec![],
+            }
+        }
+        Screen::Home => {
+            // Long UP/DOWN opens the global navigation drawer from Home
+            // (origin Home, highlighting HOME).
+            if matches!(
+                button,
+                ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down)
+            ) {
+                state.screen = Screen::Navigation {
+                    selected: nav_home_index(NavOrigin::Home),
+                    origin: NavOrigin::Home,
+                };
+                state.render_generation = state.render_generation.next();
+                vec![render_batch_with_intent(state, RenderIntent::Full)]
+            } else {
+                vec![]
+            }
+        }
         _ => vec![],
     }
 }
+
+/// Number of rows in the Settings list (SYNC NOW / SYNC INTERVAL / BLE
+/// PAIRING / SLEEP) - mirrors the firmware's `open_menu` items.
+pub const SETTINGS_ROW_COUNT: usize = 4;
 
 fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
     let mut batches = Vec::new();
@@ -3425,7 +3584,13 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(state.screen, Screen::Navigation { selected: 0 });
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 0,
+                origin: NavOrigin::Home
+            }
+        );
         // A full render is requested for the drawer overlay.
         assert!(batches
             .iter()
@@ -3453,13 +3618,25 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert_eq!(state.screen, Screen::Navigation { selected: 1 });
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 1,
+                origin: NavOrigin::Home
+            }
+        );
         // Up from 1 -> 0.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
-        assert_eq!(state.screen, Screen::Navigation { selected: 0 });
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 0,
+                origin: NavOrigin::Home
+            }
+        );
         // Up wraps from 0 -> last (5).
         let _ = update(
             &mut state,
@@ -3468,7 +3645,8 @@ mod tests {
         assert_eq!(
             state.screen,
             Screen::Navigation {
-                selected: NAV_DESTINATION_COUNT - 1
+                selected: NAV_DESTINATION_COUNT - 1,
+                origin: NavOrigin::Home
             }
         );
         // Long DOWN jumps to last; long UP jumps to first.
@@ -3476,7 +3654,13 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(state.screen, Screen::Navigation { selected: 0 });
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 0,
+                origin: NavOrigin::Home
+            }
+        );
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
@@ -3484,7 +3668,8 @@ mod tests {
         assert_eq!(
             state.screen,
             Screen::Navigation {
-                selected: NAV_DESTINATION_COUNT - 1
+                selected: NAV_DESTINATION_COUNT - 1,
+                origin: NavOrigin::Home
             }
         );
     }
@@ -3688,7 +3873,256 @@ mod tests {
     }
 
     #[test]
-    fn non_sm_screens_project_to_home_surface_until_migrated() {
+    fn drawer_select_settings_opens_sm_settings_screen() {
+        let mut state = AppState::default();
+        // Open the drawer from Home.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        // Jump to the last destination (SETTINGS, index 5).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: NAV_DESTINATION_COUNT - 1,
+                origin: NavOrigin::Home
+            }
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        // No destination effect: Settings is an SM screen now.
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Settings { selected: 0 },
+                intent: RenderIntent::Full,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn settings_rows_move_and_wrap_clamped() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+
+        // Down to the last row (3 = SLEEP).
+        for _ in 0..3 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        assert_eq!(state.screen, Screen::Settings { selected: 3 });
+        // Down past the end clamps (no wrap).
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 3 });
+        // Up back to row 2.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 2 });
+        // Up past the top clamps at 0.
+        for _ in 0..5 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+            );
+        }
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        assert!(
+            batches.iter().all(|b| {
+                !b.effects.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Render(RenderRequest {
+                            intent: RenderIntent::Full,
+                            ..
+                        })
+                    )
+                })
+            }),
+            "Settings row moves are Partial (list region refresh)"
+        );
+    }
+
+    #[test]
+    fn settings_enter_row_emits_open_settings_item_and_stays() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Move to row 1 (Sync Interval).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 1 })));
+        // The SM stays on Settings (the executor runs the wedge and returns;
+        // main re-renders Settings).
+        assert_eq!(state.screen, Screen::Settings { selected: 1 });
+    }
+
+    #[test]
+    fn settings_long_enter_backs_to_home() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Home,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn drawer_over_settings_opens_home_origin_and_reenters_settings() {
+        let mut state = AppState::default();
+        // Home -> drawer -> SETTINGS.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        // Long UP/DOWN inside Settings opens the GO TO drawer. The drawer
+        // overlay canvas is always Home, and the legacy flow closed
+        // Settings when its drawer opened: the drawer is Home-origin.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 0,
+                origin: NavOrigin::Home
+            }
+        );
+        // A no-move ENTER selects HOME: back to Home.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
+
+        // Re-enter Settings, then long-UP/DOWN -> drawer -> select
+        // SETTINGS -> Settings again.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Settings { selected: 0 },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn still_legacy_screens_project_to_home_surface_until_migrated() {
         // Stage-4 transitional projection: every screen still drawn through
         // a legacy blocking page maps to the Home surface so the executor
         // keeps rendering Home behind/around the legacy page. AlarmRinging
@@ -3697,14 +4131,27 @@ mod tests {
         let cases: Vec<(Screen, RenderView)> = vec![
             (Screen::Home, RenderView::Home),
             (
-                Screen::Navigation { selected: 0 },
+                Screen::Navigation {
+                    selected: 0,
+                    origin: NavOrigin::Home,
+                },
                 RenderView::Navigation { selected: 0 },
             ),
             (
-                Screen::Navigation { selected: 3 },
+                Screen::Navigation {
+                    selected: 3,
+                    origin: NavOrigin::Home,
+                },
                 RenderView::Navigation { selected: 3 },
             ),
-            (Screen::Settings { selected: 0 }, RenderView::Home),
+            (
+                Screen::Settings { selected: 0 },
+                RenderView::Settings { selected: 0 },
+            ),
+            (
+                Screen::Settings { selected: 3 },
+                RenderView::Settings { selected: 3 },
+            ),
             (
                 Screen::Calendar(CalendarState {
                     year: 2026,

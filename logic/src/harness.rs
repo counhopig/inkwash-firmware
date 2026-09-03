@@ -136,6 +136,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::StartSetWifi(_) => "StartSetWifi",
         Effect::StartBlePairing(_) => "StartBlePairing",
         Effect::OpenNavigationDestination { .. } => "OpenNavigationDestination",
+        Effect::OpenSettingsItem { .. } => "OpenSettingsItem",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
         Effect::EnterDeepSleep(_) => "EnterDeepSleep",
@@ -163,6 +164,7 @@ impl EffectExecutor for FakeExecutor {
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
             Effect::OpenNavigationDestination { .. } => EffectCategory::Render,
+            Effect::OpenSettingsItem { .. } => EffectCategory::Render,
             Effect::EnterLightSleep(_) | Effect::EnterDeepSleep(_) => EffectCategory::Sleep,
         };
         self.record(effect, cat);
@@ -218,7 +220,7 @@ impl EffectExecutor for FakeExecutor {
             | Effect::StartSetWifi(_)
             | Effect::StartBlePairing(_)
             | Effect::StopBlePairing => Ok(EffectOutcome::Async),
-            Effect::OpenNavigationDestination { .. } => {
+            Effect::OpenNavigationDestination { .. } | Effect::OpenSettingsItem { .. } => {
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::EnterLightSleep(_) => {
