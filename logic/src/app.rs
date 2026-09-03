@@ -74,6 +74,13 @@ pub enum Screen {
     Settings {
         selected: usize,
     },
+    /// The SYNC INTERVAL picker (Stage 4): choose from the five fixed sync
+    /// intervals (1/5/10/30/60 min). The SM owns the row cursor; ENTER
+    /// confirms (emits Effect::SetSyncInterval, fire-and-forget NVS write)
+    /// and returns to Settings; long ENTER cancels.
+    SyncIntervalPick {
+        selected: usize,
+    },
     Calendar(CalendarState),
     /// The read-only week view (Stage 4): the Sun-Sat week containing the
     /// opened day, one column per day with each day's open todos. ENTER on a
@@ -154,6 +161,9 @@ impl Screen {
                 selected: *selected,
             },
             Screen::Settings { selected } => RenderView::Settings {
+                selected: *selected,
+            },
+            Screen::SyncIntervalPick { selected } => RenderView::SyncInterval {
                 selected: *selected,
             },
             Screen::AlarmList { selected } => RenderView::AlarmList {
@@ -480,6 +490,14 @@ pub enum Effect {
         /// The inbox item `seq` to mark read (from `state.inbox.items`).
         seq: u64,
     },
+    /// The user confirmed a SYNC INTERVAL choice on the SM picker (Stage 4).
+    /// Fire-and-forget persistence of the sync interval (minutes); the
+    /// executor writes it to NVS. The state machine does not track the
+    /// value itself - the firmware's sync scheduler owns the cadence.
+    SetSyncInterval {
+        /// Interval in minutes (one of the fixed five: 1/5/10/30/60).
+        minutes: u16,
+    },
 }
 
 /// Which visible surface a render request targets. The renderer draws this
@@ -532,6 +550,9 @@ pub enum RenderView {
     /// UP/DOWN (wrapping). Carries the active stage (the executor maps it
     /// to the title + range) and the current value.
     NumberPick { stage: AddStage, value: u8 },
+    /// The SYNC INTERVAL picker list (Stage 4): five fixed options, row
+    /// cursor moved by the SM, ENTER confirms. Carries the selected row.
+    SyncInterval { selected: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1437,6 +1458,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
         Screen::Home
             | Screen::Navigation { .. }
             | Screen::Settings { .. }
+            | Screen::SyncIntervalPick { .. }
             | Screen::AlarmList { .. }
             | Screen::AlarmAdd(_)
             | Screen::TodoList { .. }
@@ -1632,7 +1654,12 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     vec![render_batch_with_intent(state, RenderIntent::Full)]
                 }
                 ButtonEvent::Pressed(ButtonId::Enter) => {
-                    if cur == SETTINGS_SLEEP_ROW {
+                    if cur == SETTINGS_SYNC_INTERVAL_ROW {
+                        // SYNC INTERVAL (row 1): open the SM interval picker.
+                        state.screen = Screen::SyncIntervalPick { selected: 0 };
+                        state.render_generation = state.render_generation.next();
+                        vec![render_batch_with_intent(state, RenderIntent::Full)]
+                    } else if cur == SETTINGS_SLEEP_ROW {
                         // SLEEP (row 3): an SM-owned effect - deep sleep with
                         // the maintenance wake needed for a far-future
                         // one-shot alarm (mirrors the idle deep-sleep plan).
@@ -1671,6 +1698,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 _ => vec![],
             }
         }
+        Screen::SyncIntervalPick { selected } => {
+            transition_sync_interval_pick_button(state, *selected, button)
+        }
         Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
         Screen::AlarmAdd(_) => transition_alarm_add_button(state, button),
         Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
@@ -1705,6 +1735,70 @@ pub const SETTINGS_ROW_COUNT: usize = 4;
 /// Index of the SLEEP row in the Settings list (0=Sync Now, 1=Sync
 /// Interval, 2=BLE Pairing, 3=Sleep).
 pub const SETTINGS_SLEEP_ROW: usize = 3;
+/// Index of the SYNC INTERVAL row in the Settings list.
+pub const SETTINGS_SYNC_INTERVAL_ROW: usize = 1;
+
+/// SyncIntervalPick screen (Stage 4): a five-option list picker owned by
+/// the state machine (rows 0..=4 = 1/5/10/30/60 minutes). UP/DOWN move the
+/// cursor (wrapping); ENTER confirms (fire-and-forget SetSyncInterval to
+/// the executor) and returns to Settings; long ENTER cancels back.
+fn transition_sync_interval_pick_button(
+    state: &mut AppState,
+    selected: usize,
+    button: ButtonEvent,
+) -> Vec<EffectBatch> {
+    match button {
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
+            // Cancel back to the Settings SYNC INTERVAL row.
+            state.screen = Screen::Settings {
+                selected: SETTINGS_SYNC_INTERVAL_ROW,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::Pressed(ButtonId::Up) => {
+            state.screen = Screen::SyncIntervalPick {
+                selected: if selected == 0 {
+                    SYNC_INTERVAL_MINUTES.len() - 1
+                } else {
+                    selected - 1
+                },
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Down) => {
+            state.screen = Screen::SyncIntervalPick {
+                selected: (selected + 1) % SYNC_INTERVAL_MINUTES.len(),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Enter) => {
+            // Confirm: fire-and-forget the interval write, return to
+            // Settings (the executor persists to NVS; the firmware sync
+            // scheduler picks the new cadence up on its next poll).
+            let minutes = SYNC_INTERVAL_MINUTES[selected];
+            state.screen = Screen::Settings {
+                selected: SETTINGS_SYNC_INTERVAL_ROW,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![
+                batch(
+                    state,
+                    OperationId(0),
+                    FailurePolicy::Continue,
+                    vec![Effect::SetSyncInterval { minutes }],
+                ),
+                render_batch_with_intent(state, RenderIntent::Full),
+            ]
+        }
+        _ => vec![],
+    }
+}
+/// The fixed SYNC INTERVAL choices (row order = the firmware's
+/// sync_interval_screen OPTIONS). Indexed by Screen::SyncIntervalPick.
+pub const SYNC_INTERVAL_MINUTES: [u16; 5] = [1, 5, 10, 30, 60];
 
 /// The "+ ADD ALARM" row is the list length (rows 0..len are stored alarms).
 /// AlarmList screen (Stage 4): browse the stored alarm rows (toggle
@@ -4811,7 +4905,11 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        // Move to row 1 (Sync Interval).
+        // Move to row 2 (BLE Pairing).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
@@ -4823,10 +4921,10 @@ mod tests {
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 1 })));
+            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 2 })));
         // The SM stays on Settings (the executor runs the wedge and returns;
         // main re-renders Settings).
-        assert_eq!(state.screen, Screen::Settings { selected: 1 });
+        assert_eq!(state.screen, Screen::Settings { selected: 2 });
     }
 
     #[test]
@@ -4923,6 +5021,156 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn settings_sync_interval_row_opens_sm_picker() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Move to row 1 (SYNC INTERVAL) and ENTER: opens the SM picker, not
+        // a legacy OpenSettingsItem wedge.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::SyncIntervalPick { selected: 0 });
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 1 })));
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::SyncInterval { selected: 0 },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn sync_interval_picker_moves_and_confirms() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::SyncIntervalPick { selected: 0 });
+        // Down twice: 0 -> 1 (5 MIN) -> 2 (10 MIN).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::SyncIntervalPick { selected: 2 });
+        // ENTER confirms 10 MIN: emits SetSyncInterval and returns to
+        // Settings row 1.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::SetSyncInterval { minutes: 10 })));
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_SYNC_INTERVAL_ROW,
+            }
+        );
+    }
+
+    #[test]
+    fn sync_interval_picker_up_wraps_and_long_enter_cancels() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // UP from row 0 wraps to row 4 (60 MIN).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::SyncIntervalPick { selected: 4 });
+        // Long ENTER cancels back to the Settings SYNC INTERVAL row.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_SYNC_INTERVAL_ROW,
+            }
+        );
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::SetSyncInterval { .. })));
     }
 
     #[test]

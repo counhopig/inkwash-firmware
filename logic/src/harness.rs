@@ -139,6 +139,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
         Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
         Effect::MarkInboxRead { .. } => "MarkInboxRead",
+        Effect::SetSyncInterval { .. } => "SetSyncInterval",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
         Effect::EnterDeepSleep(_) => "EnterDeepSleep",
@@ -166,7 +167,9 @@ impl EffectExecutor for FakeExecutor {
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
             Effect::OpenSettingsItem { .. } => EffectCategory::Render,
-            Effect::MarkInboxRead { .. } => EffectCategory::Persist,
+            Effect::MarkInboxRead { .. } | Effect::SetSyncInterval { .. } => {
+                EffectCategory::Persist
+            }
             Effect::PersistAlarmToggle { .. } | Effect::PersistTodoEdit { .. } => {
                 EffectCategory::Persist
             }
@@ -235,6 +238,9 @@ impl EffectExecutor for FakeExecutor {
                 EffectOutput::Persisted(crate::app::PersistTarget::Todos),
             )),
             Effect::MarkInboxRead { .. } => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
+            Effect::SetSyncInterval { .. } => {
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
             Effect::EnterLightSleep(_) => {
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }
