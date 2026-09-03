@@ -787,6 +787,7 @@ fn main() -> Result<()> {
                     | inkwash_logic::app::Screen::AlarmList { .. }
                     | inkwash_logic::app::Screen::TodoList { .. }
                     | inkwash_logic::app::Screen::Inbox { .. }
+                    | inkwash_logic::app::Screen::Calendar(_)
             );
         if sm_screen_is_sm {
             // Feed every debounced button event through the state machine.
@@ -881,6 +882,20 @@ fn main() -> Result<()> {
                             log::warn!("InboxStoreChanged dispatch failed: {err}");
                             dirty.push(FULL_SCREEN_RECT);
                         }
+                    } else {
+                        dismiss_full_refresh = true;
+                    }
+                }
+                if let Some(day) = deferred.calendar_day {
+                    // Week-view wedge for the day the SM cursor was on when
+                    // ENTER was pressed. The grid always shows the current
+                    // month, so the wedge opens in the clock's year/month.
+                    // Post-pump. An alarm-unwound view suppresses the
+                    // follow-up calendar redraw (its dismiss render is
+                    // already issued); otherwise force the grid redraw.
+                    let interrupted = open_deferred_week_view(&mut ctx, clock.as_ref(), day);
+                    if !interrupted {
+                        dirty.push(FULL_SCREEN_RECT);
                     } else {
                         dismiss_full_refresh = true;
                     }
@@ -1088,6 +1103,7 @@ fn main() -> Result<()> {
                     | inkwash_logic::app::Screen::AlarmList { .. }
                     | inkwash_logic::app::Screen::TodoList { .. }
                     | inkwash_logic::app::Screen::Inbox { .. }
+                    | inkwash_logic::app::Screen::Calendar(_)
             );
         if idle
             && !usb_host_connected
@@ -1207,6 +1223,23 @@ fn open_deferred_add_alarm(ctx: &mut DeviceContext, now: Option<&DateTime>) -> b
 /// follow-up reload; the alarm's dismiss render is already issued).
 fn open_deferred_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, index: usize) -> bool {
     let interrupted = screens::open_sm_inbox_item(ctx, now, index);
+    let _ = ctx
+        .alarm_poll
+        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+    let _ = ctx.alarm_poll.take_alarm_exit();
+    interrupted
+}
+
+/// Runs the week-view wedge for the state-machine Calendar screen (Stage 4,
+/// slice 6). Post-pump (the week view is a blocking screen). The grid always
+/// shows the current month, so the wedge opens in the clock's year/month for
+/// the day the SM cursor was on. Returns `true` when an alarm unwound the
+/// view (the caller suppresses the follow-up grid redraw).
+fn open_deferred_week_view(ctx: &mut DeviceContext, now: Option<&DateTime>, day: u8) -> bool {
+    let Some(dt) = now else {
+        return false;
+    };
+    let interrupted = screens::open_sm_week_view(ctx, now, dt.year, dt.month, day);
     let _ = ctx
         .alarm_poll
         .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
@@ -1440,6 +1473,7 @@ fn dispatch_app_runner(
             settings_items: executor.take_deferred_settings(),
             add_alarm: executor.take_deferred_add_alarm(),
             inbox_item: executor.take_deferred_inbox_item(),
+            calendar_day: executor.take_deferred_calendar_day(),
         }
     };
     for kick in runner.borrow_mut().take_kicks() {
@@ -1450,15 +1484,16 @@ fn dispatch_app_runner(
 
 /// Legacy blocking-page actions deferred out of a pump: drawer
 /// destinations (`OpenNavigationDestination`), Settings row items
-/// (`OpenSettingsItem`), the "+ ADD ALARM" editor (`OpenAddAlarm`) and the
-/// inbox item-detail wedge (`OpenInboxItem`). The main loop opens each
-/// after the pump.
+/// (`OpenSettingsItem`), the "+ ADD ALARM" editor (`OpenAddAlarm`), the
+/// inbox item-detail wedge (`OpenInboxItem`) and the calendar week-view
+/// wedge (`OpenCalendarDay`). The main loop opens each after the pump.
 #[derive(Default)]
 struct DeferredNav {
     destinations: Vec<usize>,
     settings_items: Vec<usize>,
     add_alarm: bool,
     inbox_item: Option<usize>,
+    calendar_day: Option<u8>,
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.

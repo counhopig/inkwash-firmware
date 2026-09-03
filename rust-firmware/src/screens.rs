@@ -483,54 +483,11 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
                     );
                 }
                 Page::Calendar => {
-                    let now = live_now.as_ref();
-                    let mut canvas = ctx.board.display.canvas_mut();
-                    canvas.clear();
-                    header(&mut canvas, "CALENDAR");
-                    if let Some(dt) = now {
-                        let todos = ctx.todo_store.load().unwrap_or_default();
-                        // Day markers for the visible month: whether a todo
-                        // is due that day (repeat schedule, or its single
-                        // due date), carrying importance so the marker can
-                        // be sized by it. Alarms don't get a mark here - the
-                        // month grid is a todo-due overview; ENTER on a day
-                        // opens the week view for the specifics, and alarms
-                        // already have their own page.
-                        let mut marks = [DayMark::default(); 32];
-                        let days_in_month = days_in_month(dt.year, dt.month);
-                        for todo in todos.iter() {
-                            for day in 1..=days_in_month {
-                                let fires = match &todo.repeat {
-                                    Some(r) => r.fires_on(
-                                        dt.year,
-                                        dt.month,
-                                        day,
-                                        weekday_of(dt.year, dt.month, day),
-                                    ),
-                                    None => todo.due_date.is_some_and(|d| {
-                                        d.year == dt.year && d.month == dt.month && d.day == day
-                                    }),
-                                };
-                                if fires {
-                                    marks[day as usize].todo = Some(todo.importance);
-                                }
-                            }
-                        }
-                        cal_selected_day = cal_selected_day.min(days_in_month).max(1);
-                        draw_month_grid(
-                            &mut canvas,
-                            dt.year,
-                            dt.month,
-                            now,
-                            cal_selected_day,
-                            &marks,
-                        );
+                    draw_calendar_grid(ctx, live_now.as_ref(), cal_selected_day);
+                    if let Some(dt) = live_now.as_ref() {
+                        let dim = days_in_month(dt.year, dt.month);
+                        cal_selected_day = cal_selected_day.min(dim).max(1);
                     }
-                    footer(
-                        &mut canvas,
-                        "UP/DOWN MOVE   ENTER WEEK VIEW   HOLD UP/DOWN SWITCH PAGE",
-                    );
-                    drop(canvas);
                 }
                 Page::Alarms => render_alarm_page(ctx.board, ctx.alarm_store, alarm_selected),
                 Page::Todos => {
@@ -694,6 +651,72 @@ fn browse_page(ctx: &mut DeviceContext, mut page: Page, now: Option<&DateTime>) 
         }
         tick();
     }
+}
+
+/// Draws the state-machine Calendar grid screen (Stage 4, slice 6): the
+/// read-only current-month grid with day marks read from the todo store and
+/// the day cursor drawn from state. The SM owns the cursor (UP/DOWN), ENTER
+/// opens a day's week view through a deferred legacy wedge. Same layout the
+/// legacy browse_page calendar block used, so the SM-drawn grid is
+/// pixel-consistent. `selected_day` is clamped to the month here too (belt
+/// and braces; the SM clamps on transitions).
+pub(crate) fn draw_calendar_grid(
+    ctx: &mut DeviceContext,
+    now: Option<&DateTime>,
+    selected_day: u8,
+) {
+    let mut canvas = ctx.board.display.canvas_mut();
+    canvas.clear();
+    header(&mut canvas, "CALENDAR");
+    if let Some(dt) = now {
+        let todos = ctx.todo_store.load().unwrap_or_default();
+        // Day markers for the visible month: whether a todo is due that day
+        // (repeat schedule, or its single due date), carrying importance so
+        // the marker can be sized by it. Alarms don't get a mark here - the
+        // month grid is a todo-due overview; ENTER on a day opens the week
+        // view for the specifics, and alarms already have their own page.
+        let mut marks = [DayMark::default(); 32];
+        let dim = days_in_month(dt.year, dt.month);
+        for todo in todos.iter() {
+            for day in 1..=dim {
+                let fires = match &todo.repeat {
+                    Some(r) => {
+                        r.fires_on(dt.year, dt.month, day, weekday_of(dt.year, dt.month, day))
+                    }
+                    None => todo
+                        .due_date
+                        .is_some_and(|d| d.year == dt.year && d.month == dt.month && d.day == day),
+                };
+                if fires {
+                    marks[day as usize].todo = Some(todo.importance);
+                }
+            }
+        }
+        let selected = selected_day.min(dim).max(1);
+        draw_month_grid(&mut canvas, dt.year, dt.month, now, selected, &marks);
+    }
+    footer(
+        &mut canvas,
+        "UP/DOWN MOVE   ENTER WEEK VIEW   HOLD UP/DOWN SWITCH PAGE",
+    );
+}
+
+/// Runs the legacy week-view wedge for the state-machine Calendar screen
+/// (Stage 4, slice 6): ENTER on a day opens that day's week view (a
+/// blocking screen). Post-pump - it dispatches alarm/button events through
+/// the shared Runtime. Returns `true` when an alarm unwound the view.
+pub(crate) fn open_sm_week_view(
+    ctx: &mut DeviceContext,
+    now: Option<&DateTime>,
+    year: u16,
+    month: u8,
+    day: u8,
+) -> bool {
+    if now.is_none() {
+        return false;
+    }
+    week_view(ctx, year, month, day, now);
+    ctx.alarm_exit_pending()
 }
 
 /// Per-day cell marker for the month grid: the importance of a todo due

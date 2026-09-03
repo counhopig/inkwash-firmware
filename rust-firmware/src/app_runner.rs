@@ -56,6 +56,10 @@ pub struct EffectRunner<'a, 'ctx> {
     /// (InboxList screen). Deferred post-pump; when it returns the caller
     /// dispatches `Event::InboxStoreChanged` with the reloaded list.
     deferred_inbox_item: Option<usize>,
+    /// The state machine asked to open a legacy week-view wedge (Calendar
+    /// screen). Deferred post-pump; when it returns the caller re-renders
+    /// the calendar grid. Carries the opened day.
+    deferred_calendar_day: Option<u8>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -68,6 +72,7 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             deferred_settings_items: Vec::new(),
             deferred_add_alarm: false,
             deferred_inbox_item: None,
+            deferred_calendar_day: None,
         }
     }
 
@@ -104,6 +109,12 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     /// the last pump (None when no row was opened).
     pub fn take_deferred_inbox_item(&mut self) -> Option<usize> {
         self.deferred_inbox_item.take()
+    }
+
+    /// The calendar day whose week view the state machine asked to open
+    /// during the last pump (None when no day was opened).
+    pub fn take_deferred_calendar_day(&mut self) -> Option<u8> {
+        self.deferred_calendar_day.take()
     }
 }
 
@@ -282,6 +293,13 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.deferred_inbox_item = Some(*index);
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
+            Effect::OpenCalendarDay { day } => {
+                // Same deferral: the day's week view (blocking) runs after
+                // the pump; the main loop re-renders the calendar grid when
+                // it returns.
+                self.deferred_calendar_day = Some(*day);
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
             Effect::PersistAlarmToggle { alarms, toggled_id } => {
                 // The AlarmList screen's confirmable enabled-toggle: save the
                 // list and mark the row dirty (two-way sync contract). The
@@ -440,6 +458,15 @@ fn render_view_into(
             width: 384,
             height: 226,
         }),
+        // Calendar day moves redraw the grid region (below the header).
+        (RenderView::Calendar { .. }, RenderIntent::Partial) => {
+            ctx.board.display.refresh_partial(crate::canvas::Rect {
+                x: 0,
+                y: 36,
+                width: 400,
+                height: 264,
+            })
+        }
     };
     request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
 }
@@ -447,10 +474,10 @@ fn render_view_into(
 /// Renders the visible surface named by `view` into the shared canvas.
 /// Home is always drawn first (the drawer opens over it from Home); the
 /// Navigation view then overlays the GO TO bar, and the Settings / AlarmList
-/// / TodoList / Inbox views draw their own lists instead. Shared with main's
-/// legacy dirty-path redraws so the canvas always matches the SM's current
-/// screen (a dirty full redraw while the drawer is open must keep the
-/// overlay).
+/// / TodoList / Inbox / Calendar views draw their own content instead.
+/// Shared with main's legacy dirty-path redraws so the canvas always matches
+/// the SM's current screen (a dirty full redraw while the drawer is open
+/// must keep the overlay).
 pub(crate) fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -475,6 +502,12 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::Inbox { selected } => {
             crate::screens::draw_inbox_list(ctx.board, ctx.inbox_store, selected);
+        }
+        RenderView::Calendar { selected_day, .. } => {
+            // The grid always renders the current clock month (matching the
+            // SM, which keeps its year/month synced to the clock on every
+            // tick); only the day cursor comes from the view.
+            crate::screens::draw_calendar_grid(ctx, clock.as_ref(), selected_day);
         }
     }
 }
