@@ -808,39 +808,18 @@ fn main() -> Result<()> {
             }
         }
 
-        // The Home loop hosts the state-machine screens (Stage 4): when the
-        // runtime is enabled and its screen is Home or the Navigation drawer
-        // (an SM-owned screen), every debounced button event is fed to the
-        // state machine as Event::Button. The SM owns what the keys mean
-        // there: long UP/DOWN opens the drawer from Home; inside the drawer
-        // UP/DOWN move the selection, ENTER selects a destination, long
-        // ENTER cancels. Every destination is an SM screen; when the runtime
-        // is disabled (core boot fact failure) the legacy Home nav stays
-        // available without the SM.
+        // The Home loop hosts the state-machine screens: every SM screen
+        // (Home, Navigation drawer, Settings, AlarmList, ... - P1#3 made
+        // app_runner_enabled constant-true, so the legacy SM-disabled Home
+        // nav loop is unreachable dead code) owns the buttons, and every
+        // debounced button event is fed to the state machine as Event::Button.
+        // The SM owns what the keys mean there and renders its own screen
+        // changes as Effect::Render kicks. The one remaining legacy action -
+        // the Settings BLE PAIRING row, still a blocking radio wedge - comes
+        // back deferred and is run below after the pump releases the Runtime
+        // borrow.
         let mut key_changed = false;
-        let sm_screen_is_sm = app_runner_enabled
-            && matches!(
-                app_runner.borrow().state().screen,
-                inkwash_logic::app::Screen::Home
-                    | inkwash_logic::app::Screen::Navigation { .. }
-                    | inkwash_logic::app::Screen::Settings { .. }
-                    | inkwash_logic::app::Screen::SyncIntervalPick { .. }
-                    | inkwash_logic::app::Screen::AlarmList { .. }
-                    | inkwash_logic::app::Screen::AlarmAdd(_)
-                    | inkwash_logic::app::Screen::TodoList { .. }
-                    | inkwash_logic::app::Screen::Inbox { .. }
-                    | inkwash_logic::app::Screen::InboxItem { .. }
-                    | inkwash_logic::app::Screen::Calendar(_)
-                    | inkwash_logic::app::Screen::WeekView { .. }
-            );
-        if sm_screen_is_sm {
-            // Feed every debounced button event through the state machine.
-            // The SM renders its own screen changes (drawer open/close/move,
-            // list row moves, screen transitions) as Effect::Render kicks.
-            // The one remaining legacy action - the Settings BLE PAIRING
-            // row, still a blocking radio wedge - comes back deferred and is
-            // run below after the pump releases the Runtime borrow (the
-            // wedge dispatches through the shared Runtime itself).
+        {
             let enter_event = ctx.board.key_enter.poll();
             let up_event = ctx.board.key_up.poll();
             let down_event = ctx.board.key_down.poll();
@@ -868,22 +847,6 @@ fn main() -> Result<()> {
                     } else {
                         dirty.push(FULL_SCREEN_RECT);
                     }
-                }
-            }
-        } else {
-            if let Some(event) = ctx.board.key_enter.poll() {
-                key_changed = true;
-                match event {
-                    ButtonEvent::Pressed(ButtonId::Enter) => {
-                        // Home has no primary action. Settings is reached
-                        // only through the long-UP/DOWN navigation drawer.
-                    }
-                    ButtonEvent::LongPressed(ButtonId::Enter) => {
-                        // Home is the root screen, so "back" stays on Home.
-                        log::info!("ENTER long pressed on Home; already at root");
-                    }
-                    ButtonEvent::Released(ButtonId::Enter) => {}
-                    other => log::debug!("unexpected key_enter event: {other:?}"),
                 }
             }
             if let Some(event) = ctx.board.key_up.poll() {
