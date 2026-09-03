@@ -8,12 +8,11 @@
 //! The task opens its own NVS store handles on the shared partition -
 //! `EspNvs` is `Send` but not `Sync`, so two threads must not share one
 //! store instance - and never touches the I2C bus: alarm reprogramming and
-//! NTP alignment are applied by the main loop from the sync receipt (see
-//! `ctx::DeviceContext::apply_sync_result`).
+//! NTP alignment are applied by the main loop from the sync receipt, and
+//! merged sync data is persisted by the state machine (the task never
+//! writes the alarm/todo/inbox stores itself).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -58,31 +57,9 @@ pub enum SyncCommand {
 /// sent, kept so the dedup cache can be updated with the real reply once
 /// the operation completes.
 pub enum PendingWifiOp {
-    Sync {
-        reply: Receiver<SyncResult>,
-        source: OpSource,
-        cmd: crate::control::Command,
-    },
-    SetWifi {
-        reply: Receiver<Result<()>>,
-        source: OpSource,
-        cmd: crate::control::Command,
-    },
-    UrgentPoll {
-        reply: Receiver<Result<bool>>,
-    },
-}
-
-/// Where a deferred operation's result should be delivered.
-pub enum OpSource {
-    Usb {
-        id: Option<String>,
-    },
-    Ble {
-        id: Option<String>,
-    },
-    /// Background (scheduler) or on-device menu; no transport reply.
-    Internal,
+    Sync { reply: Receiver<SyncResult> },
+    SetWifi { reply: Receiver<Result<()>> },
+    UrgentPoll { reply: Receiver<Result<bool>> },
 }
 
 /// What a completed Wi-Fi operation reports, for the caller (main-loop
@@ -93,12 +70,10 @@ pub enum WifiOpEvent {
     SetWifiDone,
 }
 
-/// Client handle kept by the main loop: command sender plus the
-/// last-known Wi-Fi connected state for `GetStatus` (the task owns the
-/// driver, so the main loop never touches Wi-Fi directly).
+/// Client handle kept by the main loop: the command sender. The task owns
+/// the Wi-Fi driver, so the main loop never touches Wi-Fi directly.
 pub struct SyncTask {
     tx: Sender<SyncCommand>,
-    connected: Arc<AtomicBool>,
 }
 
 impl SyncTask {
@@ -107,13 +82,11 @@ impl SyncTask {
     /// Wi-Fi work (the boot NTP resync) is done.
     pub fn spawn(partition: EspDefaultNvsPartition, wifi: WifiManager) -> Result<Self> {
         let (tx, rx) = channel();
-        let connected = Arc::new(AtomicBool::new(false));
-        let task_connected = Arc::clone(&connected);
         std::thread::Builder::new()
             .name("sync".to_string())
             .stack_size(SYNC_TASK_STACK)
-            .spawn(move || run(wifi, partition, rx, task_connected))?;
-        Ok(Self { tx, connected })
+            .spawn(move || run(wifi, partition, rx))?;
+        Ok(Self { tx })
     }
 
     pub fn sync_now(&self, now: DateTime) -> Result<Receiver<SyncResult>> {
@@ -139,20 +112,9 @@ impl SyncTask {
         self.tx.send(SyncCommand::UrgentPoll { reply: reply_tx })?;
         Ok(reply_rx)
     }
-
-    /// Last-known STA connected state (relaxed atomic updated by the task
-    /// around each connect/disconnect cycle).
-    pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-    }
 }
 
-fn run(
-    mut wifi: WifiManager,
-    partition: EspDefaultNvsPartition,
-    rx: Receiver<SyncCommand>,
-    connected: Arc<AtomicBool>,
-) {
+fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<SyncCommand>) {
     // This task runs the HTTPS+TLS round-trips, so it must be TWDT-watched
     // too: the feeds inside sync.rs only take effect for subscribed tasks,
     // and an un-watched hang would leave a pending op stuck forever.
@@ -185,7 +147,6 @@ fn run(
         };
         match cmd {
             SyncCommand::SyncNow { now, reply } => {
-                connected.store(true, Ordering::Relaxed);
                 let result = sync::sync_now(
                     &counters,
                     &mut wifi,
@@ -194,19 +155,14 @@ fn run(
                     &inbox_store,
                     &now,
                 );
-                connected.store(false, Ordering::Relaxed);
                 let _ = reply.send(result);
             }
             SyncCommand::SetWifi { creds, reply } => {
-                connected.store(true, Ordering::Relaxed);
                 let result = verify_and_save(&mut wifi, &counters, &creds);
-                connected.store(false, Ordering::Relaxed);
                 let _ = reply.send(result);
             }
             SyncCommand::UrgentPoll { reply } => {
-                connected.store(true, Ordering::Relaxed);
                 let result = sync::poll_urgent(&counters, &mut wifi);
-                connected.store(false, Ordering::Relaxed);
                 let _ = reply.send(result);
             }
         }

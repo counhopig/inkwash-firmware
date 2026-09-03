@@ -796,6 +796,9 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
             state.alarms.alarms = data.alarms.clone();
             state.todos.todos = data.todos.clone();
             state.inbox.items = data.inbox.clone();
+            // A successful sync proves the network was up; record the
+            // last-known connectivity fact (GetStatus reports it).
+            state.connectivity.wifi_connected = true;
             // Release the single-flight lock; the sync itself is done, only
             // its apply (below) remains confirmable.
             state.sync = SyncState::Idle;

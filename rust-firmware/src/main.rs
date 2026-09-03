@@ -619,33 +619,23 @@ fn main() -> Result<()> {
         let mut ble_changed = false;
         if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command()) {
             let needs_full_redraw = matches!(cmd, control::Command::SyncNow);
-            let reply = if ctx::is_migrated_command(&cmd) {
-                let runner = app_runner.clone();
-                let pre_event = if matches!(cmd, control::Command::SetTimezone { .. }) {
-                    ctx.rtc
-                        .read_time()
-                        .ok()
-                        .map(inkwash_logic::app::Event::Tick)
-                } else {
-                    None
-                };
-                ctx::dispatch_migrated_command(
-                    &mut ctx,
-                    &runner,
-                    inkwash_logic::app::Event::BleCommand(cmd.clone()),
-                    pre_event,
-                    cmd,
-                    id.as_deref(),
-                )
+            let runner = app_runner.clone();
+            let pre_event = if matches!(cmd, control::Command::SetTimezone { .. }) {
+                ctx.rtc
+                    .read_time()
+                    .ok()
+                    .map(inkwash_logic::app::Event::Tick)
             } else {
-                Some(control::dispatch(
-                    &mut ctx,
-                    control::Channel::Ble,
-                    id.as_deref(),
-                    cmd,
-                    clock.as_ref(),
-                ))
+                None
             };
+            let reply = ctx::dispatch_migrated_command(
+                &mut ctx,
+                &runner,
+                inkwash_logic::app::Event::BleCommand(cmd.clone()),
+                pre_event,
+                cmd,
+                id.as_deref(),
+            );
             if let Some(reply) = reply {
                 if needs_full_redraw && matches!(reply, control::Reply::Ok) {
                     dirty.push(FULL_SCREEN_RECT);

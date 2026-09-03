@@ -222,11 +222,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 // flight, so this sync did NOT start - fail immediately so
                 // the state machine's single-flight lock is not left
                 // waiting on a receipt that will never be this sync's.
-                let result = self.ctx.start_sync(
-                    crate::sync_task::OpSource::Internal,
-                    req.now,
-                    inkwash_logic::protocol::Command::SyncNow,
-                );
+                let result = self.ctx.start_sync(req.now);
                 match result {
                     Ok(true) => Ok(EffectOutcome::Async),
                     Ok(false) => Err((
@@ -242,14 +238,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 // later); `Ok(false)` = another Wi-Fi operation is in
                 // flight, so fail immediately rather than leave the
                 // state machine's pending slot waiting forever.
-                let result = self.ctx.start_set_wifi(
-                    creds.clone(),
-                    crate::sync_task::OpSource::Internal,
-                    inkwash_logic::protocol::Command::SetWifi {
-                        ssid: String::new(),
-                        password: String::new(),
-                    },
-                );
+                let result = self.ctx.start_set_wifi(creds.clone());
                 match result {
                     Ok(true) => Ok(EffectOutcome::Async),
                     Ok(false) => Err((

@@ -28,12 +28,12 @@ use anyhow::Result;
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
 use crate::board::Note4Board;
-use crate::control::{self, Channel, Command, Reply};
+use crate::control::{Channel, Command, Reply};
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::{PersistedCounters, WifiCreds};
 use crate::sync;
-use crate::sync_task::{OpSource, PendingWifiOp, SyncTask, WifiOpEvent};
+use crate::sync_task::{PendingWifiOp, SyncTask, WifiOpEvent};
 use crate::todos::TodoStore;
 use crate::usb_console::UsbConsole;
 
@@ -136,27 +136,6 @@ pub struct DeviceContext<'a> {
 /// using `crate::ctx::BackgroundOutcome`.
 pub use inkwash_logic::background_outcome::BackgroundOutcome;
 
-/// True when `cmd` has been migrated into the state machine (Stage 3):
-/// these run through the runner instead of the legacy `control::dispatch`.
-/// SetServer is deliberately NOT here yet: clearing the stale sync ETag on
-/// a server change is NVS sync-metadata bookkeeping that only migrates
-/// with the sync-metadata state (the SyncCompleted increment); until then
-/// the legacy path preserves that side effect exactly.
-pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
-    // SetTimezone is not routed here yet: shifting the RTC by the offset
-    // delta needs a fresh clock fact, which the unified event loop (later
-    // migration stage) guarantees. Until then the legacy path reads the
-    // RTC directly.
-    matches!(
-        cmd,
-        Command::ClearAlarms
-            | Command::SyncNow
-            | Command::SetServer { .. }
-            | Command::SetWifi { .. }
-            | Command::SetTimezone { .. }
-    )
-}
-
 /// Dispatches one migrated command into the shared state-machine runner.
 /// Mirrors `control::dispatch`'s dedup contract: a client resend with the
 /// same id + command replays the cached reply instead of re-executing.
@@ -252,7 +231,7 @@ impl DeviceContext<'_> {
     /// command frame was received - used by the main loop's idle/deep-sleep
     /// tracking, where idle counts "no USB frames" (not just
     /// state-changing ones) as idle.
-    pub fn poll_usb_control(&mut self, now: Option<&DateTime>) -> (bool, bool) {
+    pub fn poll_usb_control(&mut self, _now: Option<&DateTime>) -> (bool, bool) {
         let Some((id, cmd)) = self.usb_console.poll_command() else {
             return (false, false);
         };
@@ -260,39 +239,26 @@ impl DeviceContext<'_> {
         // Migrated commands run through the state machine (Stage 3): the
         // runner's effects (persist/RTC) execute and its Reply effect is
         // written back to USB with the frame's correlation id.
-        if is_migrated_command(&cmd) {
-            // A time-sensitive migrated command (SetTimezone shifts the RTC
-            // by the offset delta from the current clock) needs a fresh
-            // time fact: push a Tick from the latest RTC read first so the
-            // state machine's clock is current when it computes the shift.
-            let pre_event = if matches!(cmd, Command::SetTimezone { .. }) {
-                self.rtc
-                    .read_time()
-                    .ok()
-                    .map(inkwash_logic::app::Event::Tick)
-            } else {
-                None
-            };
-            let event = inkwash_logic::app::Event::UsbCommand(cmd.clone());
-            let runner = self.app_runner.clone();
-            let reply =
-                dispatch_migrated_command(self, &runner, event, pre_event, cmd, id.as_deref());
-            if let Some(reply) = &reply {
-                crate::usb_console::write_reply(reply, id.as_deref());
-            }
-            let changed = matches!(reply, Some(Reply::Ok));
-            return (changes_visible_state && changed, true);
+        // A time-sensitive migrated command (SetTimezone shifts the RTC
+        // by the offset delta from the current clock) needs a fresh
+        // time fact: push a Tick from the latest RTC read first so the
+        // state machine's clock is current when it computes the shift.
+        let pre_event = if matches!(cmd, Command::SetTimezone { .. }) {
+            self.rtc
+                .read_time()
+                .ok()
+                .map(inkwash_logic::app::Event::Tick)
+        } else {
+            None
+        };
+        let event = inkwash_logic::app::Event::UsbCommand(cmd.clone());
+        let runner = self.app_runner.clone();
+        let reply = dispatch_migrated_command(self, &runner, event, pre_event, cmd, id.as_deref());
+        if let Some(reply) = &reply {
+            crate::usb_console::write_reply(reply, id.as_deref());
         }
-        let fresh_now = self.rtc.read_time().ok();
-        let reply = control::dispatch(
-            self,
-            control::Channel::Usb,
-            id.as_deref(),
-            cmd,
-            fresh_now.as_ref().or(now),
-        );
-        crate::usb_console::write_reply(&reply, id.as_deref());
-        (changes_visible_state && matches!(reply, Reply::Ok), true)
+        let changed = matches!(reply, Some(Reply::Ok));
+        (changes_visible_state && changed, true)
     }
 
     /// Services USB plus wall-clock scheduled sync while an ordinary screen
@@ -507,7 +473,7 @@ impl DeviceContext<'_> {
             self.sync_scheduler.last_urgent_boundary =
                 inkwash_logic::scheduler::boundary_index(unix, 30);
             log::info!("Aligned sync due (interval {interval} min); dispatching");
-            if let Err(err) = self.start_sync(OpSource::Internal, *now, Command::SyncNow) {
+            if let Err(err) = self.start_sync(*now) {
                 log::warn!("Failed to dispatch scheduled sync: {err}");
             }
             return false;
@@ -530,29 +496,23 @@ impl DeviceContext<'_> {
     /// Dispatches a full sync to the sync task and records the pending
     /// receipt. Returns `Ok(true)` when dispatched, `Ok(false)` when
     /// another Wi-Fi operation is already in flight (the caller replies
-    /// busy / skips). `cmd` is kept for the dedup-cache update on
-    /// completion.
-    pub fn start_sync(&mut self, source: OpSource, now: DateTime, cmd: Command) -> Result<bool> {
+    /// busy / skips).
+    pub fn start_sync(&mut self, now: DateTime) -> Result<bool> {
         if self.pending_wifi_op.is_some() {
             return Ok(false);
         }
         let reply = self.sync.sync_now(now)?;
-        self.pending_wifi_op = Some(PendingWifiOp::Sync { reply, source, cmd });
+        self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
         Ok(true)
     }
 
     /// Dispatches a Wi-Fi verification + save to the sync task.
-    pub fn start_set_wifi(
-        &mut self,
-        creds: WifiCreds,
-        source: OpSource,
-        cmd: Command,
-    ) -> Result<bool> {
+    pub fn start_set_wifi(&mut self, creds: WifiCreds) -> Result<bool> {
         if self.pending_wifi_op.is_some() {
             return Ok(false);
         }
         let reply = self.sync.set_wifi(creds)?;
-        self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply, source, cmd });
+        self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
         Ok(true)
     }
 
@@ -564,7 +524,7 @@ impl DeviceContext<'_> {
     pub fn poll_wifi_ops(&mut self) -> Option<WifiOpEvent> {
         let op = self.pending_wifi_op.take()?;
         let event = match op {
-            PendingWifiOp::Sync { reply, source, cmd } => match reply.try_recv() {
+            PendingWifiOp::Sync { reply } => match reply.try_recv() {
                 Ok(result) => {
                     let event = WifiOpEvent::SyncDone(
                         result.outcome.as_ref().map_err(|e| e.to_string()).cloned(),
@@ -582,24 +542,22 @@ impl DeviceContext<'_> {
                     Some(event)
                 }
                 Err(TryRecvError::Empty) => {
-                    self.pending_wifi_op = Some(PendingWifiOp::Sync { reply, source, cmd });
+                    self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
                     return None;
                 }
                 Err(_) => None,
             },
-            PendingWifiOp::SetWifi { reply, source, cmd } => match reply.try_recv() {
+            PendingWifiOp::SetWifi { reply } => match reply.try_recv() {
                 Ok(result) => {
                     let event = WifiOpEvent::SetWifiDone;
-                    if self.sm_wifi_reply_target.is_some() {
-                        self.feed_set_wifi_completed(result.map_err(|e| e.to_string()));
-                        self.sm_wifi_reply_target = None;
-                    } else {
-                        self.apply_set_wifi_result(result, source, cmd);
-                    }
+                    // Every SetWifi is state-machine-routed (its reply is
+                    // delivered through the machine when a slot awaits).
+                    self.feed_set_wifi_completed(result.map_err(|e| e.to_string()));
+                    self.sm_wifi_reply_target = None;
                     Some(event)
                 }
                 Err(TryRecvError::Empty) => {
-                    self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply, source, cmd });
+                    self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
                     return None;
                 }
                 Err(_) => None,
@@ -619,9 +577,7 @@ impl DeviceContext<'_> {
                         log::info!("Urgent message available; dispatching full sync");
                         match self.rtc.read_time() {
                             Ok(now) => {
-                                if let Err(err) =
-                                    self.start_sync(OpSource::Internal, now, Command::SyncNow)
-                                {
+                                if let Err(err) = self.start_sync(now) {
                                     log::warn!("Failed to dispatch sync after urgent poll: {err}");
                                 }
                             }
@@ -648,8 +604,6 @@ impl DeviceContext<'_> {
         event
     }
 
-    /// Applies a completed sync: re-points the PCF8563 alarm slot at the
-    /// newly-synced alarm list, applies the daily NTP alignment, clears the
     /// The RTC/NVS-maintenance half of a completed sync: re-point the
     /// PCF8563 alarm slot at the newly-synced alarm list (the executor's
     /// `ApplySyncedData` already wrote the list to NVS), apply the daily
@@ -827,45 +781,6 @@ impl DeviceContext<'_> {
             }
         }
         reply_for_channel
-    }
-
-    fn apply_set_wifi_result(&mut self, result: Result<()>, source: OpSource, cmd: Command) {
-        let reply = match &result {
-            Ok(()) => {
-                log::info!("Wi-Fi credentials verified and saved");
-                Reply::Ok
-            }
-            Err(err) => {
-                log::warn!("Wi-Fi connection verification failed: {err}");
-                Reply::Error {
-                    message: format!("Connection verification failed: {err}"),
-                }
-            }
-        };
-        self.deliver_deferred_reply(source, cmd, reply);
-    }
-
-    /// Writes a deferred reply to its transport and updates the dedup
-    /// cache so a resent duplicate replays the real result instead of the
-    /// interim `Busy`.
-    fn deliver_deferred_reply(&mut self, source: OpSource, command: Command, reply: Reply) {
-        match source {
-            OpSource::Usb { id } => {
-                crate::usb_console::write_reply(&reply, id.as_deref());
-                if let Some(id) = id {
-                    self.last_command = Some((id, command, reply));
-                }
-            }
-            OpSource::Ble { id } => {
-                if let Some(ble) = self.ble_control.as_ref() {
-                    ble.write_reply(&reply, id.as_deref());
-                }
-                if let Some(id) = id {
-                    self.last_command = Some((id, command, reply));
-                }
-            }
-            OpSource::Internal => {}
-        }
     }
 }
 

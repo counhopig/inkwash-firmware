@@ -10,7 +10,6 @@ use crate::display::Rect;
 use crate::inbox::{InboxItem, InboxStore};
 use crate::rtc::{is_leap, DateTime};
 use crate::sync;
-use crate::sync_task::OpSource;
 use crate::todos::{Importance, TodoStore};
 use crate::ui::{
     draw_rows, footer, header, pick_from_list, pick_number, poll_nav, show_message, tick, Nav,
@@ -1320,11 +1319,7 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
         ctx.board.display.refresh_full_best_effort();
     }
 
-    let result = match ctx.start_sync(
-        OpSource::Internal,
-        *now_dt,
-        crate::control::Command::SyncNow,
-    ) {
+    let result = match ctx.start_sync(*now_dt) {
         Ok(true) => {
             let mut result = None;
             while result.is_none() {
@@ -1465,37 +1460,25 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 let _ = ctx.poll_wifi_ops();
                 if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command())
                 {
-                    // Migrated commands route through the state machine (same
-                    // as the main loop); the rest (GetStatus) stay on the
-                    // legacy live-read dispatch.
-                    let reply = if crate::ctx::is_migrated_command(&cmd) {
-                        let runner = ctx.app_runner.clone();
-                        let pre_event =
-                            if matches!(cmd, crate::control::Command::SetTimezone { .. }) {
-                                ctx.rtc
-                                    .read_time()
-                                    .ok()
-                                    .map(inkwash_logic::app::Event::Tick)
-                            } else {
-                                None
-                            };
-                        crate::ctx::dispatch_migrated_command(
-                            ctx,
-                            &runner,
-                            inkwash_logic::app::Event::BleCommand(cmd.clone()),
-                            pre_event,
-                            cmd,
-                            id.as_deref(),
-                        )
+                    // Every command routes through the state machine (same
+                    // as the main loop).
+                    let runner = ctx.app_runner.clone();
+                    let pre_event = if matches!(cmd, crate::control::Command::SetTimezone { .. }) {
+                        ctx.rtc
+                            .read_time()
+                            .ok()
+                            .map(inkwash_logic::app::Event::Tick)
                     } else {
-                        Some(crate::control::dispatch(
-                            ctx,
-                            crate::control::Channel::Ble,
-                            id.as_deref(),
-                            cmd,
-                            now,
-                        ))
+                        None
                     };
+                    let reply = crate::ctx::dispatch_migrated_command(
+                        ctx,
+                        &runner,
+                        inkwash_logic::app::Event::BleCommand(cmd.clone()),
+                        pre_event,
+                        cmd,
+                        id.as_deref(),
+                    );
                     if let Some(reply) = reply {
                         if let Some(ble) = ctx.ble_control.as_ref() {
                             ble.write_reply(&reply, id.as_deref());
