@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use alarms::AlarmStore;
 use anyhow::Result;
 use board::Note4Board;
-use button::POLL_INTERVAL_MS;
+use button::{ButtonEvent, ButtonId, POLL_INTERVAL_MS};
 use canvas::Rect;
 use ctx::{DeviceContext, SyncScheduler};
 use epd_task::EpdCompletion;
@@ -819,13 +819,86 @@ fn main() -> Result<()> {
             let down_event = ctx.board.key_down.poll();
             for event in [enter_event, up_event, down_event].into_iter().flatten() {
                 key_changed = true;
-                if let Err(err) = dispatch_app_runner(
+                let deferred = match dispatch_app_runner(
                     &app_runner,
                     inkwash_logic::app::Event::Button(event),
                     &mut ctx,
                 ) {
-                    log::warn!("SM button dispatch failed: {err}");
-                    continue;
+                    Ok(deferred) => deferred,
+                    Err(err) => {
+                        log::warn!("SM button dispatch failed: {err}");
+                        continue;
+                    }
+                };
+                for item in deferred.settings_items {
+                    // Settings row action (Sync Now / Sync Interval / BLE
+                    // pairing / Sleep) run as a legacy wedge after the pump.
+                    // An alarm-unwound wedge means the dismiss render is
+                    // already issued; otherwise force the Settings screen
+                    // redraw (the wedge drew over it).
+                    if open_deferred_settings_item(&mut ctx, clock.as_ref(), item) {
+                        dismiss_full_refresh = true;
+                    } else {
+                        dirty.push(FULL_SCREEN_RECT);
+                    }
+                }
+            }
+            if let Some(event) = ctx.board.key_up.poll() {
+                key_changed = true;
+                match event {
+                    ButtonEvent::Pressed(ButtonId::Up) => {
+                        // Home has no vertical selection.
+                    }
+                    ButtonEvent::LongPressed(ButtonId::Up) => {
+                        log::info!("UP long pressed; opening navigation");
+                        screens::open_navigation(&mut ctx, clock.as_ref());
+                        let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+                        // Always restore Home after the navigation stack: a
+                        // normal cancel or selecting Home leaves the drawer /
+                        // old page on screen but keys already route to Home.
+                        // The alarm flag only marks WHY the stack unwound and
+                        // is cleared here so it does not leak into the next
+                        // page. The consume-for-source policy is the shared
+                        // production code the host harness drives.
+                        let _ = ctx
+                            .alarm_poll
+                            .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+                        let _ = ctx.alarm_poll.take_alarm_exit();
+                        if !alarm_interrupted {
+                            dirty.push(FULL_SCREEN_RECT);
+                        } else {
+                            dismiss_full_refresh = true;
+                        }
+                    }
+                    ButtonEvent::Released(ButtonId::Up) => {}
+                    other => log::debug!("unexpected key_up event: {other:?}"),
+                }
+            }
+
+            if let Some(event) = ctx.board.key_down.poll() {
+                key_changed = true;
+                match event {
+                    ButtonEvent::Pressed(ButtonId::Down) => {
+                        // Home has no vertical selection.
+                    }
+                    ButtonEvent::LongPressed(ButtonId::Down) => {
+                        log::info!("DOWN long pressed; opening navigation");
+                        screens::open_navigation(&mut ctx, clock.as_ref());
+                        let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+                        // Same consume-for-source sequence as the UP path:
+                        // report the blocking-page exit then consume it once.
+                        let _ = ctx
+                            .alarm_poll
+                            .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+                        let _ = ctx.alarm_poll.take_alarm_exit();
+                        if !alarm_interrupted {
+                            dirty.push(FULL_SCREEN_RECT);
+                        } else {
+                            dismiss_full_refresh = true;
+                        }
+                    }
+                    ButtonEvent::Released(ButtonId::Down) => {}
+                    other => log::debug!("unexpected key_down event: {other:?}"),
                 }
             }
         }
@@ -1081,6 +1154,29 @@ fn run_safe_mode(
     }
 }
 
+/// Runs one Settings row action selected through the state-machine Settings
+/// screen (Stage 4, slice 2). Called strictly after the dispatch pump has
+/// released the Runtime borrow: the row actions are legacy blocking
+/// screens/wedges that dispatch alarm/button events through the shared
+/// Runtime. The SM stays on `Screen::Settings`; when the wedge returns (all
+/// rows except Sleep) the caller forces a Settings redraw.
+///
+/// Returns `true` when an alarm unwound the wedge (the SM already issued
+/// the dismiss render; the caller drops dirty rects instead of redrawing).
+fn open_deferred_settings_item(
+    ctx: &mut DeviceContext,
+    now: Option<&DateTime>,
+    item: usize,
+) -> bool {
+    screens::open_sm_settings_item(ctx, now, item);
+    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+    let _ = ctx
+        .alarm_poll
+        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+    let _ = ctx.alarm_poll.take_alarm_exit();
+    alarm_interrupted
+}
+
 /// Renders the idle/background screen with a freshly-loaded next-alarm
 /// label and pending-todo count. Called after every edit made in
 /// `screens::open_menu` (via the caller re-rendering on return) and on
@@ -1251,30 +1347,44 @@ fn collect_boot_snapshot(
 /// to the shared EPD registry here, so call sites never drain kicks by
 /// hand.
 ///
-/// Pushes one event into the shared runtime queue and pumps the single
-/// `App::update` consumer to quiescence with a fresh per-pump
-/// `EffectRunner` borrowing `ctx`. This is the only path events take into
-/// the state machine; render kicks registered during the pump are routed
-/// to the shared EPD registry here, so call sites never drain kicks by
-/// hand.
+/// Returns the legacy wedges the state machine selected while pumping this
+/// event (currently just the Settings BLE PAIRING row - the last still
+/// behind a blocking radio wedge). The caller runs each AFTER this
+/// returns - never inside a pump - because the wedge dispatches
+/// alarm/button events back through the same shared Runtime, which would
+/// re-enter `borrow_mut` on the RefCell this function held during the pump.
 fn dispatch_app_runner(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DeferredNav> {
     let last_clock = runner.borrow().last_clock();
-    {
+    let deferred = {
         let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
-        let mut runtime = runner.borrow_mut();
-        runtime.push(event);
-        runtime
-            .pump(&mut executor)
-            .map_err(|e| anyhow::anyhow!(e))?;
-    }
+        {
+            let mut runtime = runner.borrow_mut();
+            runtime.push(event);
+            runtime
+                .pump(&mut executor)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        DeferredNav {
+            settings_items: executor.take_deferred_settings(),
+        }
+    };
     for kick in runner.borrow_mut().take_kicks() {
         track_kick_shared(ctx, kick);
     }
-    Ok(())
+    Ok(deferred)
+}
+
+/// Legacy blocking-page wedges deferred out of a pump: the Settings BLE
+/// PAIRING wedge (deferred through the executor's settings-item buffer,
+/// which now only ever carries the BLE pairing row). The main loop runs it
+/// after the pump.
+#[derive(Default)]
+struct DeferredNav {
+    settings_items: Vec<usize>,
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.

@@ -463,6 +463,12 @@ pub enum Effect {
     StopBlePairing,
     EnterLightSleep(LightSleepPlan),
     EnterDeepSleep(WakeupPlan),
+    /// The user pressed ENTER on the Settings BLE PAIRING row (index 2) -
+    /// the last row still behind a legacy blocking radio screen. The state
+    /// machine stays on `Screen::Settings` while the executor runs the wedge
+    /// (deferred post-pump); a Full Settings render is re-issued when the
+    /// wedge returns.
+    OpenBlePairingScreen,
     /// The user opened an inbox item (ENTER on an Inbox row). Fire-and-forget
     /// local persistence of the read mark: the executor marks `seq` read and
     /// adds it to the pending-read set (two-way sync uploads it later). The
@@ -1606,7 +1612,9 @@ fn nav_origin_screen(_origin: NavOrigin) -> Screen {
 /// the origin, and ENTER selects a destination. Every destination
 /// (HOME/CALENDAR/INBOX/ALARMS/TODOS/SETTINGS) is a state-machine screen
 /// now; a drawer over a screen highlights that screen's row, so a no-move
-/// ENTER stays there.
+/// ENTER stays there. The Settings BLE Pairing row emits
+/// `OpenBlePairingScreen`; the
+/// Settings screen itself stays current while the executor wedge runs.
 fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     match &state.screen {
         Screen::Navigation { selected, origin } => {
@@ -1793,37 +1801,21 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                             ),
                             render_batch(state),
                         ]
-                    } else if cur == SETTINGS_BLE_PAIRING_ROW {
-                        // BLE PAIRING (row 2): an SM screen now. Enter the
-                        // pairing session (Waiting) and ask the executor to
-                        // bring the radio up (StartBlePairing -> NimBLE
-                        // advertising; the executor completes synchronously
-                        // once up). Radio lifecycle events (Started /
-                        // Succeeded / Failed / Disconnected) drive the
-                        // phase; any button exits back to the Settings BLE
-                        // row with StopBlePairing; the session timeout is a
-                        // Tick past an armed deadline. No blocking wedge.
-                        let pairing = BlePairingRequest {
-                            name: "inkwash-note4".to_string(),
-                        };
-                        state.screen = Screen::BlePairing(BlePairingState {
-                            phase: BlePairingPhase::Waiting,
-                            pairing_deadline_unix: None,
-                        });
+                    } else {
+                        // BLE pairing (row 2): deferred to the executor
+                        // (still a legacy blocking radio screen). The SM
+                        // stays on Settings; the executor returns
+                        // after the wedge and main re-renders Settings.
                         state.render_generation = state.render_generation.next();
                         vec![
                             batch(
                                 state,
                                 OperationId(0),
                                 FailurePolicy::Continue,
-                                vec![Effect::StartBlePairing(pairing)],
+                                vec![Effect::OpenBlePairingScreen],
                             ),
                             render_batch(state),
                         ]
-                    } else {
-                        // Unreachable: every Settings row (0..3) is handled
-                        // above.
-                        vec![]
                     }
                 }
                 _ => vec![],
@@ -5190,10 +5182,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_ble_pairing_row_enters_the_sm_pairing_screen() {
-        // P1#2: the Settings BLE PAIRING row is an SM screen now - ENTER
-        // enters Screen::BlePairing (Waiting) and asks the executor to start
-        // the radio (StartBlePairing); there is no legacy wedge.
+    fn settings_enter_row_emits_open_settings_item_and_stays() {
         let mut state = AppState::default();
         let _ = update(
             &mut state,
@@ -5216,27 +5205,17 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert_eq!(state.screen, Screen::Settings { selected: 2 });
         let batches = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert_eq!(
-            state.screen,
-            Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Waiting,
-                ..Default::default()
-            })
-        );
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::StartBlePairing(_))));
-        // The pairing screen is rendered.
-        assert!(batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
+        // The SM stays on Settings (the executor runs the wedge and returns;
+        // main re-renders Settings).
+        assert_eq!(state.screen, Screen::Settings { selected: 2 });
     }
 
     #[test]
@@ -5282,6 +5261,10 @@ mod tests {
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::EnterDeepSleep(WakeupPlan { .. }))));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
     }
 
     #[test]
@@ -5361,6 +5344,10 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         assert_eq!(state.screen, Screen::SyncIntervalPick { selected: 0 });
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
@@ -5515,6 +5502,10 @@ mod tests {
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StartSync(_))));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenBlePairingScreen)));
         // The SM stays on Settings.
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
     }
