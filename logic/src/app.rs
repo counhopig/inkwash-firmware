@@ -99,6 +99,7 @@ pub enum NavOrigin {
     Settings,
     AlarmList,
     TodoList,
+    Inbox,
 }
 
 impl Screen {
@@ -138,10 +139,12 @@ impl Screen {
             Screen::TodoList { selected } => RenderView::TodoList {
                 selected: *selected,
             },
+            Screen::Inbox { selected } => RenderView::Inbox {
+                selected: *selected,
+            },
             Screen::Home
             | Screen::Calendar(_)
             | Screen::AlarmEdit(_)
-            | Screen::Inbox { .. }
             | Screen::AlarmRinging
             | Screen::Reminder(_)
             | Screen::BlePairing(_) => RenderView::Home,
@@ -409,6 +412,17 @@ pub enum Effect {
     /// persists to the alarm store; when it returns, main dispatches
     /// `Event::AlarmStoreChanged` so the state machine reloads the list.
     OpenAddAlarm,
+    /// The user pressed ENTER on an InboxList row whose item detail is
+    /// still a legacy blocking screen (open_inbox_item marks the item read
+    /// and shows its body). The state machine stays on `Screen::Inbox`
+    /// while the executor runs the wedge (deferred post-pump, same as
+    /// `OpenAddAlarm`); when it returns, main dispatches
+    /// `Event::InboxStoreChanged` with the reloaded list so the machine
+    /// adopts the read marks.
+    OpenInboxItem {
+        /// Index into `state.inbox.items`.
+        index: usize,
+    },
 }
 
 /// Which visible surface a render request targets. The renderer draws this
@@ -434,6 +448,10 @@ pub enum RenderView {
     /// toggles a row's done flag and long ENTER cycles its importance
     /// (both confirmable SM edits). Carries the selected row.
     TodoList { selected: usize },
+    /// The inbox list (Stage 4): rows browsed in the state machine, ENTER
+    /// opens an item's detail through a deferred legacy wedge. Carries the
+    /// selected row; the executor loads the rows from the store.
+    Inbox { selected: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -644,6 +662,10 @@ pub enum Event {
     /// NVS list (the executor reads the store; `update` never touches NVS),
     /// which the state machine adopts and re-renders.
     AlarmStoreChanged(Vec<StoredAlarm>),
+    /// The inbox store changed out-of-band (a legacy item-detail wedge
+    /// marked an item read). The event carries the reloaded authoritative
+    /// NVS list; the state machine adopts it and re-renders.
+    InboxStoreChanged(Vec<InboxItem>),
     DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
@@ -968,6 +990,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
         Event::AlarmStoreChanged(alarms) => transition_alarm_store_changed(state, alarms),
+        Event::InboxStoreChanged(items) => transition_inbox_store_changed(state, items),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
@@ -1342,6 +1365,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::Settings { .. }
             | Screen::AlarmList { .. }
             | Screen::TodoList { .. }
+            | Screen::Inbox { .. }
     ) {
         transition_nav_button(state, button)
     } else {
@@ -1362,6 +1386,8 @@ fn nav_home_index(origin: NavOrigin) -> usize {
         NavOrigin::AlarmList => 3,
         // The drawer over the todo list highlights TODOS (4).
         NavOrigin::TodoList => 4,
+        // The drawer over the inbox list highlights INBOX (2).
+        NavOrigin::Inbox => 2,
     }
 }
 
@@ -1370,12 +1396,11 @@ fn nav_home_index(origin: NavOrigin) -> usize {
 /// With every origin a state-machine screen, closing the drawer returns to
 /// the plain root of the navigation tree: Home (Settings keeps its own
 /// back-to-Home path).
-fn nav_origin_screen(origin: NavOrigin) -> Screen {
-    match origin {
-        NavOrigin::Home | NavOrigin::Settings | NavOrigin::AlarmList | NavOrigin::TodoList => {
-            Screen::Home
-        }
-    }
+fn nav_origin_screen(_origin: NavOrigin) -> Screen {
+    // Every origin is a state-machine screen; closing the drawer (cancel /
+    // HOME / the origin's own row) returns to the plain root Home. Settings,
+    // AlarmList, TodoList and Inbox keep their own back / drawer flows.
+    Screen::Home
 }
 
 /// Navigation-drawer state machine (Stage 4): a long UP/DOWN opens the
@@ -1418,12 +1443,18 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 ButtonEvent::LongPressed(ButtonId::Enter) => Some(nav_origin_screen(origin)),
                 ButtonEvent::Pressed(ButtonId::Enter) => {
                     // Selecting a destination closes the drawer.
-                    // HOME (0), ALARMS (3), TODOS (4) and SETTINGS (5) are
-                    // SM screens; the remaining destinations are opened by
-                    // the executor (legacy page) for now.
+                    // HOME (0), INBOX (2), ALARMS (3), TODOS (4) and SETTINGS
+                    // (5) are SM screens; the remaining destination
+                    // (CALENDAR, 1) is opened by the executor (legacy page)
+                    // for now.
                     return match cur {
                         0 => {
                             state.screen = nav_origin_screen(origin);
+                            state.render_generation = state.render_generation.next();
+                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        }
+                        2 => {
+                            state.screen = Screen::Inbox { selected: 0 };
                             state.render_generation = state.render_generation.next();
                             vec![render_batch_with_intent(state, RenderIntent::Full)]
                         }
@@ -1540,6 +1571,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
         }
         Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
         Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
+        Screen::Inbox { selected } => transition_inbox_list_button(state, *selected, button),
         Screen::Home => {
             // Long UP/DOWN opens the global navigation drawer from Home
             // (origin Home, highlighting HOME).
@@ -1757,6 +1789,93 @@ fn transition_todo_list_button(
         }
         _ => vec![],
     }
+}
+
+/// InboxList screen (Stage 4): browse the stored inbox items (read/unread
+/// markers from the executor's render); ENTER opens the selected item's
+/// detail through a deferred legacy wedge (`OpenInboxItem` - the detail
+/// marks the item read and shows its body). The SM stays on `Screen::Inbox`
+/// while the wedge runs; when it returns, main dispatches
+/// `Event::InboxStoreChanged` so the machine adopts the read marks. Long
+/// UP/DOWN opens the GO TO drawer (origin Inbox); long ENTER backs to Home.
+fn transition_inbox_list_button(
+    state: &mut AppState,
+    selected: usize,
+    button: ButtonEvent,
+) -> Vec<EffectBatch> {
+    let count = state.inbox.items.len();
+    match button {
+        ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
+            // Open the GO TO drawer over the inbox list (origin Inbox).
+            state.screen = Screen::Navigation {
+                selected: nav_home_index(NavOrigin::Inbox),
+                origin: NavOrigin::Inbox,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
+            // Back out of the inbox list to root Home.
+            state.screen = Screen::Home;
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::Pressed(ButtonId::Up) => {
+            state.screen = Screen::Inbox {
+                selected: selected.saturating_sub(1),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Down) => {
+            // Clamp to the last row; an empty list stays at 0.
+            let max = count.saturating_sub(1);
+            state.screen = Screen::Inbox {
+                selected: (selected + 1).min(max),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Enter) => {
+            if count == 0 {
+                // Nothing to open on an empty list.
+                return vec![];
+            }
+            // Open the selected item's detail through the deferred legacy
+            // wedge. The SM stays on Inbox; main dispatches
+            // Event::InboxStoreChanged with the reloaded list after the
+            // wedge returns.
+            state.render_generation = state.render_generation.next();
+            vec![
+                batch(
+                    state,
+                    OperationId(0),
+                    FailurePolicy::Continue,
+                    vec![Effect::OpenInboxItem {
+                        index: selected.min(count - 1),
+                    }],
+                ),
+                render_batch_with_intent(state, RenderIntent::Full),
+            ]
+        }
+        _ => vec![],
+    }
+}
+
+/// The inbox store changed out-of-band (a legacy item-detail wedge marked
+/// items read; main dispatched this with the reloaded NVS list). Adopt the
+/// list and re-render the Inbox screen.
+fn transition_inbox_store_changed(state: &mut AppState, items: Vec<InboxItem>) -> Vec<EffectBatch> {
+    state.inbox.items = items;
+    state.render_generation = state.render_generation.next();
+    // Clamp the selection to the (possibly shorter/longer) list.
+    if let Screen::Inbox { selected } = &mut state.screen {
+        let len = state.inbox.items.len();
+        if *selected >= len {
+            *selected = len.saturating_sub(1);
+        }
+    }
+    vec![render_batch_with_intent(state, RenderIntent::Full)]
 }
 
 /// The alarm store changed out-of-band (a legacy ADD-ALARM editor wedge
@@ -5102,6 +5221,258 @@ mod tests {
         assert_eq!(state.screen, Screen::TodoList { selected: 0 });
     }
 
+    // ---- InboxList screen (Stage 4) --------------------------------------
+
+    fn inbox_item(id: u64, title: &str, read: bool) -> InboxItem {
+        InboxItem {
+            id,
+            kind: crate::inbox_item::InboxKind::Info,
+            priority: crate::inbox_item::Priority::Normal,
+            title: title.to_string(),
+            body: String::new(),
+            when: None,
+            read,
+        }
+    }
+
+    fn boot_snapshot_inbox(items: Vec<InboxItem>, now: Option<DateTime>) -> BootSnapshot {
+        let mut snap = boot_snapshot(vec![], now, false, true);
+        snap.inbox = items;
+        snap
+    }
+
+    /// Boots with `items`, then opens the INBOX drawer destination (index 2)
+    /// and selects it.
+    fn open_inbox(state: &mut AppState, items: Vec<InboxItem>) {
+        let _ = update(
+            state,
+            Event::Boot(boot_snapshot_inbox(items, Some(dt(9, 0)))),
+        );
+        let _ = update(state, Event::Button(ButtonEvent::LongPressed(ButtonId::Up)));
+        // Down twice: 0 -> 1 -> 2 (INBOX).
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 2,
+                origin: NavOrigin::Home
+            }
+        );
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+    }
+
+    #[test]
+    fn drawer_select_inbox_opens_sm_inbox_list() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot_inbox(vec![], Some(dt(9, 0)))),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::Inbox { selected: 0 },
+                intent: RenderIntent::Full,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn inbox_list_browses_and_clamps() {
+        let mut state = AppState::default();
+        open_inbox(
+            &mut state,
+            vec![
+                inbox_item(1, "a", false),
+                inbox_item(2, "b", true),
+                inbox_item(3, "c", false),
+            ],
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 2 });
+        // Down past the end clamps.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 2 });
+        // Up to top.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+    }
+
+    #[test]
+    fn inbox_enter_row_emits_open_inbox_item_and_stays() {
+        let mut state = AppState::default();
+        open_inbox(
+            &mut state,
+            vec![inbox_item(1, "a", false), inbox_item(2, "b", true)],
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenInboxItem { index: 1 })));
+        // The SM stays on Inbox (the wedge marks read; main dispatches
+        // InboxStoreChanged to adopt).
+        assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Inbox { selected: 1 },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn inbox_enter_on_empty_list_is_noop() {
+        let mut state = AppState::default();
+        open_inbox(&mut state, vec![]);
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(!batches.iter().any(|b| b
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::OpenInboxItem { .. }))));
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+    }
+
+    #[test]
+    fn inbox_store_changed_adopts_read_marks_and_clamps() {
+        let mut state = AppState::default();
+        open_inbox(
+            &mut state,
+            vec![inbox_item(1, "a", false), inbox_item(2, "b", true)],
+        );
+        // Open row 1, then the wedge marks both read; main reloads.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let reloaded = vec![inbox_item(1, "a", true), inbox_item(2, "b", true)];
+        let batches = update(&mut state, Event::InboxStoreChanged(reloaded.clone()));
+        assert_eq!(state.inbox.items, reloaded);
+        assert_eq!(state.screen, Screen::Inbox { selected: 1 });
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Inbox { selected: 1 },
+                ..
+            })
+        )));
+        // A reload to an empty list clamps selection to 0.
+        let _ = update(&mut state, Event::InboxStoreChanged(vec![]));
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+    }
+
+    #[test]
+    fn inbox_long_enter_backs_home_and_drawer_is_inbox_origin() {
+        let mut state = AppState::default();
+        open_inbox(&mut state, vec![inbox_item(1, "a", false)]);
+        // Long UP opens the drawer with INBOX highlighted (origin Inbox).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 2,
+                origin: NavOrigin::Inbox
+            }
+        );
+        // Select HOME (long UP jumps to 0), then ENTER.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Home,
+                ..
+            })
+        )));
+        // Re-enter INBOX and select INBOX again (no-move ENTER) returns to
+        // the list.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Inbox { selected: 0 });
+    }
+
     #[test]
     fn still_legacy_screens_project_to_home_surface_until_migrated() {
         // Stage-4 transitional projection: every screen still drawn through
@@ -5152,7 +5523,10 @@ mod tests {
                 Screen::TodoList { selected: 0 },
                 RenderView::TodoList { selected: 0 },
             ),
-            (Screen::Inbox { selected: 0 }, RenderView::Home),
+            (
+                Screen::Inbox { selected: 0 },
+                RenderView::Inbox { selected: 0 },
+            ),
             (Screen::AlarmRinging, RenderView::Home),
             (
                 Screen::Reminder(ReminderState {
