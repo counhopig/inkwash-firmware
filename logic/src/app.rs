@@ -76,6 +76,10 @@ pub enum Screen {
     BlePairing(BlePairingState),
 }
 
+/// Number of global navigation destinations (HOME/CALENDAR/INBOX/ALARMS/
+/// TODOS/SETTINGS - see the firmware's `NAV_DESTINATIONS`).
+pub const NAV_DESTINATION_COUNT: usize = 6;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalendarState {
     pub year: u16,
@@ -287,6 +291,14 @@ pub enum Effect {
     StopBlePairing,
     EnterLightSleep(LightSleepPlan),
     EnterDeepSleep(WakeupPlan),
+    /// The user selected a navigation-drawer destination (Enter). In this
+    /// migration slice only Home (destination 0) is a fully state-machine
+    /// screen; the other destinations are opened by the executor through
+    /// the legacy blocking page until those pages migrate to Screen states
+    /// (Stage 4). The effect is data - `update` never opens a page itself.
+    OpenNavigationDestination {
+        destination: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1144,8 +1156,87 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             ),
             render_batch_with_intent(state, RenderIntent::Full),
         ]
+    } else if matches!(state.screen, Screen::Home | Screen::Navigation { .. }) {
+        transition_nav_button(state, button)
     } else {
         vec![]
+    }
+}
+
+/// Navigation-drawer state machine (Stage 4, slice 1): a long UP/DOWN
+/// opens the drawer from Home; inside the drawer, UP/DOWN move the
+/// selection (wrapping), long UP/DOWN jump to the first/last destination,
+/// long ENTER cancels back to the pre-drawer screen, and ENTER selects.
+/// Destination 0 (HOME) is fully state-machine; selecting any other
+/// destination emits `OpenNavigationDestination` for the executor to open
+/// through the legacy page until that page migrates.
+fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    match &state.screen {
+        Screen::Home => {
+            // Long UP/DOWN opens the global navigation drawer, preselected
+            // on HOME.
+            if matches!(
+                button,
+                ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down)
+            ) {
+                state.screen = Screen::Navigation { selected: 0 };
+                state.render_generation = state.render_generation.next();
+                vec![render_batch_with_intent(state, RenderIntent::Full)]
+            } else {
+                vec![]
+            }
+        }
+        Screen::Navigation { selected } => {
+            let cur = *selected;
+            let next_screen = match button {
+                ButtonEvent::Pressed(ButtonId::Up) => Some(Screen::Navigation {
+                    selected: if cur == 0 {
+                        NAV_DESTINATION_COUNT - 1
+                    } else {
+                        cur - 1
+                    },
+                }),
+                ButtonEvent::Pressed(ButtonId::Down) => Some(Screen::Navigation {
+                    selected: (cur + 1) % NAV_DESTINATION_COUNT,
+                }),
+                ButtonEvent::LongPressed(ButtonId::Up) => Some(Screen::Navigation { selected: 0 }),
+                ButtonEvent::LongPressed(ButtonId::Down) => Some(Screen::Navigation {
+                    selected: NAV_DESTINATION_COUNT - 1,
+                }),
+                ButtonEvent::LongPressed(ButtonId::Enter) => Some(Screen::Home),
+                ButtonEvent::Pressed(ButtonId::Enter) => {
+                    // Selecting a destination: HOME is an SM screen; the
+                    // others are opened by the executor (legacy page) for
+                    // now. Either way the drawer closes back to Home.
+                    return if cur == 0 {
+                        state.screen = Screen::Home;
+                        state.render_generation = state.render_generation.next();
+                        vec![render_batch_with_intent(state, RenderIntent::Full)]
+                    } else {
+                        state.screen = Screen::Home;
+                        state.render_generation = state.render_generation.next();
+                        vec![
+                            batch(
+                                state,
+                                OperationId(0),
+                                FailurePolicy::Continue,
+                                vec![Effect::OpenNavigationDestination { destination: cur }],
+                            ),
+                            render_batch_with_intent(state, RenderIntent::Full),
+                        ]
+                    };
+                }
+                _ => None,
+            };
+            if let Some(next) = next_screen {
+                state.screen = next;
+                state.render_generation = state.render_generation.next();
+                vec![render_batch_with_intent(state, RenderIntent::Full)]
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
     }
 }
 
@@ -3261,6 +3352,135 @@ mod tests {
         let batches = update(&mut state, Event::SyncBoundaryDue);
         assert!(batches.is_empty());
         assert_eq!(state.sync, SyncState::Idle);
+    }
+
+    #[test]
+    fn long_press_opens_navigation_from_home() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Navigation { selected: 0 });
+        // A full render is requested for the drawer overlay.
+        assert!(batches
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::Render(_))) }));
+    }
+
+    #[test]
+    fn navigation_down_up_move_wrap_and_jump() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        // Down from 0 -> 1.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::Navigation { selected: 1 });
+        // Up from 1 -> 0.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Navigation { selected: 0 });
+        // Up wraps from 0 -> last (5).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: NAV_DESTINATION_COUNT - 1
+            }
+        );
+        // Long DOWN jumps to last; long UP jumps to first.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Navigation { selected: 0 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: NAV_DESTINATION_COUNT - 1
+            }
+        );
+    }
+
+    #[test]
+    fn navigation_select_home_closes_drawer() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        assert!(matches!(state.screen, Screen::Navigation { .. }));
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(!batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
+        }));
+    }
+
+    #[test]
+    fn navigation_select_non_home_emits_open_destination() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        // Move to destination 1 (CALENDAR).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home, "drawer closes to Home");
+        assert!(batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::OpenNavigationDestination { destination: 1 }))
+        }));
+    }
+
+    #[test]
+    fn navigation_cancel_with_long_enter_returns_home() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(!batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::OpenNavigationDestination { .. }))
+        }));
     }
 
     #[test]

@@ -197,6 +197,15 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             // ---- asynchronous / out-of-band effects -------------------------
+            Effect::OpenNavigationDestination { destination } => {
+                // Transitional: the executor opens the legacy destination
+                // page. Wired when the main loop routes drawer buttons
+                // through the state machine (the Stage-4 nav slice); until
+                // then the firmware opens pages on its own key handling, so
+                // this effect does not fire in practice.
+                log::warn!("OpenNavigationDestination({destination}) effect not wired; ignored");
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
             Effect::Reply { channel, reply } => {
                 // Record the reply for the caller to write after the pump:
                 // only the caller knows the correlation id of the frame that
