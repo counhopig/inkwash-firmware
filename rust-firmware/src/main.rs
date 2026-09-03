@@ -1267,27 +1267,14 @@ fn dispatch_app_runner(
 
 /// surfaced with a log and dropped - their transports aren't wired yet.
 fn track_kick_shared(ctx: &DeviceContext<'_>, kick: app_runner::AsyncKick) {
+    // Only Render effects need registry tracking: their EPD completion is
+    // matched back by request id. Every other async effect the executor
+    // reports (StartSync / StartSetWifi, whose completions arrive as their
+    // own SyncCompleted / SetWifiCompleted events) needs no kick bookkeeping
+    // - the log-and-drop arms are gone.
     let mut reg = ctx.pending_renders.borrow_mut();
-    match &kick.effect {
-        inkwash_logic::app::Effect::Render(_) => reg.register(kick),
-        inkwash_logic::app::Effect::StartSync(_) => {
-            log::warn!(
-                "AppRunner StartSync kick not yet wired to sync task (op {:?}); dropped",
-                kick.operation_id
-            );
-        }
-        inkwash_logic::app::Effect::StartBlePairing(_)
-        | inkwash_logic::app::Effect::StopBlePairing => {
-            log::warn!(
-                "AppRunner BLE pairing kick not yet wired (op {:?}); dropped",
-                kick.operation_id
-            );
-        }
-        other => log::warn!(
-            "AppRunner async kick {:?} (op {:?}) not handled; dropped",
-            other,
-            kick.operation_id
-        ),
+    if kick.is_render() {
+        reg.register(kick);
     }
 }
 
