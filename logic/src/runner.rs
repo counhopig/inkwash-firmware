@@ -28,6 +28,7 @@ pub enum EffectCategory {
     Sync,
     Tone,
     Sleep,
+    Ble,
 }
 
 /// Outcome of running one `Effect` in the executor.
@@ -79,5 +80,6 @@ pub fn err_for_category(category: EffectCategory, msg: &str) -> EffectError {
         EffectCategory::Sync => EffectError::Sync(msg.to_string()),
         EffectCategory::Tone => EffectError::Tone(msg.to_string()),
         EffectCategory::Sleep => EffectError::Sleep(msg.to_string()),
+        EffectCategory::Ble => EffectError::Ble(msg.to_string()),
     }
 }
