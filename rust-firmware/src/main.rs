@@ -396,7 +396,9 @@ fn main() -> Result<()> {
     // has no trustworthy alarm/NVS/config data and must NOT interpret any
     // AF / Tick event. This prevents dispatch on a default AppState that
     // would otherwise treat a real alarm as residue and ACK it off.
-    let mut app_runner_enabled = true;
+    // Always true on the surviving path: a core boot-fact failure diverges
+    // into `run_safe_mode` (which never returns) before this is consulted.
+    let app_runner_enabled = true;
 
     // Two-level polling cadence: while the user
     // interacts - a key is raw-low, a command arrived, a refresh is
@@ -442,16 +444,30 @@ fn main() -> Result<()> {
         if !boot_dispatched {
             boot_dispatched = true;
             let boot_result = collect_boot_snapshot(&mut ctx, clock);
-            if boot_result.core_failed {
-                // Architecture says core NVS / RTC failure must enter a
-                // minimal safe mode. We set app_runner_enabled = false so
-                // no subsequent Tick / RtcAlarmSnapshotReady reaches
-                // `update` on an uninitialized AppState - an empty alarm
-                // list would otherwise treat a real AF as residue and
-                // ACK it off, or make alarm decisions on corrupt facts.
-                app_runner_enabled = false;
-                ctx.app_runner_enabled = false;
-                log::error!("Core boot fact unavailable; AppRunner disabled for this boot");
+            // Injectable boot-fact failure hook (Stage 6): building with
+            // --cfg inkwash_force_safe_mode forces the minimum safe-mode
+            // entry on a *healthy* boot, so the safe path can be
+            // device-verified without destroying NVS/RTC. Not enabled in the
+            // normal build (see .cargo/config.toml test profile note).
+            #[cfg(inkwash_force_safe_mode)]
+            let forced_safe_mode = true;
+            #[cfg(not(inkwash_force_safe_mode))]
+            let forced_safe_mode = false;
+            if boot_result.core_failed || forced_safe_mode {
+                // Architecture (firmware-architecture.md "启动失败与安全模
+                // 式"): a core boot fact failure must NOT run the normal App
+                // (an empty alarm list would treat a real AF as residue and
+                // ACK it off, or make alarm decisions on corrupt facts), and
+                // must NOT degrade into the legacy product loop. Enter the
+                // independent minimum safe mode (fixed error screen + USB
+                // diagnostics + watchdog + reset detect; no App/nav/network/
+                // BLE/sleep). It never returns - only reset/power-cycle.
+                let reason = if forced_safe_mode {
+                    "forced by inkwash_force_safe_mode cfg (test hook)".to_string()
+                } else {
+                    boot_result.failure_reason.clone()
+                };
+                run_safe_mode(ctx.board, ctx.usb_console, &reason);
             } else {
                 if let Err(err) = dispatch_app_runner(
                     &app_runner,
@@ -1093,6 +1109,100 @@ fn main() -> Result<()> {
     }
 }
 
+/// Architecture minimum safe mode (firmware-architecture.md "启动失败与安全
+/// 模式"). Entered when a *core* boot fact is unavailable (RTC alarm-status
+/// read failed, or the alarm NVS list could not be loaded): there is no
+/// trustworthy local data or time to build a meaningful BootSnapshot, so the
+/// normal App state machine must not run (an empty alarm list would treat a
+/// real AF as residue and ACK it off). This is an independent minimal loop -
+/// NOT the normal Home/product loop with the state machine disabled:
+///
+/// - renders a fixed error screen once;
+/// - services only USB diagnostics (GetStatus -> a Status reply with no
+///   configured/connected facts; every other command -> an explicit Error)
+///   so `inkwash-desktop` can see the device is in safe mode;
+/// - keeps the watchdog fed and watches the reset (ENTER) button;
+/// - never initializes or drives Wi-Fi, BLE, light sleep or deep sleep, and
+///   never opens navigation/content pages;
+/// - never returns: the only way out is a reset / power-cycle, which re-runs
+///   the normal boot detection.
+fn run_safe_mode(
+    board: &mut Note4Board,
+    usb_console: &mut crate::usb_console::UsbConsole,
+    reason: &str,
+) -> ! {
+    log::error!("Entering minimum safe mode (core boot fact unavailable: {reason})");
+    // Fixed error screen. Drawn once; safe mode makes no further display
+    // decisions (no renderer cache, no partials, no clock).
+    {
+        let mut canvas = board.display.canvas_mut();
+        canvas.clear();
+        crate::ui::header(&mut canvas, "SAFE MODE");
+        canvas.draw_text_prop(8, 60, 1, "CORE DATA UNAVAILABLE");
+        // Reason text at scale 1; hard-split at 40 chars onto two lines.
+        let (r1, r2) = if reason.len() > 40 {
+            let (head, rest) = reason.split_at(40);
+            (head.to_string(), rest.chars().take(40).collect::<String>())
+        } else {
+            (reason.to_string(), String::new())
+        };
+        canvas.draw_text_prop(8, 80, 1, &r1);
+        if !r2.is_empty() {
+            canvas.draw_text_prop(8, 96, 1, &r2);
+        }
+        canvas.draw_text_prop(8, 140, 1, "USB DIAGNOSTICS ACTIVE");
+        canvas.draw_text_prop(8, 156, 1, "HOLD ENTER + RESET TO EXIT");
+        drop(canvas);
+        if let Err(err) = board.display.refresh_full() {
+            log::error!("Safe-mode error screen refresh failed: {err:#}");
+        }
+    }
+    // Minimal service loop.
+    loop {
+        watchdog::feed();
+        // USB diagnostics: GetStatus reports a device with nothing
+        // configured/connected; everything else returns an explicit error.
+        if let Some((id, cmd)) = usb_console.poll_command() {
+            match cmd {
+                crate::control::Command::GetStatus => {
+                    let reply = inkwash_logic::protocol::Reply::Status {
+                        wifi_configured: false,
+                        server_configured: false,
+                        wifi_connected: false,
+                        wifi_ssid: None,
+                        wifi_has_password: false,
+                        server_url: None,
+                        server_has_token: false,
+                        timezone_offset_minutes: 0,
+                    };
+                    crate::usb_console::write_reply(&reply, id.as_deref());
+                    log::info!("Safe mode: answered GetStatus (device in safe mode)");
+                }
+                other => {
+                    let reply = inkwash_logic::protocol::Reply::Error {
+                        message: format!(
+                            "device is in safe mode (core data unavailable); command {other:?} rejected"
+                        ),
+                    };
+                    crate::usb_console::write_reply(&reply, id.as_deref());
+                }
+            }
+        }
+        // Reset/button detection only (no navigation). ENTER long-press is
+        // polled so a stuck boot never hides the reset affordance; the
+        // action itself is a hardware reset via the watchdog / power latch
+        // on the next power-cycle - here we only observe.
+        board.key_enter.poll();
+        board.key_up.poll();
+        board.key_down.poll();
+        // Sane poll cadence. Deliberately NO light-sleep arm and NO
+        // deep-sleep: safe mode stays fully awake (architecture).
+        std::thread::sleep(std::time::Duration::from_millis(
+            crate::button::POLL_INTERVAL_MS as u64,
+        ));
+    }
+}
+
 /// Runs one Settings row action selected through the state-machine Settings
 /// screen (Stage 4, slice 2). Called strictly after the dispatch pump has
 /// released the Runtime borrow: the row actions are legacy blocking
@@ -1238,6 +1348,9 @@ struct BootSnapshotResult {
     /// read - the firmware should enter safe mode rather than trust this
     /// snapshot for alarm logic.
     core_failed: bool,
+    /// Human-readable reason for the safe-mode entry (shown on the fixed
+    /// error screen and logged).
+    failure_reason: String,
 }
 
 fn collect_boot_snapshot(
@@ -1245,6 +1358,7 @@ fn collect_boot_snapshot(
     clock: Option<DateTime>,
 ) -> BootSnapshotResult {
     let mut core_failed = false;
+    let mut failure_reason = String::new();
     // RTC alarm facts come from the executor's consistent status read (the
     // sole RTC owner); a failure marks the boot snapshot core-failed, as
     // before.
@@ -1253,6 +1367,7 @@ fn collect_boot_snapshot(
         Err(err) => {
             log::error!("PCF8563 alarm status read failed: {err}");
             core_failed = true;
+            failure_reason = format!("RTC alarm status read failed: {err}");
             crate::rtc_executor::AlarmStatus {
                 alarm_flag: false,
                 alarm_interrupt_enabled: false,
@@ -1263,6 +1378,11 @@ fn collect_boot_snapshot(
         Ok(list) => list,
         Err(err) => {
             log::error!("Alarm NVS load failed: {err}");
+            if failure_reason.is_empty() {
+                failure_reason = format!("Alarm NVS load failed: {err}");
+            } else {
+                failure_reason.push_str(&format!("; alarm NVS load failed: {err}"));
+            }
             core_failed = true;
             Vec::new()
         }
@@ -1306,6 +1426,7 @@ fn collect_boot_snapshot(
             status,
         },
         core_failed,
+        failure_reason,
     }
 }
 

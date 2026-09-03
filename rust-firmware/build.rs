@@ -1,6 +1,12 @@
 fn main() {
     embuild::espidf::sysenv::output();
 
+    // Declare the test-only cfg that forces the minimum safe-mode entry on a
+    // healthy boot (see main.rs run_safe_mode). Declaring it here silences
+    // "unexpected cfg condition" and lets a test build pass
+    // --cfg inkwash_force_safe_mode without warnings.
+    println!("cargo:rustc-check-cfg=cfg(inkwash_force_safe_mode)");
+
     // Capture build-time epoch seconds so the firmware can seed PCF8563 on
     // first boot (when the coin cell is missing or drained and the VL bit is
     // asserted). The build script reruns whenever source files change, so a
