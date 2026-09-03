@@ -1465,15 +1465,41 @@ fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
                 let _ = ctx.poll_wifi_ops();
                 if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command())
                 {
-                    let reply = crate::control::dispatch(
-                        ctx,
-                        crate::control::Channel::Ble,
-                        id.as_deref(),
-                        cmd,
-                        now,
-                    );
-                    if let Some(ble) = ctx.ble_control.as_ref() {
-                        ble.write_reply(&reply, id.as_deref());
+                    // Migrated commands route through the state machine (same
+                    // as the main loop); the rest (GetStatus) stay on the
+                    // legacy live-read dispatch.
+                    let reply = if crate::ctx::is_migrated_command(&cmd) {
+                        let runner = ctx.app_runner.clone();
+                        let pre_event =
+                            if matches!(cmd, crate::control::Command::SetTimezone { .. }) {
+                                ctx.rtc
+                                    .read_time()
+                                    .ok()
+                                    .map(inkwash_logic::app::Event::Tick)
+                            } else {
+                                None
+                            };
+                        crate::ctx::dispatch_migrated_command(
+                            ctx,
+                            &runner,
+                            inkwash_logic::app::Event::BleCommand(cmd.clone()),
+                            pre_event,
+                            cmd,
+                            id.as_deref(),
+                        )
+                    } else {
+                        Some(crate::control::dispatch(
+                            ctx,
+                            crate::control::Channel::Ble,
+                            id.as_deref(),
+                            cmd,
+                            now,
+                        ))
+                    };
+                    if let Some(reply) = reply {
+                        if let Some(ble) = ctx.ble_control.as_ref() {
+                            ble.write_reply(&reply, id.as_deref());
+                        }
                     }
                 }
                 // This is a passive status page with no confirm action, so
