@@ -97,6 +97,7 @@ pub enum Screen {
 pub enum NavOrigin {
     Home,
     Settings,
+    AlarmList,
 }
 
 impl Screen {
@@ -115,6 +116,9 @@ impl Screen {
     /// - `Navigation` - Home canvas with the GO TO drawer overlay.
     /// - `Settings` - the settings list (rows browsed in the state
     ///   machine; row actions are deferred executor wedges).
+    /// - `AlarmList` - the alarm list (rows browsed in the state machine;
+    ///   ENTER toggles an alarm's enabled flag through a confirmable edit;
+    ///   the "+ ADD ALARM" row is a deferred executor wedge).
     ///
     /// `AlarmRinging` maps to Home: the ringing frame is owned by the
     /// legacy `ring_screen`, which draws over whatever the SM render
@@ -127,9 +131,11 @@ impl Screen {
             Screen::Settings { selected } => RenderView::Settings {
                 selected: *selected,
             },
+            Screen::AlarmList { selected } => RenderView::AlarmList {
+                selected: *selected,
+            },
             Screen::Home
             | Screen::Calendar(_)
-            | Screen::AlarmList { .. }
             | Screen::AlarmEdit(_)
             | Screen::TodoList { .. }
             | Screen::Inbox { .. }
@@ -335,6 +341,15 @@ pub enum Effect {
     ProgramRtcAlarm(AlarmRegs),
     DisableRtcAlarm,
     AcknowledgeRtcAlarm,
+    /// Confirmable single-alarm enabled-toggle from the AlarmList screen
+    /// (Stage 4): save the new list and mark `toggled_id` dirty (two-way
+    /// sync contract). Completes as `Persisted(Alarms)`; the machine's
+    /// pending-alarm-list-edit gate matches the op id exactly, so a stale
+    /// completion cannot release a newer edit.
+    PersistAlarmToggle {
+        alarms: Vec<StoredAlarm>,
+        toggled_id: u8,
+    },
     StartSync(SyncRequest),
     /// Ask the network executor to verify + save Wi-Fi credentials (it owns
     /// the Wi-Fi driver). Completes via `Event::SetWifiCompleted`.
@@ -376,6 +391,12 @@ pub enum Effect {
         /// 3 = Sleep.
         item: usize,
     },
+    /// The user pressed ENTER on the "+ ADD ALARM" row of the state-machine
+    /// AlarmList screen (Stage 4). Adding an alarm runs through the legacy
+    /// blocking editor wedge (post-pump, like `OpenSettingsItem`), which
+    /// persists to the alarm store; when it returns, main dispatches
+    /// `Event::AlarmStoreChanged` so the state machine reloads the list.
+    OpenAddAlarm,
 }
 
 /// Which visible surface a render request targets. The renderer draws this
@@ -392,6 +413,11 @@ pub enum RenderView {
     /// The settings list (Stage 4): rows browsed in the state machine,
     /// row actions deferred to executor wedges. Carries the selected row.
     Settings { selected: usize },
+    /// The alarm list (Stage 4): rows browsed in the state machine, ENTER
+    /// toggles a row's enabled flag (confirmable SM edit); the trailing
+    /// "+ ADD ALARM" row is a deferred executor wedge. Carries the selected
+    /// row; the executor loads the rows from the store.
+    AlarmList { selected: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -597,6 +623,11 @@ pub enum Event {
     /// detected the minute crossed the interval boundary; it only reports
     /// the fact - the state machine decides whether a sync may start).
     SyncBoundaryDue,
+    /// The alarm store changed out-of-band (a legacy ADD-ALARM editor wedge
+    /// persisted a new alarm). The event carries the reloaded authoritative
+    /// NVS list (the executor reads the store; `update` never touches NVS),
+    /// which the state machine adopts and re-renders.
+    AlarmStoreChanged(Vec<StoredAlarm>),
     DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
@@ -749,7 +780,22 @@ pub struct AppState {
     /// reprogram the RTC register on the matching `AckDone`. Set when
     /// `pending_residue_ack` is set; cleared when the pending ACK clears.
     pending_residue_time: Option<DateTime>,
+    /// An in-flight AlarmList enabled-toggle (Stage 4). The screen
+    /// optimistically flips the row's `enabled`; the matching
+    /// `Persisted(Alarms)` completion confirms it (and the executor has
+    /// marked it dirty). A failure rolls the row back to its previous
+    /// value. One edit at a time: while this is Some, another row ENTER is
+    /// ignored.
+    pending_alarm_list_edit: Option<PendingAlarmListEdit>,
     retries: Vec<RetryPending>,
+}
+
+/// An in-flight single-row enabled-toggle from the AlarmList screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingAlarmListEdit {
+    operation_id: OperationId,
+    /// Row index in `alarms.alarms` whose `enabled` the toggle flipped.
+    index: usize,
 }
 
 impl Default for AppState {
@@ -770,6 +816,7 @@ impl Default for AppState {
             pending_ble_reply: None,
             pending_residue_ack: None,
             pending_residue_time: None,
+            pending_alarm_list_edit: None,
             retries: Vec::new(),
             op_counter: 0,
             batch_counter: 0,
@@ -886,6 +933,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
+        Event::AlarmStoreChanged(alarms) => transition_alarm_store_changed(state, alarms),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
@@ -1255,7 +1303,10 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
         ]
     } else if matches!(
         state.screen,
-        Screen::Home | Screen::Navigation { .. } | Screen::Settings { .. }
+        Screen::Home
+            | Screen::Navigation { .. }
+            | Screen::Settings { .. }
+            | Screen::AlarmList { .. }
     ) {
         transition_nav_button(state, button)
     } else {
@@ -1272,6 +1323,8 @@ fn nav_home_index(origin: NavOrigin) -> usize {
         // The drawer over Settings highlights SETTINGS (5), so a no-move
         // ENTER stays on Settings (legacy pick_navigation behavior).
         NavOrigin::Settings => NAV_DESTINATION_COUNT - 1,
+        // The drawer over the alarm list highlights ALARMS (3).
+        NavOrigin::AlarmList => 3,
     }
 }
 
@@ -1282,7 +1335,7 @@ fn nav_home_index(origin: NavOrigin) -> usize {
 /// back-to-Home path).
 fn nav_origin_screen(origin: NavOrigin) -> Screen {
     match origin {
-        NavOrigin::Home | NavOrigin::Settings => Screen::Home,
+        NavOrigin::Home | NavOrigin::Settings | NavOrigin::AlarmList => Screen::Home,
     }
 }
 
@@ -1326,12 +1379,17 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 ButtonEvent::LongPressed(ButtonId::Enter) => Some(nav_origin_screen(origin)),
                 ButtonEvent::Pressed(ButtonId::Enter) => {
                     // Selecting a destination closes the drawer.
-                    // HOME (0) and SETTINGS (5) are SM screens; the
-                    // remaining destinations are opened by the executor
+                    // HOME (0), ALARMS (3) and SETTINGS (5) are SM screens;
+                    // the remaining destinations are opened by the executor
                     // (legacy page) for now.
                     return match cur {
                         0 => {
                             state.screen = nav_origin_screen(origin);
+                            state.render_generation = state.render_generation.next();
+                            vec![render_batch_with_intent(state, RenderIntent::Full)]
+                        }
+                        3 => {
+                            state.screen = Screen::AlarmList { selected: 0 };
                             state.render_generation = state.render_generation.next();
                             vec![render_batch_with_intent(state, RenderIntent::Full)]
                         }
@@ -1436,6 +1494,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 _ => vec![],
             }
         }
+        Screen::AlarmList { selected } => transition_alarm_list_button(state, *selected, button),
         Screen::Home => {
             // Long UP/DOWN opens the global navigation drawer from Home
             // (origin Home, highlighting HOME).
@@ -1460,6 +1519,125 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
 /// Number of rows in the Settings list (SYNC NOW / SYNC INTERVAL / BLE
 /// PAIRING / SLEEP) - mirrors the firmware's `open_menu` items.
 pub const SETTINGS_ROW_COUNT: usize = 4;
+
+/// The "+ ADD ALARM" row is the list length (rows 0..len are stored alarms).
+/// AlarmList screen (Stage 4): browse the stored alarm rows (toggle
+/// enabled on ENTER, an SM-owned confirmable edit) plus the trailing
+/// "+ ADD ALARM" row (a deferred legacy editor wedge; the store changes,
+/// so the caller dispatches `Event::AlarmStoreChanged` to reload).
+fn transition_alarm_list_button(
+    state: &mut AppState,
+    selected: usize,
+    button: ButtonEvent,
+) -> Vec<EffectBatch> {
+    let alarm_count = state.alarms.alarms.len();
+    // Rows: 0..alarm_count are alarms; alarm_count is "+ ADD ALARM".
+    match button {
+        ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
+            // Open the GO TO drawer over the alarm list (origin AlarmList).
+            state.screen = Screen::Navigation {
+                selected: nav_home_index(NavOrigin::AlarmList),
+                origin: NavOrigin::AlarmList,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
+            // Back out of the alarm list to root Home.
+            state.screen = Screen::Home;
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        ButtonEvent::Pressed(ButtonId::Up) => {
+            state.screen = Screen::AlarmList {
+                selected: selected.saturating_sub(1),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Down) => {
+            // The selection moves through the ADD row (index == alarm_count)
+            // and clamps there.
+            let max = alarm_count;
+            state.screen = Screen::AlarmList {
+                selected: (selected + 1).min(max),
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        ButtonEvent::Pressed(ButtonId::Enter) => {
+            if selected == alarm_count {
+                // "+ ADD ALARM": deferred legacy editor wedge. The SM stays
+                // on AlarmList; the caller (main) dispatches
+                // Event::AlarmStoreChanged with the reloaded list after the
+                // wedge returns.
+                state.render_generation = state.render_generation.next();
+                vec![
+                    batch(
+                        state,
+                        OperationId(0),
+                        FailurePolicy::Continue,
+                        vec![Effect::OpenAddAlarm],
+                    ),
+                    render_batch_with_intent(state, RenderIntent::Full),
+                ]
+            } else if state.pending_alarm_list_edit.is_some() {
+                // One toggle at a time: while a persist is in flight a
+                // second row ENTER is ignored (its completion/rollback
+                // releases the gate).
+                vec![]
+            } else {
+                // Toggle the alarm's enabled flag: optimistic flip + a
+                // confirmable persist (the executor also marks it dirty).
+                // On failure the row rolls back to its previous value.
+                let op = state.next_operation_id();
+                let Some(alarm) = state.alarms.alarms.get_mut(selected) else {
+                    return vec![];
+                };
+                alarm.enabled = !alarm.enabled;
+                let toggled_id = alarm.id;
+                state.pending_alarm_list_edit = Some(PendingAlarmListEdit {
+                    operation_id: op,
+                    index: selected,
+                });
+                state.render_generation = state.render_generation.next();
+                let list = state.alarms.alarms.clone();
+                vec![
+                    batch(
+                        state,
+                        op,
+                        FailurePolicy::AbortBatch,
+                        vec![Effect::PersistAlarmToggle {
+                            alarms: list,
+                            toggled_id,
+                        }],
+                    ),
+                    render_batch_with_intent(state, RenderIntent::Full),
+                ]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// The alarm store changed out-of-band (a legacy ADD-ALARM editor wedge
+/// persisted a new alarm; main dispatched this with the reloaded NVS list).
+/// Adopt the list and re-render the AlarmList screen.
+fn transition_alarm_store_changed(
+    state: &mut AppState,
+    alarms: Vec<StoredAlarm>,
+) -> Vec<EffectBatch> {
+    state.alarms.alarms = alarms;
+    state.render_generation = state.render_generation.next();
+    // Clamp the selection to the (possibly shorter/longer) list.
+    if let Screen::AlarmList { selected } = &mut state.screen {
+        let len = state.alarms.alarms.len();
+        if *selected > len {
+            *selected = len;
+        }
+    }
+    vec![render_batch_with_intent(state, RenderIntent::Full)]
+}
 
 fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
     let mut batches = Vec::new();
@@ -1622,6 +1800,20 @@ fn transition_effect_completed(
             if let Some(commit) = state.commit_for_operation(completion.operation_id) {
                 *commit = CommitState::Succeeded;
             }
+            // An AlarmList enabled-toggle confirmed: release the gate. The
+            // executor already saved the list and marked the row dirty. The
+            // stored list changed, so re-point the RTC hardware slot at the
+            // new nearest alarm / disable if the list is now empty.
+            if state
+                .pending_alarm_list_edit
+                .as_ref()
+                .is_some_and(|edit| edit.operation_id == completion.operation_id)
+            {
+                state.pending_alarm_list_edit = None;
+                if let Some(now) = state.clock.now {
+                    batches.extend(program_alarm_for(state, &now));
+                }
+            }
         }
         EffectOutput::AckDone => {
             if let Some(commit) = state.commit_for_operation(completion.operation_id) {
@@ -1725,6 +1917,24 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
                     error: failure.error.clone(),
                 };
                 state.schedule_retry(RetryAction::PersistAlarms, now_minute);
+            }
+            // An AlarmList enabled-toggle failed to persist: roll the
+            // optimistic row back (NVS never changed), release the gate and
+            // re-render. No RTC reprogram - the hardware slot still matches
+            // the unchanged stored list.
+            let rollback_index = match state.pending_alarm_list_edit.take() {
+                Some(edit) if edit.operation_id == failure.operation_id => Some(edit.index),
+                Some(edit) => {
+                    state.pending_alarm_list_edit = Some(edit);
+                    None
+                }
+                None => None,
+            };
+            if let Some(index) = rollback_index {
+                if let Some(alarm) = state.alarms.alarms.get_mut(index) {
+                    alarm.enabled = !alarm.enabled;
+                }
+                state.render_generation = state.render_generation.next();
             }
         }
         // RTC program/disable failure (or a startup re-arm failure): NVS
@@ -4121,6 +4331,297 @@ mod tests {
         )));
     }
 
+    // ---- AlarmList screen (Stage 4) --------------------------------------
+
+    /// Boots with `alarms` loaded (clock known, no AF) so the SM is in a
+    /// Home + armed state, then opens the ALARMS drawer destination (index
+    /// 3) and selects it.
+    fn open_alarm_list(state: &mut AppState, alarms: Vec<StoredAlarm>) {
+        let _ = update(
+            state,
+            Event::Boot(boot_snapshot(alarms, Some(dt(9, 0)), false, true)),
+        );
+        let _ = update(state, Event::Button(ButtonEvent::LongPressed(ButtonId::Up)));
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 0,
+                origin: NavOrigin::Home
+            }
+        );
+        // Down three times: 0 -> 1 -> 2 -> 3 (ALARMS).
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 3,
+                origin: NavOrigin::Home
+            }
+        );
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+    }
+
+    #[test]
+    fn drawer_select_alarms_opens_sm_alarm_list() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(9, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        // Move to index 3 (ALARMS): Down three times.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+        // ALARMS is an SM screen: no destination effect.
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenNavigationDestination { .. })));
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                view: RenderView::AlarmList { selected: 0 },
+                intent: RenderIntent::Full,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn alarm_list_rows_browse_and_clamp_through_add_row() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0), alarm(2, 22, 30)]);
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+        // Down to row 1 (second alarm).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 1 });
+        // Down again to row 2 = "+ ADD ALARM".
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 2 });
+        // Down past ADD clamps.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 2 });
+        // Up back to row 1.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 1 });
+        // Up to top.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+    }
+
+    #[test]
+    fn alarm_list_enter_toggles_enabled_confirmable() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0), alarm(2, 22, 30)]);
+        // Move to row 0's alarm (id 1, enabled).
+        assert!(state.alarms.alarms[0].enabled);
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Optimistic flip in state.
+        assert!(!state.alarms.alarms[0].enabled);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::PersistAlarmToggle { alarms, toggled_id: 1 }
+                if alarms.first().is_some_and(|a| !a.enabled)
+        )));
+        // Confirmable op is tracked as in-flight (one at a time gate).
+        assert!(state.pending_alarm_list_edit.is_some());
+        // Second ENTER while in-flight is ignored.
+        let mid = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(
+            mid.is_empty()
+                || !mid.iter().any(|b| b
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistAlarmToggle { .. })))
+        );
+        // Complete the persist.
+        let op = state
+            .pending_alarm_list_edit
+            .map(|e| e.operation_id)
+            .expect("one toggle in flight");
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Alarms),
+            }),
+        );
+        assert!(
+            state.pending_alarm_list_edit.is_none(),
+            "persist confirmed: gate released"
+        );
+        assert!(!state.alarms.alarms[0].enabled);
+    }
+
+    #[test]
+    fn alarm_list_enter_on_add_row_emits_open_add_alarm() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        // Move to the ADD row (index 1).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 1 });
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenAddAlarm)));
+        // The SM stays on the AlarmList (main dispatches AlarmStoreChanged
+        // when the wedge returns).
+        assert_eq!(state.screen, Screen::AlarmList { selected: 1 });
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::PersistAlarmToggle { .. })));
+    }
+
+    #[test]
+    fn alarm_store_changed_reloads_and_clamps_selection() {
+        let mut state = AppState::default();
+        open_alarm_list(
+            &mut state,
+            vec![alarm(1, 8, 0), alarm(2, 22, 30), alarm(3, 6, 15)],
+        );
+        // Move to the ADD row (index 3).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 3 });
+        // A wedge added one alarm (now 4 rows: 0..3 alarms + ADD at 4);
+        // reload keeps selection at 3 (still a valid alarm row).
+        let reloaded = vec![
+            alarm(1, 8, 0),
+            alarm(2, 22, 30),
+            alarm(3, 6, 15),
+            alarm(9, 7, 45),
+        ];
+        let batches = update(&mut state, Event::AlarmStoreChanged(reloaded.clone()));
+        assert_eq!(state.alarms.alarms, reloaded);
+        assert_eq!(state.screen, Screen::AlarmList { selected: 3 });
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::AlarmList { selected: 3 },
+                ..
+            })
+        )));
+        // A reload to an empty list clamps selection to 0 (the ADD row).
+        let batches = update(&mut state, Event::AlarmStoreChanged(vec![]));
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::AlarmList { selected: 0 },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn alarm_list_long_enter_backs_to_home_and_drawer_is_alarm_origin() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+        // Long UP/DOWN opens the drawer with ALARMS highlighted (origin
+        // AlarmList) - legacy "you are here" on the alarm page.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Navigation {
+                selected: 3,
+                origin: NavOrigin::AlarmList
+            }
+        );
+        // No-move ENTER (dest 3 = ALARMS) closes back to the alarm list.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+        // Long ENTER from AlarmList backs to Home.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::Home,
+                ..
+            })
+        )));
+    }
+
     #[test]
     fn still_legacy_screens_project_to_home_surface_until_migrated() {
         // Stage-4 transitional projection: every screen still drawn through
@@ -4159,7 +4660,10 @@ mod tests {
                 }),
                 RenderView::Home,
             ),
-            (Screen::AlarmList { selected: 0 }, RenderView::Home),
+            (
+                Screen::AlarmList { selected: 0 },
+                RenderView::AlarmList { selected: 0 },
+            ),
             (
                 Screen::AlarmEdit(AlarmEditState { editing: None }),
                 RenderView::Home,

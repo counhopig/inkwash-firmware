@@ -57,6 +57,7 @@ pub fn priority(event: &Event) -> Priority {
         | Event::BleDisconnected
         | Event::SyncCompleted(_)
         | Event::SyncBoundaryDue
+        | Event::AlarmStoreChanged(_)
         | Event::SetWifiCompleted(_)
         | Event::DisplayCompleted(_)
         | Event::EffectCompleted(_)

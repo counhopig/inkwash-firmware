@@ -137,6 +137,8 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::StartBlePairing(_) => "StartBlePairing",
         Effect::OpenNavigationDestination { .. } => "OpenNavigationDestination",
         Effect::OpenSettingsItem { .. } => "OpenSettingsItem",
+        Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
+        Effect::OpenAddAlarm => "OpenAddAlarm",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
         Effect::EnterDeepSleep(_) => "EnterDeepSleep",
@@ -163,8 +165,11 @@ impl EffectExecutor for FakeExecutor {
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
             Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
-            Effect::OpenNavigationDestination { .. } => EffectCategory::Render,
+            Effect::OpenNavigationDestination { .. } | Effect::OpenAddAlarm => {
+                EffectCategory::Render
+            }
             Effect::OpenSettingsItem { .. } => EffectCategory::Render,
+            Effect::PersistAlarmToggle { .. } => EffectCategory::Persist,
             Effect::EnterLightSleep(_) | Effect::EnterDeepSleep(_) => EffectCategory::Sleep,
         };
         self.record(effect, cat);
@@ -223,6 +228,10 @@ impl EffectExecutor for FakeExecutor {
             Effect::OpenNavigationDestination { .. } | Effect::OpenSettingsItem { .. } => {
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
+            Effect::PersistAlarmToggle { .. } => Ok(EffectOutcome::Completed(
+                EffectOutput::Persisted(crate::app::PersistTarget::Alarms),
+            )),
+            Effect::OpenAddAlarm => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::EnterLightSleep(_) => {
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }
