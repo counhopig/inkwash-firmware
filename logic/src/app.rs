@@ -1230,6 +1230,13 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
                 FailurePolicy::AbortBatch,
                 vec![Effect::ApplySyncedData(data)],
             ));
+            // Stage 5: adopting merged server data may have changed what the
+            // current screen shows (alarm/todo/inbox lists). Emit a render
+            // request - the renderer diffs the ViewModel against its cache
+            // and refreshes (or Noops if nothing visible actually changed),
+            // so a sync that changed no on-screen data costs nothing.
+            state.render_generation = state.render_generation.next();
+            batches.push(render_batch(state));
         }
         SyncResult::Failed(message) => {
             state.sync = SyncState::Idle;
@@ -4561,6 +4568,48 @@ mod tests {
         assert_eq!(state.sync, SyncState::Idle);
         assert!(state.pending_usb_reply.is_none());
         assert!(state.pending_ble_reply.is_none());
+    }
+
+    #[test]
+    fn sync_adopt_emits_a_render_with_the_merged_data_fingerprint() {
+        // Stage 5: adopting merged server data may change what the current
+        // screen shows, so SyncCompleted(Ok) emits a render request whose
+        // ViewModel carries the merged lists' data fingerprint. The renderer
+        // diffs it against its cache - an unchanged sync (no visible delta)
+        // resolves to Noop, a changed list repaints.
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        // On the AlarmList screen, a sync that adds an alarm must change the
+        // request's data fingerprint so the renderer does not Noop it.
+        state.screen = Screen::AlarmList { selected: 0 };
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let _ = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
+        let batches = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                data: synced_data(vec![alarm(1, 9, 0), alarm(2, 10, 30)]),
+            }),
+        );
+        assert_eq!(state.alarms.alarms, vec![alarm(1, 9, 0), alarm(2, 10, 30)]);
+        let render_requests: Vec<_> = batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .filter_map(|e| match e {
+                Effect::Render(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(render_requests.len(), 1, "sync adopt emits one render");
+        let vm = &render_requests[0].view_model;
+        assert_eq!(vm.view, RenderView::AlarmList { selected: 0 });
+        // The fingerprint must differ from the pre-sync single-alarm list.
+        let mut pre = state.clone();
+        pre.alarms.alarms = vec![alarm(1, 9, 0)];
+        let pre_fp = crate::render_plan::ViewModel::from_state(&pre).data_fingerprint;
+        assert_ne!(
+            vm.data_fingerprint, pre_fp,
+            "merged-data fingerprint must reflect the added alarm"
+        );
     }
 
     #[test]
