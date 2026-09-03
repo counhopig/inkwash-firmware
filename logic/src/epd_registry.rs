@@ -16,6 +16,7 @@
 //! This module implements that registry rule as pure orchestration so a
 //! host harness drives the same logic the firmware's main loop runs.
 
+use crate::render_plan::{plan_render, RenderPlan, ViewModel};
 use crate::runner::AsyncKick;
 
 /// Terminal outcome of a render request.
@@ -37,15 +38,98 @@ pub enum FeedOutcome {
     Ignored,
 }
 
-/// The shared render-request registry.
+/// The shared render-request registry, plus the renderer's private
+/// ViewModel cache (Stage 5).
+///
+/// The cache holds the last *successfully shown* ViewModel and the number
+/// of consecutive partial refreshes since the last Full. It is private to
+/// the renderer - never part of `AppState`, never read or written by the
+/// business layer. Rules enforced here (and host-tested):
+///
+/// - [`RenderRegistry::plan_for`] diff-s the incoming request's ViewModel
+///   against the cached one to decide Noop / Partial / Full.
+/// - The cache is updated only on a **successful** completion whose
+///   render generation is still current.
+/// - A failed completion invalidates the cache (`last_shown = None`) so
+///   the next render is forced Full (partial-failure recovery).
+/// - A superseded completion does not touch the cache: the replaced
+///   request's pixels never reached the panel; the replacement request
+///   updates the cache on its own completion.
+/// - Each successful Full resets the partial counter; each successful
+///   Partial increments it toward `PARTIAL_MAINTENANCE_LIMIT`.
 #[derive(Debug, Default)]
 pub struct RenderRegistry {
     pub pending: Vec<AsyncKick>,
+    /// Last successfully-shown ViewModel (renderer-private cache).
+    pub last_shown: Option<ViewModel>,
+    /// Consecutive successful partial refreshes since the last Full.
+    pub partials_since_maintenance: u32,
 }
 
 impl RenderRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Decide the refresh plan for a request carrying `vm`, against the
+    /// cached last-shown ViewModel. Does not mutate the cache.
+    pub fn plan_for(&self, vm: &ViewModel) -> RenderPlan {
+        plan_render(
+            self.last_shown.as_ref(),
+            vm,
+            self.partials_since_maintenance,
+        )
+    }
+
+    /// The submit side calls this after handing a Partial/Full to the EPD
+    /// task; Noop submits nothing. Bookkeeping is only committed on
+    /// completion (see `note_terminal`), so this is a no-op kept for
+    /// symmetry and documentation.
+    pub fn note_submitted(&mut self, _plan: &RenderPlan) {}
+
+    /// Apply the terminal outcome of a render to the cache. `success` is
+    /// true for a Completed (pixels reached the panel); false for Failed.
+    /// `generation_is_current` is false when the request's render
+    /// generation is older than the current visible state.
+    pub fn note_terminal(
+        &mut self,
+        vm: &ViewModel,
+        plan: &RenderPlan,
+        success: bool,
+        generation_is_current: bool,
+    ) {
+        if !success {
+            // Partial-failure recovery: forget what the panel shows so the
+            // next render is a Full from a clean slate.
+            self.last_shown = None;
+            self.partials_since_maintenance = 0;
+            return;
+        }
+        if !generation_is_current {
+            // Stale completion: the visible state moved on; this render's
+            // pixels are out of date and must not become the cache.
+            return;
+        }
+        match plan {
+            RenderPlan::Full { .. } => {
+                self.last_shown = Some(vm.clone());
+                self.partials_since_maintenance = 0;
+            }
+            RenderPlan::Partial { .. } => {
+                self.last_shown = Some(vm.clone());
+                self.partials_since_maintenance = self.partials_since_maintenance.saturating_add(1);
+            }
+            RenderPlan::Noop => {
+                // Nothing changed on screen; the cache already equals vm.
+            }
+        }
+    }
+
+    /// Force-invalidate the cache (used when the renderer detects a state
+    /// it can no longer trust, e.g. a boot-after-failure).
+    pub fn invalidate_cache(&mut self) {
+        self.last_shown = None;
+        self.partials_since_maintenance = 0;
     }
 
     /// Register an in-flight render kick.
@@ -178,5 +262,140 @@ mod tests {
         let mut reg = RenderRegistry::new();
         assert_eq!(reg.feed(999, true, false), FeedOutcome::Ignored);
         assert_eq!(reg.feed(999, false, true), FeedOutcome::Ignored);
+    }
+
+    // ---- Stage-5 renderer cache rules --------------------------------------
+
+    fn home_vm(gen: u64, minute: Option<u32>) -> ViewModel {
+        ViewModel {
+            generation: RenderGeneration(gen),
+            view: crate::app::RenderView::Home,
+            clock_minute: minute,
+            overlay: crate::render_plan::Overlay::None,
+            data_fingerprint: 0,
+        }
+    }
+
+    #[test]
+    fn cache_empty_first_render_is_full() {
+        let mut reg = RenderRegistry::new();
+        let plan = reg.plan_for(&home_vm(0, None));
+        assert!(matches!(plan, RenderPlan::Full { .. }));
+        // Completing it (current generation) caches the VM.
+        reg.note_terminal(&home_vm(0, None), &plan, true, true);
+        assert_eq!(reg.last_shown.as_ref(), Some(&home_vm(0, None)));
+        assert_eq!(reg.partials_since_maintenance, 0);
+    }
+
+    #[test]
+    fn same_view_model_after_full_is_noop_and_cache_unchanged() {
+        let mut reg = RenderRegistry::new();
+        let first = home_vm(0, None);
+        let p0 = reg.plan_for(&first);
+        reg.note_terminal(&first, &p0, true, true);
+        // Identical visible state -> Noop; cache still holds the first VM.
+        let plan = reg.plan_for(&first);
+        assert_eq!(plan, RenderPlan::Noop);
+    }
+
+    #[test]
+    fn home_minute_change_is_clock_partial_and_counts() {
+        let mut reg = RenderRegistry::new();
+        let t0 = home_vm(0, Some(8 * 60));
+        let p0 = reg.plan_for(&t0);
+        reg.note_terminal(&t0, &p0, true, true);
+        let t1 = home_vm(1, Some(8 * 60 + 1));
+        let plan = reg.plan_for(&t1);
+        assert_eq!(
+            plan,
+            RenderPlan::Partial {
+                frame: crate::render_plan::Frame(1),
+                region: crate::render_plan::PartialRegion::Clock
+            }
+        );
+        reg.note_terminal(&t1, &plan, true, true);
+        assert_eq!(reg.partials_since_maintenance, 1);
+        assert_eq!(reg.last_shown.as_ref(), Some(&t1));
+    }
+
+    #[test]
+    fn failed_completion_invalidates_cache_forcing_full() {
+        let mut reg = RenderRegistry::new();
+        let t0 = home_vm(0, None);
+        let p0 = reg.plan_for(&t0);
+        reg.note_terminal(&t0, &p0, true, true);
+        assert!(reg.last_shown.is_some());
+        // A later Partial fails -> cache invalidated.
+        let t1 = home_vm(1, Some(9 * 60));
+        let plan = reg.plan_for(&t1);
+        reg.note_terminal(&t1, &plan, false, true);
+        assert!(reg.last_shown.is_none());
+        assert_eq!(reg.partials_since_maintenance, 0);
+        // Next render has no previous -> Full (recovery).
+        assert!(matches!(reg.plan_for(&t1), RenderPlan::Full { .. }));
+    }
+
+    #[test]
+    fn stale_generation_completion_does_not_update_cache() {
+        let mut reg = RenderRegistry::new();
+        let t0 = home_vm(0, Some(8 * 60));
+        let p0 = reg.plan_for(&t0);
+        reg.note_terminal(&t0, &p0, true, true);
+        // A Full for generation 1 completes AFTER state moved to
+        // generation 5: not current -> cache keeps gen-0 view.
+        let stale = home_vm(1, Some(10 * 60));
+        let plan = RenderPlan::Full {
+            frame: crate::render_plan::Frame(1),
+        };
+        reg.note_terminal(&stale, &plan, true, false);
+        assert_eq!(reg.last_shown.as_ref(), Some(&t0));
+        assert_eq!(reg.partials_since_maintenance, 0);
+    }
+
+    #[test]
+    fn maintenance_threshold_forces_full_and_resets_on_full() {
+        let mut reg = RenderRegistry::new();
+        let t0 = home_vm(0, Some(8 * 60));
+        let p0 = reg.plan_for(&t0);
+        reg.note_terminal(&t0, &p0, true, true);
+        // Push LIMIT successful partials (each minute change).
+        for gen in 1..=crate::render_plan::PARTIAL_MAINTENANCE_LIMIT {
+            let t = home_vm(u64::from(gen), Some(8 * 60 + gen));
+            let plan = reg.plan_for(&t);
+            assert!(matches!(plan, RenderPlan::Partial { .. }));
+            reg.note_terminal(&t, &plan, true, true);
+        }
+        assert_eq!(
+            reg.partials_since_maintenance,
+            crate::render_plan::PARTIAL_MAINTENANCE_LIMIT
+        );
+        // The next minute change is past the limit -> Full.
+        let next = home_vm(
+            u64::from(crate::render_plan::PARTIAL_MAINTENANCE_LIMIT + 1),
+            Some(8 * 60 + crate::render_plan::PARTIAL_MAINTENANCE_LIMIT + 1),
+        );
+        let plan = reg.plan_for(&next);
+        assert!(matches!(plan, RenderPlan::Full { .. }));
+        reg.note_terminal(&next, &plan, true, true);
+        assert_eq!(reg.partials_since_maintenance, 0);
+    }
+
+    #[test]
+    fn page_type_change_is_full_and_updates_cache() {
+        let mut reg = RenderRegistry::new();
+        let home = home_vm(0, Some(8 * 60));
+        let p0 = reg.plan_for(&home);
+        reg.note_terminal(&home, &p0, true, true);
+        let settings = ViewModel {
+            generation: RenderGeneration(1),
+            view: crate::app::RenderView::Settings { selected: 0 },
+            clock_minute: Some(8 * 60),
+            overlay: crate::render_plan::Overlay::None,
+            data_fingerprint: 0,
+        };
+        let plan = reg.plan_for(&settings);
+        assert!(matches!(plan, RenderPlan::Full { .. }));
+        reg.note_terminal(&settings, &plan, true, true);
+        assert_eq!(reg.last_shown.as_ref(), Some(&settings));
     }
 }
