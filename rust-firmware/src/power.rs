@@ -1,9 +1,7 @@
 use anyhow::{bail, Result};
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 use esp_idf_svc::sys::{
-    esp_deep_sleep_start, esp_pm_config_t, esp_pm_configure, esp_pm_lock_acquire,
-    esp_pm_lock_create, esp_pm_lock_delete, esp_pm_lock_handle_t, esp_pm_lock_release,
-    esp_pm_lock_type_t_ESP_PM_NO_LIGHT_SLEEP, esp_sleep_disable_wakeup_source,
+    esp_deep_sleep_start, esp_pm_config_t, esp_pm_configure, esp_sleep_disable_wakeup_source,
     esp_sleep_enable_ext1_wakeup, esp_sleep_enable_gpio_switch, esp_sleep_enable_gpio_wakeup,
     esp_sleep_enable_timer_wakeup, esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_LOW,
     esp_sleep_get_ext1_wakeup_status, esp_sleep_get_wakeup_cause,
@@ -229,46 +227,6 @@ pub fn usb_host_connected() -> bool {
 /// automatic light sleep cannot engage mid-operation. This guard only
 /// matters once a condition can outlive the main thread (the EPD/sync
 /// tasks, or BLE).
-pub struct LightSleepBlock {
-    handle: esp_pm_lock_handle_t,
-    reason: &'static str,
-}
-
-impl LightSleepBlock {
-    pub fn acquire(reason: &'static str) -> Result<Self> {
-        let mut handle: esp_pm_lock_handle_t = core::ptr::null_mut();
-        const LOCK_NAME: &[u8] = b"light_sleep_block\0";
-        let ret = unsafe {
-            esp_pm_lock_create(
-                esp_pm_lock_type_t_ESP_PM_NO_LIGHT_SLEEP,
-                0,
-                LOCK_NAME.as_ptr() as *const c_char,
-                &mut handle,
-            )
-        };
-        if ret != 0 {
-            bail!("esp_pm_lock_create(NO_LIGHT_SLEEP) failed: 0x{ret:x}");
-        }
-        let ret = unsafe { esp_pm_lock_acquire(handle) };
-        if ret != 0 {
-            unsafe { esp_pm_lock_delete(handle) };
-            bail!("esp_pm_lock_acquire(NO_LIGHT_SLEEP) failed: 0x{ret:x}");
-        }
-        log::info!("Light sleep blocked: {reason}");
-        Ok(Self { handle, reason })
-    }
-}
-
-impl Drop for LightSleepBlock {
-    fn drop(&mut self) {
-        unsafe {
-            esp_pm_lock_release(self.handle);
-            esp_pm_lock_delete(self.handle);
-        }
-        log::info!("Light sleep unblocked: {}", self.reason);
-    }
-}
-
 /// Disarms the light-sleep key wakeup before a deep-sleep entry. In deep
 /// sleep digital GPIO wakeup is inert, but GPIO0 is also in the ext1 mask
 /// below: an armed digital wakeup on the same pin would set a second

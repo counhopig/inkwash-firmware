@@ -60,7 +60,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     )> {
         std::mem::take(&mut self.replies)
     }
-
 }
 
 impl EffectExecutor for EffectRunner<'_, '_> {

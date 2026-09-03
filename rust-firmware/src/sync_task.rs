@@ -22,7 +22,7 @@ use crate::alarms::AlarmStore;
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::{PersistedCounters, WifiCreds};
-use crate::sync::{self, SyncOutcome, SyncResult};
+use crate::sync::{self, SyncResult};
 use crate::todos::TodoStore;
 use crate::wifi::WifiManager;
 
@@ -60,14 +60,6 @@ pub enum PendingWifiOp {
     Sync { reply: Receiver<SyncResult> },
     SetWifi { reply: Receiver<Result<()>> },
     UrgentPoll { reply: Receiver<Result<bool>> },
-}
-
-/// What a completed Wi-Fi operation reports, for the caller (main-loop
-/// redraw, sync-now menu result). Errors are pre-rendered strings
-/// (`anyhow::Error` is not `Clone`).
-pub enum WifiOpEvent {
-    SyncDone(Result<SyncOutcome, String>),
-    SetWifiDone,
 }
 
 /// Client handle kept by the main loop: the command sender. The task owns

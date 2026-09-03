@@ -800,7 +800,7 @@ fn main() -> Result<()> {
         // emits a render whose ViewModel diff decides Noop vs refresh), so
         // an unchanged sync costs no panel refresh and a changed list
         // repaints exactly what shows it.
-        let _ = ctx.poll_wifi_ops();
+        ctx.poll_wifi_ops();
 
         // The Home loop hosts the state-machine screens: every SM screen
         // (Home, Navigation drawer, Settings, AlarmList, ... - P1#3 made

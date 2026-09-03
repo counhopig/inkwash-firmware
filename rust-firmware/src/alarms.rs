@@ -34,7 +34,7 @@ const MAX_RING_SECS: u64 = 300;
 /// existing `alarms::Repeat` / `alarms::StoredAlarm` / `alarms::next_due`
 /// call site keeps working unchanged.
 pub use inkwash_logic::alarm_schedule::{
-    date_from_days, days_since_epoch, days_until, maintenance_wakeup_delay, next_due, next_id,
+    date_from_days, days_since_epoch, days_until, maintenance_wakeup_delay, next_due,
     next_occurrence_date, Repeat, StoredAlarm,
 };
 

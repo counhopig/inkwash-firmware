@@ -20,10 +20,8 @@
 //! lets a function read a store and mutate the board in the same scope
 //! without fighting the borrow checker.
 
-use std::sync::mpsc::TryRecvError;
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
+use std::sync::mpsc::TryRecvError;
 
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
@@ -33,7 +31,7 @@ use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::{PersistedCounters, WifiCreds};
 use crate::sync;
-use crate::sync_task::{PendingWifiOp, SyncTask, WifiOpEvent};
+use crate::sync_task::{PendingWifiOp, SyncTask};
 use crate::todos::TodoStore;
 use crate::usb_console::UsbConsole;
 
@@ -44,7 +42,6 @@ pub struct SyncScheduler {
     last_urgent_boundary: u64,
     last_full_boundary: u64,
     never_synced: bool,
-    last_ui_poll: Instant,
     /// True once a successful full sync has fetched the server state while
     /// the urgent flag was set. The server keeps answering `urgent: true`
     /// until the message is read, so without this flag the device would
@@ -63,7 +60,6 @@ impl SyncScheduler {
             last_urgent_boundary: inkwash_logic::scheduler::boundary_index(unix, 30),
             last_full_boundary: inkwash_logic::scheduler::boundary_index(unix, interval * 60),
             never_synced: counters.last_sync_epoch().unwrap_or(None).is_none(),
-            last_ui_poll: Instant::now(),
             urgent_synced: false,
         }
     }
@@ -261,56 +257,6 @@ impl DeviceContext<'_> {
         (changes_visible_state && changed, true)
     }
 
-    /// Services USB plus wall-clock scheduled sync while an ordinary screen
-    /// owns the main thread. BLE pairing deliberately calls
-    /// `poll_usb_control` directly because BLE and Wi-Fi share the radio.
-    /// Returns true when an RTC alarm interrupted the page stack and the
-    /// current layer must unwind to main. Nested page loops call this
-    /// after every nested call (picker, editor, sub-screen) returns, so
-    /// the alarm propagates through arbitrarily deep nesting instead of
-    /// being swallowed as a cancel. `main` consumes the flag after each
-    /// blocking screen and forces the Home refresh.
-    pub fn alarm_exit_pending(&self) -> bool {
-        self.alarm_poll.alarm_exit()
-    }
-
-    pub fn poll_background(&mut self, now: Option<&DateTime>) -> BackgroundOutcome {
-        // Alarm first: a live AF edge while a blocking page owns the
-        // thread must dispatch to AppRunner so it rings over the page.
-        // This is the device-usable guarantee during migration; the
-        // state machine (not a legacy path) owns ACK/persist/rearm.
-        if self.poll_alarm_snapshot() {
-            return BackgroundOutcome::AlarmHandled;
-        }
-        let (usb_changed, _) = self.poll_usb_control(now);
-        let runtime_outcome =
-            if self.sync_scheduler.last_ui_poll.elapsed() >= Duration::from_secs(1) {
-                self.sync_scheduler.last_ui_poll = Instant::now();
-                match self.rtc.read_time() {
-                    Ok(fresh) => self.poll_runtime(&fresh),
-                    Err(err) => {
-                        log::warn!("RTC read failed in UI background poll: {err}");
-                        BackgroundOutcome::NoChange
-                    }
-                }
-            } else {
-                BackgroundOutcome::NoChange
-            };
-        if runtime_outcome == BackgroundOutcome::AlarmHandled {
-            return BackgroundOutcome::AlarmHandled;
-        }
-        // Receipts for Wi-Fi operations dispatched while this screen owns
-        // the thread (scheduler syncs, deferred SetWifi/SyncNow replies):
-        // applied here so the RTC re-arm / NTP alignment stay timely even
-        // when the main loop is blocked behind a long-lived screen.
-        let sync_changed = self.poll_wifi_ops().is_some();
-        if usb_changed || sync_changed || runtime_outcome == BackgroundOutcome::VisibleChanged {
-            BackgroundOutcome::VisibleChanged
-        } else {
-            BackgroundOutcome::NoChange
-        }
-    }
-
     /// Polls the RTC alarm AF edge from a blocking page and dispatches a
     /// consistent snapshot to AppRunner via `rtc_alarm_callback`. The
     /// snapshot is only consumed after all three facts (time, AF, AIE)
@@ -404,20 +350,6 @@ impl DeviceContext<'_> {
         // reminder dismissal stays VisibleChanged even when no sync ran.
         let reminder_outcome = self.poll_reminders(now);
         sync_outcome.merge(reminder_outcome)
-    }
-
-    /// Services reminders only. BLE pairing uses this variant because
-    /// BLE and Wi-Fi cannot be active together on this device. The
-    /// alarm business has moved to AppRunner and is no longer polled
-    /// here.
-    pub fn poll_local_alerts(&mut self, now: &DateTime) -> BackgroundOutcome {
-        // Alarm edge first (same guarantee as poll_background), then
-        // reminders. Used by BLE pairing. A reminder that was preempted
-        // by an alarm propagates AlarmHandled.
-        if self.poll_alarm_snapshot() {
-            return BackgroundOutcome::AlarmHandled;
-        }
-        self.poll_reminders(now)
     }
 
     fn poll_reminders(&mut self, now: &DateTime) -> BackgroundOutcome {
@@ -523,14 +455,13 @@ impl DeviceContext<'_> {
     /// [`DeviceContext::poll_background`]; applies completion side effects
     /// (RTC re-arm, NTP alignment, deferred transport replies) and returns
     /// the completed operation's event for the caller.
-    pub fn poll_wifi_ops(&mut self) -> Option<WifiOpEvent> {
-        let op = self.pending_wifi_op.take()?;
-        let event = match op {
+    pub fn poll_wifi_ops(&mut self) {
+        let Some(op) = self.pending_wifi_op.take() else {
+            return;
+        };
+        match op {
             PendingWifiOp::Sync { reply } => match reply.try_recv() {
                 Ok(result) => {
-                    let event = WifiOpEvent::SyncDone(
-                        result.outcome.as_ref().map_err(|e| e.to_string()).cloned(),
-                    );
                     // Every completed sync - scheduled or on-demand - is
                     // fed through the state machine, which owns the merged
                     // data apply (Effect::ApplySyncedData) and the transport
@@ -541,28 +472,23 @@ impl DeviceContext<'_> {
                     self.feed_sync_completed(&result);
                     self.apply_sync_side_effects(ok, result.ntp_epoch);
                     self.sm_sync_reply_target = None;
-                    Some(event)
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
-                    return None;
                 }
-                Err(_) => None,
+                Err(_) => {}
             },
             PendingWifiOp::SetWifi { reply } => match reply.try_recv() {
                 Ok(result) => {
-                    let event = WifiOpEvent::SetWifiDone;
                     // Every SetWifi is state-machine-routed (its reply is
                     // delivered through the machine when a slot awaits).
                     self.feed_set_wifi_completed(result.map_err(|e| e.to_string()));
                     self.sm_wifi_reply_target = None;
-                    Some(event)
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
-                    return None;
                 }
-                Err(_) => None,
+                Err(_) => {}
             },
             PendingWifiOp::UrgentPoll { reply } => match reply.try_recv() {
                 Ok(Ok(true)) => {
@@ -574,7 +500,6 @@ impl DeviceContext<'_> {
                     // poll reports no urgent content.
                     if self.sync_scheduler.urgent_synced {
                         log::info!("Urgent flag still set and already synced; skipping full sync");
-                        None
                     } else {
                         log::info!("Urgent message available; dispatching full sync");
                         match self.rtc.read_time() {
@@ -585,25 +510,20 @@ impl DeviceContext<'_> {
                             }
                             Err(err) => log::warn!("RTC read failed after urgent poll: {err}"),
                         }
-                        None
                     }
                 }
                 Ok(Ok(false)) => {
                     self.sync_scheduler.urgent_synced = false;
-                    None
                 }
                 Ok(Err(err)) => {
                     log::warn!("Urgent poll failed: {err}");
-                    None
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
-                    return None;
                 }
-                Err(_) => None,
+                Err(_) => {}
             },
-        };
-        event
+        }
     }
 
     /// The RTC/NVS-maintenance half of a completed sync: re-point the
