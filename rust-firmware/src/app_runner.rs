@@ -52,6 +52,10 @@ pub struct EffectRunner<'a, 'ctx> {
     /// wedge (AlarmList screen). Deferred post-pump; when it returns the
     /// caller dispatches `Event::AlarmStoreChanged` with the reloaded list.
     deferred_add_alarm: bool,
+    /// The state machine asked to open a legacy inbox item-detail wedge
+    /// (InboxList screen). Deferred post-pump; when it returns the caller
+    /// dispatches `Event::InboxStoreChanged` with the reloaded list.
+    deferred_inbox_item: Option<usize>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -63,6 +67,7 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             deferred_nav: Vec::new(),
             deferred_settings_items: Vec::new(),
             deferred_add_alarm: false,
+            deferred_inbox_item: None,
         }
     }
 
@@ -93,6 +98,12 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     /// wedge during the last pump.
     pub fn take_deferred_add_alarm(&mut self) -> bool {
         std::mem::take(&mut self.deferred_add_alarm)
+    }
+
+    /// The inbox item-detail wedge the state machine asked to open during
+    /// the last pump (None when no row was opened).
+    pub fn take_deferred_inbox_item(&mut self) -> Option<usize> {
+        self.deferred_inbox_item.take()
     }
 }
 
@@ -263,6 +274,14 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.deferred_add_alarm = true;
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
+            Effect::OpenInboxItem { index } => {
+                // Same deferral: the item-detail wedge (marks read + shows
+                // the body) runs after the pump. The main loop dispatches
+                // Event::InboxStoreChanged with the reloaded list so the SM
+                // adopts the read mark.
+                self.deferred_inbox_item = Some(*index);
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
             Effect::PersistAlarmToggle { alarms, toggled_id } => {
                 // The AlarmList screen's confirmable enabled-toggle: save the
                 // list and mark the row dirty (two-way sync contract). The
@@ -406,13 +425,14 @@ fn render_view_into(
             .board
             .display
             .refresh_partial(crate::screens::NAV_BAR_RECT),
-        // Settings / AlarmList / TodoList row moves redraw the list region
-        // (rows share one chrome block; a per-row diff is a Stage-5
+        // Settings / AlarmList / TodoList / Inbox row moves redraw the list
+        // region (rows share one chrome block; a per-row diff is a Stage-5
         // RenderPlan concern).
         (
             RenderView::Settings { .. }
             | RenderView::AlarmList { .. }
-            | RenderView::TodoList { .. },
+            | RenderView::TodoList { .. }
+            | RenderView::Inbox { .. },
             RenderIntent::Partial,
         ) => ctx.board.display.refresh_partial(crate::canvas::Rect {
             x: 8,
@@ -427,9 +447,10 @@ fn render_view_into(
 /// Renders the visible surface named by `view` into the shared canvas.
 /// Home is always drawn first (the drawer opens over it from Home); the
 /// Navigation view then overlays the GO TO bar, and the Settings / AlarmList
-/// / TodoList views draw their own lists instead. Shared with main's legacy
-/// dirty-path redraws so the canvas always matches the SM's current screen
-/// (a dirty full redraw while the drawer is open must keep the overlay).
+/// / TodoList / Inbox views draw their own lists instead. Shared with main's
+/// legacy dirty-path redraws so the canvas always matches the SM's current
+/// screen (a dirty full redraw while the drawer is open must keep the
+/// overlay).
 pub(crate) fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -451,6 +472,9 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::TodoList { selected } => {
             crate::screens::draw_todo_list(ctx.board, ctx.todo_store, selected, clock.as_ref());
+        }
+        RenderView::Inbox { selected } => {
+            crate::screens::draw_inbox_list(ctx.board, ctx.inbox_store, selected);
         }
     }
 }

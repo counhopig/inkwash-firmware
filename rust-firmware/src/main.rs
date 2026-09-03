@@ -786,6 +786,7 @@ fn main() -> Result<()> {
                     | inkwash_logic::app::Screen::Settings { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
                     | inkwash_logic::app::Screen::TodoList { .. }
+                    | inkwash_logic::app::Screen::Inbox { .. }
             );
         if sm_screen_is_sm {
             // Feed every debounced button event through the state machine.
@@ -860,6 +861,28 @@ fn main() -> Result<()> {
                         }
                     } else {
                         dirty.push(FULL_SCREEN_RECT);
+                    }
+                }
+                if let Some(index) = deferred.inbox_item {
+                    // Inbox item-detail wedge (marks read + shows body) on
+                    // the InboxList screen. Post-pump. The wedge may have
+                    // been unwound by an alarm (the dismiss render is then
+                    // already issued); otherwise reload the SM inbox list
+                    // (Event::InboxStoreChanged - its Full render is the
+                    // authoritative redraw) so it adopts the read mark.
+                    let interrupted = open_deferred_inbox_item(&mut ctx, clock.as_ref(), index);
+                    if !interrupted {
+                        let reloaded = ctx.inbox_store.load().unwrap_or_default();
+                        if let Err(err) = dispatch_app_runner(
+                            &app_runner,
+                            inkwash_logic::app::Event::InboxStoreChanged(reloaded),
+                            &mut ctx,
+                        ) {
+                            log::warn!("InboxStoreChanged dispatch failed: {err}");
+                            dirty.push(FULL_SCREEN_RECT);
+                        }
+                    } else {
+                        dismiss_full_refresh = true;
                     }
                 }
             }
@@ -1064,6 +1087,7 @@ fn main() -> Result<()> {
                     | inkwash_logic::app::Screen::Settings { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
                     | inkwash_logic::app::Screen::TodoList { .. }
+                    | inkwash_logic::app::Screen::Inbox { .. }
             );
         if idle
             && !usb_host_connected
@@ -1175,6 +1199,19 @@ fn open_deferred_add_alarm(ctx: &mut DeviceContext, now: Option<&DateTime>) -> b
         .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
     let _ = ctx.alarm_poll.take_alarm_exit();
     changed
+}
+
+/// Runs the inbox item-detail wedge for the state-machine InboxList screen
+/// (Stage 4, slice 5). Post-pump (the detail is a blocking screen). Returns
+/// `true` when an alarm unwound the detail (the caller suppresses the
+/// follow-up reload; the alarm's dismiss render is already issued).
+fn open_deferred_inbox_item(ctx: &mut DeviceContext, now: Option<&DateTime>, index: usize) -> bool {
+    let interrupted = screens::open_sm_inbox_item(ctx, now, index);
+    let _ = ctx
+        .alarm_poll
+        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+    let _ = ctx.alarm_poll.take_alarm_exit();
+    interrupted
 }
 
 /// Renders the idle/background screen with a freshly-loaded next-alarm
@@ -1402,6 +1439,7 @@ fn dispatch_app_runner(
             destinations: executor.take_deferred_nav(),
             settings_items: executor.take_deferred_settings(),
             add_alarm: executor.take_deferred_add_alarm(),
+            inbox_item: executor.take_deferred_inbox_item(),
         }
     };
     for kick in runner.borrow_mut().take_kicks() {
@@ -1412,13 +1450,15 @@ fn dispatch_app_runner(
 
 /// Legacy blocking-page actions deferred out of a pump: drawer
 /// destinations (`OpenNavigationDestination`), Settings row items
-/// (`OpenSettingsItem`) and the "+ ADD ALARM" editor
-/// (`OpenAddAlarm`). The main loop opens each after the pump.
+/// (`OpenSettingsItem`), the "+ ADD ALARM" editor (`OpenAddAlarm`) and the
+/// inbox item-detail wedge (`OpenInboxItem`). The main loop opens each
+/// after the pump.
 #[derive(Default)]
 struct DeferredNav {
     destinations: Vec<usize>,
     settings_items: Vec<usize>,
     add_alarm: bool,
+    inbox_item: Option<usize>,
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.

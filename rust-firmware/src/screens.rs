@@ -1276,6 +1276,29 @@ fn format_inbox_row(item: &InboxItem) -> String {
     truncate_prop(&row, LIST_TEXT_MAX_WIDTH)
 }
 
+/// Draws the state-machine InboxList screen (Stage 4, slice 5): stored
+/// inbox rows (read/unread markers) rendered from the store; ENTER opens an
+/// item's detail through a deferred legacy wedge. Same layout the legacy
+/// inbox page used.
+pub(crate) fn draw_inbox_list(board: &mut Note4Board, store: &InboxStore, selected: usize) {
+    render_inbox_page(board, store, selected);
+}
+
+/// Runs the legacy inbox item-detail wedge for the state-machine InboxList
+/// screen (Stage 4, slice 5). Post-pump (the detail screen is a blocking
+/// page that dispatches alarm/button events through the shared Runtime). It
+/// marks the item read (store change) and shows the body; the caller then
+/// dispatches `Event::InboxStoreChanged` with the reloaded list so the SM
+/// adopts the read mark. Returns `true` when an alarm unwound the detail.
+pub(crate) fn open_sm_inbox_item(
+    ctx: &mut DeviceContext,
+    now: Option<&DateTime>,
+    index: usize,
+) -> bool {
+    open_inbox_item(ctx, now, index);
+    ctx.alarm_exit_pending()
+}
+
 fn render_inbox_page(board: &mut Note4Board, store: &InboxStore, selected: usize) {
     let items: Vec<String> = store
         .load()
