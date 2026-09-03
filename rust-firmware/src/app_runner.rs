@@ -418,7 +418,8 @@ fn render_view_into(
         (
             RenderView::WeekView { .. }
             | RenderView::InboxItem { .. }
-            | RenderView::NumberPick { .. },
+            | RenderView::NumberPick { .. }
+            | RenderView::BlePairing,
             RenderIntent::Partial,
         ) => ctx.board.display.refresh_partial(crate::canvas::Rect {
             x: 0,
@@ -480,6 +481,9 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::NumberPick { stage, value } => {
             crate::screens::draw_number_pick(ctx.board, stage, value);
+        }
+        RenderView::BlePairing => {
+            crate::screens::draw_ble_pairing(ctx.board);
         }
     }
 }

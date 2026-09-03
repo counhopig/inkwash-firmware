@@ -1102,6 +1102,22 @@ pub(crate) fn draw_alarm_list(board: &mut Note4Board, store: &AlarmStore, select
 /// value + stage; the executor draws from state using the same visual
 /// language the legacy pick_number used (title header, centered box + large
 /// scale-5 digits), so the two paths look identical.
+/// Draws the state-machine BLE pairing session screen (Stage 4): the
+/// pairing instructions canvas. The SM owns the lifecycle (events drive
+/// the phase; any button exits back to Settings); this draws the same
+/// instructions the legacy ble_pairing_screen showed while its radio
+/// wedge was on screen.
+pub(crate) fn draw_ble_pairing(board: &mut Note4Board) {
+    let mut canvas = board.display.canvas_mut();
+    canvas.clear();
+    header(&mut canvas, "BLE PAIRING");
+    canvas.draw_text_prop(8, 40, 1, "CONNECTING...");
+    canvas.draw_text_prop(8, 60, 1, "Service UUID:");
+    canvas.draw_text_prop(8, 72, 1, "d2c25e50-");
+    canvas.draw_text_prop(8, 84, 1, "5e22-48d8...");
+    footer(&mut canvas, "HOLD ENTER BACK");
+}
+
 pub(crate) fn draw_number_pick(
     board: &mut Note4Board,
     stage: inkwash_logic::app::AddStage,
