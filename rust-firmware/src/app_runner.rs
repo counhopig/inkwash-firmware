@@ -183,13 +183,23 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
             },
             Effect::StartSync(req) => {
+                // The sync task owns Wi-Fi; this only dispatches the
+                // request. `Ok(true)` = dispatched (async, receipt later);
+                // `Ok(false)` = another Wi-Fi operation is already in
+                // flight, so this sync did NOT start - fail immediately so
+                // the state machine's single-flight lock is not left
+                // waiting on a receipt that will never be this sync's.
                 let result = self.ctx.start_sync(
                     crate::sync_task::OpSource::Internal,
                     req.now,
                     inkwash_logic::protocol::Command::SyncNow,
                 );
                 match result {
-                    Ok(_) => Ok(EffectOutcome::Async),
+                    Ok(true) => Ok(EffectOutcome::Async),
+                    Ok(false) => Err((
+                        EffectCategory::Sync,
+                        "another Wi-Fi operation is already in progress".into(),
+                    )),
                     Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
                 }
             }

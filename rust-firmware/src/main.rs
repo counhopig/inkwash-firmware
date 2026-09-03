@@ -370,6 +370,7 @@ fn main() -> Result<()> {
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
         pending_wifi_op: None,
         last_command: None,
+        sm_sync_reply_target: None,
         app_runner: app_runner.clone(),
         pending_renders: std::rc::Rc::new(std::cell::RefCell::new(
             inkwash_logic::epd_registry::RenderRegistry::new(),
