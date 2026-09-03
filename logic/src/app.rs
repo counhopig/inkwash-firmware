@@ -75,6 +75,15 @@ pub enum Screen {
         selected: usize,
     },
     Calendar(CalendarState),
+    /// The read-only week view (Stage 4): the Sun-Sat week containing the
+    /// opened day, one column per day with each day's open todos. ENTER on a
+    /// Calendar day opens it; any button closes it back to the Calendar
+    /// screen (the cursor stays on the opened day).
+    WeekView {
+        year: u16,
+        month: u8,
+        day: u8,
+    },
     AlarmList {
         selected: usize,
     },
@@ -151,6 +160,11 @@ impl Screen {
                 year: *year,
                 month: *month,
                 selected_day: *selected_day,
+            },
+            Screen::WeekView { year, month, day } => RenderView::WeekView {
+                year: *year,
+                month: *month,
+                day: *day,
             },
             Screen::Home
             | Screen::AlarmEdit(_)
@@ -428,15 +442,6 @@ pub enum Effect {
         /// Index into `state.inbox.items`.
         index: usize,
     },
-    /// The user pressed ENTER on a Calendar day whose week view is still a
-    /// legacy blocking screen (week_view shows the opened week's todos).
-    /// The state machine stays on `Screen::Calendar` while the executor
-    /// runs the wedge (deferred post-pump, same as `OpenInboxItem`); when
-    /// it returns, main re-renders the calendar grid.
-    OpenCalendarDay {
-        /// The day the week view was opened from (1-based).
-        day: u8,
-    },
 }
 
 /// Which visible surface a render request targets. The renderer draws this
@@ -476,6 +481,10 @@ pub enum RenderView {
         month: u8,
         selected_day: u8,
     },
+    /// The week view (Stage 4): the Sun-Sat week containing the opened day,
+    /// one column per day with each day's open todos read from the todo
+    /// store by the executor. Full refresh on open/close.
+    WeekView { year: u16, month: u8, day: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1391,6 +1400,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::TodoList { .. }
             | Screen::Inbox { .. }
             | Screen::Calendar(_)
+            | Screen::WeekView { .. }
     ) {
         transition_nav_button(state, button)
     } else {
@@ -1601,6 +1611,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
         Screen::TodoList { selected } => transition_todo_list_button(state, *selected, button),
         Screen::Inbox { selected } => transition_inbox_list_button(state, *selected, button),
         Screen::Calendar(_) => transition_calendar_button(state, button),
+        Screen::WeekView { .. } => transition_week_view_button(state, button),
         Screen::Home => {
             // Long UP/DOWN opens the global navigation drawer from Home
             // (origin Home, highlighting HOME).
@@ -1945,20 +1956,47 @@ fn transition_calendar_button(state: &mut AppState, button: ButtonEvent) -> Vec<
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Enter) => {
-            // Open the selected day's week view: deferred legacy wedge. The
-            // SM stays on Calendar; main re-renders the grid when the wedge
-            // returns.
+            // Open the selected day's week view (an SM screen now): the
+            // view is read-only and any button closes it back to the grid.
             let day = cal.selected_day;
+            state.screen = Screen::WeekView {
+                year: cal.year,
+                month: cal.month,
+                day,
+            };
             state.render_generation = state.render_generation.next();
-            vec![
-                batch(
-                    state,
-                    OperationId(0),
-                    FailurePolicy::Continue,
-                    vec![Effect::OpenCalendarDay { day }],
-                ),
-                render_batch_with_intent(state, RenderIntent::Full),
-            ]
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
+        }
+        _ => vec![],
+    }
+}
+
+/// WeekView screen (Stage 4): read-only week columns. Any button closes it
+/// back to the Calendar grid; the grid keeps the day the view was opened
+/// from as its cursor (legacy week_view semantics: read-only, nothing to
+/// drill into, "any button closes").
+fn transition_week_view_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    let Screen::WeekView { year, month, day } = &state.screen else {
+        return vec![];
+    };
+    let (year, month, day) = (*year, *month, *day);
+    match button {
+        // Any button (short/long ENTER / UP / DOWN, releases ignored) closes
+        // the read-only view. Releases are ignored (they always follow a
+        // press that already closed it).
+        ButtonEvent::Pressed(ButtonId::Enter)
+        | ButtonEvent::LongPressed(ButtonId::Enter)
+        | ButtonEvent::Pressed(ButtonId::Up)
+        | ButtonEvent::Pressed(ButtonId::Down)
+        | ButtonEvent::LongPressed(ButtonId::Up)
+        | ButtonEvent::LongPressed(ButtonId::Down) => {
+            state.screen = Screen::Calendar(CalendarState {
+                year,
+                month,
+                selected_day: day,
+            });
+            state.render_generation = state.render_generation.next();
+            vec![render_batch_with_intent(state, RenderIntent::Full)]
         }
         _ => vec![],
     }
@@ -5633,7 +5671,7 @@ mod tests {
     }
 
     #[test]
-    fn calendar_enter_day_emits_open_calendar_day_and_stays() {
+    fn calendar_enter_day_opens_week_view_screen() {
         let mut state = AppState::default();
         open_calendar(&mut state, 15);
         // Move to day 17 then ENTER.
@@ -5657,12 +5695,34 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert!(batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::OpenCalendarDay { day: 17 })));
-        // The SM stays on Calendar (main re-renders the grid when the week
-        // view wedge returns).
+        // ENTER opens the day's week view as an SM screen (Full render of
+        // the WeekView surface).
+        assert_eq!(
+            state.screen,
+            Screen::WeekView {
+                year: 2026,
+                month: 8,
+                day: 17,
+            }
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::Render(RenderRequest {
+                intent: RenderIntent::Full,
+                view: RenderView::WeekView {
+                    year: 2026,
+                    month: 8,
+                    day: 17,
+                },
+                ..
+            })
+        )));
+        // Any button closes the read-only view back to the calendar grid,
+        // keeping the opened day as the cursor.
+        let close_batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
         assert_eq!(
             state.screen,
             Screen::Calendar(CalendarState {
@@ -5671,18 +5731,21 @@ mod tests {
                 selected_day: 17,
             })
         );
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::Render(RenderRequest {
-                intent: RenderIntent::Full,
-                view: RenderView::Calendar {
-                    year: 2026,
-                    month: 8,
-                    selected_day: 17,
-                },
-                ..
-            })
-        )));
+        assert!(close_batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(
+                e,
+                Effect::Render(RenderRequest {
+                    intent: RenderIntent::Full,
+                    view: RenderView::Calendar {
+                        year: 2026,
+                        month: 8,
+                        selected_day: 17,
+                    },
+                    ..
+                })
+            )));
     }
 
     #[test]
@@ -5842,6 +5905,18 @@ mod tests {
                     year: 2026,
                     month: 8,
                     selected_day: 15,
+                },
+            ),
+            (
+                Screen::WeekView {
+                    year: 2026,
+                    month: 8,
+                    day: 17,
+                },
+                RenderView::WeekView {
+                    year: 2026,
+                    month: 8,
+                    day: 17,
                 },
             ),
             (
@@ -6648,6 +6723,11 @@ mod tests {
                 month: 8,
                 selected_day: 15,
             }),
+            Screen::WeekView {
+                year: 2026,
+                month: 8,
+                day: 17,
+            },
         ];
         for screen in screens {
             let mut state = AppState::default();
@@ -6739,6 +6819,18 @@ mod tests {
                     year: 2026,
                     month: 8,
                     selected_day: 15,
+                },
+            ),
+            (
+                Screen::WeekView {
+                    year: 2026,
+                    month: 8,
+                    day: 17,
+                },
+                RenderView::WeekView {
+                    year: 2026,
+                    month: 8,
+                    day: 17,
                 },
             ),
             (
