@@ -201,6 +201,37 @@ fn main() -> Result<()> {
         }
     };
 
+    // P1#3 slice 2: probe the *core* boot facts (RTC alarm-status + alarm
+    // NVS list) here, BEFORE any heavy subsystem is initialized (Wi-Fi
+    // manager, sync task, light sleep). If either core fact is unavailable
+    // there is no trustworthy data/time to build a meaningful BootSnapshot,
+    // so the device enters the minimum safe mode immediately - no network /
+    // BLE / sleep subsystem is ever brought up, and no Home render or RTC
+    // re-arm happens against corrupt facts.
+    {
+        let mut core_failure = None;
+        if let Err(err) = rtc.alarm_status() {
+            core_failure = Some(format!("RTC alarm status read failed: {err}"));
+        } else if let Err(err) = alarm_store.load() {
+            core_failure = Some(format!("Alarm NVS load failed: {err}"));
+        }
+        // Injectable test hook (see build.rs): a binary built with
+        // INKWASH_FORCE_SAFE_MODE=1 forces the safe-mode entry on a healthy
+        // boot so the safe path is device-verifiable without destroying
+        // NVS/RTC. The normal build never sets it.
+        let forced = option_env!("INKWASH_FORCE_SAFE_MODE").is_some_and(|v| v == "1");
+        if let Some(reason) = core_failure {
+            run_safe_mode(&mut board, &mut usb_console, &reason);
+        }
+        if forced {
+            run_safe_mode(
+                &mut board,
+                &mut usb_console,
+                "forced by INKWASH_FORCE_SAFE_MODE=1 (test hook)",
+            );
+        }
+    }
+
     // Ring before the normal boot render, if this boot is the RTC alarm
     // firing: latency to sound matters more than latency to the home
     // screen. `power::wake_cause()` reads `esp_sleep_get_wakeup_cause`
@@ -444,29 +475,13 @@ fn main() -> Result<()> {
         if !boot_dispatched {
             boot_dispatched = true;
             let boot_result = collect_boot_snapshot(&mut ctx, clock);
-            // Injectable boot-fact failure hook (Stage 6): a binary built
-            // with INKWASH_FORCE_SAFE_MODE=1 in the build environment forces
-            // the minimum safe-mode entry on a *healthy* boot, so the safe
-            // path is device-verifiable without destroying NVS/RTC. The
-            // normal build never sets the env (build.rs only emits it when
-            // requested).
-            let forced_safe_mode =
-                option_env!("INKWASH_FORCE_SAFE_MODE").is_some_and(|v| v == "1");
-            if boot_result.core_failed || forced_safe_mode {
-                // Architecture (firmware-architecture.md "启动失败与安全模
-                // 式"): a core boot fact failure must NOT run the normal App
-                // (an empty alarm list would treat a real AF as residue and
-                // ACK it off, or make alarm decisions on corrupt facts), and
-                // must NOT degrade into the legacy product loop. Enter the
-                // independent minimum safe mode (fixed error screen + USB
-                // diagnostics + watchdog + reset detect; no App/nav/network/
-                // BLE/sleep). It never returns - only reset/power-cycle.
-                let reason = if forced_safe_mode {
-                    "forced by INKWASH_FORCE_SAFE_MODE=1 (test hook)".to_string()
-                } else {
-                    boot_result.failure_reason.clone()
-                };
-                run_safe_mode(ctx.board, ctx.usb_console, &reason);
+            // Defensive backstop only: the core facts were already probed
+            // before any heavy subsystem init (see the early probe above),
+            // so this branch fires only if a core fact fails *between* the
+            // early probe and the first loop iteration (effectively never).
+            // Same minimum safe mode as the early path.
+            if boot_result.core_failed {
+                run_safe_mode(ctx.board, ctx.usb_console, &boot_result.failure_reason);
             } else {
                 if let Err(err) = dispatch_app_runner(
                     &app_runner,
