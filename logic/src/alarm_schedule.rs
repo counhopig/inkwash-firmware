@@ -10,6 +10,7 @@
 //! below so existing call sites are unaffected.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::alarm_regs::AlarmRegs;
 use crate::datetime::{weekday_from_days, DateTime};
@@ -230,6 +231,40 @@ pub fn next_due<'a>(alarms: &'a [StoredAlarm], now: &DateTime) -> Option<&'a Sto
         .iter()
         .filter(|a| a.enabled && minutes_until(a, now) != i64::MAX)
         .min_by_key(|a| minutes_until(a, now))
+}
+
+/// Timer wake needed to make a future-month one-shot alarm fully offline.
+/// PCF8563 cannot compare month/year, so the device wakes one minute before
+/// the earliest target month and arms the RTC alarm when the date boundary
+/// is observed (the firmware's idle deep-sleep path and the Settings SLEEP
+/// action both plan this wake). Pure calculation over the alarm list + now.
+pub fn maintenance_wakeup_delay(alarms: &[StoredAlarm], now: &DateTime) -> Option<Duration> {
+    let now_epoch = now.to_unix();
+    alarms
+        .iter()
+        .filter(|alarm| alarm.enabled)
+        .filter_map(|alarm| match alarm.repeat {
+            Repeat::Once { year, month, .. }
+                if (year, month) > (now.year, now.month) && (1..=12).contains(&month) =>
+            {
+                Some(
+                    DateTime {
+                        year,
+                        month,
+                        day: 1,
+                        ..DateTime::default()
+                    }
+                    .to_unix(),
+                )
+            }
+            _ => None,
+        })
+        .min()
+        .map(|target_month| {
+            // Wake before midnight so the ordinary date-boundary tick can do
+            // the actual RTC programming without racing a 00:00 alarm.
+            Duration::from_secs(target_month.saturating_sub(now_epoch + 60).max(1))
+        })
 }
 
 /// Computes the PCF8563 compare fields for a single alarm as it should be

@@ -25,7 +25,7 @@
 //! completion can never corrupt a newer state.
 
 use crate::alarm_regs::AlarmRegs;
-use crate::alarm_schedule::{next_due, Repeat, StoredAlarm};
+use crate::alarm_schedule::{maintenance_wakeup_delay, next_due, Repeat, StoredAlarm};
 use crate::button_event::{ButtonEvent, ButtonId};
 use crate::datetime::{days_in_month, DateTime};
 use crate::device_config::{DeviceConfig, WifiCreds};
@@ -1632,20 +1632,41 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     vec![render_batch_with_intent(state, RenderIntent::Full)]
                 }
                 ButtonEvent::Pressed(ButtonId::Enter) => {
-                    // Row action: deferred to the executor (the row's
-                    // action/screen is still a legacy blocking page). The
-                    // SM stays on Settings; the executor returns after the
-                    // wedge and main re-renders Settings.
-                    state.render_generation = state.render_generation.next();
-                    vec![
-                        batch(
-                            state,
-                            OperationId(0),
-                            FailurePolicy::Continue,
-                            vec![Effect::OpenSettingsItem { item: cur }],
-                        ),
-                        render_batch_with_intent(state, RenderIntent::Full),
-                    ]
+                    if cur == SETTINGS_SLEEP_ROW {
+                        // SLEEP (row 3): an SM-owned effect - deep sleep with
+                        // the maintenance wake needed for a far-future
+                        // one-shot alarm (mirrors the idle deep-sleep plan).
+                        let maintenance = state
+                            .clock
+                            .now
+                            .and_then(|now| maintenance_wakeup_delay(&state.alarms.alarms, &now));
+                        state.render_generation = state.render_generation.next();
+                        vec![
+                            batch(
+                                state,
+                                OperationId(0),
+                                FailurePolicy::Continue,
+                                vec![Effect::EnterDeepSleep(WakeupPlan { maintenance })],
+                            ),
+                            render_batch_with_intent(state, RenderIntent::Full),
+                        ]
+                    } else {
+                        // Other row action: deferred to the executor (the
+                        // row's action/screen is still a legacy blocking
+                        // page - Sync Now / Sync Interval / BLE pairing).
+                        // The SM stays on Settings; the executor returns
+                        // after the wedge and main re-renders Settings.
+                        state.render_generation = state.render_generation.next();
+                        vec![
+                            batch(
+                                state,
+                                OperationId(0),
+                                FailurePolicy::Continue,
+                                vec![Effect::OpenSettingsItem { item: cur }],
+                            ),
+                            render_batch_with_intent(state, RenderIntent::Full),
+                        ]
+                    }
                 }
                 _ => vec![],
             }
@@ -1681,6 +1702,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
 /// Number of rows in the Settings list (SYNC NOW / SYNC INTERVAL / BLE
 /// PAIRING / SLEEP) - mirrors the firmware's `open_menu` items.
 pub const SETTINGS_ROW_COUNT: usize = 4;
+/// Index of the SLEEP row in the Settings list (0=Sync Now, 1=Sync
+/// Interval, 2=BLE Pairing, 3=Sleep).
+pub const SETTINGS_SLEEP_ROW: usize = 3;
 
 /// The "+ ADD ALARM" row is the list length (rows 0..len are stored alarms).
 /// AlarmList screen (Stage 4): browse the stored alarm rows (toggle
@@ -4803,6 +4827,102 @@ mod tests {
         // The SM stays on Settings (the executor runs the wedge and returns;
         // main re-renders Settings).
         assert_eq!(state.screen, Screen::Settings { selected: 1 });
+    }
+
+    #[test]
+    fn settings_sleep_row_emits_deep_sleep_effect() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Move to row 3 (SLEEP).
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 3 });
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Sleep is an SM effect now (deep sleep with the maintenance wake);
+        // no legacy OpenSettingsItem wedge for the Sleep row.
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::EnterDeepSleep(WakeupPlan { .. }))));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::OpenSettingsItem { item: 3 })));
+    }
+
+    #[test]
+    fn settings_sleep_with_future_once_alarm_plans_maintenance_wake() {
+        let mut state = AppState::default();
+        // A future-month one-shot alarm needs a maintenance wake before the
+        // target month (PCF8563 cannot compare month/year).
+        let mut list = vec![alarm(1, 8, 0)];
+        list[0].repeat = Repeat::Once {
+            year: 2026,
+            month: 10,
+            day: 1,
+        };
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(list, Some(dt(8, 1)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        // Row 3 (SLEEP).
+        for _ in 0..3 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
+            e,
+            Effect::EnterDeepSleep(WakeupPlan {
+                maintenance: Some(_),
+                ..
+            })
+        )));
     }
 
     #[test]

@@ -34,8 +34,8 @@ const MAX_RING_SECS: u64 = 300;
 /// existing `alarms::Repeat` / `alarms::StoredAlarm` / `alarms::next_due`
 /// call site keeps working unchanged.
 pub use inkwash_logic::alarm_schedule::{
-    date_from_days, days_since_epoch, days_until, next_due, next_id, next_occurrence_date, Repeat,
-    StoredAlarm,
+    date_from_days, days_since_epoch, days_until, maintenance_wakeup_delay, next_due, next_id,
+    next_occurrence_date, Repeat, StoredAlarm,
 };
 
 pub struct AlarmStore {
@@ -168,38 +168,9 @@ fn ring_until_dismissed(
     }
 }
 
-/// Timer wake needed to make a future-month one-shot alarm fully offline.
-/// PCF8563 cannot compare month/year, so the ESP wakes one minute before the
-/// earliest target month, remains in the normal main loop, and arms the RTC
-/// alarm when the date boundary is observed. RTC alarm wake remains available
-/// independently through EXT1 for already-armable alarms.
-pub fn maintenance_wakeup_delay(alarms: &[StoredAlarm], now: &DateTime) -> Option<Duration> {
-    let now_epoch = now.to_unix();
-    alarms
-        .iter()
-        .filter(|alarm| alarm.enabled)
-        .filter_map(|alarm| match alarm.repeat {
-            Repeat::Once { year, month, .. }
-                if (year, month) > (now.year, now.month) && (1..=12).contains(&month) =>
-            {
-                Some(
-                    DateTime {
-                        year,
-                        month,
-                        day: 1,
-                        ..DateTime::default()
-                    }
-                    .to_unix(),
-                )
-            }
-            _ => None,
-        })
-        .min()
-        .map(|target_month| {
-            // Wake before midnight so the ordinary date-boundary tick can do
-            // the actual RTC programming without racing a 00:00 alarm.
-            Duration::from_secs(target_month.saturating_sub(now_epoch + 60).max(1))
-        })
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
+        }
+    }
 }
 
 /// Reprograms the PCF8563's single hardware alarm slot to whichever stored
