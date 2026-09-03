@@ -54,9 +54,8 @@ pub fn truncate_prop(text: &str, max_width: usize) -> String {
 /// recurses into whichever screen the user picks, returning once they back
 /// all the way out to Home. Always leaves the caller (Home) to redraw its
 /// own full screen afterwards - none of these screens know how to render
-/// the home screen themselves. `pub(crate)` so main's deferred
-/// `OpenNavigationDestination` router (SM drawer selecting SETTINGS) can
-/// open it after the pump.
+/// the home screen themselves. Kept `pub(crate)` for the SM-disabled legacy
+/// path (main's open_navigation stack can reach Settings through it).
 pub(crate) fn open_menu(ctx: &mut DeviceContext, now: Option<&DateTime>) {
     let items = [
         "SYNC NOW".to_string(),
@@ -352,25 +351,6 @@ pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
             }
             _ => {}
         }
-    }
-}
-
-/// Opens one navigation-drawer destination picked through the state-machine
-/// drawer (Stage 4): the SM closed the drawer back to Home and emitted
-/// `Effect::OpenNavigationDestination`; main's post-pump router calls this
-/// for every destination that still lives behind a legacy blocking page
-/// (1..=4 - HOME and SETTINGS are SM screens and never emit this). The
-/// pages dispatch alarm/button events through the shared Runtime, which is
-/// why main opens them only after the pump released the borrow.
-pub fn open_sm_destination(ctx: &mut DeviceContext, now: Option<&DateTime>, destination: usize) {
-    // Home (0), ALARMS (3), TODOS (4) and SETTINGS (5) are SM screens and
-    // never reach this router; 1/2 still run legacy blocking pages.
-    if let 1..=2 = destination {
-        let page = match destination {
-            1 => Page::Calendar,
-            _ => Page::Inbox,
-        };
-        browse_page(ctx, page, now);
     }
 }
 

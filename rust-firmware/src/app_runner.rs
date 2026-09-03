@@ -39,14 +39,11 @@ pub struct EffectRunner<'a, 'ctx> {
         inkwash_logic::protocol::Channel,
         inkwash_logic::protocol::Reply,
     )>,
-    /// Legacy navigation destinations the state machine selected while
-    /// running this pump. Opening them is deferred to the caller (after
-    /// the pump releases the Runtime borrow) because the pages block and
-    /// dispatch alarm/button events back through the same Runtime.
-    deferred_nav: Vec<usize>,
     /// Settings row actions the state machine selected while running this
-    /// pump (Sync Now / Sync Interval / BLE pairing / Sleep). Same
-    /// deferral rationale as `deferred_nav`.
+    /// pump (Sync Now / Sync Interval / BLE pairing / Sleep). The wedges
+    /// block and dispatch alarm/button events back through the same Runtime,
+    /// so opening them is deferred to the caller (after the pump releases
+    /// the Runtime borrow).
     deferred_settings_items: Vec<usize>,
     /// The state machine asked to open the legacy "+ ADD ALARM" editor
     /// wedge (AlarmList screen). Deferred post-pump; when it returns the
@@ -68,7 +65,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             ctx,
             last_clock,
             replies: Vec::new(),
-            deferred_nav: Vec::new(),
             deferred_settings_items: Vec::new(),
             deferred_add_alarm: false,
             deferred_inbox_item: None,
@@ -85,12 +81,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
         inkwash_logic::protocol::Reply,
     )> {
         std::mem::take(&mut self.replies)
-    }
-
-    /// Drain the legacy navigation destinations the state machine selected
-    /// during the last pump. The caller opens each page after the pump.
-    pub fn take_deferred_nav(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.deferred_nav)
     }
 
     /// Drain the Settings row actions the state machine selected during the
@@ -254,26 +244,15 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             // ---- asynchronous / out-of-band effects -------------------------
-            Effect::OpenNavigationDestination { destination } => {
-                // The executor NEVER opens a legacy blocking page inside a
-                // pump: a blocking page dispatches RTC alarm snapshots /
-                // button events through the same shared Runtime, which would
-                // re-enter `borrow_mut` on the RefCell the outer pump is
-                // holding and panic. Defer the open to the caller: the main
-                // loop drains this buffer after the pump (borrow released)
-                // and opens the page there, mirroring the legacy inline
-                // `open_navigation` dispatch structure. The state machine
-                // already transitioned to the target screen before the
-                // effect ran, so the page opens onto the correct state.
-                self.deferred_nav.push(*destination);
-                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
-            }
             Effect::OpenSettingsItem { item } => {
-                // Same deferral as OpenNavigationDestination: Settings row
-                // actions (Sync Now / Sync Interval / BLE pairing / Sleep)
-                // are still legacy blocking screens and must not run inside
-                // a pump. The main loop opens the wedge after the pump and
-                // re-renders the Settings screen on return.
+                // Settings row actions (Sync Now / Sync Interval / BLE
+                // pairing / Sleep) are still legacy blocking screens and
+                // must not run inside a pump - they dispatch RTC alarm
+                // snapshots / button events through the same shared Runtime,
+                // which would re-enter `borrow_mut` on the RefCell the outer
+                // pump is holding and panic. Defer the open to the caller:
+                // the main loop drains this buffer after the pump (borrow
+                // released) and runs the wedge, then re-renders Settings.
                 self.deferred_settings_items.push(*item);
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }

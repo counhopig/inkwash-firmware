@@ -773,10 +773,9 @@ fn main() -> Result<()> {
         // state machine as Event::Button. The SM owns what the keys mean
         // there: long UP/DOWN opens the drawer from Home; inside the drawer
         // UP/DOWN move the selection, ENTER selects a destination, long
-        // ENTER cancels. Selecting a not-yet-migrated destination emits
-        // `OpenNavigationDestination`, whose legacy page this loop opens
-        // below (post-pump). When the runtime is disabled (core boot fact
-        // failure) the legacy Home nav stays available without the SM.
+        // ENTER cancels. Every destination is an SM screen; when the runtime
+        // is disabled (core boot fact failure) the legacy Home nav stays
+        // available without the SM.
         let mut key_changed = false;
         let sm_screen_is_sm = app_runner_enabled
             && matches!(
@@ -815,19 +814,6 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                for dest in deferred.destinations {
-                    // Legacy page for a drawer destination selected through
-                    // the SM drawer. Post-pump: the blocking page dispatches
-                    // alarm/button events through the shared Runtime itself.
-                    // An alarm-unwound page means the dismiss Home render is
-                    // already issued - drop dirty rects instead of pushing a
-                    // second full Home redraw.
-                    if open_deferred_destination(&mut ctx, clock.as_ref(), dest) {
-                        dismiss_full_refresh = true;
-                    } else {
-                        dirty.push(FULL_SCREEN_RECT);
-                    }
-                }
                 for item in deferred.settings_items {
                     // Settings row action (Sync Now / Sync Interval / BLE
                     // pairing / Sleep) run as a legacy wedge after the pump.
@@ -1150,33 +1136,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// Opens one legacy navigation-destination page selected through the
-/// state-machine drawer (Stage 4). Called strictly after the dispatch pump
-/// has released the Runtime borrow: the blocking pages (browse_page /
-/// open_menu) dispatch RTC alarm snapshots / button events back through the
-/// shared Runtime, which must not be re-entered from inside a pump.
-///
-/// Returns `true` when an alarm unwound the page (the SM already issued the
-/// dismiss Home render; the caller must drop dirty rects instead of pushing
-/// a second full Home redraw). Mirrors the legacy `open_navigation` caller
-/// contract.
-fn open_deferred_destination(
-    ctx: &mut DeviceContext,
-    now: Option<&DateTime>,
-    destination: usize,
-) -> bool {
-    screens::open_sm_destination(ctx, now, destination);
-    // Same unwind bookkeeping the legacy open_navigation path performed:
-    // the page stack may have been unwound by an alarm; consume the sticky
-    // exit flag here so it does not leak into the next page entry.
-    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
-    let _ = ctx
-        .alarm_poll
-        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
-    let _ = ctx.alarm_poll.take_alarm_exit();
-    alarm_interrupted
-}
-
 /// Runs one Settings row action selected through the state-machine Settings
 /// screen (Stage 4, slice 2). Called strictly after the dispatch pump has
 /// released the Runtime borrow: the row actions are legacy blocking
@@ -1447,9 +1406,9 @@ fn collect_boot_snapshot(
 /// to the shared EPD registry here, so call sites never drain kicks by
 /// hand.
 ///
-/// Returns the legacy actions the state machine selected while pumping
-/// this event (drawer destinations and Settings row items that still run
-/// behind legacy blocking pages). The caller opens each page AFTER this
+/// Returns the legacy wedges the state machine selected while pumping this
+/// event (Settings row items / "+ ADD ALARM" / inbox detail / week view that
+/// still run behind legacy blocking pages). The caller runs each AFTER this
 /// returns - never inside a pump - because the blocking pages dispatch
 /// alarm/button events back through the same shared Runtime, which would
 /// re-enter `borrow_mut` on the RefCell this function held during the pump.
@@ -1469,7 +1428,6 @@ fn dispatch_app_runner(
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
         DeferredNav {
-            destinations: executor.take_deferred_nav(),
             settings_items: executor.take_deferred_settings(),
             add_alarm: executor.take_deferred_add_alarm(),
             inbox_item: executor.take_deferred_inbox_item(),
@@ -1482,14 +1440,12 @@ fn dispatch_app_runner(
     Ok(deferred)
 }
 
-/// Legacy blocking-page actions deferred out of a pump: drawer
-/// destinations (`OpenNavigationDestination`), Settings row items
+/// Legacy blocking-page wedges deferred out of a pump: Settings row items
 /// (`OpenSettingsItem`), the "+ ADD ALARM" editor (`OpenAddAlarm`), the
 /// inbox item-detail wedge (`OpenInboxItem`) and the calendar week-view
-/// wedge (`OpenCalendarDay`). The main loop opens each after the pump.
+/// wedge (`OpenCalendarDay`). The main loop runs each after the pump.
 #[derive(Default)]
 struct DeferredNav {
-    destinations: Vec<usize>,
     settings_items: Vec<usize>,
     add_alarm: bool,
     inbox_item: Option<usize>,
