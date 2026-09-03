@@ -6704,4 +6704,81 @@ mod tests {
                 )));
         }
     }
+
+    /// The unified event loop keeps running while any SM screen is current:
+    /// a minute-change Tick on each content screen emits a Partial render of
+    /// that screen's own view (Stage-4 exit condition - no page blocks the
+    /// loop from ticking / re-rendering).
+    #[test]
+    fn minute_tick_keeps_rendering_while_any_sm_screen_is_current() {
+        let screens = [
+            (Screen::Home, RenderView::Home),
+            (
+                Screen::Settings { selected: 0 },
+                RenderView::Settings { selected: 0 },
+            ),
+            (
+                Screen::AlarmList { selected: 1 },
+                RenderView::AlarmList { selected: 1 },
+            ),
+            (
+                Screen::TodoList { selected: 0 },
+                RenderView::TodoList { selected: 0 },
+            ),
+            (
+                Screen::Inbox { selected: 0 },
+                RenderView::Inbox { selected: 0 },
+            ),
+            (
+                Screen::Calendar(CalendarState {
+                    year: 2026,
+                    month: 8,
+                    selected_day: 15,
+                }),
+                RenderView::Calendar {
+                    year: 2026,
+                    month: 8,
+                    selected_day: 15,
+                },
+            ),
+            (
+                Screen::Navigation {
+                    selected: 3,
+                    origin: NavOrigin::Home,
+                },
+                RenderView::Navigation { selected: 3 },
+            ),
+        ];
+        for (screen, expected_view) in screens {
+            let mut state = AppState::default();
+            let _ = update(
+                &mut state,
+                Event::Boot(boot_snapshot(
+                    vec![alarm(1, 9, 0)],
+                    Some(dt(8, 0)),
+                    false,
+                    true,
+                )),
+            );
+            state.screen = screen.clone();
+            // A minute-change Tick while the screen is current.
+            let tick_batches = update(&mut state, Event::Tick(dt(8, 1)));
+            let renders_expected_view = tick_batches.iter().flat_map(|b| &b.effects).any(|e| {
+                matches!(e, Effect::Render(RenderRequest { view, .. }) if *view == expected_view)
+            });
+            let has_partial = tick_batches.iter().flat_map(|b| &b.effects).any(|e| {
+                matches!(
+                    e,
+                    Effect::Render(RenderRequest {
+                        intent: RenderIntent::Partial,
+                        ..
+                    })
+                )
+            });
+            assert!(
+                renders_expected_view && has_partial,
+                "tick on {screen:?} must Partial-render {expected_view:?}"
+            );
+        }
+    }
 }
