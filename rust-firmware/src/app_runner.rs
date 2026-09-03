@@ -43,6 +43,10 @@ pub struct EffectRunner<'a, 'ctx> {
     /// the pump releases the Runtime borrow) because the pages block and
     /// dispatch alarm/button events back through the same Runtime.
     deferred_nav: Vec<usize>,
+    /// Settings row actions the state machine selected while running this
+    /// pump (Sync Now / Sync Interval / BLE pairing / Sleep). Same
+    /// deferral rationale as `deferred_nav`.
+    deferred_settings_items: Vec<usize>,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -52,6 +56,7 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             last_clock,
             replies: Vec::new(),
             deferred_nav: Vec::new(),
+            deferred_settings_items: Vec::new(),
         }
     }
 
@@ -70,6 +75,12 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     /// during the last pump. The caller opens each page after the pump.
     pub fn take_deferred_nav(&mut self) -> Vec<usize> {
         std::mem::take(&mut self.deferred_nav)
+    }
+
+    /// Drain the Settings row actions the state machine selected during the
+    /// last pump. The caller runs each wedge after the pump.
+    pub fn take_deferred_settings(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.deferred_settings_items)
     }
 }
 
@@ -223,6 +234,15 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 self.deferred_nav.push(*destination);
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
+            Effect::OpenSettingsItem { item } => {
+                // Same deferral as OpenNavigationDestination: Settings row
+                // actions (Sync Now / Sync Interval / BLE pairing / Sleep)
+                // are still legacy blocking screens and must not run inside
+                // a pump. The main loop opens the wedge after the pump and
+                // re-renders the Settings screen on return.
+                self.deferred_settings_items.push(*item);
+                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
+            }
             Effect::Reply { channel, reply } => {
                 // Record the reply for the caller to write after the pump:
                 // only the caller knows the correlation id of the frame that
@@ -291,14 +311,17 @@ impl EffectExecutor for EffectRunner<'_, '_> {
 
 /// Draws the current SM screen's canvas and submits the refresh the state
 /// machine requested. The renderer is state-driven (Stage-4/5): the request
-/// names the surface to draw - Home, or Home plus the GO TO drawer overlay -
-/// so the executor draws the SM screen instead of a call-site rectangle.
+/// names the surface to draw - Home, the GO TO drawer overlay, or the
+/// Settings list - so the executor draws the SM screen instead of a
+/// call-site rectangle.
 ///
 /// Home canvases are always fully re-rendered before the refresh (a minute
 /// tick re-draws Home then partial-refreshes only the clock rect). The
 /// drawer overlay is drawn on top of the same Home canvas; a Partial
 /// refresh of the Navigation view updates only the overlay rect (cheap
 /// selection moves on the drawer), while open/close/select stay Full.
+/// Settings is a full screen: its Partial updates are full list redraws
+/// (the list region; cheap enough on a list that redraws as one block).
 ///
 /// Returns the EPD request id so the caller can correlate the eventual
 /// `EpdCompletion` back to this render's `AsyncKick`.
@@ -324,20 +347,48 @@ fn render_view_into(
             .board
             .display
             .refresh_partial(crate::screens::NAV_BAR_RECT),
+        // Settings row moves redraw the whole list region (the rows share
+        // one chrome block; a per-row diff is a Stage-5 RenderPlan concern).
+        (RenderView::Settings { .. }, RenderIntent::Partial) => {
+            ctx.board.display.refresh_partial(crate::canvas::Rect {
+                x: 8,
+                y: 34,
+                width: 384,
+                height: 226,
+            })
+        }
     };
     request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
 }
 
 /// Renders the visible surface named by `view` into the shared canvas.
 /// Home is always drawn first (the drawer opens over it from Home); the
-/// Navigation view then overlays the GO TO bar. Shared with main's legacy
-/// dirty-path redraws so the canvas always matches the SM's current screen
-/// (a dirty full redraw while the drawer is open must keep the overlay).
+/// Navigation view then overlays the GO TO bar, and the Settings view draws
+/// the settings list instead. Shared with main's legacy dirty-path redraws
+/// so the canvas always matches the SM's current screen (a dirty full
+/// redraw while the drawer is open must keep the overlay).
 pub(crate) fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
     view: RenderView,
 ) {
+    match view {
+        RenderView::Home => draw_home_surface(ctx, clock),
+        RenderView::Navigation { selected } => {
+            draw_home_surface(ctx, clock);
+            let mut canvas = ctx.board.display.canvas_mut();
+            crate::screens::draw_navigation_bar(&mut canvas, selected);
+        }
+        RenderView::Settings { selected } => {
+            let mut canvas = ctx.board.display.canvas_mut();
+            crate::screens::draw_settings(&mut canvas, selected);
+        }
+    }
+}
+
+/// Draws the idle Home canvas (clock + cards). Shared by Home and
+/// Navigation views (the drawer overlays the Home canvas).
+fn draw_home_surface(ctx: &mut DeviceContext<'_>, clock: Option<DateTime>) {
     let next_alarm = clock
         .as_ref()
         .and_then(|dt| crate::screens::next_alarm_label(ctx.alarm_store, dt));
@@ -362,8 +413,4 @@ pub(crate) fn draw_sm_surface(
         battery_percent,
         charge,
     );
-    if let RenderView::Navigation { selected } = view {
-        let mut canvas = ctx.board.display.canvas_mut();
-        crate::screens::draw_navigation_bar(&mut canvas, selected);
-    }
 }

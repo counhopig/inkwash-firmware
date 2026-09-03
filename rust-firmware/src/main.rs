@@ -781,33 +781,36 @@ fn main() -> Result<()> {
         let sm_screen_is_sm = app_runner_enabled
             && matches!(
                 app_runner.borrow().state().screen,
-                inkwash_logic::app::Screen::Home | inkwash_logic::app::Screen::Navigation { .. }
+                inkwash_logic::app::Screen::Home
+                    | inkwash_logic::app::Screen::Navigation { .. }
+                    | inkwash_logic::app::Screen::Settings { .. }
             );
         if sm_screen_is_sm {
             // Feed every debounced button event through the state machine.
-            // The SM renders its own screen changes (drawer open/close/move)
-            // as Effect::Render kicks; a destination selection on a
-            // not-yet-migrated page comes back as a deferred destination,
-            // opened below after that event's pump releases the Runtime
-            // borrow (the legacy pages dispatch through the shared Runtime
-            // themselves).
+            // The SM renders its own screen changes (drawer open/close/move,
+            // Settings row moves, Home/Settings transitions) as
+            // Effect::Render kicks. A legacy action selected while pumping
+            // (drawer destination on a not-yet-migrated page, or a Settings
+            // row action) comes back deferred and is opened below after the
+            // pump releases the Runtime borrow (the legacy pages dispatch
+            // through the shared Runtime themselves).
             let enter_event = ctx.board.key_enter.poll();
             let up_event = ctx.board.key_up.poll();
             let down_event = ctx.board.key_down.poll();
             for event in [enter_event, up_event, down_event].into_iter().flatten() {
                 key_changed = true;
-                let destinations = match dispatch_app_runner(
+                let deferred = match dispatch_app_runner(
                     &app_runner,
                     inkwash_logic::app::Event::Button(event),
                     &mut ctx,
                 ) {
-                    Ok(destinations) => destinations,
+                    Ok(deferred) => deferred,
                     Err(err) => {
                         log::warn!("SM button dispatch failed: {err}");
                         continue;
                     }
                 };
-                for dest in destinations {
+                for dest in deferred.destinations {
                     // Legacy page for a drawer destination selected through
                     // the SM drawer. Post-pump: the blocking page dispatches
                     // alarm/button events through the shared Runtime itself.
@@ -815,6 +818,18 @@ fn main() -> Result<()> {
                     // already issued - drop dirty rects instead of pushing a
                     // second full Home redraw.
                     if open_deferred_destination(&mut ctx, clock.as_ref(), dest) {
+                        dismiss_full_refresh = true;
+                    } else {
+                        dirty.push(FULL_SCREEN_RECT);
+                    }
+                }
+                for item in deferred.settings_items {
+                    // Settings row action (Sync Now / Sync Interval / BLE
+                    // pairing / Sleep) run as a legacy wedge after the pump.
+                    // An alarm-unwound wedge means the dismiss render is
+                    // already issued; otherwise force the Settings screen
+                    // redraw (the wedge drew over it).
+                    if open_deferred_settings_item(&mut ctx, clock.as_ref(), item) {
                         dismiss_full_refresh = true;
                     } else {
                         dirty.push(FULL_SCREEN_RECT);
@@ -1007,15 +1022,18 @@ fn main() -> Result<()> {
         // a later migration stage.
         let rtc_plan_confirmed =
             !app_runner_enabled || app_runner.borrow().state().rtc_alarm_plan_confirmed();
-        // The state machine is the screen owner for Home / the Navigation
-        // drawer (Stage 4): while one of those is current the main loop is
-        // the drawer's only input host, so an idle device must stay awake
-        // (light sleep, not deep sleep) until the drawer is closed back to
-        // the plain Home state that the deep-sleep path may sleep from.
+        // The state machine is the screen owner for Home, the Navigation
+        // drawer and the Settings list (Stage 4): while one of those is
+        // current the main loop is the screen's only input host, so an idle
+        // device must stay awake (light sleep, not deep sleep) until the
+        // screen returns to the plain Home state that the deep-sleep path
+        // may sleep from. (Legacy behavior was the same: Settings and the
+        // drawer were blocking screens that never deep-slept.)
         let sm_screen_blocks_deep_sleep = app_runner_enabled
             && matches!(
                 app_runner.borrow().state().screen,
                 inkwash_logic::app::Screen::Navigation { .. }
+                    | inkwash_logic::app::Screen::Settings { .. }
             );
         if idle
             && !usb_host_connected
@@ -1081,6 +1099,29 @@ fn open_deferred_destination(
     // Same unwind bookkeeping the legacy open_navigation path performed:
     // the page stack may have been unwound by an alarm; consume the sticky
     // exit flag here so it does not leak into the next page entry.
+    let alarm_interrupted = ctx.alarm_poll.alarm_exit();
+    let _ = ctx
+        .alarm_poll
+        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
+    let _ = ctx.alarm_poll.take_alarm_exit();
+    alarm_interrupted
+}
+
+/// Runs one Settings row action selected through the state-machine Settings
+/// screen (Stage 4, slice 2). Called strictly after the dispatch pump has
+/// released the Runtime borrow: the row actions are legacy blocking
+/// screens/wedges that dispatch alarm/button events through the shared
+/// Runtime. The SM stays on `Screen::Settings`; when the wedge returns (all
+/// rows except Sleep) the caller forces a Settings redraw.
+///
+/// Returns `true` when an alarm unwound the wedge (the SM already issued
+/// the dismiss render; the caller drops dirty rects instead of redrawing).
+fn open_deferred_settings_item(
+    ctx: &mut DeviceContext,
+    now: Option<&DateTime>,
+    item: usize,
+) -> bool {
+    screens::open_sm_settings_item(ctx, now, item);
     let alarm_interrupted = ctx.alarm_poll.alarm_exit();
     let _ = ctx
         .alarm_poll
@@ -1289,19 +1330,19 @@ fn collect_boot_snapshot(
 /// to the shared EPD registry here, so call sites never drain kicks by
 /// hand.
 ///
-/// Returns the legacy navigation destinations the state machine selected
-/// while pumping this event (drawer ENTER on a not-yet-migrated page). The
-/// caller opens each page AFTER this returns - never inside a pump - because
-/// the blocking pages dispatch alarm/button events back through the same
-/// shared Runtime, which would re-enter `borrow_mut` on the RefCell this
-/// function held during the pump.
+/// Returns the legacy actions the state machine selected while pumping
+/// this event (drawer destinations and Settings row items that still run
+/// behind legacy blocking pages). The caller opens each page AFTER this
+/// returns - never inside a pump - because the blocking pages dispatch
+/// alarm/button events back through the same shared Runtime, which would
+/// re-enter `borrow_mut` on the RefCell this function held during the pump.
 fn dispatch_app_runner(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
-) -> anyhow::Result<Vec<usize>> {
+) -> anyhow::Result<DeferredNav> {
     let last_clock = runner.borrow().last_clock();
-    let deferred_nav = {
+    let deferred = {
         let mut executor = app_runner::EffectRunner::new(ctx, last_clock);
         {
             let mut runtime = runner.borrow_mut();
@@ -1310,12 +1351,24 @@ fn dispatch_app_runner(
                 .pump(&mut executor)
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
-        executor.take_deferred_nav()
+        DeferredNav {
+            destinations: executor.take_deferred_nav(),
+            settings_items: executor.take_deferred_settings(),
+        }
     };
     for kick in runner.borrow_mut().take_kicks() {
         track_kick_shared(ctx, kick);
     }
-    Ok(deferred_nav)
+    Ok(deferred)
+}
+
+/// Legacy blocking-page actions deferred out of a pump: drawer
+/// destinations (`OpenNavigationDestination`) and Settings row items
+/// (`OpenSettingsItem`). The main loop opens each after the pump.
+#[derive(Default)]
+struct DeferredNav {
+    destinations: Vec<usize>,
+    settings_items: Vec<usize>,
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.

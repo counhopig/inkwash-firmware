@@ -359,22 +359,68 @@ pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
 /// drawer (Stage 4): the SM closed the drawer back to Home and emitted
 /// `Effect::OpenNavigationDestination`; main's post-pump router calls this
 /// for every destination that still lives behind a legacy blocking page
-/// (1..=5). The pages dispatch alarm/button events through the shared
-/// Runtime, which is why main opens them only after the pump released the
-/// borrow.
+/// (1..=4 - HOME and SETTINGS are SM screens and never emit this). The
+/// pages dispatch alarm/button events through the shared Runtime, which is
+/// why main opens them only after the pump released the borrow.
 pub fn open_sm_destination(ctx: &mut DeviceContext, now: Option<&DateTime>, destination: usize) {
-    match destination {
-        1..=4 => {
-            let page = match destination {
-                1 => Page::Calendar,
-                2 => Page::Inbox,
-                3 => Page::Alarms,
-                _ => Page::Todos,
-            };
-            browse_page(ctx, page, now);
+    if let 1..=4 = destination {
+        let page = match destination {
+            1 => Page::Calendar,
+            2 => Page::Inbox,
+            3 => Page::Alarms,
+            _ => Page::Todos,
+        };
+        browse_page(ctx, page, now);
+    }
+}
+
+/// The Settings list rows, in the same order the state machine's
+/// `SETTINGS_ROW_COUNT` / `Screen::Settings { selected }` indexes.
+pub const SETTINGS_ROWS: [&str; 4] = ["SYNC NOW", "SYNC INTERVAL", "BLE PAIRING", "SLEEP"];
+
+/// Draws the Settings list screen (Stage 4, slice 2): the state machine
+/// owns the row selection and the executor draws the rows from
+/// `RenderView::Settings { selected }`. Rows use the same chrome as every
+/// other list in the app (`ui::draw_rows`), so the SM-drawn Settings screen
+/// is pixel-consistent with the legacy list screens.
+pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {
+    let items: Vec<String> = SETTINGS_ROWS.iter().map(|s| s.to_string()).collect();
+    draw_rows(canvas, "SETTINGS", &items, selected);
+    footer(canvas, "UP/DOWN MOVE   ENTER OK   HOLD ENTER BACK");
+}
+
+/// Opens one Settings row action selected through the state-machine
+/// Settings screen (Stage 4, slice 2): rows 0-3 are still legacy blocking
+/// actions/screens (Sync Now, Sync Interval picker, BLE pairing screen,
+/// Sleep), so main's post-pump router runs them as wedges - never inside a
+/// pump, because they dispatch alarm/button events through the shared
+/// Runtime. The SM stays on `Screen::Settings`; when the wedge returns
+/// (rows 0-2), main re-renders Settings. Row 3 (Sleep) never returns (it
+/// deep-sleeps).
+pub(crate) fn open_sm_settings_item(ctx: &mut DeviceContext, now: Option<&DateTime>, item: usize) {
+    match item {
+        0 => sync_now_screen(ctx, now),
+        1 => {
+            let _nav = sync_interval_screen(ctx, now);
+            // The legacy picker reports a long-UP/DOWN nav request upward;
+            // with the SM owning navigation, the drawer is opened by the SM
+            // on the Settings screen itself - nothing to propagate here.
         }
-        5 => {
-            open_menu(ctx, now);
+        2 => ble_pairing_screen(ctx, now),
+        3 => {
+            show_message(
+                ctx.board,
+                "SLEEP",
+                &["GOING TO SLEEP"],
+                std::time::Duration::from_millis(500),
+            );
+            let maintenance_wake = now.and_then(|dt| {
+                ctx.alarm_store
+                    .load()
+                    .ok()
+                    .and_then(|alarms| alarms::maintenance_wakeup_delay(&alarms, dt))
+            });
+            crate::power::enter_deep_sleep_with_wakeups(maintenance_wake);
         }
         _ => {}
     }
