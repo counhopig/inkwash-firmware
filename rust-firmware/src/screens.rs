@@ -322,6 +322,17 @@ fn pick_navigation(
 
 /// Opens the global navigation directory. Both long UP and long DOWN enter
 /// this directory; short UP/DOWN selects a destination and ENTER opens it.
+///
+/// SM-disabled safe-mode ONLY (Stage 4). With the AppRunner enabled, every
+/// destination is a state-machine screen and the drawer never reaches this
+/// legacy blocking directory. It exists solely so that a core boot fact
+/// failure (RTC alarm-status read or alarm-NVS load failed - the state
+/// machine must not interpret an AF against an untrusted empty list) still
+/// leaves a usable Home navigation. The pages it opens read the same
+/// potentially-corrupt stores the failed boot snapshot saw; this is an
+/// intentional degraded fallback, not a normal path. Removing it requires a
+/// product decision on what safe mode should offer instead (device-level
+/// verification needed), so it stays until then.
 pub fn open_navigation(ctx: &mut DeviceContext, now: Option<&DateTime>) {
     loop {
         let Some(selected) = pick_navigation(ctx, now, Page::Home) else {
@@ -1586,6 +1597,18 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
     }
 }
 
+/// Runs the legacy BLE pairing screen for the Settings BLE PAIRING row
+/// (Stage 4). THE LAST SM-ENABLED BLOCKING WEDGE: it owns the main thread
+/// for the pairing session (radio startup, pm lock held across the session,
+/// BLE command polling, 120s escape timeout) because the NimBLE radio
+/// session is not yet driven from the unified event loop. SM-side the
+/// pairing lifecycle, phase transitions, exit semantics and
+/// RenderView::BlePairing rendering are all locked (5886bde/30b1f8a); what
+/// remains to retire this wedge - and the whole AlarmPoll unwind path that
+/// only it and safe-mode feed - is device-level NimBLE event wiring (calling
+/// BleControl from the executor and dispatching Started/Succeeded/Failed /
+/// Disconnected into the state machine). This stays until that wiring
+/// lands.
 fn ble_pairing_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
     // Start BLE advertising on entry to the pairing screen.
     match crate::ble_control::BleControl::start() {
