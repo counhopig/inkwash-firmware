@@ -689,6 +689,31 @@ fn main() -> Result<()> {
             }
         }
 
+        // Radio lifecycle events (NimBLE connect/disconnect callbacks fire
+        // on the NimBLE host task): drain them and feed the state machine.
+        // A connect while a pairing session is current begins the pairing
+        // (BlePairingStarted); a disconnect ends it (BleDisconnected).
+        // Only meaningful while Screen::BlePairing is current - the SM
+        // ignores them elsewhere.
+        if let Some(lifecycle) = ctx
+            .ble_control
+            .as_mut()
+            .and_then(|ble| ble.poll_lifecycle())
+        {
+            let event = match lifecycle {
+                ble_control::BleLifecycle::Connected => {
+                    inkwash_logic::app::Event::BlePairingStarted
+                }
+                ble_control::BleLifecycle::Disconnected => {
+                    inkwash_logic::app::Event::BleDisconnected
+                }
+            };
+            if let Err(err) = dispatch_app_runner(&app_runner, event, &mut ctx) {
+                log::warn!("BLE lifecycle dispatch failed: {err}");
+            }
+            ble_changed = true;
+        }
+
         // EPD completion events: feed each one back to the state machine
         // as `EffectCompleted(RenderDone)` / `EffectFailed(Render)`. The
         // shared `pending_renders` registry (reachable from the main loop

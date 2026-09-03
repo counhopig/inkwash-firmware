@@ -35,12 +35,28 @@ const SERVICE_UUID: &str = "d2c25e50-5e22-48d8-a8b3-34f2f8e2c7d4";
 const WRITE_CHAR_UUID: &str = "d2c25e51-5e22-48d8-a8b3-34f2f8e2c7d4";
 const NOTIFY_CHAR_UUID: &str = "d2c25e52-5e22-48d8-a8b3-34f2f8e2c7d4";
 
+/// A radio lifecycle fact reported by the NimBLE callbacks (which run on
+/// the NimBLE host task, never the main thread) and drained non-blockingly
+/// by the main loop so the state machine can react - the same shape as the
+/// command channel below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleLifecycle {
+    /// A client connected (GATT). While Screen::BlePairing is current the
+    /// SM treats this as pairing having begun (BlePairingStarted).
+    Connected,
+    /// The client disconnected.
+    Disconnected,
+}
+
 /// Handle to poll BLE commands and manage the GATT server lifecycle.
 pub struct BleControl {
     rx: mpsc::Receiver<String>,
     /// Kept alive only so cloning it into the write callback's closure
     /// doesn't outlive the channel; never sent from directly.
     _tx: mpsc::SyncSender<String>,
+    lifecycle_rx: mpsc::Receiver<BleLifecycle>,
+    /// Sender cloned into the connect/disconnect callbacks.
+    _lifecycle_tx: mpsc::SyncSender<BleLifecycle>,
     notify_char: Arc<Mutex<BLECharacteristic>>,
 }
 
@@ -61,8 +77,17 @@ impl BleControl {
         let ble_advertising = device.get_advertising();
         let server = device.get_server();
 
-        server.on_connect(|_server, _desc| log::info!("BLE client connected"));
-        server.on_disconnect(|_desc, _reason| log::info!("BLE client disconnected"));
+        let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let lc_tx = lifecycle_tx.clone();
+        server.on_connect(move |_server, _desc| {
+            log::info!("BLE client connected");
+            let _ = lc_tx.try_send(BleLifecycle::Connected);
+        });
+        let lc_tx = lifecycle_tx.clone();
+        server.on_disconnect(move |_desc, _reason| {
+            log::info!("BLE client disconnected ({_reason:?})");
+            let _ = lc_tx.try_send(BleLifecycle::Disconnected);
+        });
 
         let control_service = server.create_service(uuid128!(SERVICE_UUID));
 
@@ -112,6 +137,8 @@ impl BleControl {
         Ok(Self {
             rx,
             _tx: tx,
+            lifecycle_rx,
+            _lifecycle_tx: lifecycle_tx,
             notify_char,
         })
     }
@@ -136,6 +163,13 @@ impl BleControl {
                 None
             }
         }
+    }
+
+    /// Non-blocking poll for the next radio lifecycle fact. Returns
+    /// `Some(BleLifecycle)` if a connect/disconnect fired since the last
+    /// poll, else `None`.
+    pub fn poll_lifecycle(&mut self) -> Option<BleLifecycle> {
+        self.lifecycle_rx.try_recv().ok()
     }
 
     /// Sends a reply to the connected BLE client via the notify
