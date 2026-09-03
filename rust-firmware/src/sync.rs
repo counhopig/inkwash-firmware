@@ -371,20 +371,14 @@ pub fn sync_now(
         // stay connected after this.
         wifi_mgr.disconnect();
 
-        // The sync ETag is NOT saved here: the state machine persists it as
-        // part of Effect::ApplySyncedData (the network task never writes
-        // NVS). Record when this sync ran for the periodic auto-sync
-        // checker (interim scheduler metadata; migrates to the state
-        // machine's sync-metadata state in a later increment).
-        if outcome.is_ok() {
-            if let Err(err) = counters.set_last_sync_epoch(now.to_unix()) {
-                log::warn!("Failed to record last-sync time: {err}");
-            }
-        }
+        // The network task writes NO NVS here: the sync ETag is persisted by
+        // the state machine (Effect::ApplySyncedData) and the last-sync
+        // timestamp is recorded by the main loop from the receipt
+        // (apply_sync_side_effects). This task only transports.
 
         // Unwrap at the end: connect/fetch failures early-return via `?`,
-        // but the disconnect above and the last-sync bookkeeping must run
-        // first, exactly like the original synchronous flow.
+        // but the disconnect above must run first, exactly like the
+        // original synchronous flow.
         Ok((outcome?, ntp_epoch))
     })() {
         Ok((outcome, ntp_epoch)) => (Ok(outcome), ntp_epoch),

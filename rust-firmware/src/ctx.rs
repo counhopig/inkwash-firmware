@@ -617,6 +617,12 @@ impl DeviceContext<'_> {
             // alarm.
             match self.rtc.read_time() {
                 Ok(now) => {
+                    // Record when this sync ran (main-thread NVS write; the
+                    // network task never writes NVS). The auto-sync checker
+                    // uses this to know how long since the last sync.
+                    if let Err(err) = self.counters.set_last_sync_epoch(now.to_unix()) {
+                        log::warn!("Failed to record last-sync time: {err}");
+                    }
                     match self.alarm_store.load().and_then(|list| {
                         crate::alarms::program_hardware_alarm_via(self.rtc, &list, &now)
                     }) {
