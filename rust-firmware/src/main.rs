@@ -524,7 +524,7 @@ fn main() -> Result<()> {
                 dismiss_full_refresh = true;
             }
         }
-        let mut dirty: Vec<Rect> = Vec::new();
+        let mut redraw_requested = false;
         let now = Instant::now();
 
         // Power status once per second, unchanged cadence (it gates the
@@ -608,7 +608,9 @@ fn main() -> Result<()> {
                             dismiss_full_refresh = true;
                         }
                         crate::ctx::BackgroundOutcome::VisibleChanged => {
-                            dirty.push(FULL_SCREEN_RECT);
+                            // The reminder overlay drew over the screen; the
+                            // SM renders it back after the overlay unwinds.
+                            redraw_requested = true;
                         }
                         crate::ctx::BackgroundOutcome::NoChange => {}
                     }
@@ -835,36 +837,22 @@ fn main() -> Result<()> {
             // Drop any dirty rectangles collected before/alongside the
             // alarm so no CLOCK_RECT partial can supersede that request.
             dismiss_full_refresh = false;
-            dirty.clear();
+            redraw_requested = false;
         }
-        if !dirty.is_empty() {
-            // The dirty path draws whatever screen the state machine is on
-            // (Stage 4): a full redraw while the Navigation drawer is open
-            // must keep the overlay, and every dirty Home redraw must match
-            // the SM's current screen. When the runtime is enabled we render
-            // through the shared surface painter; the legacy path (runtime
-            // disabled) keeps `render_home_now`.
-            // P1#3: app_runner_enabled is constant-true (core boot-fact
-            // failure diverges into run_safe_mode earlier), so the legacy
-            // render_home_now branch is unreachable. The dirty path draws
-            // whatever screen the state machine is on through the shared
-            // surface painter.
+        if redraw_requested {
+            // Stage 5: the only remaining redraw request is a full-surface
+            // repaint after a reminder overlay unwound. The SM owns all its
+            // own screen redraws (book/tick/command renders) through the
+            // plan-driven executor; this path only restores whatever the SM
+            // is showing when a legacy reminder overlayed it. Since only
+            // FULL_SCREEN_RECT is ever requested, draw the SM surface and
+            // refresh the full frame.
             let view = app_runner.borrow().state().screen.render_view();
             app_runner::draw_sm_surface(&mut ctx, clock, view);
-            if dirty
-                .iter()
-                .any(|rect| rect.width == 400 && rect.height == 300)
-            {
-                ctx.board
-                    .display
-                    .refresh_partial_best_effort(FULL_SCREEN_RECT);
-                log::info!("Partial display refresh queued to EPD task");
-            } else {
-                for rect in &dirty {
-                    ctx.board.display.refresh_partial_best_effort(*rect);
-                }
-                log::info!("Partial display refresh queued to EPD task");
-            }
+            ctx.board
+                .display
+                .refresh_partial_best_effort(FULL_SCREEN_RECT);
+            log::info!("Reminder-overlay redraw queued to EPD task");
         }
 
         // Idle/active selection: input, a dispatched command, or a display
@@ -879,7 +867,7 @@ fn main() -> Result<()> {
         // changes): GetStatus polls from the desktop tool must not let the
         // device drift into deep sleep mid-session.
         let user_activity = usb_activity || ble_changed || key_changed || any_key_pressed;
-        let interacted = user_activity || !dirty.is_empty();
+        let interacted = user_activity || redraw_requested;
         if interacted || any_key_pressed {
             last_activity = now;
             idle = false;
