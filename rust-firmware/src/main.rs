@@ -1187,7 +1187,7 @@ fn render_home_now(
     todo_store: &TodoStore,
     inbox_store: &InboxStore,
     clock: Option<&DateTime>,
-) -> u64 {
+) {
     let next_alarm = clock.and_then(|dt| screens::next_alarm_label(alarm_store, dt));
     let todo_summary = screens::todo_summary(todo_store, clock);
     let unread_inbox = inbox_store.unread_count().unwrap_or(0);
@@ -1209,47 +1209,6 @@ fn render_home_now(
         battery_percent,
         charge,
     );
-    home_data_fingerprint(counters, alarm_store, todo_store, inbox_store, clock)
-}
-
-/// Fingerprint of Home's data-backed content: the alarm list, todo list,
-/// unread-inbox count, Wi-Fi-configured flag, and the calendar date. A
-/// sync (or any remote state change) that leaves all of these identical
-/// produces no visible difference on Home, so the full-screen redraw it
-/// would trigger is skipped. Hour/minute are deliberately
-/// excluded - clock drift is the clock-region refresh's job, and including
-/// the minute would make every sync look "changed" (a sync takes longer
-/// than a minute boundary).
-fn home_data_fingerprint(
-    counters: &PersistedCounters,
-    alarm_store: &AlarmStore,
-    todo_store: &TodoStore,
-    inbox_store: &InboxStore,
-    clock: Option<&DateTime>,
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    if let Some(dt) = clock {
-        (dt.year, dt.month, dt.day).hash(&mut hasher);
-    }
-    counters
-        .wifi_creds()
-        .map(|creds| creds.is_some())
-        .unwrap_or(false)
-        .hash(&mut hasher);
-    if let Ok(alarms) = alarm_store.load() {
-        serde_json::to_vec(&alarms)
-            .unwrap_or_default()
-            .hash(&mut hasher);
-    }
-    if let Ok(todos) = todo_store.load() {
-        serde_json::to_vec(&todos)
-            .unwrap_or_default()
-            .hash(&mut hasher);
-    }
-    inbox_store.unread_count().unwrap_or(0).hash(&mut hasher);
-    hasher.finish()
 }
 
 fn report_power_state(board: &mut Note4Board) -> Result<()> {
