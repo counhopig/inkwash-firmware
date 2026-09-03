@@ -795,13 +795,11 @@ fn main() -> Result<()> {
         if sm_screen_is_sm {
             // Feed every debounced button event through the state machine.
             // The SM renders its own screen changes (drawer open/close/move,
-            // Settings / AlarmList row moves, screen transitions) as
-            // Effect::Render kicks. A legacy action selected while pumping
-            // (drawer destination on a not-yet-migrated page, a Settings
-            // row action, or the "+ ADD ALARM" editor) comes back deferred
-            // and is opened below after the pump releases the Runtime
-            // borrow (the legacy pages dispatch through the shared Runtime
-            // themselves).
+            // list row moves, screen transitions) as Effect::Render kicks.
+            // The one remaining legacy action - the Settings BLE PAIRING
+            // row, still a blocking radio wedge - comes back deferred and is
+            // run below after the pump releases the Runtime borrow (the
+            // wedge dispatches through the shared Runtime itself).
             let enter_event = ctx.board.key_enter.poll();
             let up_event = ctx.board.key_up.poll();
             let down_event = ctx.board.key_down.poll();
@@ -1308,9 +1306,9 @@ fn collect_boot_snapshot(
 /// hand.
 ///
 /// Returns the legacy wedges the state machine selected while pumping this
-/// event (Settings row items / "+ ADD ALARM" / inbox detail / week view that
-/// still run behind legacy blocking pages). The caller runs each AFTER this
-/// returns - never inside a pump - because the blocking pages dispatch
+/// event (currently just the Settings BLE PAIRING row - the last still
+/// behind a blocking radio wedge). The caller runs each AFTER this
+/// returns - never inside a pump - because the wedge dispatches
 /// alarm/button events back through the same shared Runtime, which would
 /// re-enter `borrow_mut` on the RefCell this function held during the pump.
 fn dispatch_app_runner(
