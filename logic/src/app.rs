@@ -7911,7 +7911,11 @@ mod tests {
                 .iter()
                 .flat_map(|b| &b.effects)
                 .any(|e| matches!(e, Effect::StopTone)));
-            // The restored screen is re-rendered with its own view (Full).
+            // The restored screen is re-rendered with its own view (Full) -
+            // the Full render's view must match the restored screen's
+            // projection, so the panel actually shows the screen the keys
+            // now operate on.
+            let expected_view = before.render_view();
             assert!(dismiss_batches
                 .iter()
                 .flat_map(|b| &b.effects)
@@ -7919,8 +7923,9 @@ mod tests {
                     e,
                     Effect::Render(RenderRequest {
                         intent: RenderIntent::Full,
+                        view,
                         ..
-                    })
+                    }) if *view == expected_view
                 )));
         }
     }
