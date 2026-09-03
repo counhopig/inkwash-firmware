@@ -104,6 +104,9 @@ pub struct DeviceContext<'a> {
     /// SM-routed sync is awaiting its receipt. Cleared when the receipt
     /// arrives (or the sync is superseded).
     pub sm_sync_reply_target: Option<(Channel, String)>,
+    /// Same as `sm_sync_reply_target` for a state-machine-routed SetWifi:
+    /// where to write the machine's eventual reply for the wifi receipt.
+    pub sm_wifi_reply_target: Option<(Channel, String)>,
     /// [[`DeviceContext::poll_alarm_snapshot`]] dispatches to AppRunner so
     /// blocking pages (which own the main thread) can still ring an alarm
     /// through the same state machine. Clone the `Rc` out, then call
@@ -146,7 +149,10 @@ pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
     // RTC directly.
     matches!(
         cmd,
-        Command::ClearAlarms | Command::SyncNow | Command::SetServer { .. }
+        Command::ClearAlarms
+            | Command::SyncNow
+            | Command::SetServer { .. }
+            | Command::SetWifi { .. }
     )
 }
 
@@ -197,10 +203,18 @@ pub(crate) fn dispatch_migrated_command(
         // network sync is now running. Its eventual reply arrives with the
         // sync receipt; remember the transport + correlation id to write it
         // to then (there is no synchronous reply for an accepted SyncNow).
-        if matches!(kick.effect, inkwash_logic::app::Effect::StartSync(_)) {
-            if let Some(id) = id {
-                ctx.sm_sync_reply_target = Some((channel, id.to_string()));
+        match &kick.effect {
+            inkwash_logic::app::Effect::StartSync(_) => {
+                if let Some(id) = id {
+                    ctx.sm_sync_reply_target = Some((channel, id.to_string()));
+                }
             }
+            inkwash_logic::app::Effect::StartSetWifi(_) => {
+                if let Some(id) = id {
+                    ctx.sm_wifi_reply_target = Some((channel, id.to_string()));
+                }
+            }
+            _ => {}
         }
         let mut reg = ctx.pending_renders.borrow_mut();
         if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
@@ -555,7 +569,12 @@ impl DeviceContext<'_> {
             PendingWifiOp::SetWifi { reply, source, cmd } => match reply.try_recv() {
                 Ok(result) => {
                     let event = WifiOpEvent::SetWifiDone;
-                    self.apply_set_wifi_result(result, source, cmd);
+                    if self.sm_wifi_reply_target.is_some() {
+                        self.feed_set_wifi_completed(result.map_err(|e| e.to_string()));
+                        self.sm_wifi_reply_target = None;
+                    } else {
+                        self.apply_set_wifi_result(result, source, cmd);
+                    }
                     Some(event)
                 }
                 Err(TryRecvError::Empty) => {
@@ -696,6 +715,60 @@ impl DeviceContext<'_> {
         if let Some(reply) = result {
             write_reply_to_channel(self, channel, &reply, Some(&id));
         }
+    }
+
+    /// Feeds a completed SetWifi result into the state machine as
+    /// `Event::SetWifiCompleted`, then writes the machine's Reply effect to
+    /// the transport that requested the SetWifi (stored in
+    /// `sm_wifi_reply_target`).
+    fn feed_set_wifi_completed(&mut self, result: Result<(), String>) {
+        let Some((channel, id)) = self.sm_wifi_reply_target.take() else {
+            return;
+        };
+        let runner = self.app_runner.clone();
+        let reply = self.dispatch_set_wifi_completed(&runner, result);
+        if let Some(reply) = reply {
+            write_reply_to_channel(self, channel, &reply, Some(&id));
+        }
+    }
+
+    /// Pushes one `SetWifiCompleted` into the runner, pumps, and returns
+    /// the reply the state machine recorded for the wifi operation.
+    fn dispatch_set_wifi_completed(
+        &mut self,
+        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
+        result: Result<(), String>,
+    ) -> Option<Reply> {
+        let last_clock = runner.borrow().last_clock();
+        let mut reply_for_channel = None;
+        {
+            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
+            let mut runtime = runner.borrow_mut();
+            runtime.push(inkwash_logic::app::Event::SetWifiCompleted(result));
+            if let Err(err) = runtime.pump(&mut executor) {
+                log::warn!("SetWifiCompleted dispatch through state machine failed: {err}");
+            }
+            for (reply_channel, reply) in executor.take_replies() {
+                if (reply_channel == Channel::Usb || reply_channel == Channel::Ble)
+                    && reply_for_channel.is_none()
+                {
+                    reply_for_channel = Some(reply);
+                }
+            }
+        }
+        for kick in runner.borrow_mut().take_kicks() {
+            let mut reg = self.pending_renders.borrow_mut();
+            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
+                reg.register(kick);
+            } else {
+                log::warn!(
+                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
+                    kick.effect,
+                    kick.operation_id
+                );
+            }
+        }
+        reply_for_channel
     }
 
     /// Pushes one `SyncCompleted` into the runner, pumps, and returns the

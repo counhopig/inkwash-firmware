@@ -209,6 +209,29 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
                 }
             }
+            Effect::StartSetWifi(creds) => {
+                // Wi-Fi verification + save runs on the sync task (it owns
+                // the Wi-Fi driver). `Ok(true)` = dispatched (receipt
+                // later); `Ok(false)` = another Wi-Fi operation is in
+                // flight, so fail immediately rather than leave the
+                // state machine's pending slot waiting forever.
+                let result = self.ctx.start_set_wifi(
+                    creds.clone(),
+                    crate::sync_task::OpSource::Internal,
+                    inkwash_logic::protocol::Command::SetWifi {
+                        ssid: String::new(),
+                        password: String::new(),
+                    },
+                );
+                match result {
+                    Ok(true) => Ok(EffectOutcome::Async),
+                    Ok(false) => Err((
+                        EffectCategory::Sync,
+                        "another Wi-Fi operation is already in progress".into(),
+                    )),
+                    Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
+                }
+            }
             Effect::StartBlePairing(_req) => Ok(EffectOutcome::Async),
             Effect::StopBlePairing => Ok(EffectOutcome::Async),
             Effect::EnterLightSleep(_plan) => {

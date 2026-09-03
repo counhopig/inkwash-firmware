@@ -56,6 +56,7 @@ pub fn priority(event: &Event) -> Priority {
         | Event::BlePairingFailed(_)
         | Event::BleDisconnected
         | Event::SyncCompleted(_)
+        | Event::SetWifiCompleted(_)
         | Event::DisplayCompleted(_)
         | Event::EffectCompleted(_)
         | Event::EffectFailed(_)

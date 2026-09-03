@@ -28,7 +28,7 @@ use crate::alarm_regs::AlarmRegs;
 use crate::alarm_schedule::{next_due, Repeat, StoredAlarm};
 use crate::button_event::ButtonEvent;
 use crate::datetime::DateTime;
-use crate::device_config::DeviceConfig;
+use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
 use crate::todo::Todo;
@@ -263,6 +263,9 @@ pub enum Effect {
     DisableRtcAlarm,
     AcknowledgeRtcAlarm,
     StartSync(SyncRequest),
+    /// Ask the network executor to verify + save Wi-Fi credentials (it owns
+    /// the Wi-Fi driver). Completes via `Event::SetWifiCompleted`.
+    StartSetWifi(WifiCreds),
     StartTone,
     StopTone,
     Render(RenderRequest),
@@ -458,6 +461,9 @@ pub enum Event {
     BlePairingFailed(BlePairingFailure),
     BleDisconnected,
     SyncCompleted(SyncResult),
+    /// A `StartSetWifi` verification+save finished (Ok when the credentials
+    /// were verified and persisted; Err carries the failure message).
+    SetWifiCompleted(Result<(), String>),
     DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
@@ -745,6 +751,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::UsbCommand(request) => transition_command(state, Channel::Usb, request),
         Event::BleCommand(request) => transition_command(state, Channel::Ble, request),
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
+        Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
         // Remaining events are wired in later migration steps. They leave
         // state unchanged rather than guessing.
         _ => vec![],
@@ -771,6 +778,38 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
     for channel in [Channel::Usb, Channel::Ble] {
         if let Some((found_channel, resolved)) = resolve_sync_completion(state, channel, &reply) {
             batches.push(reply_batch(state, found_channel, resolved));
+        }
+    }
+    batches
+}
+
+fn transition_set_wifi_completed(
+    state: &mut AppState,
+    result: Result<(), String>,
+) -> Vec<EffectBatch> {
+    let mut batches = Vec::new();
+    for channel in [Channel::Usb, Channel::Ble] {
+        let Some((found_channel, creds)) = take_set_wifi_pending(state, channel) else {
+            continue;
+        };
+        match &result {
+            Ok(()) => {
+                // The network executor verified + persisted the
+                // credentials: apply the status-visible wifi facts (SSID +
+                // has-password; the password value never enters AppState).
+                state.config.wifi_ssid = Some(creds.ssid);
+                state.config.wifi_has_password = !creds.password.is_empty();
+                state.connectivity.wifi_configured = state.config.wifi_configured();
+                batches.push(reply_batch(state, found_channel, Reply::Ok));
+            }
+            Err(message) => {
+                let msg = format!("Connection verification failed: {message}");
+                batches.push(reply_batch(
+                    state,
+                    found_channel,
+                    Reply::Error { message: msg },
+                ));
+            }
         }
     }
     batches
@@ -1409,6 +1448,37 @@ fn transition_command(
                 vec![Effect::StartSync(SyncRequest { now })],
             )]
         }
+        ControlRequest::SetWifi { ssid, password } => {
+            // Wi-Fi verification + save runs on the network executor (it
+            // owns the Wi-Fi driver); the reply is deferred like SyncNow.
+            // The command takes the requesting transport's pending slot and
+            // emits StartSetWifi; Event::SetWifiCompleted resolves it. The
+            // status-visible wifi facts are applied only on success (the
+            // executor verified + persisted the credentials), so a failed
+            // verification never leaves facts claiming credentials that are
+            // not in NVS.
+            let op = state.next_operation_id();
+            let creds = WifiCreds {
+                ssid: ssid.clone(),
+                password: password.clone(),
+            };
+            set_pending_reply(
+                state,
+                channel,
+                op,
+                ControlRequest::SetWifi {
+                    ssid: creds.ssid.clone(),
+                    password: creds.password.clone(),
+                },
+                vec![op],
+            );
+            vec![batch(
+                state,
+                op,
+                FailurePolicy::Continue,
+                vec![Effect::StartSetWifi(creds)],
+            )]
+        }
         ControlRequest::SetServer { url, token } => {
             // Save the new endpoint and invalidate the stale sync ETag: the
             // old server's conditional-request state must not survive a
@@ -1551,15 +1621,6 @@ fn transition_command(
                 ),
             ]
         }
-        // Other commands need their storage/network side effects, wired in
-        // migration step 3. Refuse rather than guess.
-        _ => vec![reply_batch(
-            state,
-            channel,
-            Reply::Error {
-                message: "command not yet supported".into(),
-            },
-        )],
     }
 }
 
@@ -1646,6 +1707,29 @@ fn resolve_sync_completion(
     let reply = reply.clone();
     *slot = None;
     Some((channel, reply))
+}
+
+/// Resolves a completed SetWifi's pending slot on `channel`. Returns the
+/// pending wifi request (SSID + password presence) and clears the slot,
+/// or `None` when the slot does not hold a pending SetWifi. The caller
+/// applies the status-visible facts and builds the reply: on success the
+/// facts reflect the verified-and-persisted credentials; on failure they
+/// are left as NVS holds them.
+fn take_set_wifi_pending(state: &mut AppState, channel: Channel) -> Option<(Channel, WifiCreds)> {
+    let slot = match channel {
+        Channel::Usb => &mut state.pending_usb_reply,
+        Channel::Ble => &mut state.pending_ble_reply,
+    };
+    let pending = slot.as_ref()?;
+    let ControlRequest::SetWifi { ssid, password } = &pending.request else {
+        return None;
+    };
+    let creds = WifiCreds {
+        ssid: ssid.clone(),
+        password: password.clone(),
+    };
+    *slot = None;
+    Some((channel, creds))
 }
 
 /// Resolves `channel`'s pending-reply slot after one of its awaited
@@ -2438,6 +2522,86 @@ mod tests {
             })
         }));
         assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn set_wifi_success_applies_facts_and_replies_ok_on_the_channel() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::BleCommand(ControlRequest::SetWifi {
+                ssid: "home-wifi".into(),
+                password: "sekrit".into(),
+            }),
+        );
+        assert!(state.pending_ble_reply.is_some());
+        assert!(state.pending_usb_reply.is_none());
+        // Facts not yet applied (verification + NVS save not confirmed).
+        assert!(state.config.wifi_ssid.is_none());
+        let batches_has_effect = batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartSetWifi(_)))
+        });
+        assert!(batches_has_effect);
+        let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
+        assert!(done.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        }));
+        // Facts now reflect the verified + persisted credentials (no secret
+        // in state - only presence).
+        assert_eq!(state.config.wifi_ssid.as_deref(), Some("home-wifi"));
+        assert!(state.config.wifi_has_password);
+        assert!(state.connectivity.wifi_configured);
+        assert!(state.pending_ble_reply.is_none());
+    }
+
+    #[test]
+    fn set_wifi_failure_replies_error_and_leaves_facts_unchanged() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetWifi {
+                ssid: "home-wifi".into(),
+                password: "wrong".into(),
+            }),
+        );
+        let done = update(
+            &mut state,
+            Event::SetWifiCompleted(Err("authentication failed".into())),
+        );
+        let error_seen = done.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => message.contains("authentication failed"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(state.pending_usb_reply.is_none());
+        assert!(
+            state.config.wifi_ssid.is_none(),
+            "failed verification must not apply wifi facts"
+        );
+    }
+
+    #[test]
+    fn set_wifi_completion_without_pending_request_is_harmless() {
+        let mut state = AppState::default();
+        let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
+        assert!(!done
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
     }
 
     #[test]
