@@ -30,6 +30,8 @@ mod board {
         pub power_present: bool,
         pub charging: bool,
         pub full: bool,
+        pub fault: bool,
+        pub no_battery: bool,
     }
 }
 
@@ -79,6 +81,8 @@ fn full_battery() -> board::ChargeSnapshot {
         power_present: false,
         charging: false,
         full: false,
+        fault: false,
+        no_battery: false,
     }
 }
 
@@ -117,6 +121,8 @@ fn main() {
             power_present: false,
             charging: false,
             full: false,
+            fault: false,
+            no_battery: false,
         },
     );
     save("home-empty.png", &c);
@@ -138,6 +144,8 @@ fn main() {
             power_present: true,
             charging: true,
             full: false,
+            fault: false,
+            no_battery: false,
         },
     );
     save("home-charging.png", &c);
