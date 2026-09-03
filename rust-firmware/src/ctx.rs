@@ -104,14 +104,15 @@ pub struct DeviceContext<'a> {
     /// where to write the machine's eventual reply for the wifi receipt.
     pub sm_wifi_reply_target: Option<(Channel, String)>,
     /// [[`DeviceContext::poll_alarm_snapshot`]] dispatches to AppRunner so
-    /// blocking pages (which own the main thread) can still ring an alarm
-    /// through the same state machine. Clone the `Rc` out, then call
-    /// `dispatch` with `self` as the driver context - no self-referential
-    /// borrow.
+    /// the bounded alert loops (reminder overlays, which briefly own the
+    /// main thread) can still ring an alarm through the same state machine.
+    /// Clone the `Rc` out, then call `dispatch` with `self` as the driver
+    /// context - no self-referential borrow.
     pub app_runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
     /// Unified registry of in-flight AppRunner render kicks, shared by the
-    /// main loop and every blocking page so an EPD completion can always
-    /// find its kick by `request_id`, regardless of who dispatched it.
+    /// main loop and the bounded alert loops so an EPD completion can
+    /// always find its kick by `request_id`, regardless of who dispatched
+    /// it.
     pub pending_renders:
         std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
     /// Disabled after a core boot fact failure. Shared by the main loop

@@ -829,16 +829,13 @@ fn main() -> Result<()> {
         // repaints exactly what shows it.
         ctx.poll_wifi_ops();
 
-        // The Home loop hosts the state-machine screens: every SM screen
-        // (Home, Navigation drawer, Settings, AlarmList, ... - P1#3 made
-        // app_runner_enabled constant-true, so the legacy SM-disabled Home
-        // nav loop is unreachable dead code) owns the buttons, and every
-        // debounced button event is fed to the state machine as Event::Button.
-        // The SM owns what the keys mean there and renders its own screen
-        // changes as Effect::Render kicks. The one remaining legacy action -
-        // the Settings BLE PAIRING row, still a blocking radio wedge - comes
-        // back deferred and is run below after the pump releases the Runtime
-        // borrow.
+        // The main loop hosts the state-machine screens: every screen (Home,
+        // Navigation drawer, Settings, AlarmList, ... ) owns the buttons, and
+        // every debounced button event is fed to the state machine as
+        // Event::Button through the single dispatch_app_runner pump. The SM
+        // owns what the keys mean there and renders its own screen changes as
+        // Effect::Render kicks. No legacy wedges remain (the SM-disabled nav
+        // loop and the blocking BLE-pairing wedge were deleted in P1#3/P1#4).
         let mut key_changed = false;
         {
             let enter_event = ctx.board.key_enter.poll();
