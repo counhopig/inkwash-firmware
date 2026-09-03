@@ -47,13 +47,20 @@ const RESPONSE_BUF_LEN: usize = 16384;
 /// being generous for a real server over the public internet.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Outcome of a bidirectional sync after the merged server state is applied.
+/// Outcome of a bidirectional sync after the merged server state is fetched.
+/// The merged data is returned to the caller - the network task never
+/// writes NVS (the state machine applies it via `Effect::ApplySyncedData`).
 #[derive(Clone, Debug)]
 pub enum SyncOutcome {
     Applied {
-        alarm_count: usize,
-        todo_count: usize,
-        inbox_count: usize,
+        /// Merged alarms the server returned (authoritative).
+        alarms: Vec<inkwash_logic::alarm_schedule::StoredAlarm>,
+        /// Merged todos the server returned (authoritative).
+        todos: Vec<crate::todos::Todo>,
+        /// Inbox items the server returned (authoritative).
+        inbox: Vec<crate::inbox::InboxItem>,
+        /// Inbox sequence numbers the server confirmed as read.
+        inbox_read_acked: Vec<u64>,
         inbox_truncated: bool,
         etag: Option<String>,
     },
@@ -263,39 +270,8 @@ pub fn fetch_and_apply(
     validate_sync_response(&parsed).map_err(|e| anyhow!("sync response validation failed: {e}"))?;
     watchdog::feed();
 
-    alarm_store
-        .save(&parsed.alarms)
-        .map_err(|e| anyhow!("failed to save synced alarms: {e}"))?;
-    todo_store
-        .save(&parsed.todos)
-        .map_err(|e| anyhow!("failed to save synced todos: {e}"))?;
-    inbox_store
-        .save(&parsed.inbox)
-        .map_err(|e| anyhow!("failed to save synced inbox: {e}"))?;
-    inbox_store
-        .ack_read(&parsed.inbox_read_acked)
-        .map_err(|e| anyhow!("failed to ack inbox reads: {e}"))?;
-    watchdog::feed();
-    // The merged server state now reflects everything we uploaded, so the
-    // pending local changes are spent. Cleared only here, after a
-    // successful round-trip - a failed sync keeps them for the retry.
-    //
-    // The PCF8563 hardware alarm is NOT reprogrammed here: the sync task
-    // never touches the I2C bus. The main loop re-points the alarm slot at
-    // the new nearest alarm when it applies the sync receipt (see
-    // `ctx::DeviceContext::apply_sync_result`); the `poll_alarm`
-    // date-boundary re-arm is the safety net if that application is ever
-    // delayed.
-    alarm_store
-        .clear_dirty()
-        .map_err(|e| anyhow!("failed to clear alarm dirty set: {e}"))?;
-    todo_store
-        .clear_dirty()
-        .map_err(|e| anyhow!("failed to clear todo dirty set: {e}"))?;
-    watchdog::feed();
-
     log::info!(
-        "Sync applied: {} alarms, {} todos, {} inbox (truncated={})",
+        "Sync fetched: {} alarms, {} todos, {} inbox (truncated={})",
         parsed.alarms.len(),
         parsed.todos.len(),
         parsed.inbox.len(),
@@ -303,9 +279,10 @@ pub fn fetch_and_apply(
     );
 
     Ok(SyncOutcome::Applied {
-        alarm_count: parsed.alarms.len(),
-        todo_count: parsed.todos.len(),
-        inbox_count: parsed.inbox.len(),
+        alarms: parsed.alarms,
+        todos: parsed.todos,
+        inbox: parsed.inbox,
+        inbox_read_acked: parsed.inbox_read_acked,
         inbox_truncated: parsed.inbox_truncated,
         etag: new_etag,
     })
@@ -394,17 +371,11 @@ pub fn sync_now(
         // stay connected after this.
         wifi_mgr.disconnect();
 
-        if let Ok(SyncOutcome::Applied {
-            etag: Some(new_etag),
-            ..
-        }) = &outcome
-        {
-            if let Err(err) = counters.save_sync_etag(new_etag) {
-                log::warn!("Failed to save sync ETag: {err}");
-            }
-        }
-        // Record when this sync ran, so the periodic auto-sync checker
-        // (`main.rs`) knows how long it has been since the last one.
+        // The sync ETag is NOT saved here: the state machine persists it as
+        // part of Effect::ApplySyncedData (the network task never writes
+        // NVS). Record when this sync ran for the periodic auto-sync
+        // checker (interim scheduler metadata; migrates to the state
+        // machine's sync-metadata state in a later increment).
         if outcome.is_ok() {
             if let Err(err) = counters.set_last_sync_epoch(now.to_unix()) {
                 log::warn!("Failed to record last-sync time: {err}");
@@ -412,8 +383,8 @@ pub fn sync_now(
         }
 
         // Unwrap at the end: connect/fetch failures early-return via `?`,
-        // but the disconnect above and the ETag/last-sync bookkeeping must
-        // run first, exactly like the original synchronous flow.
+        // but the disconnect above and the last-sync bookkeeping must run
+        // first, exactly like the original synchronous flow.
         Ok((outcome?, ntp_epoch))
     })() {
         Ok((outcome, ntp_epoch)) => (Ok(outcome), ntp_epoch),

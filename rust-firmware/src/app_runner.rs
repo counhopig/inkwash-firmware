@@ -103,6 +103,33 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 ))),
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
             },
+            Effect::ApplySyncedData(data) => {
+                // The one place a sync's merged server state is written:
+                // the network task only transports; the state machine owns
+                // the apply ordering, and this executor performs the NVS
+                // writes (alarm/todo/inbox replace + dirty-clear + inbox
+                // read acks + ETag) as a single confirmable op.
+                let result = (|| -> Result<()> {
+                    self.ctx.alarm_store.save(&data.alarms)?;
+                    self.ctx.todo_store.save(&data.todos)?;
+                    self.ctx.inbox_store.save(&data.inbox)?;
+                    self.ctx.inbox_store.ack_read(&data.inbox_read_acked)?;
+                    // The merged server state reflects everything uploaded,
+                    // so the pending local changes are spent.
+                    self.ctx.alarm_store.clear_dirty()?;
+                    self.ctx.todo_store.clear_dirty()?;
+                    if let Some(etag) = data.etag.as_deref() {
+                        self.ctx.counters.save_sync_etag(etag)?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                        inkwash_logic::app::PersistTarget::SyncApply,
+                    ))),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+                }
+            }
             Effect::WriteRtcTime(dt) => match self.ctx.rtc.write_time(dt) {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten)),
                 Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),

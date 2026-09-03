@@ -250,6 +250,11 @@ pub enum Effect {
     PersistInbox(Vec<InboxItem>),
     PersistConfig(DeviceConfig),
     PersistSyncMetadata(SyncMetadata),
+    /// Apply merged sync data (alarms/todos/inbox + read acks) in one
+    /// confirmable write. The executor saves each store, clears the dirty
+    /// sets, acks inbox reads and persists the ETag; the machine replies to
+    /// the requesting transport only after the apply confirms.
+    ApplySyncedData(SyncedData),
     /// Invalidate the stale sync ETag after a server change (SetServer).
     /// Separate from `PersistSyncMetadata` because that effect's `etag:
     /// None` means "don't touch"; clearing needs its own confirmable op.
@@ -338,6 +343,8 @@ pub enum PersistTarget {
     Inbox,
     Config,
     SyncMetadata,
+    /// A confirmed `ApplySyncedData` (merged writes landed).
+    SyncApply,
     /// SetTimezone's timezone-offset NVS write.
     Timezone,
 }
@@ -361,13 +368,26 @@ pub enum EffectOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncResult {
     Ok {
-        alarm_count: usize,
-        todo_count: usize,
-        inbox_count: usize,
-        inbox_truncated: bool,
-        etag: Option<String>,
+        /// Merged server data the state machine applies (persist is
+        /// ordered by the machine; the network task never writes NVS).
+        data: SyncedData,
     },
     Failed(String),
+}
+
+/// Merged server state returned by a successful sync, applied by the state
+/// machine through `Effect::ApplySyncedData` (the network task only
+/// transports; it never writes NVS, RTC, UI or the scheduler).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncedData {
+    pub alarms: Vec<StoredAlarm>,
+    pub todos: Vec<Todo>,
+    pub inbox: Vec<InboxItem>,
+    /// Inbox sequence numbers the server confirmed as read (executor acks
+    /// them in the same apply).
+    pub inbox_read_acked: Vec<u64>,
+    pub inbox_truncated: bool,
+    pub etag: Option<String>,
 }
 
 /// Failure of an effect, fed back via `Event::EffectFailed`.
@@ -759,25 +779,52 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
 }
 
 /// A completed network sync resolves the running sync (single-flight
-/// arbitration) and the SyncNow pending reply: `Ok` replies Ok on the
-/// transport that requested it, `Failed` replies an error. The firmware
-/// network task still applies the merged data to NVS in this interim
-/// split; the persist-effects cutover moves that into the state machine
-/// in a later Stage-3 sub-increment.
+/// arbitration) and drives the SyncNow pending reply. On success the state
+/// machine adopts the merged data and emits a confirmable
+/// `ApplySyncedData`; the transport's Ok reply is sent only when the apply
+/// confirms (persist failure must not reply success early). On failure it
+/// replies Error immediately.
 fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<EffectBatch> {
-    let reply = match &result {
-        SyncResult::Ok { .. } => Reply::Ok,
-        SyncResult::Failed(message) => Reply::Error {
-            message: message.clone(),
-        },
-    };
     let mut batches = Vec::new();
-    // Release the single-flight lock, then resolve whichever transport was
-    // running the sync (its pending reply carries the sync's request id).
-    state.sync = SyncState::Idle;
-    for channel in [Channel::Usb, Channel::Ble] {
-        if let Some((found_channel, resolved)) = resolve_sync_completion(state, channel, &reply) {
-            batches.push(reply_batch(state, found_channel, resolved));
+    match result {
+        SyncResult::Ok { data } => {
+            let apply_op = state.next_operation_id();
+            // Adopt the merged data into state (the state machine is the
+            // single owner of the alarm/todo/inbox lists) and persist it via
+            // one confirmable apply - for BOTH on-demand and scheduled
+            // syncs, so the network task never writes NVS itself.
+            state.alarms.alarms = data.alarms.clone();
+            state.todos.todos = data.todos.clone();
+            state.inbox.items = data.inbox.clone();
+            // Release the single-flight lock; the sync itself is done, only
+            // its apply (below) remains confirmable.
+            state.sync = SyncState::Idle;
+            // If a transport's SyncNow slot awaits this sync, re-point it at
+            // the apply op so the final Ok waits for the apply confirm.
+            let _ = [Channel::Usb, Channel::Ble]
+                .iter()
+                .copied()
+                .any(|channel| repoint_sync_to_apply(state, channel, apply_op));
+            // Always apply the merged data (a scheduled sync has no pending
+            // transport; its `Persisted(SyncApply)` completion is observed
+            // by the executor path with no reply to send).
+            batches.push(batch(
+                state,
+                apply_op,
+                FailurePolicy::AbortBatch,
+                vec![Effect::ApplySyncedData(data)],
+            ));
+        }
+        SyncResult::Failed(message) => {
+            state.sync = SyncState::Idle;
+            let reply = Reply::Error { message };
+            for channel in [Channel::Usb, Channel::Ble] {
+                if let Some((found_channel, resolved)) =
+                    resolve_sync_completion(state, channel, &reply)
+                {
+                    batches.push(reply_batch(state, found_channel, resolved));
+                }
+            }
         }
     }
     batches
@@ -1709,6 +1756,22 @@ fn resolve_sync_completion(
     Some((channel, reply))
 }
 
+/// Re-points a pending SyncNow slot (the transport whose SyncNow completed)
+/// at the sync-apply op: its final Ok now waits for `Effect::ApplySyncedData`
+/// to confirm. Returns `true` when such a slot was found and re-pointed.
+fn repoint_sync_to_apply(state: &mut AppState, channel: Channel, apply_op: OperationId) -> bool {
+    let slot = match channel {
+        Channel::Usb => &mut state.pending_usb_reply,
+        Channel::Ble => &mut state.pending_ble_reply,
+    };
+    let Some(pending) = slot else { return false };
+    if !matches!(pending.request, ControlRequest::SyncNow) || pending.reply.is_some() {
+        return false;
+    }
+    pending.awaiting_ops = vec![apply_op];
+    true
+}
+
 /// Resolves a completed SetWifi's pending slot on `channel`. Returns the
 /// pending wifi request (SSID + password presence) and clears the slot,
 /// or `None` when the slot does not hold a pending SetWifi. The caller
@@ -1925,6 +1988,17 @@ mod tests {
             repeat: Repeat::Daily,
             enabled: true,
             label: String::new(),
+        }
+    }
+
+    fn synced_data(alarms: Vec<StoredAlarm>) -> SyncedData {
+        SyncedData {
+            alarms,
+            todos: vec![],
+            inbox: vec![],
+            inbox_read_acked: vec![],
+            inbox_truncated: false,
+            etag: None,
         }
     }
 
@@ -2965,19 +3039,43 @@ mod tests {
     }
 
     #[test]
-    fn sync_completed_ok_replies_ok_on_the_requesting_transport() {
+    fn sync_completed_ok_applies_data_then_replies_ok_on_the_requesting_transport() {
         let mut state = AppState::default();
         state.clock.now = Some(dt(10, 0));
         let _ = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
         assert!(matches!(state.sync, SyncState::Running { .. }));
-        let done = update(
+        // SyncCompleted(Ok) adopts the merged data and emits an apply batch
+        // - no reply yet (persist must confirm before Ok).
+        let applied = update(
             &mut state,
             Event::SyncCompleted(SyncResult::Ok {
-                alarm_count: 1,
-                todo_count: 2,
-                inbox_count: 0,
-                inbox_truncated: false,
-                etag: None,
+                data: synced_data(vec![alarm(1, 9, 0), alarm(2, 10, 30)]),
+            }),
+        );
+        assert_eq!(state.alarms.alarms, vec![alarm(1, 9, 0), alarm(2, 10, 30)]);
+        assert_eq!(state.sync, SyncState::Idle);
+        assert!(state.pending_ble_reply.is_some(), "slot awaits the apply");
+        assert!(!applied
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::Reply { .. })) }));
+        let apply_op = applied
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ApplySyncedData(_)))
+                    .then_some(b.operation_id)
+            })
+            .expect("SyncCompleted(Ok) must emit an apply");
+        // Apply confirms -> final Ok on BLE, slot released.
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: apply_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::SyncApply),
             }),
         );
         assert!(done.iter().any(|b| {
@@ -2992,9 +3090,52 @@ mod tests {
             })
         }));
         assert!(state.pending_ble_reply.is_none());
-        assert_eq!(state.sync, SyncState::Idle);
-        // The other transport has no pending reply.
         assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn sync_completed_apply_failure_replies_error_and_releases_slot() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let applied = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                data: synced_data(vec![alarm(1, 9, 0)]),
+            }),
+        );
+        let apply_op = applied
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ApplySyncedData(_)))
+                    .then_some(b.operation_id)
+            })
+            .unwrap();
+        let failed = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: apply_op,
+                render_generation: None,
+                error: EffectError::Persist("apply failed".into()),
+            }),
+        );
+        assert!(failed.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Error { message },
+                } => message.contains("apply failed"),
+                _ => false,
+            })
+        }));
+        assert!(
+            state.pending_usb_reply.is_none(),
+            "slot released on apply failure"
+        );
     }
 
     #[test]
@@ -3028,11 +3169,7 @@ mod tests {
         let done = update(
             &mut state,
             Event::SyncCompleted(SyncResult::Ok {
-                alarm_count: 0,
-                todo_count: 0,
-                inbox_count: 0,
-                inbox_truncated: false,
-                etag: None,
+                data: synced_data(vec![]),
             }),
         );
         assert!(!done

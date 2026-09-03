@@ -1378,12 +1378,15 @@ fn sync_now_screen(ctx: &mut DeviceContext, now: Option<&DateTime>) {
 
     match result {
         Some(Ok(sync::SyncOutcome::Applied {
-            alarm_count,
-            todo_count,
-            inbox_count,
+            alarms,
+            todos,
+            inbox,
             inbox_truncated,
             ..
         })) => {
+            let alarm_count = alarms.len();
+            let todo_count = todos.len();
+            let inbox_count = inbox.len();
             let msg = if inbox_truncated {
                 format!("A:{alarm_count} T:{todo_count} IN:{inbox_count}+")
             } else {

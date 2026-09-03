@@ -32,7 +32,7 @@ use crate::control::{self, Channel, Command, Reply};
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::{PersistedCounters, WifiCreds};
-use crate::sync::{self, SyncOutcome};
+use crate::sync;
 use crate::sync_task::{OpSource, PendingWifiOp, SyncTask, WifiOpEvent};
 use crate::todos::TodoStore;
 use crate::usb_console::UsbConsole;
@@ -569,18 +569,16 @@ impl DeviceContext<'_> {
                     let event = WifiOpEvent::SyncDone(
                         result.outcome.as_ref().map_err(|e| e.to_string()).cloned(),
                     );
-                    // A state-machine-routed SyncNow delivers its reply
-                    // through the runner (Event::SyncCompleted -> Reply
-                    // effect) rather than the legacy deferred-reply path;
-                    // the NVS/RTC side effects below still apply.
-                    if self.sm_sync_reply_target.is_some() {
-                        let ok = result.outcome.is_ok();
-                        self.feed_sync_completed(&result);
-                        self.apply_sync_side_effects(ok, result.ntp_epoch);
-                        self.sm_sync_reply_target = None;
-                    } else {
-                        self.apply_sync_result(result, source, cmd);
-                    }
+                    // Every completed sync - scheduled or on-demand - is
+                    // fed through the state machine, which owns the merged
+                    // data apply (Effect::ApplySyncedData) and the transport
+                    // reply (only when a SyncNow slot awaits, tracked in
+                    // `sm_sync_reply_target`). The RTC/NVS-maintenance
+                    // side effects stay on the main loop here.
+                    let ok = result.outcome.is_ok();
+                    self.feed_sync_completed(&result);
+                    self.apply_sync_side_effects(ok, result.ntp_epoch);
+                    self.sm_sync_reply_target = None;
                     Some(event)
                 }
                 Err(TryRecvError::Empty) => {
@@ -652,22 +650,17 @@ impl DeviceContext<'_> {
 
     /// Applies a completed sync: re-points the PCF8563 alarm slot at the
     /// newly-synced alarm list, applies the daily NTP alignment, clears the
-    /// fresh-device fast path, and delivers the deferred transport reply
-    /// (updating the dedup cache so a resend replays the real result).
-    fn apply_sync_result(&mut self, result: sync::SyncResult, source: OpSource, cmd: Command) {
-        let sync::SyncResult { outcome, ntp_epoch } = result;
-        self.apply_sync_side_effects(outcome.is_ok(), ntp_epoch);
-        self.deliver_deferred_reply(source, cmd, reply_for_outcome(&outcome));
-    }
-
-    /// The NVS/RTC-maintenance half of a completed sync (re-arm, NTP
-    /// alignment, fresh-device/urgent flags). Shared by the legacy reply
-    /// path and the state-machine-routed path; the *reply* is delivered
-    /// separately in each.
+    /// The RTC/NVS-maintenance half of a completed sync: re-point the
+    /// PCF8563 alarm slot at the newly-synced alarm list (the executor's
+    /// `ApplySyncedData` already wrote the list to NVS), apply the daily
+    /// NTP alignment and clear the fresh-device/urgent flags. The merged
+    /// data apply + transport reply are owned by the state machine; this
+    /// only does what the machine cannot (I2C RTC work on the main thread).
     fn apply_sync_side_effects(&mut self, ok: bool, ntp_epoch: Option<u64>) {
         if ok {
-            // The sync task saved the merged alarm list to NVS; re-point
-            // the PCF8563's single alarm slot at the new nearest alarm.
+            // The merged alarm list is in NVS (applied by the machine);
+            // re-point the PCF8563's single alarm slot at the new nearest
+            // alarm.
             match self.rtc.read_time() {
                 Ok(now) => {
                     match self.alarm_store.load().and_then(|list| {
@@ -708,34 +701,36 @@ impl DeviceContext<'_> {
     }
 
     /// Feeds a completed sync receipt into the state machine as
-    /// `Event::SyncCompleted`, then writes the machine's `Reply` effect to
-    /// the transport that requested the SyncNow (stored in
-    /// `sm_sync_reply_target`). This is how a state-machine-routed SyncNow
-    /// gets its eventual Ok/Error reply, mirroring the synchronous command
-    /// path exactly once.
+    /// `Event::SyncCompleted`. The machine applies the merged data
+    /// (`Effect::ApplySyncedData`) for every sync - scheduled and
+    /// on-demand - and emits a `Reply` only when a SyncNow slot awaits
+    /// (tracked in `sm_sync_reply_target`); when present, that reply is
+    /// written to the stored transport + correlation id exactly once.
     fn feed_sync_completed(&mut self, result: &sync::SyncResult) {
         let sm_result = match &result.outcome {
             Ok(sync::SyncOutcome::Applied {
-                alarm_count,
-                todo_count,
-                inbox_count,
+                alarms,
+                todos,
+                inbox,
+                inbox_read_acked,
                 inbox_truncated,
                 etag,
             }) => inkwash_logic::app::SyncResult::Ok {
-                alarm_count: *alarm_count,
-                todo_count: *todo_count,
-                inbox_count: *inbox_count,
-                inbox_truncated: *inbox_truncated,
-                etag: etag.clone(),
+                data: inkwash_logic::app::SyncedData {
+                    alarms: alarms.clone(),
+                    todos: todos.clone(),
+                    inbox: inbox.clone(),
+                    inbox_read_acked: inbox_read_acked.clone(),
+                    inbox_truncated: *inbox_truncated,
+                    etag: etag.clone(),
+                },
             },
             Err(err) => inkwash_logic::app::SyncResult::Failed(err.to_string()),
         };
-        let Some((channel, id)) = self.sm_sync_reply_target.take() else {
-            return;
-        };
+        let target = self.sm_sync_reply_target.take();
         let runner = self.app_runner.clone();
         let result = self.dispatch_sync_completed(&runner, sm_result);
-        if let Some(reply) = result {
+        if let (Some(reply), Some((channel, id))) = (result, target) {
             write_reply_to_channel(self, channel, &reply, Some(&id));
         }
     }
@@ -870,28 +865,6 @@ impl DeviceContext<'_> {
                 }
             }
             OpSource::Internal => {}
-        }
-    }
-}
-
-fn reply_for_outcome(outcome: &Result<SyncOutcome>) -> Reply {
-    match outcome {
-        Ok(SyncOutcome::Applied {
-            alarm_count,
-            todo_count,
-            inbox_count,
-            ..
-        }) => {
-            log::info!(
-                "Sync completed: {alarm_count} alarms, {todo_count} todos, {inbox_count} inbox"
-            );
-            Reply::Ok
-        }
-        Err(err) => {
-            log::warn!("Sync failed: {err}");
-            Reply::Error {
-                message: format!("Sync failed: {err}"),
-            }
         }
     }
 }
