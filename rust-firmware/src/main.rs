@@ -692,10 +692,21 @@ fn main() -> Result<()> {
                             );
                         }
                         terminal => {
+                            // Stage 5: update the renderer cache for this
+                            // terminal before the kick is consumed by the
+                            // completion feed below (helper is
+                            // #[inline(never)] in app_runner.rs).
+                            let current_generation = app_runner.borrow().state().render_generation;
+                            let failed =
+                                terminal == inkwash_logic::epd_registry::RenderTerminal::Failed;
+                            app_runner::apply_render_cache_terminal(
+                                &ctx.pending_renders,
+                                &kick,
+                                failed,
+                                current_generation,
+                            );
                             let output = inkwash_logic::app::EffectOutput::RenderDone;
-                            let failure = if terminal
-                                == inkwash_logic::epd_registry::RenderTerminal::Failed
-                            {
+                            let failure = if failed {
                                 Some(inkwash_logic::app::EffectError::Render(format!(
                                     "epd refresh failed: {:?}",
                                     completion.kind

@@ -374,6 +374,36 @@ impl EffectExecutor for EffectRunner<'_, '_> {
 /// occupies. The region already encodes the *kind* of local change (Home
 /// clock, drawer bar, list block, calendar grid, or a whole-surface repaint
 /// for read-only pages); the refresh is submitted for exactly that rect.
+/// Stage-5 renderer cache terminal update, called from the EPD-completion
+/// path after a render kick was matched and consumed.
+///
+/// Updates the renderer's private "last successfully shown" ViewModel cache
+/// exactly per firmware-architecture.md: only a success whose render
+/// generation is still current replaces `last_shown` (Full resets the
+/// partial counter, Partial increments it, Noop leaves it); a failure
+/// invalidates the cache so the next render is a recovery Full; a
+/// superseded completion never touches the cache (its pixels never reached
+/// the panel - the replacement request updates the cache on its own
+/// completion). `#[inline(never)]` keeps this out of the completion loop's
+/// inlined frame.
+#[inline(never)]
+pub(crate) fn apply_render_cache_terminal(
+    registry: &std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
+    kick: &AsyncKick,
+    failed: bool,
+    current_generation: inkwash_logic::app::RenderGeneration,
+) {
+    let mut reg = registry.borrow_mut();
+    if failed {
+        reg.invalidate_cache();
+        return;
+    }
+    let generation_is_current = kick
+        .render_generation
+        .is_some_and(|g| g == current_generation);
+    reg.note_kick_terminal(kick, true, generation_is_current);
+}
+
 fn partial_region_rect(region: inkwash_logic::render_plan::PartialRegion) -> crate::canvas::Rect {
     match region {
         inkwash_logic::render_plan::PartialRegion::Clock => crate::canvas::Rect {
