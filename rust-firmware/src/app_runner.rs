@@ -127,6 +127,12 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
             }
+            Effect::ClearSyncEtag => match self.ctx.counters.clear_sync_etag() {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                    inkwash_logic::app::PersistTarget::SyncMetadata,
+                ))),
+                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+            },
             Effect::ProgramRtcAlarm(regs) => match self.ctx.rtc.program(regs) {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed)),
                 Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),

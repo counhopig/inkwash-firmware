@@ -250,6 +250,10 @@ pub enum Effect {
     PersistInbox(Vec<InboxItem>),
     PersistConfig(DeviceConfig),
     PersistSyncMetadata(SyncMetadata),
+    /// Invalidate the stale sync ETag after a server change (SetServer).
+    /// Separate from `PersistSyncMetadata` because that effect's `etag:
+    /// None` means "don't touch"; clearing needs its own confirmable op.
+    ClearSyncEtag,
     /// Persist the UTC-offset minutes (SetTimezone's NVS write).
     PersistTimezone(i16),
     /// Write the RTC clock to an absolute time (SetTimezone's hardware
@@ -1217,6 +1221,14 @@ fn transition_effect_completed(
                 None => {}
             }
         }
+        EffectOutput::Persisted(PersistTarget::Config) => {
+            // A SetServer config persist confirmed: apply the status-visible
+            // server facts now (NVS holds them authoritatively; the generic
+            // resolver below sends the reply).
+            for channel in [Channel::Usb, Channel::Ble] {
+                apply_confirmed_server_config(state, completion.operation_id, channel);
+            }
+        }
         EffectOutput::Persisted(PersistTarget::Timezone) => {
             // A SetTimezone timezone-offset persist confirmed: apply the
             // target offset to the status-visible config now (NVS holds it
@@ -1397,17 +1409,44 @@ fn transition_command(
                 vec![Effect::StartSync(SyncRequest { now })],
             )]
         }
-        // SetServer's stale-ETag-clear side effect (NVS sync-metadata
-        // bookkeeping) migrates with the sync-metadata state; the firmware
-        // keeps routing it on the legacy path until then. If it ever does
-        // reach the runner, refuse loudly rather than hang the transport.
-        ControlRequest::SetServer { .. } => vec![reply_batch(
-            state,
-            channel,
-            Reply::Error {
-                message: "command not yet migrated to the state machine".into(),
-            },
-        )],
+        ControlRequest::SetServer { url, token } => {
+            // Save the new endpoint and invalidate the stale sync ETag: the
+            // old server's conditional-request state must not survive a
+            // server change or the next sync would be suppressed by a
+            // now-meaningless If-None-Match. Two confirmable ops (config
+            // persist + etag clear); the reply waits for both. The
+            // status-visible config facts are applied only when the persist
+            // confirms (NVS-authoritative, like SetTimezone) so a failed
+            // command never leaves the in-state facts diverged from NVS.
+            let cfg_op = state.next_operation_id();
+            let clear_op = state.next_operation_id();
+            let cfg = DeviceConfig {
+                server_url: url.clone(),
+                auth_token: token.clone(),
+            };
+            let pending_request = ControlRequest::SetServer { url, token };
+            set_pending_reply(
+                state,
+                channel,
+                cfg_op,
+                pending_request,
+                vec![cfg_op, clear_op],
+            );
+            vec![
+                batch(
+                    state,
+                    cfg_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::PersistConfig(cfg)],
+                ),
+                batch(
+                    state,
+                    clear_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::ClearSyncEtag],
+                ),
+            ]
+        }
         ControlRequest::ClearAlarms => {
             // Empty the local list (authoritative NVS source) and disarm the
             // RTC slot. Two confirmable ops; the reply waits for both, and a
@@ -1558,6 +1597,30 @@ fn apply_confirmed_timezone(state: &mut AppState, completed_op: OperationId, cha
     }
     if let ControlRequest::SetTimezone { offset_minutes } = &pending.request {
         state.config.timezone_offset_minutes = *offset_minutes;
+    }
+}
+
+/// Applies a confirmed SetServer config persist to the status-visible
+/// server facts (URL presence + token presence; the token value never
+/// enters AppState). The target comes from the pending command's request,
+/// so the facts only ever reflect a value NVS now holds.
+fn apply_confirmed_server_config(
+    state: &mut AppState,
+    completed_op: OperationId,
+    channel: Channel,
+) {
+    let slot = match channel {
+        Channel::Usb => &state.pending_usb_reply,
+        Channel::Ble => &state.pending_ble_reply,
+    };
+    let Some(pending) = slot else { return };
+    if !pending.awaiting_ops.contains(&completed_op) {
+        return;
+    }
+    if let ControlRequest::SetServer { url, token } = &pending.request {
+        state.config.server_url = Some(url.clone());
+        state.config.server_has_token = !token.is_empty();
+        state.connectivity.server_configured = state.config.server_configured();
     }
 }
 
@@ -2304,13 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn set_server_refuses_until_migrated_with_sync_metadata() {
-        // SetServer is not yet routed to the runner: its stale-ETag-clear
-        // side effect depends on sync-metadata state that migrates with the
-        // SyncCompleted increment. Until then the state machine refuses it
-        // loudly (the firmware keeps it on the legacy path, so this branch
-        // only guards against a future mis-routing that would otherwise
-        // hang the transport).
+    fn set_server_persists_config_and_clears_etag_then_replies_ok() {
         let mut state = AppState::default();
         let batches = update(
             &mut state,
@@ -2319,25 +2376,113 @@ mod tests {
                 token: "secret".into(),
             }),
         );
-        assert!(!batches.iter().any(|b| {
-            b.effects
-                .iter()
-                .any(|e| matches!(e, Effect::PersistConfig(_)))
-        }));
-        assert!(batches.iter().any(|b| {
+        assert!(state.pending_usb_reply.is_some());
+        assert!(state.pending_ble_reply.is_none());
+        // Two confirmable batches: PersistConfig + ClearSyncEtag.
+        let cfg_batch = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistConfig(_)))
+            })
+            .expect("SetServer must persist the config");
+        let clear_batch = batches
+            .iter()
+            .find(|b| b.effects.iter().any(|e| matches!(e, Effect::ClearSyncEtag)))
+            .expect("SetServer must clear the stale ETag");
+        let cfg_op = cfg_batch.operation_id;
+        let clear_op = clear_batch.operation_id;
+        assert_ne!(cfg_op, clear_op);
+        // Status-visible facts not applied until the config persist confirms.
+        assert!(state.config.server_url.is_none(), "facts apply on confirm");
+        // Config confirms: facts applied, no reply yet (etag clear pending).
+        let mid = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: cfg_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Config),
+            }),
+        );
+        assert_eq!(
+            state.config.server_url.as_deref(),
+            Some("https://sync.example")
+        );
+        assert!(state.config.server_has_token);
+        assert!(!mid
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
+        // ETag clear confirms -> final Ok on USB, slot released.
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: clear_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::SyncMetadata),
+            }),
+        );
+        assert!(done.iter().any(|b| {
             b.effects.iter().any(|e| {
                 matches!(
                     e,
                     Effect::Reply {
                         channel: Channel::Usb,
-                        reply: Reply::Error { .. }
+                        reply: Reply::Ok
                     }
                 )
             })
         }));
+        assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn set_server_persist_failure_replies_error_and_leaves_facts_unchanged() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::BleCommand(ControlRequest::SetServer {
+                url: "https://sync.example".into(),
+                token: "secret".into(),
+            }),
+        );
+        let cfg_op = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistConfig(_)))
+            })
+            .unwrap()
+            .operation_id;
+        let failed = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: cfg_op,
+                render_generation: None,
+                error: EffectError::Persist("nvs write failed".into()),
+            }),
+        );
+        let error_seen = failed.iter().any(|b| {
+            b.effects.iter().any(|e| match e {
+                Effect::Reply {
+                    channel: Channel::Ble,
+                    reply: Reply::Error { message },
+                } => message.contains("nvs write failed"),
+                _ => false,
+            })
+        });
+        assert!(error_seen);
+        assert!(state.pending_ble_reply.is_none(), "slot released");
         assert!(
-            state.pending_usb_reply.is_none(),
-            "no slot taken on refusal"
+            state.config.server_url.is_none(),
+            "facts must not apply on a failed SetServer"
         );
     }
 

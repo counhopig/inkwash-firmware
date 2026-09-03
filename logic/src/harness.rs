@@ -116,6 +116,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistInbox(_) => "PersistInbox",
         Effect::PersistConfig(_) => "PersistConfig",
         Effect::PersistSyncMetadata(_) => "PersistSyncMetadata",
+        Effect::ClearSyncEtag => "ClearSyncEtag",
         Effect::PersistTimezone(_) => "PersistTimezone",
         Effect::WriteRtcTime(_) => "WriteRtcTime",
         Effect::ProgramRtcAlarm(_) => "ProgramRtcAlarm",
@@ -141,6 +142,7 @@ impl EffectExecutor for FakeExecutor {
             | Effect::PersistInbox(_)
             | Effect::PersistConfig(_)
             | Effect::PersistSyncMetadata(_)
+            | Effect::ClearSyncEtag
             | Effect::PersistTimezone(_) => EffectCategory::Persist,
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm | Effect::WriteRtcTime(_) => {
                 EffectCategory::Rtc
@@ -173,6 +175,9 @@ impl EffectExecutor for FakeExecutor {
             Effect::PersistSyncMetadata(_) => Ok(EffectOutcome::Completed(
                 EffectOutput::Persisted(crate::app::PersistTarget::SyncMetadata),
             )),
+            Effect::ClearSyncEtag => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                crate::app::PersistTarget::SyncMetadata,
+            ))),
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm => {
                 Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed))
             }

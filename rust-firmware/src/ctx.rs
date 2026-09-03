@@ -144,7 +144,10 @@ pub(crate) fn is_migrated_command(cmd: &Command) -> bool {
     // delta needs a fresh clock fact, which the unified event loop (later
     // migration stage) guarantees. Until then the legacy path reads the
     // RTC directly.
-    matches!(cmd, Command::ClearAlarms | Command::SyncNow)
+    matches!(
+        cmd,
+        Command::ClearAlarms | Command::SyncNow | Command::SetServer { .. }
+    )
 }
 
 /// Dispatches one migrated command into the shared state-machine runner.
