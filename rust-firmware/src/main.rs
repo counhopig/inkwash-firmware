@@ -784,6 +784,7 @@ fn main() -> Result<()> {
                     | inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
+                    | inkwash_logic::app::Screen::AlarmAdd(_)
                     | inkwash_logic::app::Screen::TodoList { .. }
                     | inkwash_logic::app::Screen::Inbox { .. }
                     | inkwash_logic::app::Screen::InboxItem { .. }
@@ -824,30 +825,6 @@ fn main() -> Result<()> {
                     // redraw (the wedge drew over it).
                     if open_deferred_settings_item(&mut ctx, clock.as_ref(), item) {
                         dismiss_full_refresh = true;
-                    } else {
-                        dirty.push(FULL_SCREEN_RECT);
-                    }
-                }
-                if deferred.add_alarm {
-                    // "+ ADD ALARM" editor wedge on the AlarmList screen.
-                    // Post-pump: the editor is a blocking screen that
-                    // dispatches alarm/button events through the shared
-                    // Runtime. When a new alarm was persisted, reload the SM
-                    // list (Event::AlarmStoreChanged): its Full render is the
-                    // authoritative redraw, so no dirty push follows. When
-                    // the user cancelled, force an AlarmList redraw to clear
-                    // the editor's pixels.
-                    let changed = open_deferred_add_alarm(&mut ctx, clock.as_ref());
-                    if changed {
-                        let reloaded = ctx.alarm_store.load().unwrap_or_default();
-                        if let Err(err) = dispatch_app_runner(
-                            &app_runner,
-                            inkwash_logic::app::Event::AlarmStoreChanged(reloaded),
-                            &mut ctx,
-                        ) {
-                            log::warn!("AlarmStoreChanged dispatch failed: {err}");
-                            dirty.push(FULL_SCREEN_RECT);
-                        }
                     } else {
                         dirty.push(FULL_SCREEN_RECT);
                     }
@@ -1053,6 +1030,7 @@ fn main() -> Result<()> {
                 inkwash_logic::app::Screen::Navigation { .. }
                     | inkwash_logic::app::Screen::Settings { .. }
                     | inkwash_logic::app::Screen::AlarmList { .. }
+                    | inkwash_logic::app::Screen::AlarmAdd(_)
                     | inkwash_logic::app::Screen::TodoList { .. }
                     | inkwash_logic::app::Screen::Inbox { .. }
                     | inkwash_logic::app::Screen::InboxItem { .. }
@@ -1125,23 +1103,6 @@ fn open_deferred_settings_item(
         .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
     let _ = ctx.alarm_poll.take_alarm_exit();
     alarm_interrupted
-}
-
-/// Runs the "+ ADD ALARM" editor wedge for the state-machine AlarmList
-/// screen (Stage 4, slice 3). Post-pump (the editor is a blocking screen).
-/// Returns `true` when a new alarm was persisted (the caller dispatches
-/// `Event::AlarmStoreChanged` so the SM adopts the store). An alarm-unwound
-/// editor leaves the exit flag set for the caller to consume once.
-fn open_deferred_add_alarm(ctx: &mut DeviceContext, now: Option<&DateTime>) -> bool {
-    let changed = screens::open_sm_add_alarm(ctx, now);
-    // Same unwind bookkeeping as the other deferred wedges: report the
-    // blocking-page exit then consume it once so it does not leak into the
-    // next page entry.
-    let _ = ctx
-        .alarm_poll
-        .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
-    let _ = ctx.alarm_poll.take_alarm_exit();
-    changed
 }
 
 /// Renders the idle/background screen with a freshly-loaded next-alarm
@@ -1367,7 +1328,6 @@ fn dispatch_app_runner(
         }
         DeferredNav {
             settings_items: executor.take_deferred_settings(),
-            add_alarm: executor.take_deferred_add_alarm(),
         }
     };
     for kick in runner.borrow_mut().take_kicks() {
@@ -1377,12 +1337,10 @@ fn dispatch_app_runner(
 }
 
 /// Legacy blocking-page wedges deferred out of a pump: Settings row items
-/// (`OpenSettingsItem`) and the "+ ADD ALARM" editor (`OpenAddAlarm`). The
-/// main loop runs each after the pump.
+/// (`OpenSettingsItem`). The main loop runs each after the pump.
 #[derive(Default)]
 struct DeferredNav {
     settings_items: Vec<usize>,
-    add_alarm: bool,
 }
 
 /// surfaced with a log and dropped - their transports aren't wired yet.

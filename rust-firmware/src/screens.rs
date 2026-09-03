@@ -1101,33 +1101,42 @@ pub(crate) fn draw_alarm_list(board: &mut Note4Board, store: &AlarmStore, select
     render_alarm_page(board, store, selected);
 }
 
-/// Runs the legacy "+ ADD ALARM" editor wedge for the state-machine
-/// AlarmList screen (Stage 4, slice 3). Post-pump (never inside a pump -
-/// the editor is a blocking screen that dispatches alarm events through the
-/// shared Runtime). When the user completes an alarm the wedge persists the
-/// merged list + marks it dirty; the caller then dispatches
-/// `Event::AlarmStoreChanged` with the reloaded list so the SM adopts the
-/// new alarm and re-programs the RTC slot through its own confirmable
-/// path. Returns `true` when the list actually changed.
-pub(crate) fn open_sm_add_alarm(ctx: &mut DeviceContext, now: Option<&DateTime>) -> bool {
-    let mut list = ctx.alarm_store.load().unwrap_or_default();
-    match add_alarm_screen(ctx, now, &list) {
-        AlarmEditOutcome::Added(alarm) => {
-            list.push(alarm);
-            if let Err(err) = ctx.alarm_store.save(&list) {
-                log::warn!("ADD ALARM: failed to save alarms: {err}");
-                return false;
-            }
-            true
-        }
-        AlarmEditOutcome::Cancelled => false,
-        AlarmEditOutcome::AlarmInterrupted => {
-            // Alarm rang over the editor: unwind to the caller (main),
-            // which routes the alarm through the shared Runtime.
-            ctx.alarm_poll.mark_exit();
-            false
-        }
-    }
+/// Draws the state-machine ADD-ALARM number picker (Stage 4, slice 9): the
+/// big stepped digit for the active stage (hour or minute). The SM owns the
+/// value + stage; the executor draws from state using the same visual
+/// language the legacy pick_number used (title header, centered box + large
+/// scale-5 digits), so the two paths look identical.
+pub(crate) fn draw_number_pick(
+    board: &mut Note4Board,
+    stage: inkwash_logic::app::AddStage,
+    value: u8,
+) {
+    let title = match stage {
+        inkwash_logic::app::AddStage::Hour => "NEW ALARM - HOUR",
+        inkwash_logic::app::AddStage::Minute => "NEW ALARM - MINUTE",
+    };
+    let mut canvas = board.display.canvas_mut();
+    canvas.clear();
+    header(&mut canvas, title);
+    let label = format!("{value:02}");
+    let number_width = Canvas::text_prop_width(&label, 5);
+    let box_width = number_width + 64;
+    let box_x = 200usize.saturating_sub(box_width / 2);
+    const BOX_TOP: usize = 123;
+    const BOX_H: usize = 120;
+    let caption_width = Canvas::text_prop_width("CHOOSE VALUE", 1);
+    canvas.draw_text_prop(
+        (400usize.saturating_sub(caption_width)) / 2,
+        87,
+        1,
+        "CHOOSE VALUE",
+    );
+    canvas.stroke_rect(box_x, BOX_TOP, box_width, BOX_H, 3);
+    canvas.fill_rect(box_x, BOX_TOP, 7, BOX_H, true);
+    let value_x = box_x + 7 + (box_width - 7 - number_width) / 2;
+    let value_y = BOX_TOP + (BOX_H.saturating_sub(80)) / 2;
+    canvas.draw_text_prop(value_x, value_y, 5, &label);
+    footer(&mut canvas, "UP/DOWN CHANGE   ENTER OK   HOLD ENTER BACK");
 }
 
 fn activate_alarm_row(ctx: &mut DeviceContext, now: Option<&DateTime>, selected: usize) {

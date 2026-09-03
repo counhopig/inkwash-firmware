@@ -45,10 +45,6 @@ pub struct EffectRunner<'a, 'ctx> {
     /// so opening them is deferred to the caller (after the pump releases
     /// the Runtime borrow).
     deferred_settings_items: Vec<usize>,
-    /// The state machine asked to open the legacy "+ ADD ALARM" editor
-    /// wedge (AlarmList screen). Deferred post-pump; when it returns the
-    /// caller dispatches `Event::AlarmStoreChanged` with the reloaded list.
-    deferred_add_alarm: bool,
 }
 
 impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
@@ -58,7 +54,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
             last_clock,
             replies: Vec::new(),
             deferred_settings_items: Vec::new(),
-            deferred_add_alarm: false,
         }
     }
 
@@ -77,12 +72,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
     /// last pump. The caller runs each wedge after the pump.
     pub fn take_deferred_settings(&mut self) -> Vec<usize> {
         std::mem::take(&mut self.deferred_settings_items)
-    }
-
-    /// Whether the state machine asked to open the "+ ADD ALARM" editor
-    /// wedge during the last pump.
-    pub fn take_deferred_add_alarm(&mut self) -> bool {
-        std::mem::take(&mut self.deferred_add_alarm)
     }
 }
 
@@ -232,14 +221,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 // the main loop drains this buffer after the pump (borrow
                 // released) and runs the wedge, then re-renders Settings.
                 self.deferred_settings_items.push(*item);
-                Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
-            }
-            Effect::OpenAddAlarm => {
-                // Same deferral: "+ ADD ALARM" runs the legacy editor wedge
-                // after the pump. The wedge persists to the alarm store; the
-                // main loop dispatches Event::AlarmStoreChanged with the
-                // reloaded list so the SM adopts the new alarm.
-                self.deferred_add_alarm = true;
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::MarkInboxRead { seq } => {
@@ -420,16 +401,20 @@ fn render_view_into(
                 height: 264,
             })
         }
-        // WeekView / InboxItem never partial-refresh (open/close are Full);
-        // keep the exhaustiveness explicit.
-        (RenderView::WeekView { .. } | RenderView::InboxItem { .. }, RenderIntent::Partial) => {
-            ctx.board.display.refresh_partial(crate::canvas::Rect {
-                x: 0,
-                y: 36,
-                width: 400,
-                height: 264,
-            })
-        }
+        // WeekView / InboxItem / NumberPick never partial-refresh (open/
+        // close and picker moves are Full); keep the exhaustiveness
+        // explicit.
+        (
+            RenderView::WeekView { .. }
+            | RenderView::InboxItem { .. }
+            | RenderView::NumberPick { .. },
+            RenderIntent::Partial,
+        ) => ctx.board.display.refresh_partial(crate::canvas::Rect {
+            x: 0,
+            y: 36,
+            width: 400,
+            height: 264,
+        }),
     };
     request_id.map_err(|e| anyhow::anyhow!("{e:#}"))
 }
@@ -477,6 +462,9 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::WeekView { year, month, day } => {
             crate::screens::draw_week_view(ctx, year, month, day, clock.as_ref());
+        }
+        RenderView::NumberPick { stage, value } => {
+            crate::screens::draw_number_pick(ctx.board, stage, value);
         }
     }
 }
