@@ -257,16 +257,15 @@ fn main() -> Result<()> {
     // arm the RTC and emit ProgramRtcAlarm / DisableRtcAlarm. Once that
     // batch runs the RTC register matches the stored list.
 
-    // Home's data fingerprint at the last actual render; the sync
-    // completion path compares against it to skip unchanged redraws.
-    let mut last_home_fp = Some(render_home_now(
+    // Initial Home canvas draw (before the first loop iteration).
+    render_home_now(
         &mut board,
         &counters,
         &alarm_store,
         &todo_store,
         &inbox_store,
         clock.as_ref(),
-    ));
+    );
     // On a deep-sleep wake the e-paper already shows the
     // pre-sleep frame, so skip the full refresh (the slowest part of boot)
     // and update only the clock region. Alarm-wakes already repainted the
@@ -321,14 +320,14 @@ fn main() -> Result<()> {
                         Ok(()) => match rtc.read_time() {
                             Ok(dt) => {
                                 clock = Some(dt);
-                                last_home_fp = Some(render_home_now(
+                                render_home_now(
                                     &mut board,
                                     &counters,
                                     &alarm_store,
                                     &todo_store,
                                     &inbox_store,
                                     clock.as_ref(),
-                                ));
+                                );
                                 board.display.refresh_partial_best_effort(CLOCK_RECT);
                                 log::info!("Clock region refreshed after NTP sync");
                             }
@@ -793,22 +792,13 @@ fn main() -> Result<()> {
 
         // Receipts from the sync task (scheduled syncs, deferred
         // USB/BLE SyncNow/SetWifi replies): applies the RTC re-arm, NTP
-        // alignment, and transport replies. A successful sync redraws the
-        // full screen only when it actually changed what Home shows
-        // - an unchanged sync leaves the panel alone.
-        if let Some(event) = ctx.poll_wifi_ops() {
-            if matches!(event, sync_task::WifiOpEvent::SyncDone(Ok(_)))
-                && Some(home_data_fingerprint(
-                    ctx.counters,
-                    ctx.alarm_store,
-                    ctx.todo_store,
-                    ctx.inbox_store,
-                    clock.as_ref(),
-                )) != last_home_fp
-            {
-                dirty.push(FULL_SCREEN_RECT);
-            }
-        }
+        // alignment, and transport replies. Stage 5: the redraw is NOT
+        // decided here - poll_wifi_ops feeds the completion into the state
+        // machine (which owns the merged-data apply + transport reply and
+        // emits a render whose ViewModel diff decides Noop vs refresh), so
+        // an unchanged sync costs no panel refresh and a changed list
+        // repaints exactly what shows it.
+        let _ = ctx.poll_wifi_ops();
 
         // The Home loop hosts the state-machine screens: every SM screen
         // (Home, Navigation drawer, Settings, AlarmList, ... - P1#3 made
@@ -917,13 +907,6 @@ fn main() -> Result<()> {
             // alarm so no CLOCK_RECT partial can supersede that request.
             dismiss_full_refresh = false;
             dirty.clear();
-            last_home_fp = Some(home_data_fingerprint(
-                ctx.counters,
-                ctx.alarm_store,
-                ctx.todo_store,
-                ctx.inbox_store,
-                clock.as_ref(),
-            ));
         }
         if !dirty.is_empty() {
             // The dirty path draws whatever screen the state machine is on
@@ -932,26 +915,13 @@ fn main() -> Result<()> {
             // the SM's current screen. When the runtime is enabled we render
             // through the shared surface painter; the legacy path (runtime
             // disabled) keeps `render_home_now`.
-            if app_runner_enabled {
-                last_home_fp = Some(home_data_fingerprint(
-                    ctx.counters,
-                    ctx.alarm_store,
-                    ctx.todo_store,
-                    ctx.inbox_store,
-                    clock.as_ref(),
-                ));
-                let view = app_runner.borrow().state().screen.render_view();
-                app_runner::draw_sm_surface(&mut ctx, clock, view);
-            } else {
-                last_home_fp = Some(render_home_now(
-                    ctx.board,
-                    ctx.counters,
-                    ctx.alarm_store,
-                    ctx.todo_store,
-                    ctx.inbox_store,
-                    clock.as_ref(),
-                ));
-            }
+            // P1#3: app_runner_enabled is constant-true (core boot-fact
+            // failure diverges into run_safe_mode earlier), so the legacy
+            // render_home_now branch is unreachable. The dirty path draws
+            // whatever screen the state machine is on through the shared
+            // surface painter.
+            let view = app_runner.borrow().state().screen.render_view();
+            app_runner::draw_sm_surface(&mut ctx, clock, view);
             if dirty
                 .iter()
                 .any(|rect| rect.width == 400 && rect.height == 300)
