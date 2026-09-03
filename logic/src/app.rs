@@ -709,13 +709,6 @@ pub struct BlePairingFailure {
     pub message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DisplayResult {
-    pub generation: RenderGeneration,
-    pub ok: bool,
-    pub recovered: bool,
-}
-
 /// All events flow through one entry. Every variant is a fact collected by
 /// the event sources; `update` alone decides what it means.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -738,7 +731,6 @@ pub enum Event {
     /// detected the minute crossed the interval boundary; it only reports
     /// the fact - the state machine decides whether a sync may start).
     SyncBoundaryDue,
-    DisplayCompleted(DisplayResult),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
     IdleDeadlineReached,

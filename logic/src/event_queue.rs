@@ -58,7 +58,6 @@ pub fn priority(event: &Event) -> Priority {
         | Event::SyncCompleted(_)
         | Event::SyncBoundaryDue
         | Event::SetWifiCompleted(_)
-        | Event::DisplayCompleted(_)
         | Event::EffectCompleted(_)
         | Event::EffectFailed(_)
         | Event::IdleDeadlineReached => Priority::High,
