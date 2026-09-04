@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件功能基线：** `45ded65`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件功能基线：** `4ac8550`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
 **宿主测试：** `logic` 271 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新功能基线（45ded65）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新功能基线（4ac8550）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -44,7 +44,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ✅ `0fc3ae6` 已随文档提交组成的 ELF `v0.5.0-158-g869dd85` 重刷 NOTE4：Calendar 选中 9/11 后打开 drawer，背景保持 Calendar；短按 ENTER 选择当前 CALENDAR 与长按 ENTER 取消两条路径均恢复 9/11。此前 RTC watchdog 修复也已在连续页面交互约 127 s 的串口记录中复测，无 `task_wdt`、panic 或 reboot（`/tmp/inkwash-rtc-wdt-retest-4729a7f.log`）。
 - ✅ Calendar drawer 与 RTC watchdog 项已通过；Inbox 页面验收正常（均为 ELF `v0.5.0-158-g869dd85` 的设备记录）。
 - ✅ `1fc308c` 已随文档提交组成的 ELF `v0.5.0-161-g0148ed9` 重刷 NOTE4：同页打开、移动、关闭 Navigation drawer 的观感均为局部刷新，关闭后来源像素恢复；切换到不同页面仍为 Full。串口 `/tmp/inkwash-drawer-partial-0148ed9.log` 对应记录为 `Partial(Rect { x: 16, y: 34, width: 176, height: 266 })`，跨页记录为 Full，无 watchdog/panic/reboot。
-- ❌ NOTE4 Alarms 页面复测（同一 ELF `v0.5.0-161-g0148ed9`）发现：ADD ALARM 完成 minute 确认后新 alarm 已加入列表但仍停留在 picker；添加多条 alarm 后连续 DOWN 停在 `+ ADD ALARM`。`45ded65` 已修复完成后回列表选中新项、persist 失败回滚刷新及列表首尾循环；新 ELF 尚未刷入复测。
+- ❌ NOTE4 Alarms 页面复测（同一 ELF `v0.5.0-161-g0148ed9`）发现：ADD ALARM 完成 minute 确认后新 alarm 已加入列表但仍停留在 picker；添加多条 alarm 后连续 DOWN 停在 `+ ADD ALARM`。`4ac8550` 已修复完成后回列表选中新项、persist 失败回滚刷新、列表首尾循环及 pending append 期间的编辑串行化；新 ELF 尚未刷入复测。
 - ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
