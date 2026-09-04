@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件功能基线：** `1adb244`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件功能基线：** `7c6bd4a`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
-**宿主测试：** `logic` 277 通过
+**宿主测试：** `logic` 278 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新功能基线（1adb244）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新功能基线（7c6bd4a）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -47,7 +47,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ✅ NOTE4 Alarms 页面长列表复测通过（ELF `v0.5.0-173-gb58fb12`）：连续 DOWN 时列表窗口随选中项滚动，末尾 `+ ADD ALARM` 文字与选框完整可见；从末尾循环回首行后底部内容和选框均正确清除，无残影。ADD ALARM 完成 minute 确认后返回列表并选中新项；列表首尾循环及长列表局部刷新正常。
 - ✅ NOTE4 Todos 页面复测通过（ELF `v0.5.0-179-g8c1b695`）：短按 UP/DOWN 在列表首尾正确循环；短 ENTER 仅切换完成状态，重新进入页面后状态保持；长 ENTER 直接返回 Home；importance 保持为外部同步数据，不由设备按键修改。
 - ✅ NOTE4 Settings 基础页面复测通过（ELF `v0.5.0-179-g8c1b695`）：列表导航正常；Sync Interval 可修改、退出后重新进入仍保持；Sync Now 可完成且无卡死或异常返回 Home。BLE pairing 与 Sleep 保留在 §4、§6 专项验收。
-- ❌ NOTE4 BLE pairing 复测：Settings 选择 BLE PAIRING 后未能保持配对屏，设备返回 Home；当前基线的启动失败清理与 Settings 回退路径待刷入新 ELF 后复测，未计入通过项。
+- ❌ NOTE4 BLE pairing 复测：Settings 选择 BLE PAIRING 后，`BLE_INIT` 后主线程同步阻塞，约 33.136 s 触发 Task WDT 并重启；串口证据 `/tmp/inkwash-ble-pairing-failure-6c4f562.log`，回溯定位到 `BLEDevice::init -> EffectRunner::run -> Runtime::apply/pump -> dispatch_app_runner -> main`。新基线将 NimBLE 生命周期移到专属 worker，尚未刷入复测，未计入通过项。
 - ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
@@ -112,10 +112,9 @@ espflash flash ... <同 ELF 路径>
 
 ## 4. BLE pairing（待真机；SM 屏已接入，radio 接线在 executor）
 
-- 当前设备复测未通过：选择 BLE PAIRING 后无法进入并返回 Home；`1adb244` 已补充启动失败后的 NimBLE 全局清理，待新 ELF 复测。
+- 当前设备复测未通过：选择 BLE PAIRING 后在 `BLE_INIT` 处触发主线程 Task WDT；串口证据见 §0。新基线由专属 worker 串行执行 NimBLE start/stop，结果按 pairing session id 回送状态机，待新 ELF 复测。
 
-- Settings → BLE PAIRING 行：期望进入配对屏 + advertising 启动
-  （executor `StartBlePairing` 已同步完成，boot 不受影响 ✅）。
+- Settings → BLE PAIRING 行：期望进入配对屏；专属 worker 异步完成 advertising 启动，主循环在等待期间仍可处理 Tick/Button。
 - 用 `inkwash-desktop` / 手机 nRF Connect 连接：**完整 connect → 发命令 → 回复 →
   disconnect → 重连** 生命周期为待真机项（NimBLE 事件闭环回调投递尚未在真机坐实）。
 
