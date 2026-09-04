@@ -40,9 +40,9 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ❌ `eab6d86` 页面验收发现 Calendar 长按 UP/DOWN 打开 drawer 时背景错误显示 Home，未满足来源页覆盖契约；
   `c9335f9` 已修复来源页保存与叠加绘制，必须重刷后复测 Calendar 及各 drawer 来源页。
 - ❌ `c9335f9` 页面复测确认 drawer 背景已正确，但 Calendar 打开前光标为 9/11，取消后变为当天 9/4；同源目的地短 ENTER 重建了当天 Calendar，未恢复保存状态。
-  `0fc3ae6` 已修复同源目的地恢复语义，必须重刷后复测。
-- ⚠️ 上述设备证据对应各自旧基线；0fc3ae6 需要重新刷写后才能继承，§1b/§3/§4/§5/§6/§8
-  的交互项仍需在本功能基线上人工逐项复验。
+  `0fc3ae6` 已修复同源目的地恢复语义。
+- ✅ `0fc3ae6` 已随文档提交组成的 ELF `v0.5.0-158-g869dd85` 重刷 NOTE4：Calendar 选中 9/11 后打开 drawer，背景保持 Calendar；短按 ENTER 选择当前 CALENDAR 与长按 ENTER 取消两条路径均恢复 9/11。此前 RTC watchdog 修复也已在连续页面交互约 127 s 的串口记录中复测，无 `task_wdt`、panic 或 reboot（`/tmp/inkwash-rtc-wdt-retest-4729a7f.log`）。
+- ⚠️ Calendar drawer 与 RTC watchdog 项已通过；§1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
 
