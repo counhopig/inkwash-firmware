@@ -2123,24 +2123,42 @@ fn transition_alarm_list_button(
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
+            let selected = selected.min(alarm_count);
             state.screen = Screen::AlarmList {
-                selected: selected.saturating_sub(1),
+                // Wrap like the navigation drawer: the ADD row remains
+                // reachable from either end even when the list is long.
+                selected: if selected == 0 {
+                    alarm_count
+                } else {
+                    selected - 1
+                },
             };
             state.render_generation = state.render_generation.next();
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Down) => {
+            let selected = selected.min(alarm_count);
             // The selection moves through the ADD row (index == alarm_count)
-            // and clamps there.
-            let max = alarm_count;
+            // and wraps like the navigation drawer instead of appearing
+            // stuck when DOWN is held at the end of a long list.
             state.screen = Screen::AlarmList {
-                selected: (selected + 1).min(max),
+                selected: if selected == alarm_count {
+                    0
+                } else {
+                    selected + 1
+                },
             };
             state.render_generation = state.render_generation.next();
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Enter) => {
             if selected == alarm_count {
+                // Do not open a second picker while the previous append is
+                // still being persisted. The confirmed completion releases
+                // this gate and the ADD row can then start another append.
+                if state.pending_alarm_add.is_some() {
+                    return vec![];
+                }
                 // "+ ADD ALARM": open the SM two-stage picker (hour, then
                 // minute). The list's ADD-row stays selected underneath so a
                 // cancel returns to it.
@@ -2263,8 +2281,15 @@ fn transition_alarm_add_button(state: &mut AppState, button: ButtonEvent) -> Vec
                     label: String::new(),
                 };
                 state.alarms.alarms.push(new_alarm);
+                let new_index = state.alarms.alarms.len() - 1;
                 let op = state.next_operation_id();
                 state.pending_alarm_add = Some(op);
+                // The append is optimistic, so show the newly-created row
+                // immediately. Persist confirmation only releases the gate
+                // and re-arms RTC; it must not leave the user in the picker.
+                state.screen = Screen::AlarmList {
+                    selected: new_index,
+                };
                 state.render_generation = state.render_generation.next();
                 let list = state.alarms.alarms.clone();
                 vec![
@@ -2923,6 +2948,7 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
     // A failed confirmable operation is retried after a backoff; the
     // current minute comes from the clock so the due window is sane.
     let now_minute = state.clock.now.map(|t| t.to_unix() / 60).unwrap_or(0);
+    let mut render_after_failure = false;
     match failure.error {
         // ACK / persistence failure: mark that exact commit failed and
         // schedule a retry (it stays in the alarm runtime so a later
@@ -2965,6 +2991,7 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
                     alarm.enabled = !alarm.enabled;
                 }
                 state.render_generation = state.render_generation.next();
+                render_after_failure = true;
             }
             // A TodoList row edit failed to persist: roll both the done
             // flag and the importance back (NVS never changed), release the
@@ -2983,6 +3010,7 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
                     todo.importance = rollback.previous_importance;
                 }
                 state.render_generation = state.render_generation.next();
+                render_after_failure = true;
             }
             // An ADD-ALARM append failed to persist: pop the optimistically
             // appended alarm back (NVS never changed), release the gate and
@@ -2991,7 +3019,11 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
             if state.pending_alarm_add == Some(failure.operation_id) {
                 state.pending_alarm_add = None;
                 state.alarms.alarms.pop();
+                if let Screen::AlarmList { selected } = &mut state.screen {
+                    *selected = (*selected).min(state.alarms.alarms.len());
+                }
                 state.render_generation = state.render_generation.next();
+                render_after_failure = true;
             }
         }
         // RTC program/disable failure (or a startup re-arm failure): NVS
@@ -3043,6 +3075,9 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
     // from the alarm-internal retry logic above - a control command is not
     // auto-retried (the client resends).
     let mut batches = Vec::new();
+    if render_after_failure {
+        batches.push(render_batch(state));
+    }
     // If a StartBlePairing failure exited the pairing screen above, emit
     // the render of the restored Settings surface.
     if let Screen::Settings { .. } = state.screen {
@@ -6344,7 +6379,7 @@ mod tests {
     }
 
     #[test]
-    fn alarm_list_rows_browse_and_clamp_through_add_row() {
+    fn alarm_list_rows_browse_and_wrap_through_add_row() {
         let mut state = AppState::default();
         open_alarm_list(&mut state, vec![alarm(1, 8, 0), alarm(2, 22, 30)]);
         assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
@@ -6360,28 +6395,67 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
         assert_eq!(state.screen, Screen::AlarmList { selected: 2 });
-        // Down past ADD clamps.
+        // Down past ADD wraps to the first alarm, so a long list never
+        // appears stuck on the trailing ADD row.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+        // Up from the top wraps back to ADD, then walks toward the top.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
         assert_eq!(state.screen, Screen::AlarmList { selected: 2 });
-        // Up back to row 1.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
         assert_eq!(state.screen, Screen::AlarmList { selected: 1 });
-        // Up to top.
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
-        );
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
         assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+    }
+
+    #[test]
+    fn alarm_list_add_row_stays_reachable_with_many_alarms() {
+        let alarms: Vec<StoredAlarm> = (0..12)
+            .map(|index| alarm(index as u8, (index % 24) as u8, 0))
+            .collect();
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, alarms);
+
+        // Twelve alarm rows plus ADD: repeated DOWN reaches the trailing row
+        // even though only seven rows are visible at once, then wraps home.
+        for selected in 1..=12 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+            assert_eq!(state.screen, Screen::AlarmList { selected });
+        }
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
+
+        // The ADD row still opens the picker after scrolling to it.
+        for _ in 0..12 {
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+        }
+        assert_eq!(state.screen, Screen::AlarmList { selected: 12 });
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(matches!(state.screen, Screen::AlarmAdd(_)));
     }
 
     #[test]
@@ -6603,6 +6677,7 @@ mod tests {
             .iter()
             .any(|b| matches!(b.effects.first(), Some(Effect::PersistAlarms(_)))));
         assert!(state.pending_alarm_add.is_some(), "add in flight");
+        assert_eq!(state.screen, Screen::AlarmList { selected: before });
         // Confirm the persist: releases the add gate and re-arms the RTC.
         let op = state.pending_alarm_add.unwrap();
         let confirm = update(
@@ -6620,6 +6695,63 @@ mod tests {
             b.effects.first(),
             Some(Effect::ProgramRtcAlarm(_)) | Some(Effect::DisableRtcAlarm)
         )));
+    }
+
+    #[test]
+    fn alarm_add_can_be_repeated_after_each_persist_confirmation() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![]);
+
+        for expected_len in 1..=3 {
+            // Empty list starts with ADD selected; later iterations move
+            // from the newly selected alarm to ADD.
+            if expected_len > 1 {
+                let _ = update(
+                    &mut state,
+                    Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+                );
+            }
+            assert_eq!(
+                state.screen,
+                Screen::AlarmList {
+                    selected: expected_len - 1
+                }
+            );
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+            );
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+            );
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+            );
+            let op = match state.pending_alarm_add {
+                Some(op) => op,
+                None => panic!("minute confirmation must start persistence"),
+            };
+            assert_eq!(state.alarms.alarms.len(), expected_len);
+            assert_eq!(
+                state.screen,
+                Screen::AlarmList {
+                    selected: expected_len - 1
+                }
+            );
+            let _ = update(
+                &mut state,
+                Event::EffectCompleted(EffectCompletion {
+                    batch_id: EffectBatchId(0),
+                    effect_id: EffectId(0),
+                    operation_id: op,
+                    render_generation: None,
+                    output: EffectOutput::Persisted(PersistTarget::Alarms),
+                }),
+            );
+            assert!(state.pending_alarm_add.is_none());
+        }
     }
 
     #[test]
@@ -6704,6 +6836,7 @@ mod tests {
         );
         assert!(state.pending_alarm_add.is_none());
         assert_eq!(state.alarms.alarms.len(), before, "rollback popped");
+        assert_eq!(state.screen, Screen::AlarmList { selected: before });
     }
 
     #[test]
