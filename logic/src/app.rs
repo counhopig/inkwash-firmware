@@ -2152,13 +2152,13 @@ fn transition_alarm_list_button(
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Enter) => {
+            // The append persist owns the authoritative list snapshot until
+            // it completes. Ignore all list ENTER actions while it is in
+            // flight so a row toggle cannot race and overwrite the append.
+            if state.pending_alarm_add.is_some() {
+                return vec![];
+            }
             if selected == alarm_count {
-                // Do not open a second picker while the previous append is
-                // still being persisted. The confirmed completion releases
-                // this gate and the ADD row can then start another append.
-                if state.pending_alarm_add.is_some() {
-                    return vec![];
-                }
                 // "+ ADD ALARM": open the SM two-stage picker (hour, then
                 // minute). The list's ADD-row stays selected underneath so a
                 // cancel returns to it.
@@ -6678,6 +6678,29 @@ mod tests {
             .any(|b| matches!(b.effects.first(), Some(Effect::PersistAlarms(_)))));
         assert!(state.pending_alarm_add.is_some(), "add in flight");
         assert_eq!(state.screen, Screen::AlarmList { selected: before });
+        // Even if the user moves to ADD and presses ENTER again before the
+        // persist completes, no second picker or concurrent list write starts.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmList {
+                selected: before + 1
+            }
+        );
+        assert!(update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        )
+        .is_empty());
+        assert_eq!(
+            state.screen,
+            Screen::AlarmList {
+                selected: before + 1
+            }
+        );
         // Confirm the persist: releases the add gate and re-arms the RTC.
         let op = state.pending_alarm_add.unwrap();
         let confirm = update(
