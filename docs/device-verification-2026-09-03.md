@@ -46,6 +46,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ✅ `1fc308c` 已随文档提交组成的 ELF `v0.5.0-161-g0148ed9` 重刷 NOTE4：同页打开、移动、关闭 Navigation drawer 的观感均为局部刷新，关闭后来源像素恢复；切换到不同页面仍为 Full。串口 `/tmp/inkwash-drawer-partial-0148ed9.log` 对应记录为 `Partial(Rect { x: 16, y: 34, width: 176, height: 266 })`，跨页记录为 Full，无 watchdog/panic/reboot。
 - ✅ NOTE4 Alarms 页面长列表复测通过（ELF `v0.5.0-173-gb58fb12`）：连续 DOWN 时列表窗口随选中项滚动，末尾 `+ ADD ALARM` 文字与选框完整可见；从末尾循环回首行后底部内容和选框均正确清除，无残影。ADD ALARM 完成 minute 确认后返回列表并选中新项；列表首尾循环及长列表局部刷新正常。
 - ✅ NOTE4 Todos 页面复测通过（ELF `v0.5.0-179-g8c1b695`）：短按 UP/DOWN 在列表首尾正确循环；短 ENTER 仅切换完成状态，重新进入页面后状态保持；长 ENTER 直接返回 Home；importance 保持为外部同步数据，不由设备按键修改。
+- ✅ NOTE4 Settings 基础页面复测通过（ELF `v0.5.0-179-g8c1b695`）：列表导航正常；Sync Interval 可修改、退出后重新进入仍保持；Sync Now 可完成且无卡死或异常返回 Home。BLE pairing 与 Sleep 保留在 §4、§6 专项验收。
 - ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
