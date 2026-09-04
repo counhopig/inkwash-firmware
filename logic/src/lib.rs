@@ -59,8 +59,9 @@ mod ble_memory_contract {
     }
 
     #[test]
-    fn ble_worker_uses_psram_and_checks_internal_heap_before_init() {
-        assert!(BLE_SOURCE.contains("MALLOC_CAP_SPIRAM | esp_idf_svc::sys::MALLOC_CAP_8BIT"));
+    fn ble_worker_uses_internal_stack_and_checks_internal_heap_before_init() {
+        assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT"));
+        assert!(!BLE_SOURCE.contains("MALLOC_CAP_SPIRAM"));
         assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA"));
         assert!(BLE_SOURCE.contains("heap_caps_get_free_size(BLE_INTERNAL_CAPS)"));
         assert!(BLE_SOURCE.contains("heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS)"));

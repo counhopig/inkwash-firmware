@@ -17,9 +17,11 @@ use crate::control;
 
 const CHANNEL_CAPACITY: usize = 16;
 /// BLE setup is driven from this worker, but the pthread stack itself lives
-/// in PSRAM so NimBLE can reserve internal RAM for its controller pools.
-/// 8 KiB leaves headroom over the configured 5120-byte NimBLE host stack
-/// without consuming the scarce internal heap.
+/// in internal RAM because the ESP32-S3 controller initialization runs with
+/// the cache disabled and cannot safely touch a PSRAM stack. 8 KiB leaves
+/// headroom over the configured 5120-byte NimBLE host stack; Wi-Fi is fully
+/// deinitialized before this worker starts BLE, so the internal heap remains
+/// sufficient for the controller.
 const BLE_TASK_STACK: usize = 8 * 1024;
 /// Match the ESP32-S3 controller's allocation capabilities. NimBLE host
 /// buffers are separate; controller startup uses internal DMA-capable RAM.
@@ -67,16 +69,17 @@ impl BleControl {
         let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (result_tx, result_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        // ESP-IDF pthread stacks default to internal RAM. Put this worker's
-        // stack in external PSRAM; its NimBLE handles remain worker-owned,
-        // while the internal heap is reserved for controller allocations.
+        // Keep this worker's stack in internal RAM: controller init runs with
+        // the cache disabled, where a PSRAM stack is not safe. Wi-Fi has
+        // already been deinitialized by the sync owner before this command
+        // can start NimBLE, preserving the controller's internal heap budget.
         let mut pthread_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
         pthread_cfg.stack_size = BLE_TASK_STACK;
         pthread_cfg.stack_alloc_caps =
-            esp_idf_svc::sys::MALLOC_CAP_SPIRAM | esp_idf_svc::sys::MALLOC_CAP_8BIT;
+            esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
         pthread_cfg.inherit_cfg = false;
         esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_pthread_set_cfg(&pthread_cfg) })
-            .map_err(|e| anyhow!("BLE worker PSRAM stack configuration failed: {e:?}"))?;
+            .map_err(|e| anyhow!("BLE worker internal stack configuration failed: {e:?}"))?;
         let worker = std::thread::Builder::new()
             .name("ble".to_string())
             .stack_size(BLE_TASK_STACK)
