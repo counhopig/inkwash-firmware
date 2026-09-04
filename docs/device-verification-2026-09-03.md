@@ -44,7 +44,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ✅ `0fc3ae6` 已随文档提交组成的 ELF `v0.5.0-158-g869dd85` 重刷 NOTE4：Calendar 选中 9/11 后打开 drawer，背景保持 Calendar；短按 ENTER 选择当前 CALENDAR 与长按 ENTER 取消两条路径均恢复 9/11。此前 RTC watchdog 修复也已在连续页面交互约 127 s 的串口记录中复测，无 `task_wdt`、panic 或 reboot（`/tmp/inkwash-rtc-wdt-retest-4729a7f.log`）。
 - ✅ Calendar drawer 与 RTC watchdog 项已通过；Inbox 页面验收正常（均为 ELF `v0.5.0-158-g869dd85` 的设备记录）。
 - ✅ `1fc308c` 已随文档提交组成的 ELF `v0.5.0-161-g0148ed9` 重刷 NOTE4：同页打开、移动、关闭 Navigation drawer 的观感均为局部刷新，关闭后来源像素恢复；切换到不同页面仍为 Full。串口 `/tmp/inkwash-drawer-partial-0148ed9.log` 对应记录为 `Partial(Rect { x: 16, y: 34, width: 176, height: 266 })`，跨页记录为 Full，无 watchdog/panic/reboot。
-- ❌ NOTE4 Alarms 页面复测（同一 ELF `v0.5.0-161-g0148ed9`）发现：ADD ALARM 完成 minute 确认后新 alarm 已加入列表但仍停留在 picker；添加多条 alarm 后连续 DOWN 停在 `+ ADD ALARM`，且长列表中 ADD 行不可见，并在底部只留下选框残影。`c8b60ff` 已修复完成后回列表选中新项、persist 失败回滚刷新、列表首尾循环、pending append 期间的编辑串行化、共享列表窗口滚动，以及覆盖完整列表区域的 Partial 刷新；新 ELF 尚未刷入复测。
+- ❌ NOTE4 Alarms 页面复测（ELF `v0.5.0-170-gecc95dd`）发现：ADD ALARM 完成 minute 确认后新 alarm 已加入列表但仍停留在 picker；添加多条 alarm 后连续 DOWN 停在 `+ ADD ALARM`，且长列表中 ADD 行不可见，并在底部只留下选框残影。`c8b60ff` 已修复完成后回列表选中新项、persist 失败回滚刷新、列表首尾循环、pending append 期间的编辑串行化、共享列表窗口滚动，以及覆盖完整列表区域的 Partial 刷新；新 ELF 尚未刷入复测。
 - ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
