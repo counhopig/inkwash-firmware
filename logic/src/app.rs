@@ -1808,6 +1808,14 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                     // Selecting a destination closes the drawer. Every
                     // destination is an SM screen now: HOME (0), CALENDAR
                     // (1), INBOX (2), ALARMS (3), TODOS (4), SETTINGS (5).
+                    // Selecting the row for the current origin is a
+                    // no-op navigation: restore the exact source state so
+                    // cursors (notably Calendar's selected day) survive.
+                    if cur == nav_home_index(origin) {
+                        state.screen = screen_before;
+                        state.render_generation = state.render_generation.next();
+                        return vec![render_batch(state)];
+                    }
                     return match cur {
                         0 => {
                             state.screen = Screen::Home;
@@ -5092,6 +5100,87 @@ mod tests {
             );
             assert_eq!(state.screen, source);
         }
+    }
+
+    #[test]
+    fn navigation_origin_short_enter_restores_exact_source_state() {
+        let sources = [
+            Screen::Home,
+            Screen::Settings { selected: 2 },
+            Screen::AlarmList { selected: 1 },
+            Screen::TodoList { selected: 0 },
+            Screen::Inbox { selected: 3 },
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 9,
+                selected_day: 11,
+            }),
+        ];
+
+        for source in sources {
+            let origin = match &source {
+                Screen::Home => NavOrigin::Home,
+                Screen::Settings { .. } => NavOrigin::Settings,
+                Screen::AlarmList { .. } => NavOrigin::AlarmList,
+                Screen::TodoList { .. } => NavOrigin::TodoList,
+                Screen::Inbox { .. } => NavOrigin::Inbox,
+                Screen::Calendar(_) => NavOrigin::Calendar,
+                _ => unreachable!(),
+            };
+            let mut state = AppState {
+                screen: source.clone(),
+                ..AppState::default()
+            };
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+            );
+            assert_eq!(
+                state.screen.render_view(),
+                RenderView::Navigation {
+                    selected: nav_home_index(origin),
+                    underlying: Box::new(source.render_view()),
+                }
+            );
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+            );
+            assert_eq!(state.screen, source);
+        }
+    }
+
+    #[test]
+    fn navigation_from_other_origin_starts_calendar_at_today() {
+        let mut state = AppState {
+            screen: Screen::Settings { selected: 0 },
+            ..AppState::default()
+        };
+        state.clock.now = Some(dt_full(12, 0, 5, 4));
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Calendar(CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 4,
+            })
+        );
     }
 
     #[test]
