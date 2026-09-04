@@ -21,6 +21,7 @@ pub mod alarm_flow;
 pub mod alarm_regs;
 pub mod alarm_schedule;
 pub mod app;
+pub mod audio_command;
 pub mod button_event;
 pub mod datetime;
 pub mod device_config;

@@ -17,7 +17,8 @@
 //! machine's StartTone effect fails cleanly (audio is a "degraded run, not a
 //! blocker" category), so an alarm still rings visually and dismisses.
 
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -42,25 +43,16 @@ const BEEP_PIP_SECS: f32 = 0.15;
 const BEEP_COUNT: u8 = 3;
 
 /// What the audio task should play.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioCommand {
-    /// Start a continuous alarm ring (repeating 880 Hz bursts) until
-    /// [`AudioCommand::Stop`]. Returns immediately to the caller.
-    StartAlarmTone,
-    /// Start the urgent-reminder siren (alternating 1397/1046 Hz notes)
-    /// until [`AudioCommand::Stop`]. Non-blocking.
-    StartSiren,
-    /// Play a short bounded beep sequence (the todo-reminder attention
-    /// tone: three 1046 Hz pips). Completes on its own; a later Stop cuts
-    /// it short. Non-blocking.
-    BeepTodo,
-    /// Stop whatever is playing (alarm ring or bounded pattern). Idempotent.
-    Stop,
-}
+pub use inkwash_logic::audio_command::AudioCommand;
+use inkwash_logic::audio_command::{AudioMode, AudioReducer};
 
 /// Handle kept by the main loop: the command sender.
 pub struct AudioTask {
-    tx: SyncSender<AudioCommand>,
+    /// A tiny mutex-protected mailbox keeps submissions non-blocking. The
+    /// old bounded `sync_channel::send` could stall the app loop when the
+    /// codec was busy; commands are never dropped, including Stop and alarm
+    /// starts.
+    mailbox: Arc<Mutex<VecDeque<AudioCommand>>>,
 }
 
 /// Result of a spawned audio task.
@@ -82,76 +74,53 @@ impl AudioTask {
         // executor StartTone did this set_mute(false)).
         codec.set_mute(false)?;
 
-        const CAP: usize = 4;
-        let (tx, rx) = sync_channel(CAP);
+        let mailbox = Arc::new(Mutex::new(VecDeque::new()));
+        let task_mailbox = mailbox.clone();
         thread::Builder::new()
             .stack_size(8 * 1024)
             .name("audio".into())
-            .spawn(move || run(codec, rx))?;
-        Ok(AudioSpawn::Running(AudioTask { tx }))
+            .spawn(move || run(codec, task_mailbox))?;
+        Ok(AudioSpawn::Running(AudioTask { mailbox }))
     }
 
     /// Ask the task to start the alarm ring. Non-blocking; the caller never
     /// waits for the sound. Errors only if the channel is gone.
     pub fn start_alarm_tone(&self) -> Result<()> {
-        self.tx
-            .send(AudioCommand::StartAlarmTone)
-            .map_err(|_| anyhow!("audio task stopped"))
+        self.enqueue(AudioCommand::StartAlarmTone)
     }
 
     /// Ask the task to play the urgent siren until stopped.
     pub fn start_siren(&self) -> Result<()> {
-        self.tx
-            .send(AudioCommand::StartSiren)
-            .map_err(|_| anyhow!("audio task stopped"))
+        self.enqueue(AudioCommand::StartSiren)
     }
 
     /// Ask the task to play the bounded todo beep.
     pub fn beep_todo(&self) -> Result<()> {
-        self.tx
-            .send(AudioCommand::BeepTodo)
-            .map_err(|_| anyhow!("audio task stopped"))
+        self.enqueue(AudioCommand::BeepTodo)
     }
 
     /// Ask the task to stop any tone. Non-blocking; idempotent.
     pub fn stop(&self) -> Result<()> {
-        self.tx
-            .send(AudioCommand::Stop)
-            .map_err(|_| anyhow!("audio task stopped"))
+        self.enqueue(AudioCommand::Stop)
+    }
+
+    fn enqueue(&self, command: AudioCommand) -> Result<()> {
+        self.mailbox
+            .lock()
+            .map_err(|_| anyhow!("audio mailbox poisoned"))?
+            .push_back(command);
+        Ok(())
     }
 }
 
-/// The active sound: a repeating pattern that runs until a `Stop` arrives,
-/// or a bounded one-shot that finishes on its own.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Playing {
-    AlarmRing,
-    Siren,
-    TodoBeep { pip: u8 },
-}
-
-fn run(mut codec: Es8311, rx: Receiver<AudioCommand>) {
+fn run(mut codec: Es8311, mailbox: Arc<Mutex<VecDeque<AudioCommand>>>) {
     log::info!("Audio task running");
-    let mut playing: Option<Playing> = None;
+    let mut reducer = AudioReducer::new();
     loop {
-        // Drain any pending command, then act on the newest state.
-        while let Ok(cmd) = rx.try_recv() {
-            match cmd {
-                AudioCommand::StartAlarmTone => playing = Some(Playing::AlarmRing),
-                AudioCommand::StartSiren => playing = Some(Playing::Siren),
-                AudioCommand::BeepTodo => playing = Some(Playing::TodoBeep { pip: 0 }),
-                AudioCommand::Stop => playing = None,
-            }
-        }
-        match playing {
-            None => match rx.recv() {
-                Ok(AudioCommand::StartAlarmTone) => playing = Some(Playing::AlarmRing),
-                Ok(AudioCommand::StartSiren) => playing = Some(Playing::Siren),
-                Ok(AudioCommand::BeepTodo) => playing = Some(Playing::TodoBeep { pip: 0 }),
-                Ok(AudioCommand::Stop) => {}
-                Err(_) => break,
-            },
-            Some(Playing::AlarmRing) => {
+        drain_commands(&mailbox, &mut reducer);
+        match reducer.mode() {
+            AudioMode::Idle => thread::sleep(Duration::from_millis(5)),
+            AudioMode::AlarmRing => {
                 watchdog::feed();
                 // One burst + a short gap, re-checking for Stop between
                 // steps so dismiss latency stays ~the gap, not the tone.
@@ -159,51 +128,62 @@ fn run(mut codec: Es8311, rx: Receiver<AudioCommand>) {
                 {
                     log::warn!("Alarm tone playback failed: {err}");
                 }
-                if wait_gap(&rx, Duration::from_millis(ALARM_BURST_GAP_MS)) {
-                    playing = None;
-                }
+                wait_gap(
+                    &mailbox,
+                    &mut reducer,
+                    Duration::from_millis(ALARM_BURST_GAP_MS),
+                );
             }
-            Some(Playing::Siren) => {
+            AudioMode::Siren => {
                 watchdog::feed();
                 for (freq, dur) in SIREN_NOTES {
                     if let Err(err) = codec.play_sine_stereo(freq, dur, SIREN_AMPLITUDE) {
                         log::warn!("Siren note failed: {err}");
                     }
                     // A quick check between notes so Stop latency is low.
-                    if rx.try_recv().is_ok() {
-                        playing = None;
+                    drain_commands(&mailbox, &mut reducer);
+                    if reducer.mode() != AudioMode::Siren {
                         break;
                     }
                 }
             }
-            Some(Playing::TodoBeep { pip }) => {
+            AudioMode::TodoBeep { pip } => {
                 if pip >= BEEP_COUNT {
-                    playing = None;
+                    reducer.apply(AudioCommand::Stop);
                     continue;
                 }
                 if let Err(err) = codec.play_sine_stereo(BEEP_HZ, BEEP_PIP_SECS, 8000) {
                     log::warn!("Todo beep failed: {err}");
                 }
-                if wait_gap(&rx, Duration::from_millis(150)) {
-                    playing = None;
-                } else if let Some(Playing::TodoBeep { pip }) = playing {
-                    playing = Some(Playing::TodoBeep { pip: pip + 1 });
+                wait_gap(&mailbox, &mut reducer, Duration::from_millis(150));
+                if matches!(reducer.mode(), AudioMode::TodoBeep { .. }) {
+                    reducer.advance_todo();
                 }
             }
         }
     }
-    log::info!("Audio task stopped");
 }
 
-/// Sleeps `duration`, waking early if a `Stop` (or any command) arrives.
-/// Returns true when a command arrived (caller should re-evaluate).
-fn wait_gap(rx: &Receiver<AudioCommand>, duration: Duration) -> bool {
+/// Drain commands during a tone gap. Every command is reduced explicitly;
+/// in particular a StartAlarmTone is never mistaken for Stop.
+fn wait_gap(
+    mailbox: &Arc<Mutex<VecDeque<AudioCommand>>>,
+    reducer: &mut AudioReducer,
+    duration: Duration,
+) {
     let until = EspSystemTime {}.now() + duration;
     while (EspSystemTime {}).now() < until {
-        if rx.try_recv().is_ok() {
-            return true;
-        }
+        drain_commands(mailbox, reducer);
         thread::sleep(Duration::from_millis(5));
     }
-    false
+}
+
+fn drain_commands(mailbox: &Arc<Mutex<VecDeque<AudioCommand>>>, reducer: &mut AudioReducer) {
+    let commands = match mailbox.lock() {
+        Ok(mut queue) => queue.drain(..).collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    for command in commands {
+        reducer.apply(command);
+    }
 }
