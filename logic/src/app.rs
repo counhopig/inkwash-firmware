@@ -67,9 +67,13 @@ pub enum Screen {
     Navigation {
         selected: usize,
         /// Which screen the drawer was opened from: cancelling the drawer
-        /// (long ENTER) restores it, and selecting a still-legacy
-        /// destination returns to it after the executor's page wedge.
+        /// (long ENTER) restores it, and the renderer draws it underneath
+        /// the drawer while it is open.
         origin: NavOrigin,
+        /// The complete state-machine screen shown underneath the drawer.
+        /// This preserves cursors and other visible state, such as the
+        /// selected day in Calendar.
+        screen_before: Box<Screen>,
     },
     Settings {
         selected: usize,
@@ -149,9 +153,7 @@ pub struct ReminderState {
     pub deadline_unix: u64,
 }
 
-/// The screen a navigation drawer was opened from. Every drawer origin is
-/// itself a state-machine screen (content pages are still legacy wedges and
-/// cannot host a drawer yet).
+/// The navigation destination row associated with a drawer origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavOrigin {
     Home,
@@ -187,8 +189,13 @@ impl Screen {
     /// timeout) and there is no legacy blocking ring screen anymore.
     pub fn render_view(&self) -> RenderView {
         match self {
-            Screen::Navigation { selected, .. } => RenderView::Navigation {
+            Screen::Navigation {
+                selected,
+                screen_before,
+                ..
+            } => RenderView::Navigation {
                 selected: *selected,
+                underlying: Box::new(screen_before.render_view()),
             },
             Screen::Settings { selected } => RenderView::Settings {
                 selected: *selected,
@@ -522,10 +529,13 @@ pub enum Effect {
 pub enum RenderView {
     /// The idle home canvas (clock + cards), with no overlay.
     Home,
-    /// Home canvas plus the GO TO drawer overlay (Stage 4, slice 1 - the
-    /// only SM-drawn overlay today). Carries the drawer's selected row so
-    /// the executor can draw the overlay from state.
-    Navigation { selected: usize },
+    /// The GO TO drawer overlay over the complete source screen. Carries the
+    /// drawer's selected row and the source view so the executor can redraw
+    /// the correct background before overlaying the bar.
+    Navigation {
+        selected: usize,
+        underlying: Box<RenderView>,
+    },
     /// The settings list (Stage 4): rows browsed in the state machine,
     /// row actions deferred to executor wedges. Carries the selected row.
     Settings { selected: usize },
@@ -1733,21 +1743,24 @@ fn nav_home_index(origin: NavOrigin) -> usize {
     }
 }
 
-/// The screen a closed drawer leaves behind when the selection does not
-/// open a sub-screen destination (cancel, HOME, or the origin's own row).
-/// With every origin a state-machine screen, closing the drawer returns to
-/// the plain root of the navigation tree: Home (Settings keeps its own
-/// back-to-Home path).
-fn nav_origin_screen(_origin: NavOrigin) -> Screen {
-    // Every origin is a state-machine screen; closing the drawer (cancel /
-    // HOME / the origin's own row) returns to the plain root Home. Settings,
-    // AlarmList, TodoList and Inbox keep their own back / drawer flows.
-    Screen::Home
+/// The screen a closed drawer leaves behind when the selection does not open
+/// a destination (cancel, HOME, or the origin's own row).
+fn nav_origin_screen(screen_before: &Screen) -> Screen {
+    screen_before.clone()
+}
+
+fn open_navigation(state: &mut AppState, origin: NavOrigin) -> Vec<EffectBatch> {
+    state.screen = Screen::Navigation {
+        selected: nav_home_index(origin),
+        origin,
+        screen_before: Box::new(state.screen.clone()),
+    };
+    state.render_generation = state.render_generation.next();
+    vec![render_batch(state)]
 }
 
 /// Navigation-drawer state machine (Stage 4): a long UP/DOWN opens the
-/// drawer from a state-machine screen (Home, or Settings once that screen
-/// exists); inside the drawer, UP/DOWN move the selection (wrapping), long
+/// drawer from a state-machine screen; inside the drawer, UP/DOWN move the selection (wrapping), long
 /// UP/DOWN jump to the first/last destination, long ENTER cancels back to
 /// the origin, and ENTER selects a destination. Every destination
 /// (HOME/CALENDAR/INBOX/ALARMS/TODOS/SETTINGS) is a state-machine screen
@@ -1755,9 +1768,14 @@ fn nav_origin_screen(_origin: NavOrigin) -> Screen {
 /// ENTER stays there.
 fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     match &state.screen {
-        Screen::Navigation { selected, origin } => {
+        Screen::Navigation {
+            selected,
+            origin,
+            screen_before,
+        } => {
             let cur = *selected;
             let origin = *origin;
+            let screen_before = screen_before.as_ref().clone();
             let next_screen = match button {
                 ButtonEvent::Pressed(ButtonId::Up) => Some(Screen::Navigation {
                     selected: if cur == 0 {
@@ -1766,27 +1784,33 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         cur - 1
                     },
                     origin,
+                    screen_before: Box::new(screen_before.clone()),
                 }),
                 ButtonEvent::Pressed(ButtonId::Down) => Some(Screen::Navigation {
                     selected: (cur + 1) % NAV_DESTINATION_COUNT,
                     origin,
+                    screen_before: Box::new(screen_before.clone()),
                 }),
                 ButtonEvent::LongPressed(ButtonId::Up) => Some(Screen::Navigation {
                     selected: 0,
                     origin,
+                    screen_before: Box::new(screen_before.clone()),
                 }),
                 ButtonEvent::LongPressed(ButtonId::Down) => Some(Screen::Navigation {
                     selected: NAV_DESTINATION_COUNT - 1,
                     origin,
+                    screen_before: Box::new(screen_before.clone()),
                 }),
-                ButtonEvent::LongPressed(ButtonId::Enter) => Some(nav_origin_screen(origin)),
+                ButtonEvent::LongPressed(ButtonId::Enter) => {
+                    Some(nav_origin_screen(&screen_before))
+                }
                 ButtonEvent::Pressed(ButtonId::Enter) => {
                     // Selecting a destination closes the drawer. Every
                     // destination is an SM screen now: HOME (0), CALENDAR
                     // (1), INBOX (2), ALARMS (3), TODOS (4), SETTINGS (5).
                     return match cur {
                         0 => {
-                            state.screen = nav_origin_screen(origin);
+                            state.screen = Screen::Home;
                             state.render_generation = state.render_generation.next();
                             vec![render_batch(state)]
                         }
@@ -1850,23 +1874,13 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
             // wedge until that action's screen migrates); long ENTER backs
             // out to Home; long UP/DOWN opens the GO TO drawer.
             //
-            // The drawer's overlay canvas is always Home (the executor's
-            // Navigation view draws Home + the bar), and the legacy
-            // Settings flow closed Settings when the drawer opened (the
-            // long-UP/DOWN nav request returned out of open_menu). So
-            // opening the drawer from Settings leaves Settings behind a
-            // Home-origin drawer: cancel/select-HOME lands on Home, and
-            // selecting SETTINGS re-enters Settings.
+            // Preserve the settings screen underneath the drawer so cancel
+            // and the origin row restore the exact cursor position.
             let cur = *selected;
             match button {
                 ButtonEvent::LongPressed(ButtonId::Up)
                 | ButtonEvent::LongPressed(ButtonId::Down) => {
-                    state.screen = Screen::Navigation {
-                        selected: nav_home_index(NavOrigin::Home),
-                        origin: NavOrigin::Home,
-                    };
-                    state.render_generation = state.render_generation.next();
-                    vec![render_batch(state)]
+                    open_navigation(state, NavOrigin::Settings)
                 }
                 ButtonEvent::Pressed(ButtonId::Up) => {
                     state.screen = Screen::Settings {
@@ -1993,12 +2007,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 button,
                 ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down)
             ) {
-                state.screen = Screen::Navigation {
-                    selected: nav_home_index(NavOrigin::Home),
-                    origin: NavOrigin::Home,
-                };
-                state.render_generation = state.render_generation.next();
-                vec![render_batch(state)]
+                open_navigation(state, NavOrigin::Home)
             } else {
                 vec![]
             }
@@ -2097,12 +2106,7 @@ fn transition_alarm_list_button(
     match button {
         ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
             // Open the GO TO drawer over the alarm list (origin AlarmList).
-            state.screen = Screen::Navigation {
-                selected: nav_home_index(NavOrigin::AlarmList),
-                origin: NavOrigin::AlarmList,
-            };
-            state.render_generation = state.render_generation.next();
-            vec![render_batch(state)]
+            open_navigation(state, NavOrigin::AlarmList)
         }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
             // Back out of the alarm list to root Home.
@@ -2294,12 +2298,7 @@ fn transition_todo_list_button(
     match button {
         ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
             // Open the GO TO drawer over the todo list (origin TodoList).
-            state.screen = Screen::Navigation {
-                selected: nav_home_index(NavOrigin::TodoList),
-                origin: NavOrigin::TodoList,
-            };
-            state.render_generation = state.render_generation.next();
-            vec![render_batch(state)]
+            open_navigation(state, NavOrigin::TodoList)
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
             state.screen = Screen::TodoList {
@@ -2385,12 +2384,7 @@ fn transition_inbox_list_button(
     match button {
         ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
             // Open the GO TO drawer over the inbox list (origin Inbox).
-            state.screen = Screen::Navigation {
-                selected: nav_home_index(NavOrigin::Inbox),
-                origin: NavOrigin::Inbox,
-            };
-            state.render_generation = state.render_generation.next();
-            vec![render_batch(state)]
+            open_navigation(state, NavOrigin::Inbox)
         }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
             // Back out of the inbox list to root Home.
@@ -2488,12 +2482,7 @@ fn transition_calendar_button(state: &mut AppState, button: ButtonEvent) -> Vec<
     match button {
         ButtonEvent::LongPressed(ButtonId::Up) | ButtonEvent::LongPressed(ButtonId::Down) => {
             // Open the GO TO drawer over the calendar (origin Calendar).
-            state.screen = Screen::Navigation {
-                selected: nav_home_index(NavOrigin::Calendar),
-                origin: NavOrigin::Calendar,
-            };
-            state.render_generation = state.render_generation.next();
-            vec![render_batch(state)]
+            open_navigation(state, NavOrigin::Calendar)
         }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
             // Back out of the calendar to root Home.
@@ -5005,13 +4994,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 0,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         // A full render is requested for the drawer overlay.
         assert!(batches
             .iter()
@@ -5021,10 +5011,87 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                view: RenderView::Navigation { selected: 0 },
+                view: RenderView::Navigation { selected: 0, .. },
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn navigation_preserves_every_source_screen_and_calendar_cursor() {
+        let sources = [
+            (Screen::Home, NavOrigin::Home),
+            (Screen::Settings { selected: 2 }, NavOrigin::Settings),
+            (Screen::AlarmList { selected: 1 }, NavOrigin::AlarmList),
+            (Screen::TodoList { selected: 0 }, NavOrigin::TodoList),
+            (Screen::Inbox { selected: 3 }, NavOrigin::Inbox),
+            (
+                Screen::Calendar(CalendarState {
+                    year: 2026,
+                    month: 9,
+                    selected_day: 27,
+                }),
+                NavOrigin::Calendar,
+            ),
+        ];
+
+        for (source, origin) in sources {
+            let mut state = AppState {
+                screen: source.clone(),
+                ..AppState::default()
+            };
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+            );
+            let selected = nav_home_index(origin);
+            assert!(matches!(
+                &state.screen,
+                Screen::Navigation {
+                    selected: actual,
+                    origin: actual_origin,
+                    screen_before,
+                } if *actual == selected && *actual_origin == origin && screen_before.as_ref() == &source
+            ));
+            assert_eq!(
+                state.screen.render_view(),
+                RenderView::Navigation {
+                    selected,
+                    underlying: Box::new(source.render_view()),
+                }
+            );
+            let opened_vm = crate::render_plan::ViewModel::from_state(&state);
+
+            // Moving the drawer selection changes only the nav-bar field;
+            // the source view remains the same for a NAV_BAR partial.
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+            );
+            assert_eq!(
+                state.screen.render_view(),
+                RenderView::Navigation {
+                    selected: (selected + 1) % NAV_DESTINATION_COUNT,
+                    underlying: Box::new(source.render_view()),
+                }
+            );
+            let moved_vm = crate::render_plan::ViewModel::from_state(&state);
+            assert_eq!(
+                crate::render_plan::plan_render(Some(&opened_vm), &moved_vm, 0),
+                crate::render_plan::RenderPlan::Partial {
+                    frame: crate::render_plan::Frame(moved_vm.generation.0 as u32),
+                    region: crate::render_plan::PartialRegion::NavBar,
+                }
+            );
+
+            // Cancellation restores the exact source, including Calendar's
+            // selected day rather than reconstructing it from NavOrigin.
+            let _ = update(
+                &mut state,
+                Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+            );
+            assert_eq!(state.screen, source);
+        }
     }
 
     #[test]
@@ -5039,60 +5106,65 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 1,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         // Up from 1 -> 0.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 0,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         // Up wraps from 0 -> last (5).
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
-                selected: NAV_DESTINATION_COUNT - 1,
-                origin: NavOrigin::Home
+                selected: 5,
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         // Long DOWN jumps to last; long UP jumps to first.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 0,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
-                selected: NAV_DESTINATION_COUNT - 1,
-                origin: NavOrigin::Home
+                selected: 5,
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
     }
 
     #[test]
@@ -5199,7 +5271,7 @@ mod tests {
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
             Effect::Render(RenderRequest {
-                view: RenderView::Navigation { selected: 0 },
+                view: RenderView::Navigation { selected: 0, .. },
                 ..
             })
         )));
@@ -5282,13 +5354,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
-                selected: NAV_DESTINATION_COUNT - 1,
-                origin: NavOrigin::Home
+                selected: 5,
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         let batches = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
@@ -6046,7 +6119,7 @@ mod tests {
     }
 
     #[test]
-    fn drawer_over_settings_opens_home_origin_and_reenters_settings() {
+    fn drawer_over_settings_restores_settings_origin() {
         let mut state = AppState::default();
         // Home -> drawer -> SETTINGS.
         let _ = update(
@@ -6062,41 +6135,28 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
-        // Long UP/DOWN inside Settings opens the GO TO drawer. The drawer
-        // overlay canvas is always Home, and the legacy flow closed
-        // Settings when its drawer opened: the drawer is Home-origin.
+        // Long UP/DOWN inside Settings opens the GO TO drawer over Settings.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
-                selected: 0,
-                origin: NavOrigin::Home
+                selected: 5,
+                origin: NavOrigin::Settings,
+                ..
             }
-        );
-        // A no-move ENTER selects HOME: back to Home.
+        ));
+        // A no-move ENTER selects SETTINGS and restores the source screen.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(state.screen, Screen::Settings { selected: 0 });
 
-        // Re-enter Settings, then long-UP/DOWN -> drawer -> select
-        // SETTINGS -> Settings again.
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
-        );
+        // Re-open and select SETTINGS explicitly; it also restores the
+        // source rather than reconstructing a fresh page.
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
         let _ = update(
             &mut state,
@@ -6131,24 +6191,26 @@ mod tests {
             Event::Boot(boot_snapshot(alarms, Some(dt(9, 0)), false, true)),
         );
         let _ = update(state, Event::Button(ButtonEvent::LongPressed(ButtonId::Up)));
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 0,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         // Down three times: 0 -> 1 -> 2 -> 3 (ALARMS).
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 3,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
         assert_eq!(state.screen, Screen::AlarmList { selected: 0 });
     }
@@ -6566,13 +6628,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 3,
-                origin: NavOrigin::AlarmList
+                origin: NavOrigin::AlarmList,
+                ..
             }
-        );
+        ));
         // No-move ENTER (dest 3 = ALARMS) closes back to the alarm list.
         let _ = update(
             &mut state,
@@ -6625,13 +6688,14 @@ mod tests {
         for _ in 0..4 {
             let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
         }
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 4,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
         assert_eq!(state.screen, Screen::TodoList { selected: 0 });
     }
@@ -6851,13 +6915,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 4,
-                origin: NavOrigin::TodoList
+                origin: NavOrigin::TodoList,
+                ..
             }
-        );
+        ));
         // Select HOME (move Up 4 times: 4 -> 3 -> 2 -> 1 -> 0, or long UP
         // jumps to 0).
         let _ = update(
@@ -6929,13 +6994,14 @@ mod tests {
         // Down twice: 0 -> 1 -> 2 (INBOX).
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Down)));
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 2,
-                origin: NavOrigin::Home
+                origin: NavOrigin::Home,
+                ..
             }
-        );
+        ));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
         assert_eq!(state.screen, Screen::Inbox { selected: 0 });
     }
@@ -7155,13 +7221,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 2,
-                origin: NavOrigin::Inbox
+                origin: NavOrigin::Inbox,
+                ..
             }
-        );
+        ));
         // Select HOME (long UP jumps to 0), then ENTER.
         let _ = update(
             &mut state,
@@ -7348,13 +7415,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::Navigation {
                 selected: 1,
-                origin: NavOrigin::Calendar
+                origin: NavOrigin::Calendar,
+                ..
             }
-        );
+        ));
         // Select HOME (long UP jumps to 0) -> Home.
         let _ = update(
             &mut state,
@@ -7454,27 +7522,30 @@ mod tests {
     }
 
     #[test]
-    fn still_legacy_screens_project_to_home_surface_until_migrated() {
-        // Stage-4 transitional projection: every screen still drawn through
-        // a legacy blocking page maps to the Home surface so the executor
-        // keeps rendering Home behind/around the legacy page. AlarmRinging
-        // is covered by the legacy ring screen, which draws over whatever
-        // the SM render produced.
+    fn screens_project_to_their_render_surfaces() {
         let cases: Vec<(Screen, RenderView)> = vec![
             (Screen::Home, RenderView::Home),
             (
                 Screen::Navigation {
                     selected: 0,
                     origin: NavOrigin::Home,
+                    screen_before: Box::new(Screen::Home),
                 },
-                RenderView::Navigation { selected: 0 },
+                RenderView::Navigation {
+                    selected: 0,
+                    underlying: Box::new(RenderView::Home),
+                },
             ),
             (
                 Screen::Navigation {
                     selected: 3,
                     origin: NavOrigin::Home,
+                    screen_before: Box::new(Screen::Home),
                 },
-                RenderView::Navigation { selected: 3 },
+                RenderView::Navigation {
+                    selected: 3,
+                    underlying: Box::new(RenderView::Home),
+                },
             ),
             (
                 Screen::Settings { selected: 0 },
@@ -8942,8 +9013,12 @@ mod tests {
                 Screen::Navigation {
                     selected: 3,
                     origin: NavOrigin::Home,
+                    screen_before: Box::new(Screen::Home),
                 },
-                RenderView::Navigation { selected: 3 },
+                RenderView::Navigation {
+                    selected: 3,
+                    underlying: Box::new(RenderView::Home),
+                },
             ),
         ];
         for (screen, expected_view) in refresh_screens {

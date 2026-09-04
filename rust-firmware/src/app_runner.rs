@@ -473,9 +473,8 @@ fn partial_region_rect(region: inkwash_logic::render_plan::PartialRegion) -> cra
 }
 
 /// Renders the visible surface named by `view` into the shared canvas.
-/// Home is always drawn first (the drawer opens over it from Home); the
-/// Navigation view then overlays the GO TO bar, and the Settings / AlarmList
-/// / TodoList / Inbox / Calendar views draw their own content instead.
+/// Navigation first redraws its saved source surface, then overlays the GO TO
+/// bar. This keeps the drawer attached to the page that opened it.
 /// Shared with main's legacy dirty-path redraws so the canvas always matches
 /// the SM's current screen (a dirty full redraw while the drawer is open
 /// must keep the overlay).
@@ -486,8 +485,11 @@ pub(crate) fn draw_sm_surface(
 ) {
     match view {
         RenderView::Home => draw_home_surface(ctx, clock),
-        RenderView::Navigation { selected } => {
-            draw_home_surface(ctx, clock);
+        RenderView::Navigation {
+            selected,
+            underlying,
+        } => {
+            draw_sm_surface(ctx, clock, *underlying);
             let mut canvas = ctx.board.display.canvas_mut();
             crate::screens::draw_navigation_bar(&mut canvas, selected);
         }
@@ -535,8 +537,7 @@ pub(crate) fn draw_sm_surface(
     }
 }
 
-/// Draws the idle Home canvas (clock + cards). Shared by Home and
-/// Navigation views (the drawer overlays the Home canvas).
+/// Draws the idle Home canvas (clock + cards).
 fn draw_home_surface(ctx: &mut DeviceContext<'_>, clock: Option<DateTime>) {
     let next_alarm = clock
         .as_ref()

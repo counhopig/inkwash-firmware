@@ -129,7 +129,13 @@ impl ViewModel {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
-        match &state.screen {
+        // Navigation keeps the complete source screen in `screen_before` so
+        // its visible data remains part of the drawer's render projection.
+        let data_screen = match &state.screen {
+            crate::app::Screen::Navigation { screen_before, .. } => screen_before.as_ref(),
+            screen => screen,
+        };
+        match data_screen {
             crate::app::Screen::AlarmList { .. } => {
                 for a in &state.alarms.alarms {
                     (a.id, a.hour, a.minute, a.enabled).hash(&mut hasher);
@@ -531,14 +537,20 @@ mod tests {
     fn drawer_cursor_move_is_navbar_partial() {
         let prev = ViewModel {
             generation: crate::app::RenderGeneration(1),
-            view: RenderView::Navigation { selected: 0 },
+            view: RenderView::Navigation {
+                selected: 0,
+                underlying: Box::new(RenderView::Home),
+            },
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
         };
         let mut cur = prev.clone();
         cur.generation = crate::app::RenderGeneration(2);
-        cur.view = RenderView::Navigation { selected: 3 };
+        cur.view = RenderView::Navigation {
+            selected: 3,
+            underlying: Box::new(RenderView::Home),
+        };
         assert_eq!(
             plan_render(Some(&prev), &cur, 0),
             RenderPlan::Partial {
