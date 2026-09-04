@@ -253,6 +253,14 @@ fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
                 let _ = reply.send(result);
             }
         }
+
+        // Feed after each command as well as in the idle timeout branch. The
+        // main loop continuously polls alarm state while pages are active, so
+        // a busy command stream can otherwise prevent recv_timeout from ever
+        // reaching its watchdog-feed timeout path.
+        if inkwash_logic::worker_heartbeat::should_feed_after_command(watchdog_subscribed) {
+            crate::watchdog::feed();
+        }
     }
 }
 

@@ -39,3 +39,4 @@ pub mod scheduler;
 pub mod sync_validate;
 pub mod todo;
 pub mod wake_cause;
+pub mod worker_heartbeat;
