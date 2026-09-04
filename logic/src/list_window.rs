@@ -2,6 +2,14 @@
 
 /// Number of rows that fit in the list area of the NOTE4 display.
 pub const MAX_LISTED_ITEMS: usize = 7;
+/// List geometry shared by the canvas renderer and the EPD partial-refresh
+/// mapping. The region reaches the 300px panel boundary so the last row's
+/// text and selection frame are refreshed together.
+pub const LIST_REGION_Y: usize = 34;
+pub const LIST_REGION_HEIGHT: usize = 266;
+pub const LIST_FIRST_ROW_Y: usize = 39;
+pub const LIST_ROW_HEIGHT: usize = 37;
+pub const LIST_DISPLAY_HEIGHT: usize = 300;
 
 /// The slice of a list that the renderer should draw, with `selected` always
 /// inside the slice when the list is non-empty.
@@ -61,7 +69,10 @@ pub fn list_window(item_count: usize, selected: usize) -> ListWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{list_window, ListWindow, MAX_LISTED_ITEMS};
+    use super::{
+        list_window, ListWindow, LIST_DISPLAY_HEIGHT, LIST_FIRST_ROW_Y, LIST_REGION_HEIGHT,
+        LIST_REGION_Y, LIST_ROW_HEIGHT, MAX_LISTED_ITEMS,
+    };
 
     fn assert_window(
         item_count: usize,
@@ -107,5 +118,12 @@ mod tests {
     #[test]
     fn invalid_cursor_clamps_to_last_drawable_row() {
         assert_window(20, usize::MAX, 13, 20, 19);
+    }
+
+    #[test]
+    fn list_refresh_region_contains_the_last_visible_row() {
+        assert_eq!(LIST_REGION_Y + LIST_REGION_HEIGHT, LIST_DISPLAY_HEIGHT);
+        let last_row_end = LIST_FIRST_ROW_Y + MAX_LISTED_ITEMS * LIST_ROW_HEIGHT;
+        assert!(last_row_end <= LIST_REGION_Y + LIST_REGION_HEIGHT);
     }
 }

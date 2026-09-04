@@ -576,6 +576,27 @@ mod tests {
     }
 
     #[test]
+    fn list_window_scroll_to_last_row_stays_on_list_partial() {
+        let prev = ViewModel {
+            generation: crate::app::RenderGeneration(1),
+            view: RenderView::AlarmList { selected: 6 },
+            clock_minute: Some(8 * 60),
+            overlay: Overlay::None,
+            data_fingerprint: 7,
+        };
+        let mut cur = prev.clone();
+        cur.generation = crate::app::RenderGeneration(2);
+        cur.view = RenderView::AlarmList { selected: 7 };
+        assert_eq!(
+            plan_render(Some(&prev), &cur, 0),
+            RenderPlan::Partial {
+                frame: Frame(2),
+                region: PartialRegion::List
+            }
+        );
+    }
+
+    #[test]
     fn same_page_data_change_repaints_list_region() {
         let prev = ViewModel {
             generation: crate::app::RenderGeneration(1),

@@ -453,9 +453,9 @@ fn partial_region_rect(region: inkwash_logic::render_plan::PartialRegion) -> cra
         inkwash_logic::render_plan::PartialRegion::NavBar => crate::screens::NAV_BAR_RECT,
         inkwash_logic::render_plan::PartialRegion::List => crate::canvas::Rect {
             x: 8,
-            y: 34,
+            y: inkwash_logic::list_window::LIST_REGION_Y as u16,
             width: 384,
-            height: 226,
+            height: inkwash_logic::list_window::LIST_REGION_HEIGHT as u16,
         },
         inkwash_logic::render_plan::PartialRegion::CalendarGrid => crate::canvas::Rect {
             x: 0,

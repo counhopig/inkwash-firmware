@@ -19,7 +19,8 @@ pub fn header(canvas: &mut Canvas, title: &str) {
 /// code. The device UI intentionally has no persistent button-hint footer.
 pub fn footer(_canvas: &mut Canvas, _hint: &str) {}
 
-const LIST_ROW_HEIGHT: usize = 37;
+const LIST_FIRST_ROW_Y: usize = inkwash_logic::list_window::LIST_FIRST_ROW_Y;
+const LIST_ROW_HEIGHT: usize = inkwash_logic::list_window::LIST_ROW_HEIGHT;
 /// Fixed left edge for row text, selected or not - previously the selected
 /// row's ">" chevron pushed its text 26px right of every other row's, so
 /// the reading edge jumped as the selection moved. The stroke/accent-bar
@@ -36,7 +37,7 @@ pub fn draw_rows(canvas: &mut Canvas, title: &str, items: &[String], selected: u
     canvas.clear();
     header(canvas, title);
     let window = inkwash_logic::list_window::list_window(items.len(), selected);
-    let mut y = 39usize;
+    let mut y = LIST_FIRST_ROW_Y;
     for (index, item) in items
         .iter()
         .enumerate()
