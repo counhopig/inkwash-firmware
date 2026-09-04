@@ -133,11 +133,6 @@ pub struct DeviceContext<'a> {
     pub alarm_poll: inkwash_logic::alarm_flow::AlarmPoll,
 }
 
-/// Background-poll outcome vocabulary lives in `inkwash-logic` (pure,
-/// host-testable); re-exported here so every firmware call site keeps
-/// using `crate::ctx::BackgroundOutcome`.
-pub use inkwash_logic::background_outcome::BackgroundOutcome;
-
 /// Dispatches one migrated command into the shared state-machine runner.
 /// Mirrors `control::dispatch`'s dedup contract: a client resend with the
 /// same id + command replays the cached reply instead of re-executing.
@@ -361,18 +356,14 @@ impl DeviceContext<'_> {
     /// function only schedules network + reminder work, mirroring what
     /// it did before AppRunner existed; the legacy alarm branch is
     /// gone so the two paths cannot race for the same AF.
-    pub fn poll_runtime(&mut self, now: &DateTime) -> BackgroundOutcome {
+    pub fn poll_runtime(&mut self, now: &DateTime) {
         // Stage 5/6: reminders are now a state-machine overlay - the fact
         // layer dispatches ReminderDue (Screen::Reminder + its render), so
-        // nothing visible happens here and no reminder outcome merges into
-        // the sync outcome. The reminder's enter/exit Full renders come from
-        // the SM's own render effects.
+        // nothing visible happens here. This only advances the sync
+        // scheduler (boundary dispatch) and raises reminder facts; the
+        // SM's own render effects are the only refreshes.
         self.poll_reminders(now);
-        if self.poll_scheduled_sync(now) {
-            BackgroundOutcome::VisibleChanged
-        } else {
-            BackgroundOutcome::NoChange
-        }
+        self.poll_scheduled_sync(now);
     }
 
     fn poll_reminders(&mut self, now: &DateTime) {

@@ -8614,9 +8614,9 @@ mod tests {
     /// state machine - boot into Firing, dismiss to WaitingForRearm, let
     /// ACK + persistence complete, then a cross-minute Tick re-arms the
     /// next alarm. Asserts ACK / persist / rearm each happen exactly once
-    /// and no stage is skipped or doubled. This is the logic that the
-    /// firmware AppRunner + ring_screen handoff relies on; it is testable
-    /// on the host because `update` is pure.
+    /// and no stage is skipped or doubled. This is the logic the firmware
+    /// AppRunner drives (the ring is a non-blocking SM state now); it is
+    /// testable on the host because `update` is pure.
     #[test]
     fn alarm_lifecycle_ring_dismiss_rearm_each_once() {
         let mut state = AppState::default();

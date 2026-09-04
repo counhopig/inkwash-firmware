@@ -549,8 +549,7 @@ fn main() -> Result<()> {
                         // the executor, whose plan diff refreshes the Home
                         // clock partial when the minute changed (and
                         // correctly skips read-only sub-screens that show no
-                        // clock). A separate dirty.push(CLOCK_RECT) here
-                        // would double-refresh the clock every minute.
+
                         if let Err(err) = dispatch_app_runner(
                             &app_runner,
                             inkwash_logic::app::Event::Tick(dt),

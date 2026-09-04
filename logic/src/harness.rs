@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 
 use crate::alarm_flow::{AlarmHost, AlarmPoll};
 use crate::app::{AppState, Effect, EffectError, EffectOutput, Event, RenderView, Screen};
-use crate::background_outcome::BackgroundOutcome;
 use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
 use crate::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 use crate::runtime::Runtime;
@@ -462,12 +461,6 @@ impl Harness {
     pub fn ringing(&self) -> bool {
         matches!(self.screen(), Screen::AlarmRinging)
     }
-
-    /// A background-poll merge helper exposed for completeness: the
-    /// harness can assert the stable priority rule.
-    pub fn merge(a: BackgroundOutcome, b: BackgroundOutcome) -> BackgroundOutcome {
-        a.merge(b)
-    }
 }
 
 /// Test helpers for building snapshots on the host.
@@ -620,19 +613,6 @@ mod tests {
         assert!(h.ringing(), "runtime AF must ring");
     }
 
-    #[test]
-    fn background_outcome_merge_priorities_alarm_first() {
-        // The blocking-page/reminder route reduces to BackgroundOutcome;
-        // alarm must win over every other source.
-        use crate::background_outcome::BackgroundOutcome as B;
-        assert_eq!(B::AlarmHandled.merge(B::NoChange), B::AlarmHandled);
-        assert_eq!(B::NoChange.merge(B::AlarmHandled), B::AlarmHandled);
-        assert_eq!(B::AlarmHandled.merge(B::VisibleChanged), B::AlarmHandled);
-        assert_eq!(B::VisibleChanged.merge(B::AlarmHandled), B::AlarmHandled);
-        assert_eq!(B::VisibleChanged.merge(B::NoChange), B::VisibleChanged);
-        assert_eq!(B::NoChange.merge(B::NoChange), B::NoChange);
-    }
-
     // ---- verification point 3: two consecutive alarms --------------------
 
     #[test]
@@ -757,22 +737,6 @@ mod tests {
         h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
             .unwrap();
         assert_eq!(h.screen(), &Screen::Home);
-    }
-
-    // ---- verification point 6: reminder exit -> page redraw -------------
-
-    #[test]
-    fn reminder_dismiss_survives_merge_as_visible() {
-        use crate::background_outcome::BackgroundOutcome as B;
-        // A reminder was shown and dismissed (VisibleChanged); no sync ran
-        // (NoChange). The merged page outcome must stay VisibleChanged so
-        // the page redraws.
-        assert_eq!(B::NoChange.merge(B::VisibleChanged), B::VisibleChanged);
-        // urgent+todo both dismiss -> VisibleChanged.
-        assert_eq!(
-            B::VisibleChanged.merge(B::VisibleChanged),
-            B::VisibleChanged
-        );
     }
 
     // ---- verification point 7: render kick <-> EPD completion loop ------
@@ -931,67 +895,6 @@ mod tests {
         let _ = h.poll_alarm(&mut host);
         assert_eq!(host.dispatches, 2, "new AF edge re-dispatches");
         assert!(!h.ringing(), "no due alarm at 9:01, residue only");
-    }
-
-    // ---- shared reminder orchestration (firmware's reminders::poll) -----
-
-    use crate::reminder_flow::{run_reminders, ReminderHost};
-
-    struct ScriptReminder {
-        urgent: BackgroundOutcome,
-        todo: BackgroundOutcome,
-        urgent_calls: usize,
-        todo_calls: usize,
-    }
-    impl ReminderHost for ScriptReminder {
-        fn urgent(&mut self) -> BackgroundOutcome {
-            self.urgent_calls += 1;
-            self.urgent
-        }
-        fn todo(&mut self) -> BackgroundOutcome {
-            self.todo_calls += 1;
-            self.todo
-        }
-    }
-
-    #[test]
-    fn reminder_chain_urgent_alarm_short_circuits_todo() {
-        let mut s = ScriptReminder {
-            urgent: BackgroundOutcome::AlarmHandled,
-            todo: BackgroundOutcome::VisibleChanged,
-            urgent_calls: 0,
-            todo_calls: 0,
-        };
-        assert_eq!(run_reminders(&mut s), BackgroundOutcome::AlarmHandled);
-        assert_eq!(s.todo_calls, 0, "todo must not run after alarm");
-    }
-
-    #[test]
-    fn reminder_chain_dismiss_variants() {
-        // urgent-only dismiss -> VisibleChanged (page redraws).
-        let mut s = ScriptReminder {
-            urgent: BackgroundOutcome::VisibleChanged,
-            todo: BackgroundOutcome::NoChange,
-            urgent_calls: 0,
-            todo_calls: 0,
-        };
-        assert_eq!(run_reminders(&mut s), BackgroundOutcome::VisibleChanged);
-        // todo-only dismiss -> VisibleChanged.
-        let mut s = ScriptReminder {
-            urgent: BackgroundOutcome::NoChange,
-            todo: BackgroundOutcome::VisibleChanged,
-            urgent_calls: 0,
-            todo_calls: 0,
-        };
-        assert_eq!(run_reminders(&mut s), BackgroundOutcome::VisibleChanged);
-        // urgent+todo dismiss -> VisibleChanged.
-        let mut s = ScriptReminder {
-            urgent: BackgroundOutcome::VisibleChanged,
-            todo: BackgroundOutcome::VisibleChanged,
-            urgent_calls: 0,
-            todo_calls: 0,
-        };
-        assert_eq!(run_reminders(&mut s), BackgroundOutcome::VisibleChanged);
     }
 
     // ---- shared EPD registry (superseded terminal rule) ------------------
@@ -1208,21 +1111,6 @@ mod tests {
         assert_eq!(h.screen(), &Screen::Home);
         // Navigation/Settings entry check (alarm_exit_pending) is false.
         assert!(!h.alarm_exit(), "Navigation entry sees no pending alarm");
-        // A reminder in that page, dismissed, propagates VisibleChanged.
-        use crate::reminder_flow::{run_reminders, ReminderHost};
-        struct NoAlarm;
-        impl ReminderHost for NoAlarm {
-            fn urgent(&mut self) -> BackgroundOutcome {
-                BackgroundOutcome::NoChange
-            }
-            fn todo(&mut self) -> BackgroundOutcome {
-                BackgroundOutcome::VisibleChanged
-            }
-        }
-        assert_eq!(
-            run_reminders(&mut NoAlarm),
-            BackgroundOutcome::VisibleChanged
-        );
     }
 
     #[test]
