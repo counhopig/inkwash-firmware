@@ -175,26 +175,39 @@ impl EffectExecutor for EffectRunner<'_, '_> {
             },
             Effect::StartTone => {
                 // The state machine emits StartTone when entering Firing.
-                // The ES8311 codec starts muted; without `set_mute(false)`
-                // here, every subsequent `play_sine_stereo` call from
-                // `alarms::ring_screen` writes to I2S but produces no
-                // sound. ring_screen does the actual tone bursts; this
-                // effect only owns the codec unmute so the first alarm
-                // *and* every alarm after a StopTone are audible.
-                if let Some(audio) = self.ctx.board.audio.as_mut() {
-                    if let Err(err) = audio.set_mute(false) {
+                // The audio task (the sole owner of the ES8311 codec) starts
+                // the repeating alarm ring; this effect only dispatches the
+                // command and acknowledges - the main loop never blocks on a
+                // tone. Audio unavailability degrades cleanly (the effect
+                // still completes; the ring stays visual + dismissable).
+                match self.ctx.audio_task {
+                    Some(task) => {
+                        if let Err(err) = task.start_alarm_tone() {
+                            Err((EffectCategory::Tone, format!("{err:#}")))
+                        } else {
+                            Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
+                        }
+                    }
+                    None => {
+                        // No codec at boot: report the failure so the SM can
+                        // record the degraded audio state, but the ring
+                        // lifecycle (visual + dismiss) must keep working.
+                        Err((
+                            EffectCategory::Tone,
+                            "audio codec unavailable at boot".into(),
+                        ))
+                    }
+                }
+            }
+            Effect::StopTone => {
+                // Ask the audio task to stop the ring. The effect completes
+                // immediately (the sound fades within a burst gap); the SM
+                // transitions to WaitingForRearm without waiting for audio.
+                if let Some(task) = self.ctx.audio_task {
+                    if let Err(err) = task.stop() {
                         return Err((EffectCategory::Tone, format!("{err:#}")));
                     }
                 }
-                Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
-            }
-            Effect::StopTone => {
-                // StopTone must NOT call `set_mute(true)` - doing so
-                // leaves the codec muted after dismiss and silences every
-                // future alarm. ring_screen already stops the I2S stream
-                // (`drain_and_disable` after `play_sine_stereo`); we
-                // simply acknowledge the effect so the state machine can
-                // transition to WaitingForRearm.
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             // ---- asynchronous / out-of-band effects -------------------------

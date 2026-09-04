@@ -98,14 +98,10 @@ fn show_due_todos(
     drop(canvas);
     ctx.board.display.refresh_full_best_effort();
 
-    if let Some(audio) = ctx.board.audio.as_mut() {
-        for _ in 0..3 {
-            if let Err(err) = audio.play_sine_stereo(1046.0, 0.15, 8000) {
-                log::warn!("Todo reminder tone failed: {err}");
-                break;
-            }
-            thread::sleep(Duration::from_millis(150));
-        }
+    // Attention tone goes through the audio task (non-blocking; the codec
+    // is owned there, never by the board).
+    if let Some(task) = ctx.audio_task {
+        let _ = task.beep_todo();
     }
     loop {
         watchdog::feed();
@@ -169,18 +165,18 @@ fn show_urgent(
     drop(canvas);
     ctx.board.display.refresh_full_best_effort();
 
-    if let Some(audio) = ctx.board.audio.as_mut() {
-        if let Err(err) = audio.set_volume(255) {
-            log::warn!("Urgent volume boost failed: {err}");
-        }
+    // Siren goes through the audio task (non-blocking).
+    if let Some(task) = ctx.audio_task {
+        let _ = task.start_siren();
     }
-    const SIREN: [(f32, f32); 2] = [(1397.0, 0.12), (1046.0, 0.12)];
-    let mut siren_step = 0usize;
     let ring_start = EspSystemTime {}.now();
     loop {
         watchdog::feed();
         // An RTC alarm preempts the urgent reminder (see show_due_todos).
         if ctx.poll_alarm_snapshot() {
+            if let Some(task) = ctx.audio_task {
+                let _ = task.stop();
+            }
             ctx.alarm_poll.mark_exit();
             return crate::ctx::BackgroundOutcome::AlarmHandled;
         }
@@ -191,43 +187,20 @@ fn show_urgent(
         ctx.board.key_enter.poll();
         if ctx.board.key_enter.is_pressed() {
             while ctx.board.key_enter.poll().is_some() {}
+            if let Some(task) = ctx.audio_task {
+                let _ = task.stop();
+            }
             return crate::ctx::BackgroundOutcome::VisibleChanged;
         }
         if (EspSystemTime {}).now().saturating_sub(ring_start)
             >= Duration::from_secs(URGENT_RING_MAX_SECS)
         {
             log::warn!("Urgent reminder timed out after {URGENT_RING_MAX_SECS}s");
+            if let Some(task) = ctx.audio_task {
+                let _ = task.stop();
+            }
             return crate::ctx::BackgroundOutcome::VisibleChanged;
         }
-        let (frequency, duration) = SIREN[siren_step % SIREN.len()];
-        if let Some(audio) = ctx.board.audio.as_mut() {
-            if let Err(err) = audio.play_sine_stereo(frequency, duration, 24000) {
-                log::warn!("Urgent siren note failed: {err}");
-            }
-        } else {
-            thread::sleep(Duration::from_millis(duration as u64 * 1000));
-        }
-        siren_step += 1;
-        let poll_deadline = EspSystemTime {}.now() + Duration::from_millis(400);
-        loop {
-            watchdog::feed();
-            if ctx.poll_alarm_snapshot() {
-                ctx.alarm_poll.mark_exit();
-                return crate::ctx::BackgroundOutcome::AlarmHandled;
-            }
-            reject_pending_command(ctx.usb_console);
-            if let Some(ble) = ctx.ble_control.as_mut() {
-                crate::ble_control::reject_pending_command(ble);
-            }
-            ctx.board.key_enter.poll();
-            if ctx.board.key_enter.is_pressed() {
-                while ctx.board.key_enter.poll().is_some() {}
-                return crate::ctx::BackgroundOutcome::VisibleChanged;
-            }
-            if (EspSystemTime {}).now() >= poll_deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
-        }
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
     }
 }

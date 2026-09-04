@@ -1,6 +1,7 @@
 mod alarms;
 mod app_runner;
 mod audio;
+mod audio_task;
 mod ble_control;
 mod board;
 mod button;
@@ -238,14 +239,13 @@ fn main() -> Result<()> {
     // again (harmless, not a consuming read); unlike the raw cause logged
     // above, this distinguishes ENTER-wake from alarm-wake.
     // AppRunner is the sole alarm owner from step 2 onwards. The legacy
-    // `alarms::handle_fired_alarm` boot ring is gone: AppRunner now
-    // dispatches the BootSnapshot (with the raw AF/AIE facts captured
-    // after `Note4Board::take` which no longer pre-clears them), the
-    // state machine decides whether to ring, and the main loop drives
-    // `alarms::ring_screen` if the state machine entered Firing. The
-    // wake-cause flag is captured for the legacy AlarmScheduler and the
-    // deep-sleep wake path; the actual ringing comes from the state
-    // machine, not the legacy ring_until_dismissed call.
+    // `alarms::handle_fired_alarm` boot ring and `ring_screen` are gone:
+    // AppRunner dispatches the BootSnapshot (with the raw AF/AIE facts
+    // captured after `Note4Board::take`, which no longer pre-clears them),
+    // the state machine decides whether to ring (Screen::AlarmRinging), and
+    // the executor renders the ring frame + starts the tone through the
+    // audio task. The wake-cause flag is captured for the deep-sleep wake
+    // path; the ringing comes entirely from the state machine.
     let alarm_fired_at_boot = power::wake_cause() == power::WakeCause::RtcAlarm;
 
     // Keep the PCF8563's single hardware alarm slot pointed at whichever
@@ -278,12 +278,24 @@ fn main() -> Result<()> {
         log::info!("Initial display refresh queued to EPD task");
     }
 
-    if board.audio.is_none() {
-        log::warn!("ES8311 not available");
-    }
     if board.nfc.is_none() {
         log::warn!("NFC not available");
     }
+
+    // The audio task owns the process's one ES8311 codec; every tone (alarm
+    // ring, reminders) goes through its command channel so the main loop
+    // never blocks on a tone. A missing codec degrades to silence; the
+    // state machine's StartTone effect reports the failure cleanly.
+    let audio_handle = match audio_task::AudioTask::spawn(board.take_audio())? {
+        audio_task::AudioSpawn::Running(handle) => {
+            log::info!("Audio task spawned");
+            Some(handle)
+        }
+        audio_task::AudioSpawn::Unavailable => {
+            log::warn!("ES8311 not available; tones disabled");
+            None
+        }
+    };
 
     report_power_state(&mut board)?;
 
@@ -397,6 +409,7 @@ fn main() -> Result<()> {
         inbox_store: &inbox_store,
         usb_console: &mut usb_console,
         ble_control: &mut ble_control,
+        audio_task: audio_handle.as_ref(),
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
         pending_wifi_op: None,
         last_command: None,
@@ -492,37 +505,12 @@ fn main() -> Result<()> {
                     log::warn!("Runtime Boot dispatch failed: {err}");
                 }
             }
-            // Boot alarm: if the state machine entered Firing (RTC-alarm
-            // wake), drive the ring screen immediately so the user can
-            // dismiss the alarm without waiting for the next loop
-            // iteration. Same handoff path the runtime AF branch uses:
-            // AppRunner owns ACK + persist + screen selection; the main
-            // loop owns the blocking ring UI; ENTER press dispatches back
-            // into the state machine for Firing -> WaitingForRearm.
-            if app_runner_enabled
-                && matches!(
-                    app_runner.borrow().state().screen,
-                    inkwash_logic::app::Screen::AlarmRinging
-                )
-            {
-                log::info!("Boot from RTC alarm; entering ring screen");
-                if let Err(err) =
-                    alarms::ring_screen(ctx.board, ctx.usb_console, ctx.ble_control.as_mut())
-                {
-                    log::error!("Boot ring_screen failed: {err}");
-                }
-                let _ = dispatch_app_runner(
-                    &app_runner,
-                    inkwash_logic::app::Event::Button(
-                        inkwash_logic::button_event::ButtonEvent::Pressed(
-                            inkwash_logic::button_event::ButtonId::Enter,
-                        ),
-                    ),
-                    &mut ctx,
-                )
-                .map(|_| ());
-                dismiss_full_refresh = true;
-            }
+            // Boot alarm needs no special casing: the SM entered
+            // Screen::AlarmRinging from the Boot dispatch (same transition
+            // as a runtime RtcAlarmSnapshotReady), the executor rendered the
+            // ring frame and started the tone through the audio task; ENTER
+            // presses flow through the normal button poll below and dismiss
+            // via the SM's dismiss_ringing.
         }
         let mut redraw_requested = false;
         let now = Instant::now();
@@ -623,14 +611,15 @@ fn main() -> Result<()> {
         // low -> high AF edge is resolved by the *shared* `AlarmPoll`
         // orchestration (the same code `DeviceContext::poll_alarm_snapshot`
         // runs for blocking pages): AF edge -> consistent snapshot ->
-        // dispatch `RtcAlarmSnapshotReady` -> ring screen -> dismiss ->
-        // sticky exit flag. `main` consumes the exit flag below; the
-        // edge / retry / firing semantics are identical on Home and every
-        // blocking page.
+        // dispatch `RtcAlarmSnapshotReady`. The SM enters
+        // Screen::AlarmRinging (non-blocking), the executor renders the
+        // ring + starts the audio-task tone; ENTER / the ring-deadline Tick
+        // dismiss through the SM. `main` consumes the exit flag below; the
+        // edge / retry / firing semantics are identical at boot and runtime.
         if ctx.poll_alarm_snapshot() {
-            // `poll_alarm_snapshot` drives ring_screen + dismiss. The
-            // dismiss transition itself emits a Full render request, so
-            // there is no second dirty-path refresh here.
+            // The SM's own dismiss transition emits a Full render request;
+            // the dirty-path suppression flag keeps a stale reminder /
+            // residue redraw from superseding it.
             dismiss_full_refresh = true;
             // Home is the root page: the sticky exit flag exists to let
             // *nested* pages unwind layer by layer. Here we are already

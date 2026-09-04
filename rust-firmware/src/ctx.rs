@@ -82,6 +82,11 @@ pub struct DeviceContext<'a> {
     pub inbox_store: &'a InboxStore,
     pub usb_console: &'a mut UsbConsole,
     pub ble_control: &'a mut Option<BleControl>,
+    /// Handle to the audio task (the sole owner of the ES8311 codec). `None`
+    /// when the codec failed to initialise at boot (audio is a degraded-run
+    /// category, never a boot blocker). Every tone - alarm ring, reminder -
+    /// goes through this handle; nobody touches the codec directly.
+    pub audio_task: Option<&'a crate::audio_task::AudioTask>,
     pub sync_scheduler: SyncScheduler,
     /// One long-running Wi-Fi operation at a time (the sync task
     /// serializes them anyway); `None` when idle. The receipt is polled by
@@ -309,27 +314,12 @@ impl DeviceContext<'_> {
             log::warn!("Blocking page RTC alarm snapshot read failed; stays retryable: {err}");
         }
         self.alarm_poll = poll;
-        if firing {
-            // Drive the blocking ring/dismiss loop right here so the alarm
-            // covers the current page (main's AF fast path is not running).
-            // ACK / persist already happened via the dispatch above.
-            log::info!("RTC alarm fired over blocking page; entering ring screen");
-            if let Err(err) =
-                crate::alarms::ring_screen(self.board, self.usb_console, self.ble_control.as_mut())
-            {
-                log::error!("ring_screen failed: {err}");
-            }
-            let mut poll = std::mem::take(&mut self.alarm_poll);
-            let runner = self.app_runner.clone();
-            let pending_renders = self.pending_renders.clone();
-            let mut host = CtxAlarmHost {
-                ctx: self,
-                runner,
-                pending_renders,
-            };
-            poll.ring_dismiss(&mut host);
-            self.alarm_poll = poll;
-        }
+        // Firing is now a pure state-machine affair: the SM entered
+        // Screen::AlarmRinging, the executor started the alarm tone through
+        // the audio task (non-blocking) and rendered the ring frame; ENTER
+        // and the ring-deadline Tick dismiss through the SM's shared
+        // `dismiss_ringing`. Nothing blocks here - the unified loop keeps
+        // serving Button/Tick/USB/BLE/EPD events while the alarm rings.
         firing
     }
 

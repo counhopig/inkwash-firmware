@@ -79,8 +79,9 @@ pub struct Note4Board {
     /// not wired here - see `power::WAKE_PINS` for why.)
     pub wake: crate::wake::Waker,
     /// `None` when the ES8311 failed to initialize; the rest of the board
-    /// (display/buttons/RTC/Wi-Fi) still works without it.
-    pub audio: Option<Es8311>,
+    /// (display/buttons/RTC/Wi-Fi) still works without it. Owned by the
+    /// board only until `take_audio` moves it onto the audio task.
+    audio: Option<Es8311>,
     /// `None` when the GT23SC6699 failed to initialize; see `audio` above.
     pub nfc: Option<NfcTag>,
 }
@@ -337,6 +338,14 @@ impl Note4Board {
             audio,
             nfc,
         })
+    }
+
+    /// Moves the ES8311 codec out of the board and onto the audio task.
+    /// Returns `None` if the codec failed to initialise at boot. The board
+    /// keeps no audio handle afterwards; every tone goes through
+    /// `audio_task::AudioTask`.
+    pub fn take_audio(&mut self) -> Option<Es8311> {
+        self.audio.take()
     }
 
     /// Debounced charger status. Reads both charge-management IC lines and
