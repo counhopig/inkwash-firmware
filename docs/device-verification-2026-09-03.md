@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件功能基线：** `0fc3ae6`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件功能基线：** `1fc308c`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
-**宿主测试：** `logic` 266 通过
+**宿主测试：** `logic` 269 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新功能基线（0fc3ae6）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新功能基线（1fc308c）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -42,7 +42,9 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ❌ `c9335f9` 页面复测确认 drawer 背景已正确，但 Calendar 打开前光标为 9/11，取消后变为当天 9/4；同源目的地短 ENTER 重建了当天 Calendar，未恢复保存状态。
   `0fc3ae6` 已修复同源目的地恢复语义。
 - ✅ `0fc3ae6` 已随文档提交组成的 ELF `v0.5.0-158-g869dd85` 重刷 NOTE4：Calendar 选中 9/11 后打开 drawer，背景保持 Calendar；短按 ENTER 选择当前 CALENDAR 与长按 ENTER 取消两条路径均恢复 9/11。此前 RTC watchdog 修复也已在连续页面交互约 127 s 的串口记录中复测，无 `task_wdt`、panic 或 reboot（`/tmp/inkwash-rtc-wdt-retest-4729a7f.log`）。
-- ⚠️ Calendar drawer 与 RTC watchdog 项已通过；§1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
+- ✅ Calendar drawer 与 RTC watchdog 项已通过；Inbox 页面验收正常（均为 ELF `v0.5.0-158-g869dd85` 的设备记录）。
+- ⚠️ `1fc308c` 新增 Navigation drawer 的最小刷新：同一来源且 clock/data/overlay 不变时 open/move/close 仅提交 `NavBar` Partial；跨目的地、来源事实或 clock 变化保守 Full。该 ELF 尚未刷入 NOTE4 复测，需人工确认无 Full 闪屏及关闭后的来源像素恢复。
+- ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
 
