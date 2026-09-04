@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件功能基线：** `667ced5`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件功能基线：** `42bb30b`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
 **宿主测试：** `logic` 261 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新功能基线（667ced5）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新功能基线（42bb30b）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -26,16 +26,15 @@ espflash flash --port /dev/tty.usbmodem1101 --chip esp32s3 --flash-size 16mb \
   --flash-mode dio --flash-freq 80mhz --partition-table rust-firmware/partitions.csv \
   rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
 python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
-  --expect "bring-up starting" --expect "Initial display refresh queued" --output /tmp/boot.log
+  --expect "bring-up starting" --expect "EPD refresh completed: Full" --output /tmp/boot.log
 ```
 
-期望日志：`bring-up starting (git $(git describe --always --dirty --tags))`、`Wakeup cause raw = 0x0`、
-`PCF8563: ... vl=false`、`Initial display refresh queued to EPD task`、
-`EPD refresh completed: Full`、`Audio task running` + `Audio task spawned`、
+期望日志：`bring-up starting (git $(git describe --always --dirty --tags))`、
+`EPD refresh completed: Full`；若 codec 可用还应出现 `Audio task running` + `Audio task spawned`，
 约 1 s 周期 `Power state:` 心跳。
 - ✅ 本会话已确认 e463b45 冷启动（v0.5.0-145）+ 早先 dd64f6b（v0.5.0-142）冷启动：无 panic、无 safe-mode、audio task 启动、
   两笔 Full EPD completion、12 s power loop。
-- ⚠️ 上述设备证据对应各自旧基线；667ced5 需要重新刷写后才能继承，§1b/§3/§4/§5/§6/§8
+- ⚠️ 上述设备证据对应各自旧基线；42bb30b 需要重新刷写后才能继承，§1b/§3/§4/§5/§6/§8
   的交互项仍需在本功能基线上人工逐项复验。
 
 ---
@@ -126,7 +125,7 @@ printf '>>IW {"cmd":"get_status"}\n' >/dev/tty.usbmodem1101   # 或 desktop --st
 
 - 长静默（>IDLE_ENTER_AFTER）进入 1 s idle；>DEEP_SLEEP_AFTER 无 USB 时深睡
   （串口枚举消失/维护唤醒重现）。
-- 深睡 wake 只刷 clock（`Deep-sleep wake: clock region refreshed`）。
+- 深睡 wake 的历史面板内容未知，Boot Render 通过 RenderPlan 执行 Full；后续同一运行周期的分钟变化才允许 Clock Partial。
 - alarm 唤醒先响铃（SM Boot 路径）。
 - 观察：无 watchdog reset、无卡死、唤醒后按键正常。
 
