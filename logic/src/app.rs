@@ -583,7 +583,7 @@ pub enum RenderView {
     /// cursor moved by the SM, ENTER confirms. Carries the selected row.
     SyncInterval { selected: usize },
     /// The BLE pairing session (Stage 4): the pairing-instructions screen.
-    /// The SM owns the lifecycle (events drive the phase; any button exits
+    /// The SM owns the lifecycle (events drive the phase; long ENTER exits
     /// back to Settings); the executor draws the instructions canvas. The
     /// phase-specific visuals stay with the radio layer until the NimBLE
     /// event wiring lands (the SM phase transitions are locked regardless).
@@ -1249,17 +1249,13 @@ fn transition_ble_disconnected(state: &mut AppState) -> Vec<EffectBatch> {
     vec![render_batch(state)]
 }
 
-/// BlePairing screen buttons (Stage 4): any press closes the pairing
-/// session back to the Settings BLE PAIRING row (mirroring the legacy
-/// modal's "HOLD ENTER BACK"). Releases are ignored.
+/// BlePairing screen buttons (Stage 4): only a long ENTER closes the pairing
+/// session back to the Settings BLE PAIRING row (the UI's "HOLD ENTER BACK").
+/// Short ENTER/UP/DOWN input is ignored so the entry action cannot be
+/// interpreted as an exit while asynchronous BLE startup is still pending.
 fn transition_ble_pairing_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     match button {
-        ButtonEvent::Pressed(ButtonId::Enter)
-        | ButtonEvent::LongPressed(ButtonId::Enter)
-        | ButtonEvent::Pressed(ButtonId::Up)
-        | ButtonEvent::Pressed(ButtonId::Down)
-        | ButtonEvent::LongPressed(ButtonId::Up)
-        | ButtonEvent::LongPressed(ButtonId::Down) => {
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
             state.screen = Screen::Settings {
                 selected: SETTINGS_BLE_PAIRING_ROW,
             };
@@ -1980,9 +1976,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         // bring the radio up (StartBlePairing -> NimBLE
                         // advertising on the dedicated worker). Radio lifecycle events (Started /
                         // Succeeded / Failed / Disconnected) drive the
-                        // phase; any button exits back to the Settings BLE
-                        // row with StopBlePairing; the session timeout is a
-                        // Tick past an armed deadline. No blocking wedge.
+                        // phase; long ENTER exits back to the Settings BLE row
+                        // with StopBlePairing; the session timeout is a Tick
+                        // past an armed deadline. No blocking wedge.
                         let session_id = state.next_operation_id().0;
                         let pairing = BlePairingRequest {
                             name: "inkwash-note4".to_string(),
@@ -6193,14 +6189,13 @@ mod tests {
     }
 
     #[test]
-    fn ble_pairing_any_button_exits_to_settings() {
-        // Any button press closes the session back to the Settings BLE row
-        // and tears down the radio.
+    fn ble_pairing_short_buttons_do_not_exit_during_startup() {
+        // The short ENTER that entered the screen, and incidental UP/DOWN
+        // input while the worker starts, must not tear down the radio.
         let buttons = [
             ButtonEvent::Pressed(ButtonId::Enter),
-            ButtonEvent::LongPressed(ButtonId::Up),
             ButtonEvent::Pressed(ButtonId::Down),
-            ButtonEvent::LongPressed(ButtonId::Enter),
+            ButtonEvent::Pressed(ButtonId::Up),
         ];
         for b in buttons {
             let mut state = AppState::default();
@@ -6213,17 +6208,43 @@ mod tests {
                 ..Default::default()
             });
             let batches = update(&mut state, Event::Button(b));
-            assert_eq!(
-                state.screen,
-                Screen::Settings {
-                    selected: SETTINGS_BLE_PAIRING_ROW,
-                }
-            );
-            assert!(batches
+            assert!(matches!(state.screen, Screen::BlePairing(_)));
+            assert!(!batches
                 .iter()
                 .flat_map(|b| &b.effects)
                 .any(|e| matches!(e, Effect::StopBlePairing)));
         }
+    }
+
+    #[test]
+    fn ble_pairing_long_enter_exits_to_settings_once() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        state.screen = Screen::BlePairing(BlePairingState {
+            phase: BlePairingPhase::Pairing,
+            ..Default::default()
+        });
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            }
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .filter(|e| matches!(e, Effect::StopBlePairing))
+                .count(),
+            1
+        );
     }
 
     #[test]

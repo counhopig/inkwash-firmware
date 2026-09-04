@@ -170,6 +170,7 @@ fn run(
                 name: _name,
                 session_id,
             }) => {
+                log::info!("BLE worker: Start session {session_id}");
                 // A re-entry is serialized after the preceding Stop and is
                 // therefore safe even if the caller moved quickly.
                 session.take();
@@ -187,6 +188,7 @@ fn run(
                 }
             }
             Ok(WorkerCommand::Stop { session_id }) => {
+                log::info!("BLE worker: Stop session {session_id}");
                 session.take();
                 let _ = result_tx.try_send(BleTaskResult::Stopped { session_id });
             }
