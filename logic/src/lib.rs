@@ -22,6 +22,7 @@ pub mod alarm_regs;
 pub mod alarm_schedule;
 pub mod app;
 pub mod audio_command;
+pub mod ble_memory;
 pub mod button_event;
 pub mod datetime;
 pub mod device_config;
@@ -59,10 +60,11 @@ mod ble_memory_contract {
     #[test]
     fn ble_worker_uses_psram_and_checks_internal_heap_before_init() {
         assert!(BLE_SOURCE.contains("MALLOC_CAP_SPIRAM | esp_idf_svc::sys::MALLOC_CAP_8BIT"));
+        assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA"));
         assert!(BLE_SOURCE.contains("heap_caps_get_free_size(BLE_INTERNAL_CAPS)"));
         assert!(BLE_SOURCE.contains("heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS)"));
         assert!(BLE_SOURCE.contains("BLEDevice::init();"));
-        assert!(BLE_SOURCE.contains("if free < BLE_MIN_INTERNAL_FREE"));
+        assert!(BLE_SOURCE.contains("if !inkwash_logic::ble_memory::sufficient_internal_heap"));
     }
 
     #[test]

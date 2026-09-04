@@ -21,14 +21,10 @@ const CHANNEL_CAPACITY: usize = 16;
 /// 8 KiB leaves headroom over the configured 5120-byte NimBLE host stack
 /// without consuming the scarce internal heap.
 const BLE_TASK_STACK: usize = 8 * 1024;
+/// Match the ESP32-S3 controller's allocation capabilities. NimBLE host
+/// buffers are separate; controller startup uses internal DMA-capable RAM.
 const BLE_INTERNAL_CAPS: u32 =
-    esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
-/// Below this guard NimBLE's controller allocation is known to be unsafe:
-/// its C API logs a failed malloc and then asserts instead of returning a
-/// recoverable error. Keep the app alive on Settings rather than entering
-/// that path.
-const BLE_MIN_INTERNAL_FREE: usize = 64 * 1024;
-const BLE_MIN_INTERNAL_LARGEST_BLOCK: usize = 32 * 1024;
+    esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA;
 
 const SERVICE_UUID: &str = "d2c25e50-5e22-48d8-a8b3-34f2f8e2c7d4";
 const WRITE_CHAR_UUID: &str = "d2c25e51-5e22-48d8-a8b3-34f2f8e2c7d4";
@@ -229,7 +225,7 @@ impl BleSession {
         let largest =
             unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS) };
         log::info!("BLE preflight: internal free={free} largest_block={largest} bytes");
-        if free < BLE_MIN_INTERNAL_FREE || largest < BLE_MIN_INTERNAL_LARGEST_BLOCK {
+        if !inkwash_logic::ble_memory::sufficient_internal_heap(free, largest) {
             return Err(anyhow!(
                 "BLE unavailable: internal heap free={free} largest_block={largest}"
             ));
