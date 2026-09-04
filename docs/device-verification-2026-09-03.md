@@ -21,7 +21,7 @@ Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
 ```bash
 cd inkwash-firmware
 ./scripts/build-rust.sh --release
-./scripts/check-git-rev.sh            # 期望: OK - ELF embeds current revision v0.5.0-148-g667ced5
+./scripts/check-git-rev.sh            # 期望: OK - ELF embeds current `git describe --always --dirty --tags`
 espflash flash --port /dev/tty.usbmodem1101 --chip esp32s3 --flash-size 16mb \
   --flash-mode dio --flash-freq 80mhz --partition-table rust-firmware/partitions.csv \
   rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
@@ -29,7 +29,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
   --expect "bring-up starting" --expect "Initial display refresh queued" --output /tmp/boot.log
 ```
 
-期望日志：`bring-up starting (git v0.5.0-148-g667ced5)`、`Wakeup cause raw = 0x0`、
+期望日志：`bring-up starting (git $(git describe --always --dirty --tags))`、`Wakeup cause raw = 0x0`、
 `PCF8563: ... vl=false`、`Initial display refresh queued to EPD task`、
 `EPD refresh completed: Full`、`Audio task running` + `Audio task spawned`、
 约 1 s 周期 `Power state:` 心跳。
