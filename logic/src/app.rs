@@ -7639,6 +7639,196 @@ mod tests {
     }
 
     #[test]
+    fn tone_start_failure_keeps_ring_dismissable() {
+        // Audio is a degraded-run category: if StartTone fails (EffectError::
+        // Tone, e.g. no codec at boot), the SM stays Firing - the ring stays
+        // visual - and an ENTER still dismisses exactly like a healthy ring.
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        // StartTone is op 0, effect id varies; fail it.
+        let _ = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: OperationId(0),
+                render_generation: None,
+                error: EffectError::Tone("audio codec unavailable".into()),
+            }),
+        );
+        // Still ringing (no tone but the visual + lifecycle survive).
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Firing { .. }
+        ));
+        // ENTER dismisses normally.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::WaitingForRearm { .. }
+        ));
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .filter(|e| matches!(e, Effect::StopTone))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn epd_completion_and_sync_answered_while_ringing() {
+        // The unified loop keeps serving display + sync completions while
+        // Firing: a RenderDone for a superseded/other request and a
+        // SyncCompleted are absorbed without disturbing the ring.
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        // A sync completion for a request that isn't ours is ignored.
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                data: synced_data(vec![]),
+            }),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        // An EffectCompleted for an op that doesn't match our commit is
+        // dropped (no state corruption).
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(9),
+                effect_id: EffectId(9),
+                operation_id: OperationId(999),
+                render_generation: None,
+                output: EffectOutput::RenderDone,
+            }),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Firing { .. }
+        ));
+    }
+
+    #[test]
+    fn rearmed_alarm_triggers_again_with_fresh_tone_and_render() {
+        // After a ring is dismissed and the RTC is fully re-armed (the same
+        // exactly-once rearm the lifecycle test covers), a fresh snapshot at
+        // the alarm's minute re-rings through the exact same non-blocking
+        // entry: StartTone + Full render.
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        // Dismiss -> WaitingForRearm.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::WaitingForRearm { .. }
+        ));
+        let (ack_op, persist_op) = match &state.alarm_runtime {
+            AlarmRuntimeState::WaitingForRearm {
+                ack, persistence, ..
+            } => (
+                match ack {
+                    CommitState::InFlight { operation_id } => *operation_id,
+                    _ => OperationId(0),
+                },
+                match persistence {
+                    CommitState::InFlight { operation_id } => *operation_id,
+                    _ => OperationId(0),
+                },
+            ),
+            _ => panic!("expected WaitingForRearm"),
+        };
+        // Persist completes.
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(1),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Alarms),
+            }),
+        );
+        // Cross-minute Tick: the minute advanced, so ack (still in flight)
+        // finishing now re-arms -> ProgramRtcAlarm.
+        let _ = update(&mut state, Event::Tick(dt(9, 1)));
+        let rearm_batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(2),
+                operation_id: ack_op,
+                render_generation: None,
+                output: EffectOutput::AckDone,
+            }),
+        );
+        let program_op = rearm_batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
+            })
+            .map(|b| b.operation_id)
+            .expect("rearm must ProgramRtcAlarm after ack completes past the minute");
+        // Complete the program -> Armed (the precondition for another ring).
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(3),
+                operation_id: program_op,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
+            }),
+        );
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Armed { alarm_id: 1 }
+        ));
+        // A fresh snapshot while Armed re-rings.
+        let batches = update(
+            &mut state,
+            Event::RtcAlarmSnapshotReady(RtcAlarmSnapshot {
+                now: dt(9, 0),
+                alarm_flag: true,
+                alarm_interrupt_enabled: true,
+            }),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Firing { .. }
+        ));
+        assert!(batches
+            .iter()
+            .any(|b| b.effects.contains(&Effect::StartTone)));
+        assert!(
+            batches
+                .iter()
+                .filter(|b| b.render_generation.is_some())
+                .count()
+                >= 1
+        );
+    }
+
+    #[test]
     fn boot_with_firing_alarm_renders_once_not_twice() {
         let mut state = AppState::default();
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
