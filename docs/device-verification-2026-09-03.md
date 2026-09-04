@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件 HEAD：** `dd64f6b`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件 HEAD：** `e463b45`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
 **宿主测试：** `logic` 255 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新最终 HEAD（dd64f6b）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新最终 HEAD（e463b45）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -21,7 +21,7 @@ Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
 ```bash
 cd inkwash-firmware
 ./scripts/build-rust.sh --release
-./scripts/check-git-rev.sh            # 期望: OK - ELF embeds current revision v0.5.0-142-gdd64f6b
+./scripts/check-git-rev.sh            # 期望: OK - ELF embeds current revision v0.5.0-145-ge463b45
 espflash flash --port /dev/tty.usbmodem1101 --chip esp32s3 --flash-size 16mb \
   --flash-mode dio --flash-freq 80mhz --partition-table rust-firmware/partitions.csv \
   rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
@@ -29,11 +29,11 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
   --expect "bring-up starting" --expect "Initial display refresh queued" --output /tmp/boot.log
 ```
 
-期望日志：`bring-up starting (git v0.5.0-142-gdd64f6b)`、`Wakeup cause raw = 0x0`、
+期望日志：`bring-up starting (git v0.5.0-145-ge463b45)`、`Wakeup cause raw = 0x0`、
 `PCF8563: ... vl=false`、`Initial display refresh queued to EPD task`、
 `EPD refresh completed: Full`、`Audio task running` + `Audio task spawned`、
 约 1 s 周期 `Power state:` 心跳。
-- ✅ 本会话已确认 dd64f6b 冷启动（v0.5.0-142）：无 panic、无 safe-mode、audio task 启动、
+- ✅ 本会话已确认 e463b45 冷启动（v0.5.0-145）+ 早先 dd64f6b（v0.5.0-142）冷启动：无 panic、无 safe-mode、audio task 启动、
   两笔 Full EPD completion、12 s power loop。
 - ⚠️ d8acc74 及其后版本在更早会话确认的启动行为仅对相应旧基线成立；本 HEAD 已重刷确认，
   但 §3/§4/§5/§6 的交互项仍需在本 HEAD 上人工逐项复验。
