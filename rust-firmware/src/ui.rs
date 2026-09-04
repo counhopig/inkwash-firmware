@@ -19,9 +19,6 @@ pub fn header(canvas: &mut Canvas, title: &str) {
 /// code. The device UI intentionally has no persistent button-hint footer.
 pub fn footer(_canvas: &mut Canvas, _hint: &str) {}
 
-/// Rows visible at once. Longer lists scroll around the selection.
-pub use inkwash_logic::list_window::MAX_LISTED_ITEMS;
-
 const LIST_ROW_HEIGHT: usize = 37;
 /// Fixed left edge for row text, selected or not - previously the selected
 /// row's ">" chevron pushed its text 26px right of every other row's, so
