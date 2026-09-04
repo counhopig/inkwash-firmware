@@ -127,16 +127,6 @@ impl EpdClient {
         Ok(id)
     }
 
-    /// UI screens are best-effort callers: a display fault must not silently
-    /// disappear, but it also must not stop buttons, alarms, or the watchdog.
-    /// The refresh itself (and any failure recovery) happens in the EPD
-    /// task.
-    pub fn refresh_full_best_effort(&mut self) {
-        if let Err(err) = self.refresh_full() {
-            log::error!("EPD full refresh request failed: {err}");
-        }
-    }
-
     /// Logs a request-send failure. The panel-level recovery for a failed
     /// partial refresh (one full refresh from the same snapshot) lives in
     /// the EPD task, where the FFI result is known.

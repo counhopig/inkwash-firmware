@@ -1,206 +1,129 @@
-//! Full-screen todo and urgent-inbox reminders shared by every UI loop.
-//! Persistence is updated before presentation so a reset or failed display
-//! cannot trap the device in a repeated reminder loop.
+//! Reminder fact layer (Stage 5/6).
+//!
+//! Gathers whether a full-screen reminder is due (urgent inbox alerts first,
+//! then high-importance todos due today) and, when one is, dispatches
+//! `Event::ReminderDue` into the state machine with the *final* visible
+//! lines. Persistence is applied here, before dispatch, so a reset or a
+//! dropped dispatch cannot trap the device in a repeated reminder loop -
+//! the same "persist before present" guarantee the legacy blocking loops
+//! had.
+//!
+//! Nothing blocks and nothing is drawn here: the SM owns the reminder
+//! overlay (Screen::Reminder), the RenderPlan-driven executor renders it
+//! (Effect::Render -> ViewModel -> RenderPlan -> EPD), and any button /
+//! the deadline Tick dismisses it through the SM. The legacy full-screen
+//! show loops and their direct `refresh_full_best_effort` calls are gone.
 
-use std::thread;
-use std::time::Duration;
-
-use esp_idf_svc::systime::EspSystemTime;
-
-use crate::button::{ButtonEvent, POLL_INTERVAL_MS};
 use crate::rtc::DateTime;
-use crate::screens;
-use crate::todos::Todo;
-use crate::usb_console::reject_pending_command;
-use crate::{ui, watchdog};
 
-const URGENT_RING_MAX_SECS: u64 = 120;
-
-/// Shows both reminder classes in priority order. Urgent inbox alerts go
-/// first; a due-todo reminder may follow after the urgent alert is
-/// dismissed. Returns a structured outcome so the caller can tell an RTC
-/// alarm that preempted a reminder from an ordinary reminder dismissal.
-/// An alarm short-circuits the chain: no further reminder class runs after
-/// one.
-///
-/// The ordering and short-circuit are shared production orchestration in
-/// `inkwash-logic::reminder_flow::run_reminders`; this entry runs that
-/// exact code through a [`CtxReminderHost`] adapter, so the host harness
-/// tests the same flow the firmware executes.
-pub fn poll(ctx: &mut crate::ctx::DeviceContext, now: &DateTime) -> crate::ctx::BackgroundOutcome {
-    let mut host = CtxReminderHost { ctx, now };
-    inkwash_logic::reminder_flow::run_reminders(&mut host)
-}
-
-/// `ReminderHost` adapter over `DeviceContext`, delegating each reminder
-/// class to the existing show/dismiss implementations.
-struct CtxReminderHost<'a, 'ctx> {
-    ctx: &'a mut crate::ctx::DeviceContext<'ctx>,
-    now: &'a DateTime,
-}
-
-impl inkwash_logic::reminder_flow::ReminderHost for CtxReminderHost<'_, '_> {
-    fn urgent(&mut self) -> crate::ctx::BackgroundOutcome {
-        remind_urgent_inbox(self.ctx)
+/// The urgent-reminder / due-todo cadence is the caller's choice (main runs
+/// this once per scheduled-sync boundary). Returns nothing that implies a
+/// redraw happened; the SM's own render covers the overlay.
+pub fn poll(ctx: &mut crate::ctx::DeviceContext, _now: &DateTime) {
+    // Never stack a reminder over one that is already showing (an alarm is
+    // ringing or a reminder is current): the SM's transition_reminder_due
+    // also drops reminders while an alarm rings.
+    use inkwash_logic::app::Screen;
+    let screen_blocks = {
+        let runner = ctx.app_runner.borrow();
+        let state = runner.state();
+        matches!(state.screen, Screen::Reminder(_) | Screen::AlarmRinging)
+    };
+    if screen_blocks {
+        return;
     }
-    fn todo(&mut self) -> crate::ctx::BackgroundOutcome {
-        remind_due_todos(self.ctx, self.now)
+
+    // Urgent inbox first (priority over todo). An urgent reminder being
+    // shown preempts the todo class in the same pass: once an urgent
+    // ReminderDue has been dispatched the SM is on Screen::Reminder, and
+    // the next poll pass sees screen_blocks and stops - so urgent is shown
+    // and todo waits until the urgent is dismissed (the SM dismiss then
+    // allows a later pass to raise the todo reminder). This is the
+    // urgent>todo ordering with no alarm/todo stacking.
+    let now = _now;
+    if let Some(payload) = urgent_payload(ctx) {
+        dispatch(ctx, payload);
+        return;
+    }
+    if let Some(payload) = todo_payload(ctx, now) {
+        dispatch(ctx, payload);
     }
 }
 
-fn remind_due_todos(
+fn dispatch(ctx: &mut crate::ctx::DeviceContext, payload: inkwash_logic::app::ReminderPayload) {
+    if let Err(err) = ctx.dispatch_event(inkwash_logic::app::Event::ReminderDue(payload)) {
+        log::warn!("ReminderDue dispatch failed: {err}");
+    }
+}
+
+/// Gathers urgent inbox titles, marking each read first (persist-before-
+/// present), and returns the payload when there was something urgent.
+fn urgent_payload(
     ctx: &mut crate::ctx::DeviceContext,
-    now: &DateTime,
-) -> crate::ctx::BackgroundOutcome {
-    use inkwash_logic::reminder_dedup::{
-        already_reminded_today, due_high_importance_todos, reminder_date_key,
-    };
-    match ctx.counters.todo_reminded_date() {
-        Ok(prev) if already_reminded_today(prev.as_deref(), now) => {
-            return crate::ctx::BackgroundOutcome::NoChange;
-        }
-        Ok(_) => {}
-        Err(err) => log::warn!("Failed to read todo reminder date: {err}"),
-    }
-
-    let Ok(list) = ctx.todo_store.load() else {
-        return crate::ctx::BackgroundOutcome::NoChange;
-    };
-    let due: Vec<&Todo> = due_high_importance_todos(&list, now);
-    if due.is_empty() {
-        return crate::ctx::BackgroundOutcome::NoChange;
-    }
-
-    let date_key = reminder_date_key(now);
-    if let Err(err) = ctx.counters.set_todo_reminded_date(&date_key) {
-        log::warn!("Failed to record todo reminder date; not reminding: {err}");
-        return crate::ctx::BackgroundOutcome::NoChange;
-    }
-    log::info!("{} high-importance todo(s) due today; reminding", due.len());
-    show_due_todos(ctx, &due)
-}
-
-fn show_due_todos(
-    ctx: &mut crate::ctx::DeviceContext,
-    due: &[&Todo],
-) -> crate::ctx::BackgroundOutcome {
-    let mut canvas = ctx.board.display.canvas_mut();
-    canvas.clear();
-    ui::header(&mut canvas, "TODOS DUE");
-    for (index, todo) in due.iter().take(7).enumerate() {
-        let text = screens::truncate_prop(&todo.text, 300);
-        canvas.draw_text_prop(16, 48 + index * 24, 1, &format!("!! {text}"));
-    }
-    if due.len() > 7 {
-        canvas.draw_text_prop(16, 268, 1, "MORE...");
-    }
-    canvas.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
-    drop(canvas);
-    ctx.board.display.refresh_full_best_effort();
-
-    // Attention tone goes through the audio task (non-blocking; the codec
-    // is owned there, never by the board).
-    if let Some(task) = ctx.audio_task {
-        let _ = task.beep_todo();
-    }
-    loop {
-        watchdog::feed();
-        // An RTC alarm preempts the reminder: AppRunner rings over it and
-        // the caller unwinds to main.
-        if ctx.poll_alarm_snapshot() {
-            ctx.alarm_poll.mark_exit();
-            return crate::ctx::BackgroundOutcome::AlarmHandled;
-        }
-        reject_pending_command(ctx.usb_console);
-        if let Some(ble) = ctx.ble_control.as_mut() {
-            crate::ble_control::reject_pending_command(ble);
-        }
-        if ctx.board.key_enter.poll().is_some_and(|event| {
-            matches!(event, ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_))
-        }) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
-    }
-    crate::ctx::BackgroundOutcome::VisibleChanged
-}
-
-fn remind_urgent_inbox(ctx: &mut crate::ctx::DeviceContext) -> crate::ctx::BackgroundOutcome {
-    let Ok(list) = ctx.inbox_store.load() else {
-        return crate::ctx::BackgroundOutcome::NoChange;
-    };
-    let urgent = ctx.inbox_store.unread_urgent().unwrap_or_default();
+) -> Option<inkwash_logic::app::ReminderPayload> {
+    use inkwash_logic::app::{ReminderKind, ReminderPayload};
+    let list = ctx.inbox_store.load().ok()?;
+    let urgent = ctx.inbox_store.unread_urgent().ok()?;
     if urgent.is_empty() {
-        return crate::ctx::BackgroundOutcome::NoChange;
+        return None;
     }
     for id in &urgent {
         if let Err(err) = ctx.inbox_store.mark_read(*id) {
             log::warn!("Failed to mark urgent inbox read; not reminding: {err}");
-            return crate::ctx::BackgroundOutcome::NoChange;
+            return None;
         }
     }
-    let titles: Vec<String> = list
+    let lines: Vec<String> = list
         .iter()
         .filter(|item| urgent.contains(&item.id))
-        .map(|item| screens::truncate_prop(&item.title, 330))
+        .map(|item| crate::screens::truncate_prop(&item.title, 330))
         .collect();
-    log::info!("{} urgent inbox message(s) to show", titles.len());
-    show_urgent(ctx, &titles)
+    if lines.is_empty() {
+        return None;
+    }
+    log::info!("{} urgent inbox message(s) to remind", lines.len());
+    Some(ReminderPayload {
+        kind: ReminderKind::Urgent,
+        lines,
+    })
 }
 
-fn show_urgent(
+/// Gathers high-importance todos due today, recording the reminder date
+/// first (persist-before-present), and returns the payload when there was
+/// something due.
+fn todo_payload(
     ctx: &mut crate::ctx::DeviceContext,
-    titles: &[String],
-) -> crate::ctx::BackgroundOutcome {
-    let mut canvas = ctx.board.display.canvas_mut();
-    canvas.clear();
-    ui::header(&mut canvas, "URGENT");
-    for (index, title) in titles.iter().take(4).enumerate() {
-        canvas.draw_text_prop(16, 48 + index * 24, 1, &format!("!! {title}"));
+    now: &DateTime,
+) -> Option<inkwash_logic::app::ReminderPayload> {
+    use inkwash_logic::app::{ReminderKind, ReminderPayload};
+    use inkwash_logic::reminder_dedup::{
+        already_reminded_today, due_high_importance_todos, reminder_date_key,
+    };
+    match ctx.counters.todo_reminded_date() {
+        Ok(prev) if already_reminded_today(prev.as_deref(), now) => return None,
+        Ok(_) => {}
+        Err(err) => log::warn!("Failed to read todo reminder date: {err}"),
     }
-    if titles.len() > 4 {
-        canvas.draw_text_prop(16, 268, 1, "MORE IN INBOX...");
+    let list = ctx.todo_store.load().ok()?;
+    let due = due_high_importance_todos(&list, now);
+    if due.is_empty() {
+        return None;
     }
-    canvas.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
-    drop(canvas);
-    ctx.board.display.refresh_full_best_effort();
-
-    // Siren goes through the audio task (non-blocking).
-    if let Some(task) = ctx.audio_task {
-        let _ = task.start_siren();
+    let date_key = reminder_date_key(now);
+    if let Err(err) = ctx.counters.set_todo_reminded_date(&date_key) {
+        log::warn!("Failed to record todo reminder date; not reminding: {err}");
+        return None;
     }
-    let ring_start = EspSystemTime {}.now();
-    loop {
-        watchdog::feed();
-        // An RTC alarm preempts the urgent reminder (see show_due_todos).
-        if ctx.poll_alarm_snapshot() {
-            if let Some(task) = ctx.audio_task {
-                let _ = task.stop();
-            }
-            ctx.alarm_poll.mark_exit();
-            return crate::ctx::BackgroundOutcome::AlarmHandled;
-        }
-        reject_pending_command(ctx.usb_console);
-        if let Some(ble) = ctx.ble_control.as_mut() {
-            crate::ble_control::reject_pending_command(ble);
-        }
-        ctx.board.key_enter.poll();
-        if ctx.board.key_enter.is_pressed() {
-            while ctx.board.key_enter.poll().is_some() {}
-            if let Some(task) = ctx.audio_task {
-                let _ = task.stop();
-            }
-            return crate::ctx::BackgroundOutcome::VisibleChanged;
-        }
-        if (EspSystemTime {}).now().saturating_sub(ring_start)
-            >= Duration::from_secs(URGENT_RING_MAX_SECS)
-        {
-            log::warn!("Urgent reminder timed out after {URGENT_RING_MAX_SECS}s");
-            if let Some(task) = ctx.audio_task {
-                let _ = task.stop();
-            }
-            return crate::ctx::BackgroundOutcome::VisibleChanged;
-        }
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
-    }
+    let lines: Vec<String> = due
+        .iter()
+        .map(|t| crate::screens::truncate_prop(&t.text, 300))
+        .collect();
+    log::info!(
+        "{} high-importance todo(s) due today; reminding",
+        lines.len()
+    );
+    Some(ReminderPayload {
+        kind: ReminderKind::Todo,
+        lines,
+    })
 }

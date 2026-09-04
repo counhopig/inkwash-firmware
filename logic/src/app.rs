@@ -477,6 +477,10 @@ pub enum Effect {
     /// the Wi-Fi driver). Completes via `Event::SetWifiCompleted`.
     StartSetWifi(WifiCreds),
     StartTone,
+    /// Start the reminder's attention tone (siren for urgent, beep for
+    /// todo). Distinct from StartTone so the executor can pick the right
+    /// pattern; stopped by StopTone like the alarm ring.
+    StartReminderTone(ReminderKind),
     StopTone,
     Render(RenderRequest),
     /// Send a control reply to exactly one transport. `channel` is which
@@ -1647,7 +1651,7 @@ fn transition_reminder_due(state: &mut AppState, payload: ReminderPayload) -> Ve
             state,
             OperationId(0),
             FailurePolicy::Continue,
-            vec![Effect::StartTone],
+            vec![Effect::StartReminderTone(payload.kind)],
         ),
         render_batch(state),
     ]
@@ -7984,9 +7988,9 @@ mod tests {
                 ..
             })
         ));
-        assert!(batches
-            .iter()
-            .any(|b| b.effects.contains(&Effect::StartTone)));
+        assert!(batches.iter().any(|b| b
+            .effects
+            .contains(&Effect::StartReminderTone(ReminderKind::Urgent))));
         assert!(
             batches
                 .iter()

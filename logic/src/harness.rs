@@ -124,6 +124,7 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::DisableRtcAlarm => "DisableRtcAlarm",
         Effect::AcknowledgeRtcAlarm => "AcknowledgeRtcAlarm",
         Effect::StartTone => "StartTone",
+        Effect::StartReminderTone(_) => "StartReminderTone",
         Effect::StopTone => "StopTone",
         Effect::Reply { .. } => "Reply",
         Effect::Render(_) => "Render",
@@ -155,7 +156,9 @@ impl EffectExecutor for FakeExecutor {
                 EffectCategory::Rtc
             }
             Effect::AcknowledgeRtcAlarm => EffectCategory::Ack,
-            Effect::StartTone | Effect::StopTone => EffectCategory::Tone,
+            Effect::StartTone | Effect::StartReminderTone(_) | Effect::StopTone => {
+                EffectCategory::Tone
+            }
             Effect::Reply { .. } => EffectCategory::Ack,
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
@@ -202,7 +205,7 @@ impl EffectExecutor for FakeExecutor {
                 crate::app::PersistTarget::Timezone,
             ))),
             Effect::AcknowledgeRtcAlarm => Ok(EffectOutcome::Completed(EffectOutput::AckDone)),
-            Effect::StartTone | Effect::StopTone => {
+            Effect::StartTone | Effect::StartReminderTone(_) | Effect::StopTone => {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
             Effect::Reply { .. } => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),

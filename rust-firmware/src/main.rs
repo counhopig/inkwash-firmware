@@ -85,13 +85,6 @@ const CLOCK_RECT: Rect = Rect {
     height: 92,
 };
 
-const FULL_SCREEN_RECT: Rect = Rect {
-    x: 0,
-    y: 0,
-    width: 400,
-    height: 300,
-};
-
 /// Epoch seconds captured at firmware build time. Used as the fallback RTC
 /// seed when PCF8563 reports `voltage_low = true` (battery was disconnected
 /// or drained). Captured by `build.rs` so a rebuild refreshes the value;
@@ -478,10 +471,6 @@ fn main() -> Result<()> {
     // same AppRunner) also register their kicks here for the EPD
     // completion match.
     // (ctx.pending_renders owns it; we clone the Rc handle.)
-    // Marks that the AppRunner already submitted the one full render for an
-    // alarm dismiss this iteration. The final dirty path consumes the
-    // marker to prevent an older CLOCK_RECT request from following it.
-    let mut dismiss_full_refresh = false;
     loop {
         watchdog::feed();
         if !boot_dispatched {
@@ -512,7 +501,6 @@ fn main() -> Result<()> {
             // presses flow through the normal button poll below and dismiss
             // via the SM's dismiss_ringing.
         }
-        let mut redraw_requested = false;
         let now = Instant::now();
 
         // Power status once per second, unchanged cadence (it gates the
@@ -582,26 +570,12 @@ fn main() -> Result<()> {
                     // 30 s boundary, gated once/day anyway). Ordinary menu
                     // loops service this same scheduler through
                     // DeviceContext.
-                    match ctx.poll_runtime(&dt) {
-                        crate::ctx::BackgroundOutcome::AlarmHandled => {
-                            // An alarm rang from a reminder during the
-                            // minute poll: AppRunner rendered Home and the
-                            // reminder already unwound. Clear the sticky
-                            // exit flag so a later navigation does not see
-                            // this historical alarm as its own exit reason.
-                            let _ = ctx
-                                .alarm_poll
-                                .consume_for(inkwash_logic::alarm_flow::AlarmSource::BlockingPage);
-                            let _ = ctx.alarm_poll.take_alarm_exit();
-                            dismiss_full_refresh = true;
-                        }
-                        crate::ctx::BackgroundOutcome::VisibleChanged => {
-                            // The reminder overlay drew over the screen; the
-                            // SM renders it back after the overlay unwinds.
-                            redraw_requested = true;
-                        }
-                        crate::ctx::BackgroundOutcome::NoChange => {}
-                    }
+                    // Stage 5/6: reminders are SM overlays now (ReminderDue
+                    // -> Screen::Reminder -> SM render) and sync adoptions
+                    // emit their own SM renders, so poll_runtime has no
+                    // caller-side drawing to do - it only advances the sync
+                    // scheduler and raises reminder facts.
+                    ctx.poll_runtime(&dt);
                 }
                 Err(err) => log::warn!("PCF8563 read_time failed: {err}"),
             }
@@ -617,10 +591,8 @@ fn main() -> Result<()> {
         // dismiss through the SM. `main` consumes the exit flag below; the
         // edge / retry / firing semantics are identical at boot and runtime.
         if ctx.poll_alarm_snapshot() {
-            // The SM's own dismiss transition emits a Full render request;
-            // the dirty-path suppression flag keeps a stale reminder /
-            // residue redraw from superseding it.
-            dismiss_full_refresh = true;
+            // The SM owns the ring's Full renders (enter + dismiss); nothing
+            // here needs a caller-side dirty-path suppression anymore.
             // Home is the root page: the sticky exit flag exists to let
             // *nested* pages unwind layer by layer. Here we are already
             // at Home, so the flag must be consumed immediately -
@@ -843,29 +815,6 @@ fn main() -> Result<()> {
             }
         }
 
-        if dismiss_full_refresh {
-            // The full AppRunner render captured the current Home canvas.
-            // Drop any dirty rectangles collected before/alongside the
-            // alarm so no CLOCK_RECT partial can supersede that request.
-            dismiss_full_refresh = false;
-            redraw_requested = false;
-        }
-        if redraw_requested {
-            // Stage 5: the only remaining redraw request is a full-surface
-            // repaint after a reminder overlay unwound. The SM owns all its
-            // own screen redraws (book/tick/command renders) through the
-            // plan-driven executor; this path only restores whatever the SM
-            // is showing when a legacy reminder overlayed it. Since only
-            // FULL_SCREEN_RECT is ever requested, draw the SM surface and
-            // refresh the full frame.
-            let view = app_runner.borrow().state().screen.render_view();
-            app_runner::draw_sm_surface(&mut ctx, clock, view);
-            ctx.board
-                .display
-                .refresh_partial_best_effort(FULL_SCREEN_RECT);
-            log::info!("Reminder-overlay redraw queued to EPD task");
-        }
-
         // Idle/active selection: input, a dispatched command, or a display
         // refresh counts as activity; a raw-low key forces the 20 ms
         // cadence so the polled debounce keeps its 4-sample timing after a
@@ -878,7 +827,7 @@ fn main() -> Result<()> {
         // changes): GetStatus polls from the desktop tool must not let the
         // device drift into deep sleep mid-session.
         let user_activity = usb_activity || ble_changed || key_changed || any_key_pressed;
-        let interacted = user_activity || redraw_requested;
+        let interacted = user_activity;
         if interacted || any_key_pressed {
             last_activity = now;
             idle = false;

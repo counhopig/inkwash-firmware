@@ -199,6 +199,29 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     }
                 }
             }
+            Effect::StartReminderTone(kind) => {
+                // Start the reminder's attention tone through the audio task
+                // (siren for urgent, bounded beep for todo). Non-blocking;
+                // audio unavailability degrades cleanly (the effect still
+                // completes; the overlay stays visible + dismissable).
+                match self.ctx.audio_task {
+                    Some(task) => {
+                        let result = match kind {
+                            inkwash_logic::app::ReminderKind::Urgent => task.start_siren(),
+                            inkwash_logic::app::ReminderKind::Todo => task.beep_todo(),
+                        };
+                        if let Err(err) = result {
+                            Err((EffectCategory::Tone, format!("{err:#}")))
+                        } else {
+                            Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
+                        }
+                    }
+                    None => Err((
+                        EffectCategory::Tone,
+                        "audio codec unavailable at boot".into(),
+                    )),
+                }
+            }
             Effect::StopTone => {
                 // Ask the audio task to stop the ring. The effect completes
                 // immediately (the sound fades within a burst gap); the SM

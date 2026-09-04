@@ -226,6 +226,37 @@ pub(crate) fn dispatch_migrated_command(
 }
 
 impl DeviceContext<'_> {
+    /// Dispatches one non-command event (reminder facts, etc.) into the
+    /// shared state-machine runner and routes any render kicks into the
+    /// shared EPD registry, so the SM's render effects reach the panel the
+    /// same way every other dispatch does. Non-blocking: the pump only runs
+    /// the pure update + synchronous effects.
+    pub fn dispatch_event(&mut self, event: inkwash_logic::app::Event) -> anyhow::Result<()> {
+        let runner = self.app_runner.clone();
+        let last_clock = runner.borrow().last_clock();
+        {
+            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
+            let mut runtime = runner.borrow_mut();
+            runtime.push(event);
+            runtime
+                .pump(&mut executor)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        for kick in runner.borrow_mut().take_kicks() {
+            let mut reg = self.pending_renders.borrow_mut();
+            if kick.is_render() {
+                reg.register(kick);
+            } else {
+                log::warn!(
+                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
+                    kick.effect,
+                    kick.operation_id
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Services one queued USB command from any UI loop. Returns
     /// `(visible_change, activity)`: `visible_change` is true when a
     /// successful command may have changed visible device state (the
@@ -331,20 +362,21 @@ impl DeviceContext<'_> {
     /// it did before AppRunner existed; the legacy alarm branch is
     /// gone so the two paths cannot race for the same AF.
     pub fn poll_runtime(&mut self, now: &DateTime) -> BackgroundOutcome {
-        let sync_outcome = if self.poll_scheduled_sync(now) {
+        // Stage 5/6: reminders are now a state-machine overlay - the fact
+        // layer dispatches ReminderDue (Screen::Reminder + its render), so
+        // nothing visible happens here and no reminder outcome merges into
+        // the sync outcome. The reminder's enter/exit Full renders come from
+        // the SM's own render effects.
+        self.poll_reminders(now);
+        if self.poll_scheduled_sync(now) {
             BackgroundOutcome::VisibleChanged
         } else {
             BackgroundOutcome::NoChange
-        };
-        // A reminder's outcome (AlarmHandled / VisibleChanged / NoChange)
-        // merges with the sync outcome by stable priority; a plain
-        // reminder dismissal stays VisibleChanged even when no sync ran.
-        let reminder_outcome = self.poll_reminders(now);
-        sync_outcome.merge(reminder_outcome)
+        }
     }
 
-    fn poll_reminders(&mut self, now: &DateTime) -> BackgroundOutcome {
-        crate::reminders::poll(self, now)
+    fn poll_reminders(&mut self, now: &DateTime) {
+        crate::reminders::poll(self, now);
     }
 
     /// Runs an urgent/full sync when its wall-clock boundary advances. The

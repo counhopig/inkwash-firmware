@@ -184,19 +184,6 @@ impl BleControl {
     }
 }
 
-/// Drains one queued BLE command (if any) and replies `busy` without
-/// executing it, mirroring `usb_console::reject_pending_command`. Called
-/// from the same blocking screens USB's version is (due-todo, urgent-inbox,
-/// RTC alarm-ringing) now that `BleControl` is reachable from them via
-/// `DeviceContext::ble_control` - see the `Busy` reply in
-/// `control-protocol.md`.
-pub fn reject_pending_command(ble: &mut BleControl) {
-    if let Some((id, _cmd)) = ble.poll_command() {
-        log::info!("Blocking screen active; replying busy to a queued BLE command");
-        ble.write_reply(&control::Reply::Busy, id.as_deref());
-    }
-}
-
 impl Drop for BleControl {
     fn drop(&mut self) {
         // `deinit_full()` stops the NimBLE port, resets the server (which
