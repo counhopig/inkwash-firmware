@@ -85,7 +85,7 @@ const DIRTY_SET_BUF_LEN: usize = 1024;
 /// isn't clobbered by the device's stale copy on the next sync. The set is
 /// cleared only after a successful sync. Same contract for both
 /// `AlarmStore` (dirty = `enabled` changed) and `TodoStore` (dirty =
-/// `done`/`importance` changed).
+/// `done` changed).
 pub struct DirtySet<'a> {
     nvs: &'a EspDefaultNvs,
     key: &'static str,

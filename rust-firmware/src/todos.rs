@@ -46,7 +46,7 @@ impl TodoStore {
     // --- Two-way sync dirty tracking -------------------------------------
     //
     // The device uploads only `local_id`s that changed *locally* since the
-    // last successful sync, so a `done`/`importance` edit made on the
+    // last successful sync, so a `done` edit made on the
     // Server/Desktop side is not clobbered by the device's stale copy on
     // the next sync. The set is cleared only after a successful sync.
 
@@ -54,8 +54,7 @@ impl TodoStore {
         DirtySet::new(&self.nvs, KEY_DIRTY)
     }
 
-    /// Marks `id` as locally changed (done flag and/or importance) and
-    /// pending upload.
+    /// Marks `id` as locally changed (done flag) and pending upload.
     pub fn mark_dirty(&self, id: u8) -> Result<()> {
         self.dirty().mark(id)
     }

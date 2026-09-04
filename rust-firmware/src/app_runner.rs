@@ -276,10 +276,10 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
             }
             Effect::PersistTodoEdit { todos, edited_id } => {
-                // The TodoList screen's confirmable done-toggle / importance
-                // cycle: save the list and mark the row dirty (two-way sync
-                // contract). The completion feeds back as Persisted(Todos),
-                // which releases the machine's one-at-a-time edit gate.
+                // The TodoList screen's confirmable done-toggle: save the
+                // list and mark the row dirty (two-way sync contract). The
+                // completion feeds back as Persisted(Todos), which releases
+                // the machine's one-at-a-time edit gate.
                 match (
                     TodoStore::save(self.ctx.todo_store, todos),
                     self.ctx.todo_store.mark_dirty(*edited_id),

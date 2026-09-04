@@ -691,8 +691,8 @@ pub(crate) fn draw_number_pick(
 
 /// Draws the state-machine TodoList screen (Stage 4, slice 4): stored todo
 /// rows rendered from the store (with the due-today / repeat markers). The
-/// SM owns done-toggle / importance cycling; the executor renders. Same
-/// layout the legacy todos page used.
+/// SM owns the done-toggle and navigation; importance is server-authored and
+/// displayed as part of each row. The executor renders the screen.
 pub(crate) fn draw_todo_list(
     board: &mut Note4Board,
     store: &TodoStore,

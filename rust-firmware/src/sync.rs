@@ -18,7 +18,7 @@ use crate::alarms::AlarmStore;
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::PersistedCounters;
-use crate::todos::{Importance, TodoStore};
+use crate::todos::TodoStore;
 use crate::watchdog;
 use crate::wifi;
 
@@ -84,11 +84,6 @@ struct DeviceAlarmState {
 struct DeviceTodoState {
     id: u8,
     done: bool,
-    /// The device may cycle importance on-device; the server merges it.
-    /// Serialized as `Some(..)` always by the current firmware, but kept
-    /// optional so an older firmware's upload (without the field) is still
-    /// wire-compatible on the server side.
-    importance: Option<Importance>,
 }
 
 /// Reads `read`'s body into `buf` until it fills, the peer closes the
@@ -216,7 +211,7 @@ pub fn fetch_and_apply(
         .pending_read()
         .map_err(|e| anyhow!("failed to load pending inbox reads for upload: {e}"))?;
     // Two-way sync: only items the user actually changed on-device are
-    // uploaded (alarm `enabled`, todo `done`/`importance`). Server-side
+    // uploaded (alarm `enabled`, todo `done`). Server-side
     // edits therefore survive the next sync instead of being clobbered by
     // the device's stale copy; the dirty sets are cleared on success below.
     let dirty_alarms = alarm_store
@@ -240,10 +235,6 @@ pub fn fetch_and_apply(
             .map(|todo| DeviceTodoState {
                 id: todo.id,
                 done: todo.done,
-                // The device owns the todo's importance (long-ENTER cycles
-                // it in `screens.rs`), so it's uploaded for the server to
-                // merge.
-                importance: Some(todo.importance),
             })
             .collect(),
         inbox_read: pending_read,

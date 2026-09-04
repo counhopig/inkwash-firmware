@@ -31,7 +31,7 @@ use crate::datetime::{days_in_month, DateTime};
 use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
-use crate::todo::{Importance, Todo};
+use crate::todo::Todo;
 use crate::wake_cause::WakeCause;
 
 /// Monotonic version number of the *visible* state. Only incremented when a
@@ -544,9 +544,9 @@ pub enum RenderView {
     /// "+ ADD ALARM" row is a deferred executor wedge. Carries the selected
     /// row; the executor loads the rows from the store.
     AlarmList { selected: usize },
-    /// The todo list (Stage 4): rows browsed in the state machine; ENTER
-    /// toggles a row's done flag and long ENTER cycles its importance
-    /// (both confirmable SM edits). Carries the selected row.
+    /// The todo list (Stage 4): rows browsed in the state machine; short
+    /// ENTER toggles a row's done flag and long ENTER returns Home. Carries
+    /// the selected row.
     TodoList { selected: usize },
     /// The inbox list (Stage 4): rows browsed in the state machine, ENTER
     /// opens an item's detail (an SM screen). Carries the selected row; the
@@ -966,24 +966,20 @@ pub struct AppState {
     /// optimistically and the list persists confirmably (one add in flight
     /// at a time). A failed persist pops the appended alarm back.
     pending_alarm_add: Option<OperationId>,
-    /// An in-flight TodoList row edit (Stage 4): ENTER toggled `done` or
-    /// long ENTER cycled `importance` optimistically. The matching
-    /// `Persisted(Todos)` completion confirms it (executor marked it
-    /// dirty); a failure rolls the row back to the captured previous
-    /// state. One edit at a time.
+    /// An in-flight TodoList done-toggle (Stage 4). The matching
+    /// `Persisted(Todos)` completion confirms it (the executor marks it
+    /// dirty); a failure rolls the row back to its previous state. One edit
+    /// at a time.
     pending_todo_list_edit: Option<PendingTodoListEdit>,
     retries: Vec<RetryPending>,
 }
 
-/// An in-flight single-row edit from the TodoList screen. Captures the
-/// row's `done` + `importance` before the optimistic change so a failed
-/// persist can roll both back (the two edit kinds touch different fields).
+/// An in-flight single-row done-toggle from the TodoList screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingTodoListEdit {
     operation_id: OperationId,
     index: usize,
     previous_done: bool,
-    previous_importance: Importance,
 }
 
 /// An in-flight single-row enabled-toggle from the AlarmList screen.
@@ -2315,13 +2311,11 @@ fn range_for_stage(stage: AddStage) -> (u8, u8) {
     }
 }
 
-/// row's done flag, long ENTER cycles its importance (Low -> Medium ->
-/// High) - matching the legacy todos page, where long ENTER cycled
-/// importance and the only way out was the long-UP/DOWN drawer. Both row
-/// actions are optimistic confirmable SM edits (the executor persists the
-/// list + marks the row dirty); a failure rolls the row back. Long UP/DOWN
-/// opens the GO TO drawer (origin TodoList). An empty list has no rows to
-/// act on (moves stay at 0).
+/// Short ENTER toggles a row's done flag through an optimistic confirmable
+/// edit (the executor persists the list + marks the row dirty). Long ENTER
+/// returns Home without editing the selected todo. Long UP/DOWN opens the GO
+/// TO drawer (origin TodoList). An empty list has no rows to act on (moves
+/// stay at 0).
 fn transition_todo_list_button(
     state: &mut AppState,
     selected: usize,
@@ -2360,40 +2354,32 @@ fn transition_todo_list_button(
             state.render_generation = state.render_generation.next();
             vec![render_batch(state)]
         }
-        // ENTER toggles done; long ENTER cycles importance. Both go
-        // through the same confirmable-edit path (one at a time).
-        ButtonEvent::Pressed(ButtonId::Enter) | ButtonEvent::LongPressed(ButtonId::Enter) => {
+        ButtonEvent::LongPressed(ButtonId::Enter) => {
+            state.screen = Screen::Home;
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
+        // Short ENTER toggles done through the confirmable-edit path.
+        ButtonEvent::Pressed(ButtonId::Enter) => {
             if state.pending_todo_list_edit.is_some() {
                 // One edit at a time: while a persist is in flight another
                 // row action is ignored (completion/rollback releases it).
                 return vec![];
             }
-            // Capture what the edit will change before borrowing the row.
-            let toggles_done = button == ButtonEvent::Pressed(ButtonId::Enter);
             let op = state.next_operation_id();
-            let (previous_done, previous_importance, edited_id) = {
+            let (previous_done, edited_id) = {
                 let Some(todo) = state.todos.todos.get_mut(selected) else {
                     return vec![];
                 };
                 let previous_done = todo.done;
-                let previous_importance = todo.importance;
                 let edited_id = todo.id;
-                if toggles_done {
-                    todo.done = !todo.done;
-                } else {
-                    todo.importance = match todo.importance {
-                        Importance::Low => Importance::Medium,
-                        Importance::Medium => Importance::High,
-                        Importance::High => Importance::Low,
-                    };
-                }
-                (previous_done, previous_importance, edited_id)
+                todo.done = !todo.done;
+                (previous_done, edited_id)
             };
             state.pending_todo_list_edit = Some(PendingTodoListEdit {
                 operation_id: op,
                 index: selected,
                 previous_done,
-                previous_importance,
             });
             state.render_generation = state.render_generation.next();
             let list = state.todos.todos.clone();
@@ -3004,9 +2990,8 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
                 state.render_generation = state.render_generation.next();
                 render_after_failure = true;
             }
-            // A TodoList row edit failed to persist: roll both the done
-            // flag and the importance back (NVS never changed), release the
-            // gate and re-render.
+            // A TodoList done-toggle failed to persist: roll the done flag
+            // back (NVS never changed), release the gate and re-render.
             let todo_rollback = match state.pending_todo_list_edit.take() {
                 Some(edit) if edit.operation_id == failure.operation_id => Some(edit),
                 Some(edit) => {
@@ -3018,7 +3003,6 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
             if let Some(rollback) = todo_rollback {
                 if let Some(todo) = state.todos.todos.get_mut(rollback.index) {
                     todo.done = rollback.previous_done;
-                    todo.importance = rollback.previous_importance;
                 }
                 state.render_generation = state.render_generation.next();
                 render_after_failure = true;
@@ -3634,6 +3618,7 @@ fn program_alarm_for(state: &mut AppState, now: &DateTime) -> Vec<EffectBatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::todo::Importance;
 
     fn dt(hour: u8, minute: u8) -> DateTime {
         DateTime {
@@ -7046,68 +7031,26 @@ mod tests {
     }
 
     #[test]
-    fn todo_list_long_enter_cycles_importance_confirmable() {
+    fn todo_list_long_enter_returns_home_without_editing() {
         let mut state = AppState::default();
-        // Row 0 starts Medium.
-        open_todo_list(&mut state, vec![todo(1, "a", false)]);
-        assert_eq!(state.todos.todos[0].importance, Importance::Medium);
+        let todos = vec![todo(1, "a", false)];
+        open_todo_list(&mut state, todos.clone());
+        let before = state.todos.todos.clone();
         let batches = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
         );
-        // Medium -> High.
-        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
-        assert_eq!(state.todos.todos[0].importance, Importance::High);
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::PersistTodoEdit { todos, edited_id: 1 }
-                if todos.first().is_some_and(|t| t.importance == Importance::High)
-        )));
-        let op = state
-            .pending_todo_list_edit
-            .map(|e| e.operation_id)
-            .expect("edit in flight");
-        let _ = update(
-            &mut state,
-            Event::EffectCompleted(EffectCompletion {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op,
-                render_generation: None,
-                output: EffectOutput::Persisted(PersistTarget::Todos),
-            }),
-        );
-        // High -> Low on the next cycle (confirm the persist so the gate
-        // releases before the next edit).
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
-        );
-        assert_eq!(state.todos.todos[0].importance, Importance::Low);
-        let op = state
-            .pending_todo_list_edit
-            .map(|e| e.operation_id)
-            .expect("edit in flight");
-        let _ = update(
-            &mut state,
-            Event::EffectCompleted(EffectCompletion {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op,
-                render_generation: None,
-                output: EffectOutput::Persisted(PersistTarget::Todos),
-            }),
-        );
-        // And Low -> Medium.
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
-        );
-        assert_eq!(state.todos.todos[0].importance, Importance::Medium);
+        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(state.todos.todos, before);
+        assert!(state.pending_todo_list_edit.is_none());
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|effect| matches!(effect, Effect::PersistTodoEdit { .. })));
     }
 
     #[test]
-    fn todo_list_edit_persist_failure_rolls_back_done_and_importance() {
+    fn todo_list_done_persist_failure_rolls_back_without_touching_importance() {
         let mut state = AppState::default();
         open_todo_list(&mut state, vec![todo(1, "a", false)]);
         // Toggle done.
@@ -7136,31 +7079,7 @@ mod tests {
             "failed persist releases the gate"
         );
         assert!(!state.todos.todos[0].done, "done rolled back");
-        // Long-ENTER cycle then fail: importance rolls back too.
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
-        );
-        assert_eq!(state.todos.todos[0].importance, Importance::High);
-        let op = state
-            .pending_todo_list_edit
-            .map(|e| e.operation_id)
-            .unwrap();
-        let _ = update(
-            &mut state,
-            Event::EffectFailed(EffectFailure {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: op,
-                render_generation: None,
-                error: EffectError::Persist("nvs full".into()),
-            }),
-        );
-        assert_eq!(
-            state.todos.todos[0].importance,
-            Importance::Medium,
-            "importance rolled back to pre-edit value"
-        );
+        assert_eq!(state.todos.todos[0].importance, Importance::Medium);
     }
 
     #[test]
