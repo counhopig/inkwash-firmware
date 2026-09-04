@@ -716,7 +716,7 @@ fn render_todo_page(
         .collect();
     let mut canvas = board.display.canvas_mut();
     draw_rows(&mut canvas, "TODOS", &items, selected);
-    footer(&mut canvas, "ENTER DONE   HOLD ENTER IMPORTANCE");
+    footer(&mut canvas, "ENTER DONE   HOLD ENTER HOME");
 }
 
 /// Whether `todo` (repeating or one-off) is due on `now`'s date.
