@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件功能基线：** `c8b60ff`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件功能基线：** `a153718`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
 **宿主测试：** `logic` 277 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新功能基线（c8b60ff）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新功能基线（a153718）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -45,6 +45,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ✅ Calendar drawer 与 RTC watchdog 项已通过；Inbox 页面验收正常（均为 ELF `v0.5.0-158-g869dd85` 的设备记录）。
 - ✅ `1fc308c` 已随文档提交组成的 ELF `v0.5.0-161-g0148ed9` 重刷 NOTE4：同页打开、移动、关闭 Navigation drawer 的观感均为局部刷新，关闭后来源像素恢复；切换到不同页面仍为 Full。串口 `/tmp/inkwash-drawer-partial-0148ed9.log` 对应记录为 `Partial(Rect { x: 16, y: 34, width: 176, height: 266 })`，跨页记录为 Full，无 watchdog/panic/reboot。
 - ✅ NOTE4 Alarms 页面长列表复测通过（ELF `v0.5.0-173-gb58fb12`）：连续 DOWN 时列表窗口随选中项滚动，末尾 `+ ADD ALARM` 文字与选框完整可见；从末尾循环回首行后底部内容和选框均正确清除，无残影。ADD ALARM 完成 minute 确认后返回列表并选中新项；列表首尾循环及长列表局部刷新正常。
+- ❌ NOTE4 Todos 页面复测（HEAD `9421d40`）发现：连续短按 DOWN 到末项不会回到首项，UP 首项也不会循环到末项。长按 ENTER 按产品契约继续循环 importance，返回通过长按 UP/DOWN 打开 drawer 后选择 HOME；`a153718` 已修复列表首尾循环，待新 ELF 刷入复测。
 - ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
@@ -99,7 +100,7 @@ espflash flash ... <同 ELF 路径>
 | Calendar | 本月网格 | UP/DOWN 移日 → ENTER 开周 | 任意键关 |
 | Inbox | 未读 ○/已读 • | ENTER 开详情（自动标读） | 任意键关 |
 | Alarms | 列表 + 开关行 | ENTER 翻转 enabled（持久化）；ADD 行 → 两段 picker | 长按 ENTER 回 |
-| Todos | 列表 | ENTER 完成/长按 循环重要性（持久化） | 长按 ENTER 回 |
+| Todos | 列表 | ENTER 完成/长按循环重要性（持久化） | 长按 UP/DOWN 开 drawer，选择 HOME 返回 |
 | Settings | SYNC NOW/INTERVAL/BLE/SLEEP | row1 → SM interval picker；row3 → 深睡 | 长按 ENTER 回 Home |
 | BLE pairing | Settings row2 → 配对屏 |（见 §4）| 任意键退出 |
 
