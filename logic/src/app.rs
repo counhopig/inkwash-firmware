@@ -8135,6 +8135,67 @@ mod tests {
     }
 
     #[test]
+    fn double_enter_ring_dismisses_exactly_once() {
+        // Two ENTERs while Firing: the first dismisses (Firing ->
+        // WaitingForRearm), the second is a no-op - StopTone + the restore
+        // render fire exactly once.
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        let first = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        let second = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        let count = |batches: &[EffectBatch]| {
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .filter(|e| matches!(e, Effect::StopTone))
+                .count()
+        };
+        assert_eq!(count(&first), 1);
+        assert_eq!(count(&second), 0, "second ENTER must not StopTone again");
+    }
+
+    #[test]
+    fn tick_while_reminder_shown_produces_no_extra_overlay_render() {
+        // A reminder overlay is current; a per-minute Tick must not add a
+        // reminder render (the reminder is in the tick-skip set - only its
+        // own enter/dismiss render and deadline dismissal render).
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Todo,
+                lines: vec!["due".into()],
+            }),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        // A minute-roll Tick (not past the deadline) leaves the reminder
+        // untouched and emits no render.
+        let batches = update(&mut state, Event::Tick(dt(8, 1)));
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopTone)));
+    }
+
+    #[test]
     fn boot_with_firing_alarm_renders_once_not_twice() {
         let mut state = AppState::default();
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
