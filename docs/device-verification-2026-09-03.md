@@ -1,11 +1,11 @@
 # 真机验证矩阵 — 迁移收尾架构（阶段 5/6/7/最终复审，2026-09-04 更新）
 
-**固件功能基线：** `eab6d86`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
+**固件功能基线：** `c9335f9`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
-**宿主测试：** `logic` 263 通过
+**宿主测试：** `logic` 264 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
-旧版本号则只对该旧基线成立。新功能基线（eab6d86）必须在重刷后才可把「最终版本通过」
+旧版本号则只对该旧基线成立。新功能基线（c9335f9）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
 **设备：** NOTE4 黑白版（MAC `20:6e:f1:b4:7d:e4`）
 **端口：** `/dev/tty.usbmodem1101`（USB-Serial-JTAG；开/关端口会复位芯片，检查间隔请留足静默）
@@ -37,7 +37,9 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ❌ `db3d0bf` 页面交互复测出现 Task WDT reset（`/tmp/inkwash-pages-db3d0bf.log`，约 27 s 后；
   `pthread did not reset`，随后 `RTC_SW_CPU_RST`）。`eab6d86` 已修复 RTC executor 连续命令流的喂狗路径；
   必须重刷该基线并复测页面矩阵，不能继承这次失败前的交互结论。
-- ⚠️ 上述设备证据对应各自旧基线；eab6d86 需要重新刷写后才能继承，§1b/§3/§4/§5/§6/§8
+- ❌ `eab6d86` 页面验收发现 Calendar 长按 UP/DOWN 打开 drawer 时背景错误显示 Home，未满足来源页覆盖契约；
+  `c9335f9` 已修复来源页保存与叠加绘制，必须重刷后复测 Calendar 及各 drawer 来源页。
+- ⚠️ 上述设备证据对应各自旧基线；c9335f9 需要重新刷写后才能继承，§1b/§3/§4/§5/§6/§8
   的交互项仍需在本功能基线上人工逐项复验。
 
 ---
