@@ -354,6 +354,10 @@ fn main() -> Result<()> {
         audio_task: audio_handle.as_ref(),
         sync_scheduler: SyncScheduler::new(clock.as_ref(), &counters),
         pending_wifi_op: None,
+        ble_session_id: None,
+        ble_wifi_suspended: false,
+        ble_start_failure: None,
+        ble_start_cancelled: false,
         last_command: None,
         sm_sync_reply_target: None,
         sm_wifi_reply_target: None,
@@ -564,6 +568,20 @@ fn main() -> Result<()> {
 
         // Poll BLE worker results, lifecycle facts, and incoming commands;
         // every operation is non-blocking on the main loop.
+        while let Some((session_id, message)) = ctx.take_ble_start_failure() {
+            let current_session = inkwash_logic::app::ble_pairing_session_matches(
+                &app_runner.borrow().state().screen,
+                session_id,
+            );
+            if current_session {
+                let event = inkwash_logic::app::Event::BlePairingFailed(
+                    inkwash_logic::app::BlePairingFailure { message },
+                );
+                if let Err(err) = dispatch_app_runner(&app_runner, event, &mut ctx) {
+                    log::warn!("BLE preflight result dispatch failed: {err}");
+                }
+            }
+        }
         while let Some(result) = ctx.ble_control.poll_result() {
             let (session_id, event) = match result {
                 ble_control::BleTaskResult::Started { session_id } => {
@@ -578,6 +596,14 @@ fn main() -> Result<()> {
                         inkwash_logic::app::BlePairingFailure { message },
                     ),
                 ),
+                ble_control::BleTaskResult::Stopped { session_id } => {
+                    if ctx.ble_stopped(session_id) {
+                        log::info!("BLE session {session_id} stopped; Wi-Fi resume queued");
+                    } else {
+                        log::warn!("Ignoring stale BLE stop result for session {session_id}");
+                    }
+                    continue;
+                }
             };
             let current_session = inkwash_logic::app::ble_pairing_session_matches(
                 &app_runner.borrow().state().screen,

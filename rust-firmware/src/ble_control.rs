@@ -40,11 +40,12 @@ pub enum BleLifecycle {
 pub enum BleTaskResult {
     Started { session_id: u64 },
     Failed { session_id: u64, message: String },
+    Stopped { session_id: u64 },
 }
 
 enum WorkerCommand {
     Start { name: String, session_id: u64 },
-    Stop,
+    Stop { session_id: u64 },
     Reply(String),
 }
 
@@ -109,9 +110,9 @@ impl BleControl {
 
     /// Queue radio teardown without blocking the main loop. The worker's
     /// command order guarantees Stop runs before a later Start.
-    pub fn stop(&self) -> Result<()> {
+    pub fn stop(&self, session_id: u64) -> Result<()> {
         self.command_tx
-            .try_send(WorkerCommand::Stop)
+            .try_send(WorkerCommand::Stop { session_id })
             .map_err(|err| anyhow!("BLE worker stop queue unavailable: {err}"))
     }
 
@@ -147,7 +148,9 @@ impl Drop for BleControl {
     fn drop(&mut self) {
         // Best-effort wakeup; dropping the last sender also makes the worker
         // leave its receive loop and drop any session it still owns.
-        let _ = self.command_tx.try_send(WorkerCommand::Stop);
+        let _ = self
+            .command_tx
+            .try_send(WorkerCommand::Stop { session_id: 0 });
     }
 }
 
@@ -180,8 +183,9 @@ fn run(
                     }
                 }
             }
-            Ok(WorkerCommand::Stop) => {
+            Ok(WorkerCommand::Stop { session_id }) => {
                 session.take();
+                let _ = result_tx.try_send(BleTaskResult::Stopped { session_id });
             }
             Ok(WorkerCommand::Reply(json)) => {
                 if let Some(active) = session.as_ref() {

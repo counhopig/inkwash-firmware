@@ -23,6 +23,7 @@ pub mod alarm_schedule;
 pub mod app;
 pub mod audio_command;
 pub mod ble_memory;
+pub mod ble_radio;
 pub mod button_event;
 pub mod datetime;
 pub mod device_config;
@@ -77,5 +78,23 @@ mod ble_memory_contract {
         assert!(config_is("BT_CTRL_BLE_SCAN", "n"));
         assert!(config_is("BT_CTRL_DTM_ENABLE", "n"));
         assert!(config_is("BT_CTRL_RUN_IN_FLASH_ONLY", "y"));
+    }
+
+    #[test]
+    fn firmware_owns_radio_arbitration_and_restores_wifi() {
+        const SYNC_TASK: &str = include_str!("../../rust-firmware/src/sync_task.rs");
+        const CTX: &str = include_str!("../../rust-firmware/src/ctx.rs");
+        const APP_RUNNER: &str = include_str!("../../rust-firmware/src/app_runner.rs");
+        assert!(SYNC_TASK.contains("SyncCommand::SuspendForBle"));
+        assert!(SYNC_TASK.contains("SyncCommand::ResumeAfterBle"));
+        assert!(SYNC_TASK.contains("wifi.suspend_for_ble()"));
+        assert!(SYNC_TASK.contains("wifi.resume_after_ble()"));
+        assert!(CTX.contains("self.sync.suspend_for_ble()?"));
+        assert!(CTX.contains("self.ble_control.start(&name, session_id)"));
+        assert!(CTX.contains("self.sync.resume_after_ble()"));
+        assert!(CTX.contains("ble_start_cancelled"));
+        assert!(CTX.contains("self.resume_wifi_after_ble()"));
+        assert!(APP_RUNNER.contains("start_ble_pairing(req)"));
+        assert!(CTX.contains("pub fn ble_stopped"));
     }
 }

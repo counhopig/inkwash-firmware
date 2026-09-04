@@ -49,6 +49,10 @@ pub enum SyncCommand {
     /// Lightweight urgent-message poll; `true` when the server has urgent
     /// content (the scheduler then dispatches a full sync).
     UrgentPoll { reply: Sender<Result<bool>> },
+    /// Stop Wi-Fi and release its run-time buffers before BLE controller init.
+    SuspendForBle { reply: Sender<Result<()>> },
+    /// Restore the shared Wi-Fi driver after BLE deinitialization.
+    ResumeAfterBle { reply: Sender<Result<()>> },
 }
 
 /// A Wi-Fi operation dispatched to the sync task, awaiting its receipt.
@@ -57,9 +61,23 @@ pub enum SyncCommand {
 /// sent, kept so the dedup cache can be updated with the real reply once
 /// the operation completes.
 pub enum PendingWifiOp {
-    Sync { reply: Receiver<SyncResult> },
-    SetWifi { reply: Receiver<Result<()>> },
-    UrgentPoll { reply: Receiver<Result<bool>> },
+    Sync {
+        reply: Receiver<SyncResult>,
+    },
+    SetWifi {
+        reply: Receiver<Result<()>>,
+    },
+    UrgentPoll {
+        reply: Receiver<Result<bool>>,
+    },
+    SuspendForBle {
+        reply: Receiver<Result<()>>,
+        session_id: u64,
+        name: String,
+    },
+    ResumeAfterBle {
+        reply: Receiver<Result<()>>,
+    },
 }
 
 /// Client handle kept by the main loop: the command sender. The task owns
@@ -104,6 +122,20 @@ impl SyncTask {
         self.tx.send(SyncCommand::UrgentPoll { reply: reply_tx })?;
         Ok(reply_rx)
     }
+
+    pub fn suspend_for_ble(&self) -> Result<Receiver<Result<()>>> {
+        let (reply_tx, reply_rx) = channel();
+        self.tx
+            .send(SyncCommand::SuspendForBle { reply: reply_tx })?;
+        Ok(reply_rx)
+    }
+
+    pub fn resume_after_ble(&self) -> Result<Receiver<Result<()>>> {
+        let (reply_tx, reply_rx) = channel();
+        self.tx
+            .send(SyncCommand::ResumeAfterBle { reply: reply_tx })?;
+        Ok(reply_rx)
+    }
 }
 
 fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<SyncCommand>) {
@@ -126,6 +158,7 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
         }
     };
 
+    let mut wifi_suspended = false;
     loop {
         let cmd = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(cmd) => cmd,
@@ -139,22 +172,51 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
         };
         match cmd {
             SyncCommand::SyncNow { now, reply } => {
-                let result = sync::sync_now(
-                    &counters,
-                    &mut wifi,
-                    &alarm_store,
-                    &todo_store,
-                    &inbox_store,
-                    &now,
-                );
+                let result = if wifi_suspended {
+                    crate::sync::SyncResult {
+                        outcome: Err(anyhow::anyhow!("Wi-Fi is suspended for BLE pairing")),
+                        ntp_epoch: None,
+                    }
+                } else {
+                    sync::sync_now(
+                        &counters,
+                        &mut wifi,
+                        &alarm_store,
+                        &todo_store,
+                        &inbox_store,
+                        &now,
+                    )
+                };
                 let _ = reply.send(result);
             }
             SyncCommand::SetWifi { creds, reply } => {
-                let result = verify_and_save(&mut wifi, &counters, &creds);
+                let result = if wifi_suspended {
+                    Err(anyhow::anyhow!("Wi-Fi is suspended for BLE pairing"))
+                } else {
+                    verify_and_save(&mut wifi, &counters, &creds)
+                };
                 let _ = reply.send(result);
             }
             SyncCommand::UrgentPoll { reply } => {
-                let result = sync::poll_urgent(&counters, &mut wifi);
+                let result = if wifi_suspended {
+                    Err(anyhow::anyhow!("Wi-Fi is suspended for BLE pairing"))
+                } else {
+                    sync::poll_urgent(&counters, &mut wifi)
+                };
+                let _ = reply.send(result);
+            }
+            SyncCommand::SuspendForBle { reply } => {
+                let result = wifi.suspend_for_ble();
+                if result.is_ok() {
+                    wifi_suspended = true;
+                }
+                let _ = reply.send(result);
+            }
+            SyncCommand::ResumeAfterBle { reply } => {
+                let result = wifi.resume_after_ble();
+                if result.is_ok() {
+                    wifi_suspended = false;
+                }
                 let _ = reply.send(result);
             }
         }

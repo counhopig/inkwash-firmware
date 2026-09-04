@@ -86,6 +86,13 @@ pub struct DeviceContext<'a> {
     /// serializes them anyway); `None` when idle. The receipt is polled by
     /// [`DeviceContext::poll_wifi_ops`].
     pub pending_wifi_op: Option<PendingWifiOp>,
+    /// Session currently arbitrating the shared radio.  The ID is carried
+    /// through every completion so a stale worker result cannot resume Wi-Fi
+    /// for a newer pairing session.
+    pub ble_session_id: Option<u64>,
+    pub ble_wifi_suspended: bool,
+    pub ble_start_failure: Option<(u64, String)>,
+    pub ble_start_cancelled: bool,
     /// The last id-tagged command `control::dispatch` actually executed
     /// (USB or BLE, whichever came last), and the reply it produced.
     /// Resent duplicates of that exact `(id, Command)` replay the cached
@@ -458,6 +465,78 @@ impl DeviceContext<'_> {
         Ok(true)
     }
 
+    /// Begins BLE radio arbitration without waiting on the sync task.  The
+    /// worker is started only after its SuspendForBle receipt arrives.
+    pub fn start_ble_pairing(
+        &mut self,
+        request: &inkwash_logic::app::BlePairingRequest,
+    ) -> Result<bool> {
+        if self.pending_wifi_op.is_some()
+            || self.ble_session_id.is_some()
+            || self.ble_wifi_suspended
+        {
+            return Ok(false);
+        }
+        let reply = self.sync.suspend_for_ble()?;
+        self.ble_session_id = Some(request.session_id);
+        self.ble_start_cancelled = false;
+        self.pending_wifi_op = Some(PendingWifiOp::SuspendForBle {
+            reply,
+            session_id: request.session_id,
+            name: request.name.clone(),
+        });
+        Ok(true)
+    }
+
+    /// Queue Wi-Fi restoration after the matching BLE worker Stop receipt.
+    fn resume_wifi_after_ble(&mut self) {
+        if self.pending_wifi_op.is_some() || !self.ble_wifi_suspended {
+            if !self.ble_wifi_suspended {
+                self.ble_session_id = None;
+            }
+            return;
+        }
+        match self.sync.resume_after_ble() {
+            Ok(reply) => {
+                self.pending_wifi_op = Some(PendingWifiOp::ResumeAfterBle { reply });
+            }
+            Err(err) => log::error!("Failed to queue Wi-Fi resume after BLE: {err:#}"),
+        }
+    }
+
+    /// Main consumes a failed preflight/suspend attempt as a normal BLE
+    /// lifecycle fact, so the state machine returns to Settings and queues
+    /// its ordinary Stop teardown path.
+    pub fn take_ble_start_failure(&mut self) -> Option<(u64, String)> {
+        self.ble_start_failure.take()
+    }
+
+    /// Applies a BLE worker result that is independent of the state-machine
+    /// screen.  Returns `true` when the result belongs to the current radio
+    /// session and may affect Wi-Fi ownership.
+    pub fn ble_stopped(&mut self, session_id: u64) -> bool {
+        if self.ble_session_id != Some(session_id) {
+            return false;
+        }
+        self.resume_wifi_after_ble();
+        true
+    }
+
+    /// Cancels a start whose Wi-Fi suspend receipt has not arrived yet.  In
+    /// that window there is no BLE session to stop; polling the suspend
+    /// receipt will restore Wi-Fi directly instead of queueing a stale Start
+    /// behind the already-issued UI exit.
+    pub fn stop_ble_pairing(&mut self) -> Result<()> {
+        if matches!(
+            &self.pending_wifi_op,
+            Some(PendingWifiOp::SuspendForBle { .. })
+        ) {
+            self.ble_start_cancelled = true;
+            return Ok(());
+        }
+        self.ble_control.stop(self.ble_session_id.unwrap_or(0))
+    }
+
     /// Polls the pending Wi-Fi operation's receipt (non-blocking). Called
     /// every main-loop iteration and by blocking screens via
     /// [`DeviceContext::poll_background`]; applies completion side effects
@@ -530,6 +609,60 @@ impl DeviceContext<'_> {
                     self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
                 }
                 Err(_) => {}
+            },
+            PendingWifiOp::SuspendForBle {
+                reply,
+                session_id,
+                name,
+            } => match reply.try_recv() {
+                Ok(Ok(())) => {
+                    self.ble_wifi_suspended = true;
+                    let still_pairing = {
+                        let runner = self.app_runner.borrow();
+                        inkwash_logic::app::ble_pairing_session_matches(
+                            &runner.state().screen,
+                            session_id,
+                        )
+                    };
+                    if self.ble_start_cancelled || !still_pairing {
+                        self.ble_start_cancelled = false;
+                        self.resume_wifi_after_ble();
+                    } else if let Err(err) = self.ble_control.start(&name, session_id) {
+                        self.ble_start_failure = Some((
+                            session_id,
+                            format!("BLE worker start queue failed: {err:#}"),
+                        ));
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.ble_start_failure =
+                        Some((session_id, format!("Wi-Fi suspend failed: {err:#}")));
+                    self.ble_session_id = Some(session_id);
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::SuspendForBle {
+                        reply,
+                        session_id,
+                        name,
+                    });
+                }
+                Err(_) => {
+                    self.ble_start_failure =
+                        Some((session_id, "Wi-Fi suspend task disconnected".to_string()));
+                }
+            },
+            PendingWifiOp::ResumeAfterBle { reply } => match reply.try_recv() {
+                Ok(Ok(())) => {
+                    self.ble_wifi_suspended = false;
+                    self.ble_session_id = None;
+                }
+                Ok(Err(err)) => {
+                    log::error!("Wi-Fi resume after BLE failed: {err:#}");
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::ResumeAfterBle { reply });
+                }
+                Err(_) => log::error!("Wi-Fi resume task disconnected after BLE"),
             },
         }
     }

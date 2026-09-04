@@ -371,9 +371,16 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 // owns all radio handles and reports Started/Failed facts to
                 // the main loop. Never call BLEDevice::init on this thread.
                 self.ctx
-                    .ble_control
-                    .start(&req.name, req.session_id)
-                    .map(|()| EffectOutcome::Async)
+                    .start_ble_pairing(req)
+                    .and_then(|started| {
+                        if started {
+                            Ok(EffectOutcome::Async)
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "Wi-Fi is busy or BLE radio is still stopping"
+                            ))
+                        }
+                    })
                     .map_err(|err| {
                         (
                             EffectCategory::Ble,
@@ -385,8 +392,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 // Stop is serialized behind any in-flight Start on the same
                 // worker, so a fast exit/re-entry cannot race deinit/init.
                 self.ctx
-                    .ble_control
-                    .stop()
+                    .stop_ble_pairing()
                     .map(|()| EffectOutcome::Async)
                     .map_err(|err| {
                         (
