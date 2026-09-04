@@ -240,11 +240,26 @@ impl BleSession {
         BLEDevice::init();
         let result = Self::start_initialized();
         if result.is_err() {
-            if let Err(err) = BLEDevice::deinit_full() {
-                log::warn!("BLE cleanup after start failure failed: {err:?}");
-            }
+            Self::shutdown_nimble();
         }
         result
+    }
+
+    /// Stop advertising while the NimBLE host is still alive. The crate's
+    /// `deinit_full()` resets its global advertising object *after* stopping
+    /// the host; if advertising is still active that reset calls
+    /// `ble_gap_adv_stop()` after `nimble_port_deinit()`, which is a
+    /// use-after-deinit on ESP-IDF and panics in `ble_gap_adv_active()`.
+    fn shutdown_nimble() {
+        let advertising = BLEDevice::take().get_advertising();
+        if advertising.lock().is_advertising() {
+            if let Err(err) = advertising.lock().stop() {
+                log::warn!("BLE advertising stop before deinit failed: {err:?}");
+            }
+        }
+        if let Err(err) = BLEDevice::deinit_full() {
+            log::warn!("BLE cleanup after stop failed: {err:?}");
+        }
     }
 
     fn start_initialized() -> Result<Self> {
@@ -328,10 +343,7 @@ impl BleSession {
 
 impl Drop for BleSession {
     fn drop(&mut self) {
-        if let Err(err) = BLEDevice::deinit_full() {
-            log::warn!("BLE deinit_full failed: {err:?}");
-        } else {
-            log::info!("BLE control torn down; advertising stopped");
-        }
+        BleSession::shutdown_nimble();
+        log::info!("BLE control torn down; advertising stopped");
     }
 }

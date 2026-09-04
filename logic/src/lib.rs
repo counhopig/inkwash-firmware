@@ -103,4 +103,15 @@ mod ble_memory_contract {
         assert!(APP_RUNNER.contains("start_ble_pairing(req)"));
         assert!(CTX.contains("pub fn ble_stopped"));
     }
+
+    #[test]
+    fn ble_cleanup_stops_advertising_before_deinit() {
+        let stop = BLE_SOURCE
+            .find("advertising.lock().stop()")
+            .expect("cleanup must stop advertising explicitly");
+        let deinit = BLE_SOURCE
+            .find("BLEDevice::deinit_full()")
+            .expect("cleanup must deinitialize NimBLE");
+        assert!(stop < deinit, "advertising must stop before NimBLE deinit");
+    }
 }
