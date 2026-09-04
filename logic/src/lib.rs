@@ -60,6 +60,7 @@ mod ble_memory_contract {
 
     #[test]
     fn ble_worker_uses_internal_stack_and_checks_internal_heap_before_init() {
+        assert!(BLE_SOURCE.contains("const BLE_TASK_STACK: usize = 16 * 1024"));
         assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT"));
         assert!(!BLE_SOURCE.contains("MALLOC_CAP_SPIRAM"));
         assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA"));
@@ -67,6 +68,22 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS)"));
         assert!(BLE_SOURCE.contains("BLEDevice::init();"));
         assert!(BLE_SOURCE.contains("if !inkwash_logic::ble_memory::sufficient_internal_heap"));
+        assert!(BLE_SOURCE.contains("log_stack_high_watermark(\"before BLE init\")"));
+        assert!(BLE_SOURCE.contains("log_stack_high_watermark(\"after BLE init\")"));
+    }
+
+    #[test]
+    fn ble_worker_rejects_duplicate_starts_without_dropping_active_session() {
+        let start_guard = BLE_SOURCE
+            .find("if session.is_some()")
+            .expect("worker must guard duplicate Start commands");
+        let start_init = BLE_SOURCE
+            .find("match BleSession::start()")
+            .expect("worker must initialize after duplicate Start guard");
+        assert!(start_guard < start_init);
+        assert!(BLE_SOURCE.contains("active_session_id"));
+        assert!(BLE_SOURCE.contains("rejecting Start session"));
+        assert!(BLE_SOURCE.contains("ignoring stale Stop session"));
     }
 
     #[test]

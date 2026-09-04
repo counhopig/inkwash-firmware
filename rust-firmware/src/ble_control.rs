@@ -18,11 +18,12 @@ use crate::control;
 const CHANNEL_CAPACITY: usize = 16;
 /// BLE setup is driven from this worker, but the pthread stack itself lives
 /// in internal RAM because the ESP32-S3 controller initialization runs with
-/// the cache disabled and cannot safely touch a PSRAM stack. 8 KiB leaves
-/// headroom over the configured 5120-byte NimBLE host stack; Wi-Fi is fully
-/// deinitialized before this worker starts BLE, so the internal heap remains
-/// sufficient for the controller.
-const BLE_TASK_STACK: usize = 8 * 1024;
+/// the cache disabled and cannot safely touch a PSRAM stack. 16 KiB gives the
+/// NimBLE host/controller initialization path headroom over the configured
+/// 5120-byte NimBLE host stack; Wi-Fi is fully deinitialized before this
+/// worker starts BLE, so the internal heap remains sufficient for the
+/// controller.
+const BLE_TASK_STACK: usize = 16 * 1024;
 /// Match the ESP32-S3 controller's allocation capabilities. NimBLE host
 /// buffers are separate; controller startup uses internal DMA-capable RAM.
 const BLE_INTERNAL_CAPS: u32 =
@@ -164,6 +165,7 @@ fn run(
     result_tx: mpsc::SyncSender<BleTaskResult>,
 ) {
     let mut session = None;
+    let mut active_session_id = None;
     loop {
         match command_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(WorkerCommand::Start {
@@ -171,15 +173,26 @@ fn run(
                 session_id,
             }) => {
                 log::info!("BLE worker: Start session {session_id}");
-                // A re-entry is serialized after the preceding Stop and is
-                // therefore safe even if the caller moved quickly.
-                session.take();
+                // Never tear down an active session to service a duplicate or
+                // corrupted Start. Stop must be received first; dropping the
+                // NimBLE session here could run deinit on a live controller.
+                if session.is_some() {
+                    log::warn!(
+                        "BLE worker: rejecting Start session {session_id}; active session {:?}",
+                        active_session_id
+                    );
+                    continue;
+                }
+                log_stack_high_watermark("before BLE init");
                 match BleSession::start() {
                     Ok(new_session) => {
                         session = Some(new_session);
+                        active_session_id = Some(session_id);
+                        log_stack_high_watermark("after BLE init");
                         let _ = result_tx.try_send(BleTaskResult::Started { session_id });
                     }
                     Err(err) => {
+                        log_stack_high_watermark("after BLE init failure");
                         let _ = result_tx.try_send(BleTaskResult::Failed {
                             session_id,
                             message: format!("{err:#}"),
@@ -189,7 +202,15 @@ fn run(
             }
             Ok(WorkerCommand::Stop { session_id }) => {
                 log::info!("BLE worker: Stop session {session_id}");
-                session.take();
+                if session.is_some() && (session_id == 0 || active_session_id == Some(session_id)) {
+                    session.take();
+                    active_session_id = None;
+                } else if session.is_some() {
+                    log::warn!(
+                        "BLE worker: ignoring stale Stop session {session_id}; active session {:?}",
+                        active_session_id
+                    );
+                }
                 let _ = result_tx.try_send(BleTaskResult::Stopped { session_id });
             }
             Ok(WorkerCommand::Reply(json)) => {
@@ -216,6 +237,16 @@ fn run(
         }
     }
     session.take();
+}
+
+/// ESP-IDF reports this value in bytes (not the FreeRTOS word units used by
+/// the upstream API). Keeping the measurement in the worker log makes a
+/// device trace sufficient to distinguish a controller allocation failure
+/// from a worker-stack exhaustion before the next BLE regression.
+fn log_stack_high_watermark(stage: &str) {
+    let free_bytes =
+        unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark2(std::ptr::null_mut()) };
+    log::info!("BLE worker stack: {stage}, high-water free={free_bytes} bytes");
 }
 
 /// The NimBLE-owning half of the BLE implementation. It never crosses the
