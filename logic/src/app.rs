@@ -150,9 +150,9 @@ impl Screen {
     ///   ENTER toggles an alarm's enabled flag through a confirmable edit;
     ///   the "+ ADD ALARM" row is a deferred executor wedge).
     ///
-    /// `AlarmRinging` maps to Home: the ringing frame is owned by the
-    /// legacy `ring_screen`, which draws over whatever the SM render
-    /// produced before the EPD request lands.
+    /// `AlarmRinging` renders its own full-frame alarm view; the SM owns
+    /// the whole lifecycle (Firing state, ENTER dismiss, ring-deadline
+    /// timeout) and there is no legacy blocking ring screen anymore.
     pub fn render_view(&self) -> RenderView {
         match self {
             Screen::Navigation { selected, .. } => RenderView::Navigation {
@@ -193,7 +193,8 @@ impl Screen {
                 value: *value,
             },
             Screen::BlePairing(_) => RenderView::BlePairing,
-            Screen::Home | Screen::AlarmRinging => RenderView::Home,
+            Screen::AlarmRinging => RenderView::AlarmRinging,
+            Screen::Home => RenderView::Home,
         }
     }
 }
@@ -533,6 +534,12 @@ pub enum RenderView {
     /// phase-specific visuals stay with the radio layer until the NimBLE
     /// event wiring lands (the SM phase transitions are locked regardless).
     BlePairing,
+    /// The non-blocking alarm ring screen (Stage 5/6): shown while
+    /// `AlarmRuntimeState::Firing` and the ring overlay is up. The executor
+    /// draws the alarm frame; ENTER (via Event::Button) and the ring-deadline
+    /// Tick both leave through the SM's `dismiss_ringing`. No legacy blocking
+    /// ring owns this frame anymore.
+    AlarmRinging,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7397,7 +7404,7 @@ mod tests {
                 Screen::Inbox { selected: 0 },
                 RenderView::Inbox { selected: 0 },
             ),
-            (Screen::AlarmRinging, RenderView::Home),
+            (Screen::AlarmRinging, RenderView::AlarmRinging),
             (
                 Screen::BlePairing(BlePairingState {
                     phase: BlePairingPhase::Waiting,

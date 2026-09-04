@@ -490,6 +490,9 @@ pub(crate) fn draw_sm_surface(
         RenderView::BlePairing => {
             crate::screens::draw_ble_pairing(ctx.board);
         }
+        RenderView::AlarmRinging => {
+            crate::screens::draw_alarm_ringing(ctx.board);
+        }
     }
 }
 

@@ -593,6 +593,24 @@ pub(crate) fn draw_alarm_list(board: &mut Note4Board, store: &AlarmStore, select
 /// the phase; any button exits back to Settings); this draws the same
 /// instructions the legacy ble_pairing_screen showed while its radio
 /// wedge was on screen.
+/// Draws the non-blocking alarm ring frame (Stage 5/6). The SM owns the
+/// ring lifecycle (Firing state, ENTER dismiss, ring-deadline timeout); this
+/// only paints the ALARM canvas the legacy ring_screen used to draw over the
+/// page. Replaces the direct `refresh_full_best_effort` call the legacy
+/// blocking ring made - the RenderPlan-driven executor submits this frame.
+pub(crate) fn draw_alarm_ringing(board: &mut Note4Board) {
+    let mut canvas = board.display.canvas_mut();
+    canvas.clear();
+    header(&mut canvas, "ALARM");
+    let alarm_w = Canvas::text_prop_width("ALARM", 4);
+    canvas.draw_text_prop(200usize.saturating_sub(alarm_w / 2), 92, 4, "ALARM");
+    let hint = "ENTER = DISMISS";
+    let hint_w = Canvas::text_prop_width(hint, 1);
+    canvas.draw_text_prop(200usize.saturating_sub(hint_w / 2), 184, 1, hint);
+    footer(&mut canvas, "ENTER = DISMISS");
+    drop(canvas);
+}
+
 pub(crate) fn draw_ble_pairing(board: &mut Note4Board) {
     let mut canvas = board.display.canvas_mut();
     canvas.clear();
