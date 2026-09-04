@@ -4,15 +4,9 @@
 //! intentionally NOT here: it's a transient value re-read from the RTC each
 //! poll, so it stays an explicit parameter where it's needed.
 //!
-//! `ble_control` holds a `&'a mut Option<BleControl>` (not a `BleControl`
-//! directly) because its *contents* have a distinct lifetime from the rest
-//! of this struct - owned by the main loop, populated only while the BLE
-//! pairing screen is open, and torn down (`= None`) when leaving it. Storing
-//! the reference to the slot rather than threading `&mut Option<BleControl>`
-//! as a separate parameter everywhere means every blocking screen that goes
-//! through `DeviceContext` automatically gets the chance to reply `busy` to
-//! a queued BLE command instead of leaving BLE the one control channel with
-//! no reply at all during a ring/reminder.
+//! `ble_control` is a main-loop handle to the dedicated BLE worker. The
+//! worker owns the NimBLE session while this context polls callback facts and
+//! forwards replies without touching thread-affine radio handles.
 //!
 //! The store fields are `&'a` (immutable) because their methods all take
 //! `&self` (the underlying NVS handles have internal mutability); only
@@ -81,7 +75,7 @@ pub struct DeviceContext<'a> {
     pub todo_store: &'a TodoStore,
     pub inbox_store: &'a InboxStore,
     pub usb_console: &'a mut UsbConsole,
-    pub ble_control: &'a mut Option<BleControl>,
+    pub ble_control: &'a mut BleControl,
     /// Handle to the audio task (the sole owner of the ES8311 codec). `None`
     /// when the codec failed to initialise at boot (audio is a degraded-run
     /// category, never a boot blocker). Every tone - alarm ring, reminder -
@@ -674,6 +668,14 @@ impl DeviceContext<'_> {
             let mut reg = self.pending_renders.borrow_mut();
             if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
                 reg.register(kick);
+            } else if matches!(
+                kick.effect,
+                inkwash_logic::app::Effect::StartBlePairing(_)
+                    | inkwash_logic::app::Effect::StopBlePairing
+            ) {
+                // BLE worker results are delivered through its dedicated
+                // result channel and correlated by session id, not by an
+                // AppRunner async kick.
             } else {
                 log::warn!(
                     "AppRunner async kick {:?} (op {:?}) not wired; dropped",
@@ -770,9 +772,7 @@ fn write_reply_to_channel(
     match channel {
         Channel::Usb => crate::usb_console::write_reply(reply, id),
         Channel::Ble => {
-            if let Some(ble) = ctx.ble_control.as_ref() {
-                ble.write_reply(reply, id);
-            }
+            ctx.ble_control.write_reply(reply, id);
         }
     }
 }

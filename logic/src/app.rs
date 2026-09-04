@@ -294,6 +294,9 @@ pub struct BlePairingState {
     /// Tick past this deadline - never a blocking-loop timer). None when no
     /// session deadline is armed (e.g. tests construct states directly).
     pub pairing_deadline_unix: Option<u64>,
+    /// Monotonic session id used to discard a late worker result after the
+    /// user has exited and re-entered pairing.
+    pub session_id: u64,
 }
 
 impl Default for BlePairingState {
@@ -301,6 +304,7 @@ impl Default for BlePairingState {
         Self {
             phase: BlePairingPhase::Waiting,
             pairing_deadline_unix: None,
+            session_id: 0,
         }
     }
 }
@@ -631,6 +635,7 @@ pub struct SyncMetadata {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlePairingRequest {
     pub name: String,
+    pub session_id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1134,6 +1139,14 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
     }
 }
 
+/// Returns whether a completion from the BLE worker belongs to the pairing
+/// session currently shown by the state machine. Worker startup is allowed to
+/// outlive a user cancel/re-entry, so late results must not advance a newer
+/// session.
+pub fn ble_pairing_session_matches(screen: &Screen, session_id: u64) -> bool {
+    matches!(screen, Screen::BlePairing(pairing) if pairing.session_id == session_id)
+}
+
 /// The wall-clock full-sync boundary is due. The event-collection layer
 /// reported the fact; the machine decides whether a sync may start: it
 /// must be idle (single network op) and wifi + server must be configured.
@@ -1206,9 +1219,13 @@ fn transition_ble_pairing_failed(
     if !matches!(state.screen, Screen::BlePairing(_)) {
         return vec![];
     }
-    if let Screen::BlePairing(st) = &mut state.screen {
-        st.phase = BlePairingPhase::Failure(failure.message);
-    }
+    // A worker start failure cannot be shown by a stale connecting surface;
+    // return to the selected Settings row where the user can retry. The
+    // Stop serializes radio cleanup. The executor logs the failure detail.
+    let _ = failure;
+    state.screen = Screen::Settings {
+        selected: SETTINGS_BLE_PAIRING_ROW,
+    };
     state.render_generation = state.render_generation.next();
     vec![
         batch(
@@ -1961,18 +1978,20 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         // BLE PAIRING (row 2): an SM screen now. Enter the
                         // pairing session (Waiting) and ask the executor to
                         // bring the radio up (StartBlePairing -> NimBLE
-                        // advertising; the executor completes synchronously
-                        // once up). Radio lifecycle events (Started /
+                        // advertising on the dedicated worker). Radio lifecycle events (Started /
                         // Succeeded / Failed / Disconnected) drive the
                         // phase; any button exits back to the Settings BLE
                         // row with StopBlePairing; the session timeout is a
                         // Tick past an armed deadline. No blocking wedge.
+                        let session_id = state.next_operation_id().0;
                         let pairing = BlePairingRequest {
                             name: "inkwash-note4".to_string(),
+                            session_id,
                         };
                         state.screen = Screen::BlePairing(BlePairingState {
                             phase: BlePairingPhase::Waiting,
                             pairing_deadline_unix: None,
+                            session_id,
                         });
                         state.render_generation = state.render_generation.next();
                         vec![
@@ -5603,13 +5622,14 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert_eq!(
+        assert!(matches!(
             state.screen,
             Screen::BlePairing(BlePairingState {
                 phase: BlePairingPhase::Waiting,
-                ..Default::default()
+                session_id: 1,
+                ..
             })
-        );
+        ));
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
@@ -5619,6 +5639,17 @@ mod tests {
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
+    }
+
+    #[test]
+    fn ble_worker_results_ignore_stale_or_non_pairing_sessions() {
+        let pairing = Screen::BlePairing(BlePairingState {
+            session_id: 7,
+            ..Default::default()
+        });
+        assert!(ble_pairing_session_matches(&pairing, 7));
+        assert!(!ble_pairing_session_matches(&pairing, 6));
+        assert!(!ble_pairing_session_matches(&Screen::Home, 7));
     }
 
     #[test]
@@ -6005,7 +6036,7 @@ mod tests {
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StopBlePairing)));
-        // Failed -> Failure(message) + StopBlePairing.
+        // Failed -> Settings BLE row + StopBlePairing.
         let batches = update(
             &mut state,
             Event::BlePairingFailed(BlePairingFailure {
@@ -6014,24 +6045,14 @@ mod tests {
         );
         assert_eq!(
             state.screen,
-            Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Failure("timeout".into()),
-                ..Default::default()
-            })
+            Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            }
         );
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StopBlePairing)));
-        // Disconnected -> Waiting.
-        let _ = update(&mut state, Event::BleDisconnected);
-        assert_eq!(
-            state.screen,
-            Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Waiting,
-                ..Default::default()
-            })
-        );
     }
 
     #[test]
@@ -6141,6 +6162,7 @@ mod tests {
         state.screen = Screen::BlePairing(BlePairingState {
             phase: BlePairingPhase::Pairing,
             pairing_deadline_unix: Some(dt(8, 1).to_unix()),
+            ..Default::default()
         });
         // Tick before the deadline: session continues.
         let batches = update(&mut state, Event::Tick(dt(8, 0)));

@@ -328,14 +328,10 @@ fn main() -> Result<()> {
     // channels in `DeviceContext`.
     let sync_task = sync_task::SyncTask::spawn(sync_partition, wifi_mgr)?;
 
-    // Owned here (not inside `DeviceContext`) because its lifetime differs
-    // from the rest of the bundled state: populated only while the BLE
-    // pairing screen is open, torn down on leaving it. `DeviceContext` holds
-    // a `&mut` to this slot rather than the `BleControl` itself, so every
-    // blocking screen that goes through it (reminders, alarm ring) can still
-    // reach BLE to reply `busy` to a queued command - see `ctx.rs`'s doc
-    // comment.
-    let mut ble_control: Option<ble_control::BleControl> = None;
+    // The BLE worker owns NimBLE and is idle until the state machine enters
+    // pairing. Its handle stays in the main context so callbacks and replies
+    // remain serviceable while start/stop run asynchronously off-thread.
+    let mut ble_control = ble_control::BleControl::spawn()?;
 
     // AppRunner shared handle: the state machine is the sole alarm
     // business owner. Wrapped in Rc<RefCell<>> so blocking pages (which
@@ -566,12 +562,38 @@ fn main() -> Result<()> {
         // changes; the renderer diff decides Noop vs refresh.
         let (_usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref());
 
-        // Poll BLE for incoming commands (if BLE is active), dispatch them, and send replies.
-        // `poll_command` returns an owned `(id, Command)`, ending the borrow
-        // of `ctx.ble_control` before `dispatch` needs `&mut ctx` - the same
-        // shape `ble_pairing_screen` uses.
+        // Poll BLE worker results, lifecycle facts, and incoming commands;
+        // every operation is non-blocking on the main loop.
+        while let Some(result) = ctx.ble_control.poll_result() {
+            let (session_id, event) = match result {
+                ble_control::BleTaskResult::Started { session_id } => {
+                    (session_id, inkwash_logic::app::Event::BlePairingStarted)
+                }
+                ble_control::BleTaskResult::Failed {
+                    session_id,
+                    message,
+                } => (
+                    session_id,
+                    inkwash_logic::app::Event::BlePairingFailed(
+                        inkwash_logic::app::BlePairingFailure { message },
+                    ),
+                ),
+            };
+            let current_session = inkwash_logic::app::ble_pairing_session_matches(
+                &app_runner.borrow().state().screen,
+                session_id,
+            );
+            if current_session {
+                if let Err(err) = dispatch_app_runner(&app_runner, event, &mut ctx) {
+                    log::warn!("BLE worker result dispatch failed: {err}");
+                }
+            } else {
+                log::warn!("Ignoring stale BLE worker result for session {session_id}");
+            }
+        }
+
         let mut ble_changed = false;
-        if let Some((id, cmd)) = ctx.ble_control.as_ref().and_then(|ble| ble.poll_command()) {
+        if let Some((id, cmd)) = ctx.ble_control.poll_command() {
             let runner = app_runner.clone();
             let pre_event = if matches!(cmd, control::Command::SetTimezone { .. }) {
                 ctx.rtc
@@ -596,9 +618,7 @@ fn main() -> Result<()> {
                 if matches!(reply, control::Reply::Ok) {
                     ble_changed = true;
                 }
-                if let Some(ble) = ctx.ble_control.as_ref() {
-                    ble.write_reply(&reply, id.as_deref());
-                }
+                ctx.ble_control.write_reply(&reply, id.as_deref());
             }
         }
 
@@ -608,11 +628,7 @@ fn main() -> Result<()> {
         // (BlePairingStarted); a disconnect ends it (BleDisconnected).
         // Only meaningful while Screen::BlePairing is current - the SM
         // ignores them elsewhere.
-        if let Some(lifecycle) = ctx
-            .ble_control
-            .as_mut()
-            .and_then(|ble| ble.poll_lifecycle())
-        {
+        if let Some(lifecycle) = ctx.ble_control.poll_lifecycle() {
             let event = match lifecycle {
                 ble_control::BleLifecycle::Connected => {
                     inkwash_logic::app::Event::BlePairingStarted

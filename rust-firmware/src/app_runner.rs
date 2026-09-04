@@ -366,34 +366,34 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
                 }
             }
-            Effect::StartBlePairing(_req) => {
-                // Bring the NimBLE control channel up (advertising started,
-                // control service registered). The caller (SM) entered
-                // Screen::BlePairing; radio lifecycle events (connect/
-                // disconnect) are reported by the NimBLE callbacks through
-                // the unified event queue when wired. Starting advertising
-                // is synchronous from the caller's view (BleControl::start
-                // blocks until advertising is up), so complete immediately.
-                // The slot teardown on session exit is StopBlePairing.
-                match crate::ble_control::BleControl::start() {
-                    Ok(ble) => {
-                        *self.ctx.ble_control = Some(ble);
-                        Ok(EffectOutcome::Completed(EffectOutput::BlePairingDone))
-                    }
-                    Err(err) => Err((
-                        EffectCategory::Ble,
-                        format!("BLE advertising start failed: {err:#}"),
-                    )),
-                }
+            Effect::StartBlePairing(req) => {
+                // NimBLE init/advertising can block for seconds; the worker
+                // owns all radio handles and reports Started/Failed facts to
+                // the main loop. Never call BLEDevice::init on this thread.
+                self.ctx
+                    .ble_control
+                    .start(&req.name, req.session_id)
+                    .map(|()| EffectOutcome::Async)
+                    .map_err(|err| {
+                        (
+                            EffectCategory::Ble,
+                            format!("BLE worker start failed: {err:#}"),
+                        )
+                    })
             }
             Effect::StopBlePairing => {
-                // Tear the radio down: dropping the slot runs BleControl's
-                // Drop (nimble_port deinit). Synchronous completion - the
-                // SM does not await an external event for teardown.
-                if let Some(ble) = self.ctx.ble_control.take() {
-                    drop(ble);
-                }
-                Ok(EffectOutcome::Completed(EffectOutput::BlePairingDone))
+                // Stop is serialized behind any in-flight Start on the same
+                // worker, so a fast exit/re-entry cannot race deinit/init.
+                self.ctx
+                    .ble_control
+                    .stop()
+                    .map(|()| EffectOutcome::Async)
+                    .map_err(|err| {
+                        (
+                            EffectCategory::Ble,
+                            format!("BLE worker stop failed: {err:#}"),
+                        )
+                    })
             }
             Effect::EnterLightSleep(_plan) => {
                 if let Err(err) = crate::power::configure_light_sleep() {
