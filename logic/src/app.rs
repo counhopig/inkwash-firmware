@@ -754,6 +754,14 @@ pub enum AlarmRuntimeState {
         fired_minute: u64,
         ack: CommitState,
         persistence: CommitState,
+        /// Wall-clock unix second at which the ring must auto-dismiss if the
+        /// user has not pressed ENTER. The timeout is an *event*: the
+        /// collection layer keeps emitting Ticks and `transition_tick`
+        /// compares them against this deadline (same shape as the BLE
+        /// pairing deadline) - never a blocking-loop timer. Mirrors the
+        /// legacy `MAX_RING_SECS` safety bound so an unattended alarm cannot
+        /// ring forever.
+        ring_deadline_unix: Option<u64>,
     },
     WaitingForRearm {
         fired_alarm_id: u8,
@@ -1411,6 +1419,10 @@ fn resolve_rtc_alarm(state: &mut AppState, now: DateTime, aie: bool) -> Vec<Effe
                 persistence: CommitState::InFlight {
                     operation_id: persist_id,
                 },
+                // Safety bound: auto-dismiss 300 s after the trigger minute if
+                // nobody presses ENTER (the legacy blocking ring's cap). The
+                // collection layer's Ticks drive this - no blocking timer.
+                ring_deadline_unix: Some(now.to_unix() + 300),
             };
             state.screen = Screen::AlarmRinging;
 
@@ -1498,40 +1510,52 @@ fn transition_rtc_snapshot(state: &mut AppState, snapshot: RtcAlarmSnapshot) -> 
 /// firing), returning to the pre-ring page and copying the in-flight commit
 /// state into `WaitingForRearm` so the background ack/persistence still
 /// advance and the rearm happens on a later minute.
+/// Leaves the ringing screen for a non-ringing future, shared by the ENTER
+/// dismiss (transition_button) and the ring-timeout Tick (transition_tick).
+///
+/// Copies the in-flight commit states into `WaitingForRearm` so the
+/// background ack/persistence still advance and the rearm happens on a later
+/// minute (the same semantics the legacy blocking dismiss used), restores the
+/// pre-ring page and issues StopTone + a Full render of the restored surface.
+fn dismiss_ringing(state: &mut AppState) -> Vec<EffectBatch> {
+    // Keep the current commit states; the background completions continue
+    // to advance them while waiting for the minute to roll.
+    let AlarmRuntimeState::Firing {
+        alarm_id,
+        fired_minute,
+        ack,
+        persistence,
+        ..
+    } = state.alarm_runtime.clone()
+    else {
+        return vec![];
+    };
+    state.alarm_runtime = AlarmRuntimeState::WaitingForRearm {
+        fired_alarm_id: alarm_id,
+        fired_minute,
+        ack,
+        persistence,
+        minute_advanced: false,
+    };
+    state.screen = state.screen_before_ring.clone();
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StopTone],
+        ),
+        render_batch(state),
+    ]
+}
+
 fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     if matches!(button, ButtonEvent::Pressed(ButtonId::Enter))
         && state.screen == Screen::AlarmRinging
         && matches!(&state.alarm_runtime, AlarmRuntimeState::Firing { .. })
     {
-        // Keep the current commit states; the background completions
-        // continue to advance them while waiting for the minute to roll.
-        let AlarmRuntimeState::Firing {
-            alarm_id,
-            fired_minute,
-            ack,
-            persistence,
-        } = state.alarm_runtime.clone()
-        else {
-            return vec![];
-        };
-        state.alarm_runtime = AlarmRuntimeState::WaitingForRearm {
-            fired_alarm_id: alarm_id,
-            fired_minute,
-            ack,
-            persistence,
-            minute_advanced: false,
-        };
-        state.screen = state.screen_before_ring.clone();
-        state.render_generation = state.render_generation.next();
-        vec![
-            batch(
-                state,
-                OperationId(0),
-                FailurePolicy::Continue,
-                vec![Effect::StopTone],
-            ),
-            render_batch(state),
-        ]
+        dismiss_ringing(state)
     } else if matches!(
         state.screen,
         Screen::Home
@@ -2425,6 +2449,23 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
             cal.year = now.year;
             cal.month = now.month;
             cal.selected_day = cal.selected_day.min(dim).max(1);
+        }
+    }
+
+    // Ring timeout (Stage 5/6): while an alarm is Firing with an armed ring
+    // deadline, a Tick past it auto-dismisses exactly like an ENTER press -
+    // the timeout is an event (Ticks), never a blocking-loop timer. Keeps an
+    // unattended alarm from ringing forever without the legacy MAX_RING_SECS
+    // blocking loop.
+    if state.screen == Screen::AlarmRinging {
+        if let AlarmRuntimeState::Firing {
+            ring_deadline_unix: Some(deadline),
+            ..
+        } = state.alarm_runtime
+        {
+            if now.to_unix() >= deadline {
+                batches.extend(dismiss_ringing(state));
+            }
         }
     }
 
@@ -7506,6 +7547,88 @@ mod tests {
         assert!(batches
             .iter()
             .any(|b| b.effects.contains(&Effect::StartTone)));
+    }
+
+    #[test]
+    fn firing_alarm_tick_before_deadline_keeps_ringing() {
+        // A Tick while Firing and before the ring deadline leaves the ring
+        // untouched (no StopTone, screen stays AlarmRinging).
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        let batches = update(&mut state, Event::Tick(dt(9, 1)));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopTone)));
+    }
+
+    #[test]
+    fn firing_alarm_timeout_tick_dismisses_like_enter() {
+        // The ring timeout is an event: a Tick at/past the ring deadline
+        // auto-dismisses exactly like an ENTER press (StopTone once,
+        // WaitingForRearm, restore pre-ring page, Full render).
+        let mut state = AppState::default();
+        // Boot with a matching AF: Home is the pre-ring page; the ring
+        // deadline is armed ~300s after the 9:00 trigger.
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Firing { .. }
+        ));
+        // A Tick well past the 300s deadline (9:06) dismisses like ENTER.
+        let batches = update(&mut state, Event::Tick(dt(9, 6)));
+        assert_eq!(state.screen, Screen::Home);
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::WaitingForRearm { .. }
+        ));
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .filter(|e| matches!(e, Effect::StopTone))
+                .count(),
+            1,
+            "timeout dismiss must StopTone exactly once"
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
+    }
+
+    #[test]
+    fn usb_get_status_answered_while_alarm_ringing() {
+        // The unified event loop keeps serving commands while Firing: a USB
+        // GetStatus is answered and leaves the ringing screen untouched.
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::GetStatus));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(batches
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
+    }
+
+    #[test]
+    fn ble_command_answered_while_alarm_ringing() {
+        // BLE commands take the same entry while Firing and are answered on
+        // the BLE transport without disturbing the ring.
+        let mut state = AppState::default();
+        let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
+        let _ = update(&mut state, Event::Boot(snapshot));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        let batches = update(&mut state, Event::BleCommand(ControlRequest::GetStatus));
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(batches
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
     }
 
     #[test]
