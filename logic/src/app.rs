@@ -297,6 +297,10 @@ pub struct BlePairingState {
     /// Monotonic session id used to discard a late worker result after the
     /// user has exited and re-entered pairing.
     pub session_id: u64,
+    /// The key state must pass through a release after entering the screen
+    /// before a long ENTER may cancel it. This prevents the long-press event
+    /// for the key that opened pairing from immediately closing it again.
+    pub input_released: bool,
 }
 
 impl Default for BlePairingState {
@@ -305,6 +309,7 @@ impl Default for BlePairingState {
             phase: BlePairingPhase::Waiting,
             pairing_deadline_unix: None,
             session_id: 0,
+            input_released: false,
         }
     }
 }
@@ -1251,11 +1256,22 @@ fn transition_ble_disconnected(state: &mut AppState) -> Vec<EffectBatch> {
 
 /// BlePairing screen buttons (Stage 4): only a long ENTER closes the pairing
 /// session back to the Settings BLE PAIRING row (the UI's "HOLD ENTER BACK").
-/// Short ENTER/UP/DOWN input is ignored so the entry action cannot be
-/// interpreted as an exit while asynchronous BLE startup is still pending.
+/// The entry key must first be released after the screen transition, so its
+/// later long-press event cannot be interpreted as an exit while startup is
+/// still pending. Release of any key arms the screen for a future long ENTER.
 fn transition_ble_pairing_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    let Screen::BlePairing(pairing) = &mut state.screen else {
+        return vec![];
+    };
     match button {
+        ButtonEvent::Released(_) => {
+            pairing.input_released = true;
+            vec![]
+        }
         ButtonEvent::LongPressed(ButtonId::Enter) => {
+            if !pairing.input_released {
+                return vec![];
+            }
             state.screen = Screen::Settings {
                 selected: SETTINGS_BLE_PAIRING_ROW,
             };
@@ -1988,6 +2004,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                             phase: BlePairingPhase::Waiting,
                             pairing_deadline_unix: None,
                             session_id,
+                            input_released: false,
                         });
                         state.render_generation = state.render_generation.next();
                         vec![
@@ -6231,6 +6248,22 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
         );
+        assert!(matches!(state.screen, Screen::BlePairing(_)));
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .all(|e| !matches!(e, Effect::StopBlePairing)));
+
+        // Once the input layer reports a release, a new long ENTER is an
+        // intentional exit and emits exactly one stop effect.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Released(ButtonId::Enter)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
         assert_eq!(
             state.screen,
             Screen::Settings {
@@ -6245,6 +6278,95 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn ble_pairing_entry_press_then_same_hold_long_press_does_not_exit() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        // Navigate Home -> Settings and select BLE PAIRING with the same
+        // short ENTER that opens the pairing screen.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(matches!(state.screen, Screen::BlePairing(_)));
+
+        // The key remains held: its long-press event must not stop the new
+        // session, and no render/side effect is needed.
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert!(matches!(state.screen, Screen::BlePairing(_)));
+        assert!(batches.iter().all(|batch| batch.effects.is_empty()));
+
+        // A release arms the screen; only a subsequent long ENTER exits.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Released(ButtonId::Enter)),
+        );
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            }
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| &batch.effects)
+                .filter(|effect| matches!(effect, Effect::StopBlePairing))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ble_pairing_started_preserves_release_guard() {
+        let mut state = AppState {
+            screen: Screen::BlePairing(BlePairingState {
+                input_released: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _ = update(&mut state, Event::BlePairingStarted);
+        assert!(matches!(
+            state.screen,
+            Screen::BlePairing(BlePairingState {
+                phase: BlePairingPhase::Pairing,
+                input_released: true,
+                ..
+            })
+        ));
     }
 
     #[test]

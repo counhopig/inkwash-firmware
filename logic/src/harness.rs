@@ -614,9 +614,11 @@ mod tests {
         assert_eq!(h.executor.log.count("StartBlePairing"), 1);
 
         // No worker completion is delivered yet, but the runtime continues
-        // to accept ordinary events. Only the explicit long ENTER can stop
-        // the pending session; the short entry key is ignored.
+        // to accept ordinary events. The entry key must be released before
+        // the explicit long ENTER can stop the pending session.
         h.dispatch(Event::Tick(dt(8, 1))).unwrap();
+        h.dispatch(Event::Button(Btn::Released(ButtonId::Enter)))
+            .unwrap();
         h.dispatch(Event::Button(Btn::LongPressed(ButtonId::Enter)))
             .unwrap();
         assert_eq!(h.screen(), &Screen::Settings { selected: 2 });
