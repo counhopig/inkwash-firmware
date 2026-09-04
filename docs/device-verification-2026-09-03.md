@@ -48,7 +48,7 @@ python3 scripts/capture-serial.py --port /dev/tty.usbmodem1101 --duration 20 \
 - ✅ NOTE4 Todos 页面复测通过（ELF `v0.5.0-179-g8c1b695`）：短按 UP/DOWN 在列表首尾正确循环；短 ENTER 仅切换完成状态，重新进入页面后状态保持；长 ENTER 直接返回 Home；importance 保持为外部同步数据，不由设备按键修改。
 - ✅ NOTE4 Settings 基础页面复测通过（ELF `v0.5.0-179-g8c1b695`）：列表导航正常；Sync Interval 可修改、退出后重新进入仍保持；Sync Now 可完成且无卡死或异常返回 Home。BLE pairing 与 Sleep 保留在 §4、§6 专项验收。
 - ❌ NOTE4 BLE pairing 复测：Settings 选择 BLE PAIRING 后，`BLE_INIT` 后主线程同步阻塞，约 33.136 s 触发 Task WDT 并重启；串口证据 `/tmp/inkwash-ble-pairing-failure-6c4f562.log`，回溯定位到 `BLEDevice::init -> EffectRunner::run -> Runtime::apply/pump -> dispatch_app_runner -> main`。新基线将 NimBLE 生命周期移到专属 worker，尚未刷入复测，未计入通过项。
-- ⚠️ 当前候选修复（待真机）：BLE worker 使用 8 KiB PSRAM pthread 栈；进入配对前由 sync task 独占的 `WifiManager` 停止 Wi-Fi 驱动并释放运行时缓冲，BLE worker 收到 SuspendForBle 完成后才初始化 NimBLE；Stop 完成后再由同一 owner 恢复 Wi-Fi。启动前按 controller 所需的 internal+DMA 能力检查 heap，总空闲量门槛为 60 KiB、最大连续块门槛为 24 KiB，接纳候选 ELF 实测的 `64831/31744` bytes；不足、Wi-Fi busy 或同步任务失败均回 Settings。需按 §4 重建、刷写当前 ELF 后复测，确认不出现 `Malloc failed`/`emi.c 164`/WDT，且手机仍能发现并连接 `Inkwash`；退出配对后再验证 Sync Now。
+- ⚠️ 当前候选修复（待真机）：BLE worker 使用 8 KiB PSRAM pthread 栈；进入配对前由 sync task 独占的 `WifiManager` 丢弃（并由 `EspWifi` Drop 完整 deinit）Wi-Fi driver，释放运行时缓冲，BLE worker 收到 SuspendForBle 完成后才初始化 NimBLE；Stop 完成后由同一 owner 重建全新 Wi-Fi driver。即使 Wi-Fi 从未 start，已构造的 driver 也会在 hand-off 中释放；启动前按 controller 所需的 internal+DMA 能力检查 heap，总空闲量门槛为 60 KiB、最大连续块门槛为 24 KiB，接纳候选 ELF 实测的 `64831/31744` bytes；不足、Wi-Fi busy 或同步任务失败均回 Settings。需按 §4 重建、刷写当前 ELF 后复测，确认不出现 `Malloc failed`/`emi.c 164`/WDT，且手机仍能发现并连接 `Inkwash`；退出配对后再验证 Sync Now。
 - ⚠️ §1b/§3 其余页面、§4/§5/§6/§8 仍需在本功能基线上人工逐项复验。
 
 ---
@@ -113,7 +113,7 @@ espflash flash ... <同 ELF 路径>
 
 ## 4. BLE pairing（待真机；SM 屏已接入，radio 接线在 executor）
 
-- 当前设备复测未通过：选择 BLE PAIRING 后在 `BLE_INIT` 处触发主线程 Task WDT；串口证据见 §0。新基线由 sync task 先暂停 Wi-Fi、专属 worker 串行执行 NimBLE start/stop，结果按 pairing session id 回送状态机，待新 ELF 复测。
+- 当前设备复测未通过：选择 BLE PAIRING 后在 `BLE_INIT` 处触发主线程 Task WDT；串口证据见 §0。新基线由 sync task 先释放 Wi-Fi driver、专属 worker 串行执行 NimBLE start/stop，结果按 pairing session id 回送状态机，待新 ELF 复测。
 
 - Settings → BLE PAIRING 行：期望进入配对屏；专属 worker 异步完成 advertising 启动，主循环在等待期间仍可处理 Tick/Button。
 - 进入配对前若 SyncNow/SetWifi/urgent poll 在途，期望明确失败并回到 Settings；不得停止正在进行的 Wi-Fi 操作。

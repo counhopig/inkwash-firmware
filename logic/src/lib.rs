@@ -89,6 +89,11 @@ mod ble_memory_contract {
         assert!(SYNC_TASK.contains("SyncCommand::ResumeAfterBle"));
         assert!(SYNC_TASK.contains("wifi.suspend_for_ble()"));
         assert!(SYNC_TASK.contains("wifi.resume_after_ble()"));
+        const WIFI: &str = include_str!("../../rust-firmware/src/wifi.rs");
+        assert!(WIFI.contains("wifi: Option<EspWifi<'static>>"));
+        assert!(WIFI.contains("self.wifi.take()"));
+        assert!(WIFI.contains("fn ensure_driver"));
+        assert!(WIFI.contains("EspWifi::new(modem, self.sysloop.clone(), None)"));
         assert!(CTX.contains("self.sync.suspend_for_ble()?"));
         assert!(CTX.contains("self.ble_control.start(&name, session_id)"));
         assert!(CTX.contains("self.sync.resume_after_ble()"));

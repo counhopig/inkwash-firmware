@@ -19,10 +19,12 @@ const WIFI_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for the first NTP sync to complete.
 const NTP_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Owns the *one* `EspWifi` driver instance for the whole process. Create
-/// this exactly once (`main.rs` does so right after taking `sysloop`) and
-/// thread `&mut WifiManager` everywhere Wi-Fi is needed - boot-time sync,
-/// the on-device setup wizard, and `sync::sync_now`.
+/// Owns the process's Wi-Fi driver handle. Create this manager exactly once
+/// (`main.rs` does so right after taking `sysloop`) and thread
+/// `&mut WifiManager` everywhere Wi-Fi is needed - boot-time sync, the
+/// on-device setup wizard, and `sync::sync_now`. The underlying `EspWifi` is
+/// lazy and is deliberately dropped during BLE hand-off so its Drop path
+/// deinitializes the driver and releases its internal buffers.
 ///
 /// **History of the "one connect per boot" limitation.** This driver was
 /// long believed to allow only one successful `connect()` per boot session.
@@ -57,39 +59,48 @@ const NTP_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 /// tracking still panics on reuse (esp-idf-svc#503).
 ///
 /// `used`/`restart_for_fresh_wifi_session` are retained for compatibility
-/// and as a fallback, but no caller relies on the restart anymore. The only
-/// stop/start cycle is the explicit BLE hand-off below, serialized on this
-/// owner task and using raw ESP-IDF calls.
+/// and as a fallback, but no caller relies on the restart anymore. BLE now
+/// uses a fresh driver instance after the explicit hand-off, avoiding the
+/// known same-instance stop/start crash entirely.
 pub struct WifiManager {
-    wifi: EspWifi<'static>,
+    wifi: Option<EspWifi<'static>>,
+    sysloop: EspSystemEventLoop,
     used: bool,
-    /// Whether the underlying driver is started.  This is kept separately
-    /// from the esp-idf-svc status cache because BLE arbitration stops and
-    /// starts the driver through the raw ESP-IDF API.
+    /// Whether the current underlying driver is started.
     started: bool,
-    /// Whether BLE suspension actually stopped a started driver.  If Wi-Fi
-    /// had never been started, leaving it stopped after BLE is the correct
-    /// restoration of the pre-pairing state.
+    /// Whether Wi-Fi had a live driver before BLE took ownership. If Wi-Fi
+    /// had never been started, leaving it unconstructed after BLE is the
+    /// correct restoration of the pre-pairing state.
     suspended_was_started: bool,
 }
 
 impl WifiManager {
     /// Takes the modem peripheral (via `Peripherals::steal()` - safe here
     /// because this is called exactly once, immediately after `sysloop`
-    /// exists and before anything else touches Wi-Fi) and brings up the
-    /// driver in STA mode, disconnected. Call `connect`/`disconnect`/`scan`
-    /// afterward as needed; this instance lives for the rest of the
-    /// program.
+    /// exists and before anything else touches Wi-Fi). Driver construction is
+    /// lazy so BLE can release it even when boot never started Wi-Fi.
     pub fn new(sysloop: &EspSystemEventLoop) -> Result<Self> {
-        let peripherals = unsafe { Peripherals::steal() };
-        let wifi = EspWifi::new(peripherals.modem, sysloop.clone(), None)
-            .context("failed to create Wi-Fi driver with netif")?;
         Ok(Self {
-            wifi,
+            wifi: None,
+            sysloop: sysloop.clone(),
             used: false,
             started: false,
             suspended_was_started: false,
         })
+    }
+
+    fn ensure_driver(&mut self) -> Result<&mut EspWifi<'static>> {
+        if self.wifi.is_none() {
+            let modem = unsafe { Peripherals::steal() }.modem;
+            let wifi = EspWifi::new(modem, self.sysloop.clone(), None)
+                .context("failed to create Wi-Fi driver with netif")?;
+            self.wifi = Some(wifi);
+            log::info!("Wi-Fi driver constructed");
+        }
+        Ok(self
+            .wifi
+            .as_mut()
+            .expect("Wi-Fi driver exists after ensure_driver"))
     }
 
     /// Whether `connect()` has already succeeded at least once this boot
@@ -106,6 +117,7 @@ impl WifiManager {
     /// connect-then-drop lifecycle but without tearing down the driver
     /// itself.
     pub fn connect(&mut self, creds: &WifiCreds) -> Result<()> {
+        self.ensure_driver()?;
         // Match the reference demo: keep the Wi-Fi config in RAM rather than
         // in NVS so a fresh session starts from the configuration we set here.
         esp_idf_svc::sys::esp!(unsafe {
@@ -120,7 +132,7 @@ impl WifiManager {
         let password: HeaplessString<64> = HeaplessString::try_from(creds.password.as_str())
             .map_err(|_| anyhow!("Wi-Fi password longer than 64 characters"))?;
 
-        self.wifi
+        self.ensure_driver()?
             .set_configuration(&Configuration::Client(ClientConfiguration {
                 ssid,
                 password,
@@ -134,7 +146,9 @@ impl WifiManager {
             .context("failed to set Wi-Fi station configuration")?;
 
         if !self.started {
-            self.wifi.start().context("failed to start Wi-Fi")?;
+            self.ensure_driver()?
+                .start()
+                .context("failed to start Wi-Fi")?;
             self.started = true;
         }
 
@@ -223,7 +237,7 @@ impl WifiManager {
         let netif_deadline = (EspSystemTime {}).now() + Duration::from_secs(10);
         loop {
             watchdog::feed();
-            if let Ok(true) = self.wifi.sta_netif().is_up() {
+            if let Ok(true) = self.ensure_driver()?.sta_netif().is_up() {
                 log::info!("Wi-Fi netif is up (DHCP done)");
                 break;
             }
@@ -254,44 +268,47 @@ impl WifiManager {
     /// for the same reason `connect()` bypasses the wrapper - see its
     /// comment.
     pub fn disconnect(&mut self) {
+        if !self.started || self.wifi.is_none() {
+            return;
+        }
         let ret = unsafe { esp_idf_svc::sys::esp_wifi_disconnect() };
         if ret != 0 {
             log::warn!("esp_wifi_disconnect failed: 0x{ret:x}");
         }
     }
 
-    /// Stops the Wi-Fi driver while it is owned by the sync task.  BLE and
+    /// Drops the Wi-Fi driver while it is owned by the sync task. BLE and
     /// Wi-Fi cannot safely compete for the NOTE4's scarce internal DMA heap;
-    /// stopping here releases the driver's run-time buffers before NimBLE
-    /// controller initialization.
+    /// `EspWifi`'s Drop path calls `esp_wifi_deinit`, releasing the driver's
+    /// static and run-time buffers before NimBLE controller initialization.
     pub fn suspend_for_ble(&mut self) -> Result<()> {
-        if !self.started {
-            return Ok(());
+        self.suspended_was_started = self.started;
+        if self.started {
+            self.disconnect();
         }
-        self.disconnect();
-        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_stop() })
-            .map_err(|e| anyhow!("esp_wifi_stop for BLE failed: {e:?}"))?;
         self.started = false;
-        self.suspended_was_started = true;
-        log::info!("Wi-Fi driver suspended for BLE");
+        if self.wifi.take().is_some() {
+            log::info!("Wi-Fi driver dropped for BLE; internal heap released");
+        } else {
+            log::info!("Wi-Fi driver was not constructed; BLE hand-off needs no Wi-Fi drop");
+        }
         Ok(())
     }
 
-    /// Restarts the same Wi-Fi driver instance after BLE has been torn down.
-    /// Keeping construction and all calls on the sync task preserves the
-    /// single-owner rule; the next sync configures and connects it normally.
+    /// Reconstructs a fresh Wi-Fi driver after BLE deinitialization when one
+    /// existed before pairing. Keeping construction and all calls on the
+    /// sync task preserves the single-owner rule and avoids reusing a driver
+    /// across the known stop/start crash boundary.
     pub fn resume_after_ble(&mut self) -> Result<()> {
         if !self.suspended_was_started {
             return Ok(());
         }
-        // Match suspend_for_ble's raw call.  EspWifi's event-driven started
-        // cache is known to panic on a stop/start reuse cycle; the driver is
-        // still the same instance and its netif remains owned by this task.
-        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_start() })
-            .map_err(|e| anyhow!("esp_wifi_start after BLE failed: {e:?}"))?;
+        self.ensure_driver()?
+            .start()
+            .context("failed to start fresh Wi-Fi driver after BLE")?;
         self.started = true;
         self.suspended_was_started = false;
-        log::info!("Wi-Fi driver resumed after BLE");
+        log::info!("Fresh Wi-Fi driver resumed after BLE");
         Ok(())
     }
 }
