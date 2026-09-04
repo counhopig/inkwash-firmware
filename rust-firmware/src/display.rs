@@ -127,15 +127,6 @@ impl EpdClient {
         Ok(id)
     }
 
-    /// Logs a request-send failure. The panel-level recovery for a failed
-    /// partial refresh (one full refresh from the same snapshot) lives in
-    /// the EPD task, where the FFI result is known.
-    pub fn refresh_partial_best_effort(&mut self, rect: Rect) {
-        if let Err(err) = self.refresh_partial(rect) {
-            log::error!("EPD partial refresh request failed: {err}");
-        }
-    }
-
     /// Non-blocking drain of completed refreshes: the app
     /// state machine observes each refresh's success/failure/recovery here.
     pub fn poll_completion(&mut self) -> Option<EpdCompletion> {

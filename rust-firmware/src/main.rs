@@ -40,7 +40,6 @@ use alarms::AlarmStore;
 use anyhow::Result;
 use board::Note4Board;
 use button::POLL_INTERVAL_MS;
-use canvas::Rect;
 use ctx::{DeviceContext, SyncScheduler};
 use epd_task::EpdCompletion;
 use inbox::InboxStore;
@@ -69,21 +68,13 @@ const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// sleep.
 const DEEP_SLEEP_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Fallback maintenance wake when no future alarm needs a month-boundary
-/// wake: 10 minutes. Each wake boots, re-renders and refreshes just the
-/// clock region, and realigns the sync scheduler, so the on-screen
-/// time stays within ~10 min of reality and syncs stay alive through deep
+/// wake: 10 minutes. Each wake boots, lets the state machine project the
+/// current Home ViewModel, and lets RenderPlan refresh just the clock region;
+/// this keeps the on-screen time within ~10 min and syncs alive through deep
 /// sleep. Cost: ~1.6 s active per 10 min boot -> ~0.13 mA average, still
 /// µA-class idle. (The old 1 h fallback left the frozen e-paper clock up
 /// to an hour stale - the official firmware wakes far more often.)
 const MAINTENANCE_WAKE_FALLBACK: Duration = Duration::from_secs(10 * 60);
-
-/// Bounding rect for the large home clock and its date/status metadata.
-const CLOCK_RECT: Rect = Rect {
-    x: 16,
-    y: 36,
-    width: 368,
-    height: 92,
-};
 
 /// Epoch seconds captured at firmware build time. Used as the fallback RTC
 /// seed when PCF8563 reports `voltage_low = true` (battery was disconnected
@@ -118,8 +109,8 @@ fn main() -> Result<()> {
         log::warn!("Task watchdog subscribe failed: {err}");
     }
     // True when this boot is a deep-sleep wake (any non-undefined wake
-    // cause), as opposed to a power-on reset / fresh flash. Used by the
-    // deep-sleep wake path to skip the full-screen refresh on wake.
+    // cause), as opposed to a power-on reset / fresh flash. Used to seed an
+    // explicit previous Home ViewModel for the RenderPlan wake decision.
     let woke_from_deep_sleep = power::log_wakeup_cause();
     let mut board = Note4Board::take()?;
     log::info!("Power latch is high; rendering home screen");
@@ -239,8 +230,6 @@ fn main() -> Result<()> {
     // the executor renders the ring frame + starts the tone through the
     // audio task. The wake-cause flag is captured for the deep-sleep wake
     // path; the ringing comes entirely from the state machine.
-    let alarm_fired_at_boot = power::wake_cause() == power::WakeCause::RtcAlarm;
-
     // Keep the PCF8563's single hardware alarm slot pointed at whichever
     // stored alarm is nearest, every boot: after arming/editing an alarm,
     // The RTC alarm register is *not* reprogrammed here: doing so would
@@ -249,27 +238,6 @@ fn main() -> Result<()> {
     // (Event::Boot) loads the alarm list from NVS, decides whether to
     // arm the RTC and emit ProgramRtcAlarm / DisableRtcAlarm. Once that
     // batch runs the RTC register matches the stored list.
-
-    // Initial Home canvas draw (before the first loop iteration).
-    render_home_now(
-        &mut board,
-        &counters,
-        &alarm_store,
-        &todo_store,
-        &inbox_store,
-        clock.as_ref(),
-    );
-    // On a deep-sleep wake the e-paper already shows the
-    // pre-sleep frame, so skip the full refresh (the slowest part of boot)
-    // and update only the clock region. Alarm-wakes already repainted the
-    // ring screen with their own full refresh, so they keep the full path.
-    if woke_from_deep_sleep && !alarm_fired_at_boot {
-        board.display.refresh_partial_best_effort(CLOCK_RECT);
-        log::info!("Deep-sleep wake: clock region refreshed");
-    } else {
-        board.display.refresh_full()?;
-        log::info!("Initial display refresh queued to EPD task");
-    }
 
     if board.nfc.is_none() {
         log::warn!("NFC not available");
@@ -323,19 +291,7 @@ fn main() -> Result<()> {
                     let timezone_offset = counters.timezone_offset_minutes().unwrap_or(0);
                     match wifi::ntp_sync_and_set_rtc(&rtc, timezone_offset) {
                         Ok(()) => match rtc.read_time() {
-                            Ok(dt) => {
-                                clock = Some(dt);
-                                render_home_now(
-                                    &mut board,
-                                    &counters,
-                                    &alarm_store,
-                                    &todo_store,
-                                    &inbox_store,
-                                    clock.as_ref(),
-                                );
-                                board.display.refresh_partial_best_effort(CLOCK_RECT);
-                                log::info!("Clock region refreshed after NTP sync");
-                            }
+                            Ok(dt) => clock = Some(dt),
                             Err(err) => {
                                 log::warn!("PCF8563 read_time after NTP sync failed: {err}")
                             }
@@ -427,6 +383,26 @@ fn main() -> Result<()> {
     // DeviceContext scheduling.
     app_runner.borrow_mut().set_last_clock(clock);
     let mut boot_dispatched = false;
+    if woke_from_deep_sleep {
+        // Deep sleep preserves the Home frame on the panel. Seed an explicit
+        // previous ViewModel so Boot's Render effect can choose the clock
+        // partial through RenderPlan; alarm boot changes the surface to
+        // AlarmRinging and therefore still promotes to Full.
+        if let Some(clock) = clock {
+            let minute = u32::from(clock.hour) * 60 + u32::from(clock.minute);
+            let previous_minute = if minute == 0 { 1439 } else { minute - 1 };
+            ctx.pending_renders.borrow_mut().seed_last_shown(
+                inkwash_logic::render_plan::ViewModel {
+                    generation: inkwash_logic::app::RenderGeneration(0),
+                    view: inkwash_logic::app::RenderView::Home,
+                    clock_minute: Some(previous_minute),
+                    overlay: inkwash_logic::render_plan::Overlay::None,
+                    data_fingerprint: 0,
+                },
+            );
+            log::info!("Deep-sleep wake: seeded Home ViewModel for RenderPlan");
+        }
+    }
     // True when AppRunner may process runtime events. Set false when the
     // BootSnapshot reports a core fact failure, meaning the state machine
     // has no trustworthy alarm/NVS/config data and must NOT interpret any
@@ -1026,42 +1002,6 @@ fn run_safe_mode(
             crate::button::POLL_INTERVAL_MS as u64,
         ));
     }
-}
-
-/// Renders the idle/background screen with a freshly-loaded next-alarm
-/// label and pending-todo count. Called after every edit made in
-/// `screens::open_menu` (via the caller re-rendering on return) and on
-/// every clock tick, so these two NVS-backed reads happen fairly often;
-/// both stores are tiny JSON blobs, cheap next to the EPD refresh itself.
-fn render_home_now(
-    board: &mut Note4Board,
-    counters: &PersistedCounters,
-    alarm_store: &AlarmStore,
-    todo_store: &TodoStore,
-    inbox_store: &InboxStore,
-    clock: Option<&DateTime>,
-) {
-    let next_alarm = clock.and_then(|dt| screens::next_alarm_label(alarm_store, dt));
-    let todo_summary = screens::todo_summary(todo_store, clock);
-    let unread_inbox = inbox_store.unread_count().unwrap_or(0);
-    let wifi_configured = counters
-        .wifi_creds()
-        .map(|creds| creds.is_some())
-        .unwrap_or(false);
-    let battery_percent = board.battery_percent();
-    let charge = board.charge_snapshot();
-    board.display.render_home(
-        clock,
-        next_alarm.as_ref().map(|label| label.time.as_str()),
-        next_alarm.as_ref().and_then(|label| label.date.as_deref()),
-        next_alarm.as_ref().map(|label| label.days_left),
-        todo_summary.pending,
-        todo_summary.due_today,
-        unread_inbox,
-        wifi_configured,
-        battery_percent,
-        charge,
-    );
 }
 
 fn report_power_state(board: &mut Note4Board) -> Result<()> {

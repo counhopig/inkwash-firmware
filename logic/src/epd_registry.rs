@@ -126,6 +126,16 @@ impl RenderRegistry {
         self.partials_since_maintenance = 0;
     }
 
+    /// Seed the renderer's startup cache with the surface known to remain on
+    /// the panel across a deep-sleep wake. This is intentionally explicit:
+    /// normal cold boot starts with no previous frame, while a maintenance
+    /// wake may use the RenderPlan clock partial for the preserved Home
+    /// frame.
+    pub fn seed_last_shown(&mut self, view_model: ViewModel) {
+        self.last_shown = Some(view_model);
+        self.partials_since_maintenance = 0;
+    }
+
     /// Apply a completed render kick's terminal outcome to the cache.
     /// Called by the EPD completion path after `feed` matched a kick. The
     /// plan is recomputed from the kick's own ViewModel against the cache
@@ -332,6 +342,20 @@ mod tests {
         reg.note_terminal(&t1, &plan, true, true);
         assert_eq!(reg.partials_since_maintenance, 1);
         assert_eq!(reg.last_shown.as_ref(), Some(&t1));
+    }
+
+    #[test]
+    fn seeded_deep_wake_home_frame_uses_clock_partial() {
+        let mut reg = RenderRegistry::new();
+        reg.seed_last_shown(home_vm(0, Some(8 * 60)));
+        let current = home_vm(1, Some(8 * 60 + 1));
+        assert_eq!(
+            reg.plan_for(&current),
+            RenderPlan::Partial {
+                frame: crate::render_plan::Frame(1),
+                region: crate::render_plan::PartialRegion::Clock,
+            }
+        );
     }
 
     #[test]
