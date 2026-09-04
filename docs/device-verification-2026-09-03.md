@@ -3,7 +3,7 @@
 **固件功能基线：** `7c6bd4a`（架构迁移：SM 屏为唯一屏幕宿主、RenderPlan 唯一刷新来源、
 最小安全模式、alarm/reminder 均非阻塞——ring/reminder 为 SM overlay 经
 Effect::Render→ViewModel→RenderPlan→EPD，音频经独立 audio task）
-**宿主测试：** `logic` 278 通过
+**宿主测试：** `logic` 279 通过
 **基线历史：** 本文件早先记录对应旧基线 `d8acc74`（252 测试）；以下 ✅ 项若注明了
 旧版本号则只对该旧基线成立。新功能基线（7c6bd4a）必须在重刷后才可把「最终版本通过」
 结论继承到它——见 §0 重刷 + §7 逐项确认。
