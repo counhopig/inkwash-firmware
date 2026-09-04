@@ -2321,7 +2321,7 @@ fn range_for_stage(stage: AddStage) -> (u8, u8) {
 /// actions are optimistic confirmable SM edits (the executor persists the
 /// list + marks the row dirty); a failure rolls the row back. Long UP/DOWN
 /// opens the GO TO drawer (origin TodoList). An empty list has no rows to
-/// act on (moves clamp at 0).
+/// act on (moves stay at 0).
 fn transition_todo_list_button(
     state: &mut AppState,
     selected: usize,
@@ -2334,17 +2334,28 @@ fn transition_todo_list_button(
             open_navigation(state, NavOrigin::TodoList)
         }
         ButtonEvent::Pressed(ButtonId::Up) => {
+            let selected = selected.min(count.saturating_sub(1));
             state.screen = Screen::TodoList {
-                selected: selected.saturating_sub(1),
+                selected: if count == 0 {
+                    0
+                } else if selected == 0 {
+                    count - 1
+                } else {
+                    selected - 1
+                },
             };
             state.render_generation = state.render_generation.next();
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Down) => {
-            // Clamp to the last row; an empty list stays at 0.
-            let max = count.saturating_sub(1);
+            let selected = selected.min(count.saturating_sub(1));
+            // Wrap at both ends; an empty list stays at 0.
             state.screen = Screen::TodoList {
-                selected: (selected + 1).min(max),
+                selected: if count == 0 || selected + 1 == count {
+                    0
+                } else {
+                    selected + 1
+                },
             };
             state.render_generation = state.render_generation.next();
             vec![render_batch(state)]
@@ -6946,7 +6957,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_list_browse_clamps_and_empty_stays_at_zero() {
+    fn todo_list_browse_wraps_and_empty_stays_at_zero() {
         let mut state = AppState::default();
         open_todo_list(&mut state, vec![todo(1, "a", false), todo(2, "b", true)]);
         assert_eq!(state.screen, Screen::TodoList { selected: 0 });
@@ -6956,24 +6967,25 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
         assert_eq!(state.screen, Screen::TodoList { selected: 1 });
-        // Down past the end clamps.
+        // Down past the end wraps to the first row.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert_eq!(state.screen, Screen::TodoList { selected: 1 });
-        // Up to top.
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+        // Up from the first row wraps to the last row, then back to top.
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
+        assert_eq!(state.screen, Screen::TodoList { selected: 1 });
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
         assert_eq!(state.screen, Screen::TodoList { selected: 0 });
 
-        // Empty list: opens at 0, Down clamps at 0.
+        // Empty list: opens at 0, Down stays at 0.
         let mut state = AppState::default();
         open_todo_list(&mut state, vec![]);
         assert_eq!(state.screen, Screen::TodoList { selected: 0 });
@@ -7044,6 +7056,7 @@ mod tests {
             Event::Button(ButtonEvent::LongPressed(ButtonId::Enter)),
         );
         // Medium -> High.
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
         assert_eq!(state.todos.todos[0].importance, Importance::High);
         assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
             e,
