@@ -29,6 +29,7 @@ pub mod epd_registry;
 pub mod event_queue;
 pub mod harness;
 pub mod inbox_item;
+pub mod list_window;
 pub mod protocol;
 pub mod reminder_dedup;
 pub mod render_plan;
