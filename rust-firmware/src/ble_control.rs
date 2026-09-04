@@ -16,7 +16,19 @@ use esp32_nimble::{uuid128, BLEAdvertisementData, BLECharacteristic, BLEDevice, 
 use crate::control;
 
 const CHANNEL_CAPACITY: usize = 16;
-const BLE_TASK_STACK: usize = 16 * 1024;
+/// BLE setup is driven from this worker, but the pthread stack itself lives
+/// in PSRAM so NimBLE can reserve internal RAM for its controller pools.
+/// 8 KiB leaves headroom over the configured 5120-byte NimBLE host stack
+/// without consuming the scarce internal heap.
+const BLE_TASK_STACK: usize = 8 * 1024;
+const BLE_INTERNAL_CAPS: u32 =
+    esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
+/// Below this guard NimBLE's controller allocation is known to be unsafe:
+/// its C API logs a failed malloc and then asserts instead of returning a
+/// recoverable error. Keep the app alive on Settings rather than entering
+/// that path.
+const BLE_MIN_INTERNAL_FREE: usize = 64 * 1024;
+const BLE_MIN_INTERNAL_LARGEST_BLOCK: usize = 32 * 1024;
 
 const SERVICE_UUID: &str = "d2c25e50-5e22-48d8-a8b3-34f2f8e2c7d4";
 const WRITE_CHAR_UUID: &str = "d2c25e51-5e22-48d8-a8b3-34f2f8e2c7d4";
@@ -58,10 +70,29 @@ impl BleControl {
         let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (result_tx, result_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        std::thread::Builder::new()
+        // ESP-IDF pthread stacks default to internal RAM. Put this worker's
+        // stack in external PSRAM; its NimBLE handles remain worker-owned,
+        // while the internal heap is reserved for controller allocations.
+        let mut pthread_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
+        pthread_cfg.stack_size = BLE_TASK_STACK;
+        pthread_cfg.stack_alloc_caps =
+            esp_idf_svc::sys::MALLOC_CAP_SPIRAM | esp_idf_svc::sys::MALLOC_CAP_8BIT;
+        pthread_cfg.inherit_cfg = false;
+        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_pthread_set_cfg(&pthread_cfg) })
+            .map_err(|e| anyhow!("BLE worker PSRAM stack configuration failed: {e:?}"))?;
+        let worker = std::thread::Builder::new()
             .name("ble".to_string())
             .stack_size(BLE_TASK_STACK)
-            .spawn(move || run(command_rx, tx, lifecycle_tx, result_tx))?;
+            .spawn(move || run(command_rx, tx, lifecycle_tx, result_tx));
+        // Do not leak the BLE-specific pthread policy into any later thread
+        // creation on the main task.
+        let default_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
+        if let Err(err) =
+            esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_pthread_set_cfg(&default_cfg) })
+        {
+            log::warn!("BLE worker pthread policy restore failed: {err:?}");
+        }
+        worker?;
         Ok(Self {
             command_tx,
             rx,
@@ -194,6 +225,15 @@ struct BleSession {
 
 impl BleSession {
     fn start() -> Result<Self> {
+        let free = unsafe { esp_idf_svc::sys::heap_caps_get_free_size(BLE_INTERNAL_CAPS) };
+        let largest =
+            unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS) };
+        log::info!("BLE preflight: internal free={free} largest_block={largest} bytes");
+        if free < BLE_MIN_INTERNAL_FREE || largest < BLE_MIN_INTERNAL_LARGEST_BLOCK {
+            return Err(anyhow!(
+                "BLE unavailable: internal heap free={free} largest_block={largest}"
+            ));
+        }
         BLEDevice::init();
         let result = Self::start_initialized();
         if result.is_err() {

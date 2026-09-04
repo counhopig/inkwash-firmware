@@ -71,3 +71,19 @@ CONFIG_BT_BLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=5120
+# The device is a GATT peripheral only; omit central/observer/scanning code
+# and BLE 5 extended feature pools that the control service never uses.
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+CONFIG_BT_NIMBLE_DTM_MODE_TEST=n
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# The ESP32-S3 controller has separate build-time pools from NimBLE's host
+# roles. Keep only one advertising activity plus one connection, and omit
+# controller scan/DTM code. Controller code in flash also returns >20 KiB of
+# scarce internal instruction RAM to the heap needed by the BLE pools.
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_BLE_SCAN=n
+CONFIG_BT_CTRL_DTM_ENABLE=n
+CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y

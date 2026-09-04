@@ -41,3 +41,39 @@ pub mod sync_validate;
 pub mod todo;
 pub mod wake_cause;
 pub mod worker_heartbeat;
+
+#[cfg(test)]
+mod ble_memory_contract {
+    // Keep the host-only guard next to the host-testable state-machine tests.
+    // The hardware crate cannot be built for the host, but these invariants
+    // must stay coupled to its ESP-IDF memory configuration.
+    const BLE_SOURCE: &str = include_str!("../../rust-firmware/src/ble_control.rs");
+    const SDKCONFIG: &str = include_str!("../../rust-firmware/sdkconfig.defaults");
+
+    fn config_is(name: &str, value: &str) -> bool {
+        SDKCONFIG
+            .lines()
+            .any(|line| line.trim() == format!("CONFIG_{name}={value}"))
+    }
+
+    #[test]
+    fn ble_worker_uses_psram_and_checks_internal_heap_before_init() {
+        assert!(BLE_SOURCE.contains("MALLOC_CAP_SPIRAM | esp_idf_svc::sys::MALLOC_CAP_8BIT"));
+        assert!(BLE_SOURCE.contains("heap_caps_get_free_size(BLE_INTERNAL_CAPS)"));
+        assert!(BLE_SOURCE.contains("heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS)"));
+        assert!(BLE_SOURCE.contains("BLEDevice::init();"));
+        assert!(BLE_SOURCE.contains("if free < BLE_MIN_INTERNAL_FREE"));
+    }
+
+    #[test]
+    fn ble_controller_memory_budget_is_peripheral_only() {
+        assert!(config_is("BT_NIMBLE_ROLE_CENTRAL", "n"));
+        assert!(config_is("BT_NIMBLE_ROLE_OBSERVER", "n"));
+        assert!(config_is("BT_NIMBLE_MAX_CONNECTIONS", "1"));
+        assert!(config_is("BT_NIMBLE_50_FEATURE_SUPPORT", "n"));
+        assert!(config_is("BT_CTRL_BLE_MAX_ACT", "2"));
+        assert!(config_is("BT_CTRL_BLE_SCAN", "n"));
+        assert!(config_is("BT_CTRL_DTM_ENABLE", "n"));
+        assert!(config_is("BT_CTRL_RUN_IN_FLASH_ONLY", "y"));
+    }
+}
