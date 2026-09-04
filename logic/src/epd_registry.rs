@@ -292,6 +292,19 @@ mod tests {
         }
     }
 
+    fn nav_vm(gen: u64, selected: usize, source: crate::app::RenderView) -> ViewModel {
+        ViewModel {
+            generation: RenderGeneration(gen),
+            view: crate::app::RenderView::Navigation {
+                selected,
+                underlying: Box::new(source),
+            },
+            clock_minute: Some(8 * 60),
+            overlay: crate::render_plan::Overlay::None,
+            data_fingerprint: 0,
+        }
+    }
+
     #[test]
     fn cache_empty_first_render_is_full() {
         let mut reg = RenderRegistry::new();
@@ -346,6 +359,48 @@ mod tests {
         reg.note_terminal(&t1, &plan, true, true);
         assert_eq!(reg.partials_since_maintenance, 1);
         assert_eq!(reg.last_shown.as_ref(), Some(&t1));
+    }
+
+    #[test]
+    fn nav_bar_partial_completion_caches_current_view_for_next_diff() {
+        let mut reg = RenderRegistry::new();
+        let home = home_vm(0, Some(8 * 60));
+        let first = reg.plan_for(&home);
+        reg.note_terminal(&home, &first, true, true);
+
+        let open = nav_vm(1, 0, crate::app::RenderView::Home);
+        let open_plan = reg.plan_for(&open);
+        assert_eq!(
+            open_plan,
+            RenderPlan::Partial {
+                frame: crate::render_plan::Frame(1),
+                region: crate::render_plan::PartialRegion::NavBar,
+            }
+        );
+        reg.note_terminal(&open, &open_plan, true, true);
+        assert_eq!(reg.last_shown.as_ref(), Some(&open));
+
+        let moved = nav_vm(2, 3, crate::app::RenderView::Home);
+        let moved_plan = reg.plan_for(&moved);
+        assert!(matches!(
+            moved_plan,
+            RenderPlan::Partial {
+                region: crate::render_plan::PartialRegion::NavBar,
+                ..
+            }
+        ));
+        reg.note_terminal(&moved, &moved_plan, true, true);
+        assert_eq!(reg.last_shown.as_ref(), Some(&moved));
+
+        let close = home_vm(3, Some(8 * 60));
+        let close_plan = reg.plan_for(&close);
+        assert!(matches!(
+            close_plan,
+            RenderPlan::Partial {
+                region: crate::render_plan::PartialRegion::NavBar,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -204,14 +204,41 @@ pub fn plan_render(
         return RenderPlan::Noop;
     }
 
-    // Page type changed or an overlay entered/exited -> Full.
-    let same_surface = surface_kind(&current.view) == surface_kind(&prev.view);
-    if !same_surface || current.overlay != prev.overlay {
+    // An overlay entered/exited -> Full.
+    if current.overlay != prev.overlay {
         return RenderPlan::Full { frame };
     }
 
     // Maintenance threshold reached -> Full.
     if partials_since_maintenance >= PARTIAL_MAINTENANCE_LIMIT {
+        return RenderPlan::Full { frame };
+    }
+
+    // Opening, moving, or closing a drawer can repaint only the nav bar when
+    // the source pixels and all other visible facts are unchanged. The
+    // executor still redraws the complete canvas before submitting this
+    // partial, so closing the drawer erases it with the restored source.
+    if same_navigation_background(&prev.view, &current.view)
+        && current.clock_minute == prev.clock_minute
+        && current.overlay == prev.overlay
+        && current.data_fingerprint == prev.data_fingerprint
+    {
+        return RenderPlan::Partial {
+            frame,
+            region: PartialRegion::NavBar,
+        };
+    }
+
+    // Any other transition touching the navigation drawer is conservative:
+    // a changed source, clock, or data fingerprint must redraw the source
+    // and drawer together, and a different destination changes page type.
+    if is_navigation_view(&prev.view) || is_navigation_view(&current.view) {
+        return RenderPlan::Full { frame };
+    }
+
+    // Page type changed -> Full.
+    let same_surface = surface_kind(&current.view) == surface_kind(&prev.view);
+    if !same_surface {
         return RenderPlan::Full { frame };
     }
 
@@ -239,6 +266,42 @@ pub fn plan_render(
     };
 
     RenderPlan::Partial { frame, region }
+}
+
+/// Returns true when the previous and current views are the same source page
+/// with a navigation drawer transition (open, move, or close).
+fn same_navigation_background(previous: &RenderView, current: &RenderView) -> bool {
+    match (previous, current) {
+        (
+            RenderView::Navigation {
+                underlying: previous_source,
+                ..
+            },
+            RenderView::Navigation {
+                underlying: current_source,
+                ..
+            },
+        ) => previous_source == current_source,
+        (
+            RenderView::Navigation {
+                underlying: previous_source,
+                ..
+            },
+            current_source,
+        ) => previous_source.as_ref() == current_source,
+        (
+            previous_source,
+            RenderView::Navigation {
+                underlying: current_source,
+                ..
+            },
+        ) => previous_source == current_source.as_ref(),
+        _ => false,
+    }
+}
+
+fn is_navigation_view(view: &RenderView) -> bool {
+    matches!(view, RenderView::Navigation { .. })
 }
 
 /// The refresh family of a view. Views in the same family may share partial
@@ -558,6 +621,128 @@ mod tests {
                 region: PartialRegion::NavBar
             }
         );
+    }
+
+    #[test]
+    fn drawer_open_move_close_is_navbar_partial_for_home_calendar_and_inbox() {
+        let sources = [
+            RenderView::Home,
+            RenderView::Calendar {
+                year: 2026,
+                month: 9,
+                selected_day: 11,
+            },
+            RenderView::Inbox { selected: 2 },
+        ];
+        for source in sources {
+            let source_vm = ViewModel {
+                generation: RenderGeneration(1),
+                view: source.clone(),
+                clock_minute: Some(12 * 60),
+                overlay: Overlay::None,
+                data_fingerprint: 17,
+            };
+            let open_vm = ViewModel {
+                generation: RenderGeneration(2),
+                view: RenderView::Navigation {
+                    selected: 1,
+                    underlying: Box::new(source.clone()),
+                },
+                ..source_vm.clone()
+            };
+            assert_eq!(
+                plan_render(Some(&source_vm), &open_vm, 0),
+                RenderPlan::Partial {
+                    frame: Frame(2),
+                    region: PartialRegion::NavBar,
+                }
+            );
+
+            let moved_vm = ViewModel {
+                generation: RenderGeneration(3),
+                view: RenderView::Navigation {
+                    selected: 4,
+                    underlying: Box::new(source.clone()),
+                },
+                ..open_vm.clone()
+            };
+            assert_eq!(
+                plan_render(Some(&open_vm), &moved_vm, 0),
+                RenderPlan::Partial {
+                    frame: Frame(3),
+                    region: PartialRegion::NavBar,
+                }
+            );
+
+            let close_vm = ViewModel {
+                generation: RenderGeneration(4),
+                view: source.clone(),
+                ..moved_vm.clone()
+            };
+            assert_eq!(
+                plan_render(Some(&moved_vm), &close_vm, 0),
+                RenderPlan::Partial {
+                    frame: Frame(4),
+                    region: PartialRegion::NavBar,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn drawer_transition_is_full_when_destination_or_source_facts_change() {
+        let source = RenderView::Inbox { selected: 0 };
+        let prev = ViewModel {
+            generation: RenderGeneration(1),
+            view: RenderView::Navigation {
+                selected: 2,
+                underlying: Box::new(source.clone()),
+            },
+            clock_minute: Some(12 * 60),
+            overlay: Overlay::None,
+            data_fingerprint: 5,
+        };
+
+        let destination = ViewModel {
+            generation: RenderGeneration(2),
+            view: RenderView::Calendar {
+                year: 2026,
+                month: 9,
+                selected_day: 4,
+            },
+            ..prev.clone()
+        };
+        assert!(matches!(
+            plan_render(Some(&prev), &destination, 0),
+            RenderPlan::Full { .. }
+        ));
+
+        let mut data_changed = prev.clone();
+        data_changed.generation = RenderGeneration(3);
+        data_changed.data_fingerprint += 1;
+        assert!(matches!(
+            plan_render(Some(&prev), &data_changed, 0),
+            RenderPlan::Full { .. }
+        ));
+
+        let mut clock_changed = prev.clone();
+        clock_changed.generation = RenderGeneration(4);
+        clock_changed.clock_minute = Some(12 * 60 + 1);
+        assert!(matches!(
+            plan_render(Some(&prev), &clock_changed, 0),
+            RenderPlan::Full { .. }
+        ));
+
+        let mut different_source = prev.clone();
+        different_source.generation = RenderGeneration(5);
+        different_source.view = RenderView::Navigation {
+            selected: 2,
+            underlying: Box::new(RenderView::Inbox { selected: 1 }),
+        };
+        assert!(matches!(
+            plan_render(Some(&prev), &different_source, 0),
+            RenderPlan::Full { .. }
+        ));
     }
 
     #[test]
