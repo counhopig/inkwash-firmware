@@ -64,14 +64,26 @@ impl BleControl {
     /// Brings up the NimBLE stack, registers the control service, and
     /// starts advertising. Torn down by `Drop`.
     pub fn start() -> Result<Self> {
+        BLEDevice::init();
+        let result = Self::start_initialized();
+        if result.is_err() {
+            // A failure before `BleControl` is constructed cannot run its
+            // Drop implementation. Tear down the partial global stack so a
+            // retry starts cleanly after the SM returns to Settings.
+            if let Err(err) = BLEDevice::deinit_full() {
+                log::warn!("BLE cleanup after start failure failed: {err:?}");
+            }
+        }
+        result
+    }
+
+    fn start_initialized() -> Result<Self> {
         // `BLEDevice::take()` forces a process-wide `Lazy` that only runs
         // the underlying `nimble_port_init()` the *first* time it's
         // forced - after `Drop`'s `deinit_full()` below, a later `take()`
         // alone would silently return a device backed by a stopped stack.
-        // `BLEDevice::init()` is what actually (re)starts the port, and is
-        // itself idempotent (internally flag-guarded), so calling it
-        // unconditionally here is correct on both first entry and re-entry.
-        BLEDevice::init();
+        // `BLEDevice::init()` was called by `start`, before entering this
+        // fallible setup sequence.
         let device = BLEDevice::take();
 
         let ble_advertising = device.get_advertising();

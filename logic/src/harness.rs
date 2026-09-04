@@ -161,7 +161,7 @@ impl EffectExecutor for FakeExecutor {
             Effect::Reply { .. } => EffectCategory::Ack,
             Effect::Render(_) => EffectCategory::Render,
             Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
-            Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Sync,
+            Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Ble,
             Effect::MarkInboxRead { .. } | Effect::SetSyncInterval { .. } => {
                 EffectCategory::Persist
             }
