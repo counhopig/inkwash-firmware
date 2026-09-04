@@ -108,10 +108,7 @@ fn main() -> Result<()> {
     if let Err(err) = watchdog::subscribe() {
         log::warn!("Task watchdog subscribe failed: {err}");
     }
-    // True when this boot is a deep-sleep wake (any non-undefined wake
-    // cause), as opposed to a power-on reset / fresh flash. Used to seed an
-    // explicit previous Home ViewModel for the RenderPlan wake decision.
-    let woke_from_deep_sleep = power::log_wakeup_cause();
+    power::log_wakeup_cause();
     let mut board = Note4Board::take()?;
     log::info!("Power latch is high; rendering home screen");
     // The RTC executor owns the sole Pcf8563 driver (see rtc_executor.rs).
@@ -383,26 +380,6 @@ fn main() -> Result<()> {
     // DeviceContext scheduling.
     app_runner.borrow_mut().set_last_clock(clock);
     let mut boot_dispatched = false;
-    if woke_from_deep_sleep {
-        // Deep sleep preserves the Home frame on the panel. Seed an explicit
-        // previous ViewModel so Boot's Render effect can choose the clock
-        // partial through RenderPlan; alarm boot changes the surface to
-        // AlarmRinging and therefore still promotes to Full.
-        if let Some(clock) = clock {
-            let minute = u32::from(clock.hour) * 60 + u32::from(clock.minute);
-            let previous_minute = if minute == 0 { 1439 } else { minute - 1 };
-            ctx.pending_renders.borrow_mut().seed_last_shown(
-                inkwash_logic::render_plan::ViewModel {
-                    generation: inkwash_logic::app::RenderGeneration(0),
-                    view: inkwash_logic::app::RenderView::Home,
-                    clock_minute: Some(previous_minute),
-                    overlay: inkwash_logic::render_plan::Overlay::None,
-                    data_fingerprint: 0,
-                },
-            );
-            log::info!("Deep-sleep wake: seeded Home ViewModel for RenderPlan");
-        }
-    }
     // True when AppRunner may process runtime events. Set false when the
     // BootSnapshot reports a core fact failure, meaning the state machine
     // has no trustworthy alarm/NVS/config data and must NOT interpret any
