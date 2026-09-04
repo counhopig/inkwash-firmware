@@ -213,7 +213,7 @@ impl EffectExecutor for FakeExecutor {
                 let id = self.next_request_id;
                 self.next_request_id += 1;
                 self.renders.push((id, Some(req.generation)));
-                self.render_views.push(req.view);
+                self.render_views.push(req.view.clone());
                 Ok(EffectOutcome::AsyncWithId(id))
             }
             Effect::StartSync(_)

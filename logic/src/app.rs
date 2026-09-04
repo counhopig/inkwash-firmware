@@ -114,7 +114,39 @@ pub enum Screen {
         index: usize,
     },
     AlarmRinging,
+    /// A full-screen reminder overlay (urgent inbox or due-todo). Carries
+    /// the final visible lines the renderer draws - the executor does not
+    /// re-read stores, because urgent items were already marked read when
+    /// the fact was raised. The reminder is transient: ENTER dismisses it
+    /// (StopTone + restore + Full render), a Tick past its deadline does
+    /// the same, and an RTC alarm preempts it.
+    Reminder(ReminderState),
     BlePairing(BlePairingState),
+}
+
+/// The two reminder classes. Which one is showing changes the tone and the
+/// renderer's header, but not the lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReminderKind {
+    /// Urgent inbox messages (siren).
+    Urgent,
+    /// High-importance todos due today (beep).
+    Todo,
+}
+
+/// A transient full-screen reminder overlay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReminderState {
+    pub kind: ReminderKind,
+    /// The final visible content lines (already deduped / read-marked by the
+    /// fact layer when the fact was raised).
+    pub lines: Vec<String>,
+    /// Screen shown underneath; ENTER / timeout restores it. Boxed to break
+    /// the Screen -> ReminderState -> Screen recursion.
+    pub screen_before: Box<Screen>,
+    /// Wall-clock unix deadline at which the reminder auto-dismisses (a
+    /// Tick event, never a blocking timer).
+    pub deadline_unix: u64,
 }
 
 /// The screen a navigation drawer was opened from. Every drawer origin is
@@ -194,6 +226,10 @@ impl Screen {
             },
             Screen::BlePairing(_) => RenderView::BlePairing,
             Screen::AlarmRinging => RenderView::AlarmRinging,
+            Screen::Reminder(ReminderState { kind, lines, .. }) => RenderView::Reminder {
+                kind: *kind,
+                lines: lines.clone(),
+            },
             Screen::Home => RenderView::Home,
         }
     }
@@ -478,7 +514,7 @@ pub enum Effect {
 /// Which visible surface a render request targets. The renderer draws this
 /// surface (not a call-site rectangle) and refreshes the panel rect the
 /// surface maps to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderView {
     /// The idle home canvas (clock + cards), with no overlay.
     Home,
@@ -540,6 +576,14 @@ pub enum RenderView {
     /// Tick both leave through the SM's `dismiss_ringing`. No legacy blocking
     /// ring owns this frame anymore.
     AlarmRinging,
+    /// The full-screen reminder overlay (urgent or todo). Carries the final
+    /// visible lines to draw (the fact layer already applied read/date
+    /// persistence); the executor draws them verbatim - it does not re-read
+    /// the stores.
+    Reminder {
+        kind: ReminderKind,
+        lines: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -726,6 +770,12 @@ pub enum Event {
     BlePairingSucceeded(BlePairingResult),
     BlePairingFailed(BlePairingFailure),
     BleDisconnected,
+    /// The reminder fact layer raised a full-screen reminder (urgent inbox
+    /// alerts or high-importance todos due now). The payload carries the
+    /// *final* visible lines - the fact layer already applied urgent-read /
+    /// todo-date persistence before raising - so the SM never re-reads
+    /// stores or decides presentation on stale data.
+    ReminderDue(ReminderPayload),
     SyncCompleted(SyncResult),
     /// A `StartSetWifi` verification+save finished (Ok when the credentials
     /// were verified and persisted; Err carries the failure message).
@@ -1070,6 +1120,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::BlePairingSucceeded(result) => transition_ble_pairing_succeeded(state, result),
         Event::BlePairingFailed(failure) => transition_ble_pairing_failed(state, failure),
         Event::BleDisconnected => transition_ble_disconnected(state),
+        Event::ReminderDue(payload) => transition_reminder_due(state, payload),
     }
 }
 
@@ -1416,7 +1467,17 @@ fn resolve_rtc_alarm(state: &mut AppState, now: DateTime, aie: bool) -> Vec<Effe
             let alarm_id = alarm.id;
             let ack_id = state.next_operation_id();
             let persist_id = state.next_operation_id();
-            state.screen_before_ring = state.screen.clone();
+            // An alarm preempts any current reminder: the reminder was
+            // already marked-read/persisted when shown, so it must *not*
+            // resume after the alarm dismisses. Restore the reminder's own
+            // underlying screen instead (the reviewer's air-preempt rule:
+            // "urgent 被 alarm 抢占后不得继续显示 todo").
+            state.screen_before_ring =
+                if let Screen::Reminder(ReminderState { screen_before, .. }) = &state.screen {
+                    screen_before.as_ref().clone()
+                } else {
+                    state.screen.clone()
+                };
             state.alarm_runtime = AlarmRuntimeState::Firing {
                 alarm_id,
                 fired_minute,
@@ -1557,12 +1618,76 @@ fn dismiss_ringing(state: &mut AppState) -> Vec<EffectBatch> {
     ]
 }
 
+/// Enters the reminder overlay. Sets the current screen as `screen_before`,
+/// shows `Screen::Reminder` with the payload's final lines, arms the
+/// auto-dismiss deadline (120 s, matching the legacy urgent cap), starts the
+/// reminder tone and renders the overlay (Full).
+fn transition_reminder_due(state: &mut AppState, payload: ReminderPayload) -> Vec<EffectBatch> {
+    // A reminder never preempts a ring; if an alarm is already ringing the
+    // fact is dropped (the alarm is the higher-priority alert).
+    if state.screen == Screen::AlarmRinging
+        || matches!(state.alarm_runtime, AlarmRuntimeState::Firing { .. })
+    {
+        return vec![];
+    }
+    let deadline = state
+        .clock
+        .now
+        .map(|now| now.to_unix() + 120)
+        .unwrap_or_else(|| crate::datetime::DateTime::from_unix(0).to_unix() + 120);
+    state.screen = Screen::Reminder(ReminderState {
+        kind: payload.kind,
+        lines: payload.lines,
+        screen_before: Box::new(state.screen.clone()),
+        deadline_unix: deadline,
+    });
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StartTone],
+        ),
+        render_batch(state),
+    ]
+}
+
+/// Leaves the reminder overlay: stops the tone, restores the underlying
+/// screen and issues a Full render. Shared by ENTER dismiss and the
+/// reminder-deadline Tick.
+fn dismiss_reminder(state: &mut AppState) -> Vec<EffectBatch> {
+    let Screen::Reminder(ReminderState { screen_before, .. }) = &state.screen else {
+        return vec![];
+    };
+    state.screen = screen_before.as_ref().clone();
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StopTone],
+        ),
+        render_batch(state),
+    ]
+}
+
 fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     if matches!(button, ButtonEvent::Pressed(ButtonId::Enter))
         && state.screen == Screen::AlarmRinging
         && matches!(&state.alarm_runtime, AlarmRuntimeState::Firing { .. })
     {
         dismiss_ringing(state)
+    } else if matches!(state.screen, Screen::Reminder(_))
+        && matches!(
+            button,
+            ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_)
+        )
+    {
+        // Any button closes the reminder overlay (matches the legacy
+        // "ENTER = DISMISS" modal that also unwound on other presses).
+        dismiss_reminder(state)
     } else if matches!(
         state.screen,
         Screen::Home
@@ -2475,6 +2600,14 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
             }
         }
     }
+    // Reminder timeout: a Tick past the reminder's deadline dismisses it
+    // exactly like a button press (StopTone + restore + Full render). The
+    // deadline is an event, never a blocking-loop timer.
+    if let Screen::Reminder(ReminderState { deadline_unix, .. }) = state.screen {
+        if now.to_unix() >= deadline_unix {
+            batches.extend(dismiss_reminder(state));
+        }
+    }
 
     // BLE pairing timeout (Stage 5/6): while a pairing session is current
     // with an armed deadline, a Tick past it ends the session as a timeout -
@@ -2539,6 +2672,7 @@ fn tick_refreshes_current_screen(screen: &Screen) -> bool {
     !matches!(
         screen,
         Screen::AlarmRinging
+            | Screen::Reminder(_)
             | Screen::WeekView { .. }
             | Screen::InboxItem { .. }
             | Screen::AlarmAdd(_)
@@ -7829,6 +7963,174 @@ mod tests {
     }
 
     #[test]
+    fn reminder_due_enters_overlay_with_tone_and_full_render() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        let batches = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Urgent,
+                lines: vec!["URGENT: server down".into()],
+            }),
+        );
+        assert!(matches!(
+            state.screen,
+            Screen::Reminder(ReminderState {
+                kind: ReminderKind::Urgent,
+                ..
+            })
+        ));
+        assert!(batches
+            .iter()
+            .any(|b| b.effects.contains(&Effect::StartTone)));
+        assert!(
+            batches
+                .iter()
+                .filter(|b| b.render_generation.is_some())
+                .count()
+                >= 1
+        );
+        // The ViewModel projection marks the overlay.
+        let vm = crate::render_plan::ViewModel::from_state(&state);
+        assert_eq!(vm.overlay, crate::render_plan::Overlay::Reminder);
+        assert_eq!(
+            vm.view,
+            crate::app::RenderView::Reminder {
+                kind: ReminderKind::Urgent,
+                lines: vec!["URGENT: server down".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn reminder_any_button_dismisses_restores_and_stops_tone() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        // Enter a reminder over Home; then press UP -> dismiss.
+        let _ = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Todo,
+                lines: vec!["todo due".into()],
+            }),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
+        );
+        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|b| &b.effects)
+                .filter(|e| matches!(e, Effect::StopTone))
+                .count(),
+            1
+        );
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))));
+    }
+
+    #[test]
+    fn reminder_over_settings_restores_settings_on_dismiss() {
+        let mut state = AppState {
+            screen: Screen::Settings { selected: 1 },
+            ..Default::default()
+        };
+        let _ = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Todo,
+                lines: vec!["due".into()],
+            }),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 1 });
+    }
+
+    #[test]
+    fn alarm_preempts_reminder_and_does_not_resume_it() {
+        // An RTC alarm while a reminder is up preempts to AlarmRinging; on
+        // dismiss it restores the reminder's *underlying* screen - the
+        // reminder never resumes (it was already persisted at show time).
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(
+                vec![alarm(1, 9, 0)],
+                Some(dt(8, 0)),
+                false,
+                true,
+            )),
+        );
+        state.screen = Screen::Settings { selected: 2 };
+        let _ = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Urgent,
+                lines: vec!["urgent".into()],
+            }),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        // Alarm fires at its 9:00 minute over the reminder (Settings was
+        // under the reminder).
+        let _ = update(
+            &mut state,
+            Event::RtcAlarmSnapshotReady(RtcAlarmSnapshot {
+                now: dt(9, 0),
+                alarm_flag: true,
+                alarm_interrupt_enabled: true,
+            }),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        // Dismiss the alarm: it must land on Settings (reminder's
+        // underlying screen), not on the reminder.
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::Settings { selected: 2 });
+    }
+
+    #[test]
+    fn reminder_deadline_tick_dismisses() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Todo,
+                lines: vec!["due".into()],
+            }),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        // A Tick well past the 120s deadline dismisses like a button.
+        let batches = update(&mut state, Event::Tick(dt(8, 3)));
+        assert_eq!(state.screen, Screen::Home);
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopTone)));
+    }
+
+    #[test]
     fn boot_with_firing_alarm_renders_once_not_twice() {
         let mut state = AppState::default();
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
@@ -8713,4 +9015,13 @@ mod tests {
             assert_eq!(state.screen, screen, "screen must not change");
         }
     }
+}
+/// The final visible payload for a reminder overlay, raised by the
+/// firmware's reminder fact layer (and the host harness). The layer has
+/// already applied urgent-read and todo-reminded-date persistence, so these
+/// are the exact lines to draw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReminderPayload {
+    pub kind: ReminderKind,
+    pub lines: Vec<String>,
 }

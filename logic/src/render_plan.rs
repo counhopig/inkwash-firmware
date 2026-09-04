@@ -158,6 +158,7 @@ impl ViewModel {
             .map(|dt| u32::from(dt.hour) * 60 + u32::from(dt.minute));
         let overlay = match state.screen {
             crate::app::Screen::AlarmRinging => Overlay::AlarmRinging,
+            crate::app::Screen::Reminder(_) => Overlay::Reminder,
             _ => Overlay::None,
         };
         ViewModel {
@@ -259,7 +260,8 @@ fn surface_kind(view: &RenderView) -> SurfaceKind {
         | RenderView::InboxItem { .. }
         | RenderView::NumberPick { .. }
         | RenderView::BlePairing
-        | RenderView::AlarmRinging => SurfaceKind::ReadOnlySurface,
+        | RenderView::AlarmRinging
+        | RenderView::Reminder { .. } => SurfaceKind::ReadOnlySurface,
     }
 }
 

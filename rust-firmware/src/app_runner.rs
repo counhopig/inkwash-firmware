@@ -294,7 +294,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                         Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
                     }
                     inkwash_logic::render_plan::RenderPlan::Partial { region, .. } => {
-                        draw_sm_surface(self.ctx, self.last_clock, req.view);
+                        draw_sm_surface(self.ctx, self.last_clock, req.view.clone());
                         let rect = partial_region_rect(region);
                         match self.ctx.board.display.refresh_partial(rect) {
                             Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
@@ -302,7 +302,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                         }
                     }
                     inkwash_logic::render_plan::RenderPlan::Full { .. } => {
-                        draw_sm_surface(self.ctx, self.last_clock, req.view);
+                        draw_sm_surface(self.ctx, self.last_clock, req.view.clone());
                         match self.ctx.board.display.refresh_full() {
                             Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
                             Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
@@ -505,6 +505,9 @@ pub(crate) fn draw_sm_surface(
         }
         RenderView::AlarmRinging => {
             crate::screens::draw_alarm_ringing(ctx.board);
+        }
+        RenderView::Reminder { kind, lines } => {
+            crate::screens::draw_reminder(ctx.board, kind, lines.as_slice());
         }
     }
 }

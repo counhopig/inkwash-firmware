@@ -54,6 +54,7 @@ pub fn priority(event: &Event) -> Priority {
         | Event::BlePairingStarted
         | Event::BlePairingSucceeded(_)
         | Event::BlePairingFailed(_)
+        | Event::ReminderDue(_)
         | Event::BleDisconnected
         | Event::SyncCompleted(_)
         | Event::SyncBoundaryDue

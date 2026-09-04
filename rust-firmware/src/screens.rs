@@ -611,6 +611,40 @@ pub(crate) fn draw_alarm_ringing(board: &mut Note4Board) {
     drop(canvas);
 }
 
+/// Draws the full-screen reminder overlay (urgent or todo) from the SM's
+/// final visible lines. The RenderPlan-driven executor submits this frame;
+/// the function never refreshes the panel itself (the legacy reminder
+/// loops' direct refresh_full_best_effort is gone).
+pub(crate) fn draw_reminder(
+    board: &mut Note4Board,
+    kind: inkwash_logic::app::ReminderKind,
+    lines: &[String],
+) {
+    let mut canvas = board.display.canvas_mut();
+    canvas.clear();
+    let title = match kind {
+        inkwash_logic::app::ReminderKind::Urgent => "URGENT",
+        inkwash_logic::app::ReminderKind::Todo => "TODOS DUE",
+    };
+    header(&mut canvas, title);
+    // At most 7 rows (todo) / 4 rows (urgent) fit before the hint; the fact
+    // layer already truncated to the visible set, so draw what we got with a
+    // "MORE..." tail when there are more lines than fit.
+    let (max_rows, overflow_label) = match kind {
+        inkwash_logic::app::ReminderKind::Urgent => (4, "MORE IN INBOX..."),
+        inkwash_logic::app::ReminderKind::Todo => (7, "MORE..."),
+    };
+    for (index, line) in lines.iter().take(max_rows).enumerate() {
+        let text = truncate_prop(line, 300);
+        canvas.draw_text_prop(16, 48 + index * 24, 1, &format!("!! {text}"));
+    }
+    if lines.len() > max_rows {
+        canvas.draw_text_prop(16, 48 + max_rows * 24, 1, overflow_label);
+    }
+    footer(&mut canvas, "ENTER = DISMISS");
+    drop(canvas);
+}
+
 pub(crate) fn draw_ble_pairing(board: &mut Note4Board) {
     let mut canvas = board.display.canvas_mut();
     canvas.clear();
