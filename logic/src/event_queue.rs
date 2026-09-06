@@ -59,6 +59,7 @@ pub fn priority(event: &Event) -> Priority {
         | Event::SyncCompleted(_)
         | Event::SyncBoundaryDue
         | Event::SetWifiCompleted(_)
+        | Event::WifiConfigApplied(_)
         | Event::EffectCompleted(_)
         | Event::EffectFailed(_) => Priority::High,
     }

@@ -20,7 +20,10 @@ if ($env:IDF_PATH) {
         (Join-Path $env:USERPROFILE ".espressif\frameworks\esp-idf-*"),
         "C:\Espressif\frameworks\esp-idf*"
     )) {
-        $candidates += @(Get-Item -Path $pattern -Directory -ErrorAction SilentlyContinue)
+        $candidates += @(
+            Get-Item -Path $pattern -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSIsContainer }
+        )
     }
     $idfRoot = $candidates |
         Sort-Object FullName -Descending |
@@ -53,6 +56,13 @@ if ($prepend.Count -gt 0) {
 }
 
 . (Join-Path $idfRoot "export.ps1")
+
+if ($env:CARGO_HOME) {
+    $cargoBin = Join-Path $env:CARGO_HOME "bin"
+    if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) {
+        $env:Path = "$cargoBin;$env:Path"
+    }
+}
 
 if (-not $env:LIBCLANG_PATH) {
     # esp-idf-sys's bindgen step needs espup's esp-clang, which clang-sys does

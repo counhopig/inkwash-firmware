@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import re
 import sys
 import time
@@ -43,6 +44,8 @@ def parse_args() -> argparse.Namespace:
 
 def available_port(exact: str | None) -> str | None:
     if exact:
+        if os.name == "nt" and re.fullmatch(r"COM\d+", exact, re.IGNORECASE):
+            return exact
         return exact if Path(exact).exists() else None
     matches: list[str] = []
     for pattern in DEFAULT_PATTERNS:

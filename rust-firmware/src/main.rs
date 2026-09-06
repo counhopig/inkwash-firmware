@@ -356,6 +356,7 @@ fn main() -> Result<()> {
         pending_wifi_op: None,
         ble_session_id: None,
         ble_wifi_suspended: false,
+        ble_set_wifi_after_resume: None,
         ble_start_failure: None,
         ble_start_cancelled: false,
         last_command: None,
@@ -620,6 +621,52 @@ fn main() -> Result<()> {
 
         let mut ble_changed = false;
         if let Some((id, cmd)) = ctx.ble_control.poll_command() {
+            if let Some(id_value) = id.as_deref() {
+                if let Some((last_id, last_cmd, last_reply)) = &ctx.last_command {
+                    if last_id == id_value && last_cmd == &cmd {
+                        ctx.ble_control.write_reply(last_reply, Some(id_value));
+                        ble_changed = true;
+                        continue;
+                    }
+                }
+            }
+            if let control::Command::SetWifi { ssid, password } = cmd.clone() {
+                let ble_pairing_ready = {
+                    let runtime = app_runner.borrow();
+                    matches!(
+                        runtime.state().screen,
+                        inkwash_logic::app::Screen::BlePairing(_)
+                    ) && runtime.state().pending_ble_reply.is_none()
+                };
+                if ble_pairing_ready && ctx.ble_wifi_suspended {
+                    let request = control::Command::SetWifi {
+                        ssid: ssid.clone(),
+                        password: password.clone(),
+                    };
+                    let reply =
+                        if ctx.begin_ble_set_wifi_handoff(storage::WifiCreds { ssid, password }) {
+                            control::Reply::Ok
+                        } else {
+                            control::Reply::Busy
+                        };
+                    ctx.ble_control.write_reply(&reply, id.as_deref());
+                    if let Some(id_value) = id.as_deref() {
+                        ctx.last_command = Some((id_value.to_string(), request, reply.clone()));
+                    }
+                    if matches!(reply, control::Reply::Ok) {
+                        let event = inkwash_logic::app::Event::BlePairingSucceeded(
+                            inkwash_logic::app::BlePairingResult {
+                                name: "Inkwash".into(),
+                            },
+                        );
+                        if let Err(err) = dispatch_app_runner(&app_runner, event, &mut ctx) {
+                            log::warn!("BLE SetWifi handoff stop dispatch failed: {err}");
+                        }
+                    }
+                    ble_changed = true;
+                    continue;
+                }
+            }
             let runner = app_runner.clone();
             let pre_event = if matches!(cmd, control::Command::SetTimezone { .. }) {
                 ctx.rtc

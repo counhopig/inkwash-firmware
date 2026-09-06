@@ -770,6 +770,15 @@ pub struct DeviceStatus {
     pub timezone_offset_minutes: i16,
 }
 
+/// Status-visible Wi-Fi facts confirmed by a background credential
+/// verification. Carries no password; the sync task already persisted the
+/// credentials before emitting this fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WifiConfigApplied {
+    pub ssid: String,
+    pub has_password: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlePairingResult {
     pub name: String,
@@ -804,6 +813,9 @@ pub enum Event {
     /// A `StartSetWifi` verification+save finished (Ok when the credentials
     /// were verified and persisted; Err carries the failure message).
     SetWifiCompleted(Result<(), String>),
+    /// A background credential verification (currently BLE handoff after the
+    /// reply/disconnect window) confirmed the Wi-Fi config was saved.
+    WifiConfigApplied(WifiConfigApplied),
     /// The wall-clock full-sync boundary is due (the event-collection layer
     /// detected the minute crossed the interval boundary; it only reports
     /// the fact - the state machine decides whether a sync may start).
@@ -1135,6 +1147,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::BleCommand(request) => transition_command(state, Channel::Ble, request),
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
         Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
+        Event::WifiConfigApplied(fact) => transition_wifi_config_applied(state, fact),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
         Event::BlePairingStarted => transition_ble_pairing_started(state),
         Event::BlePairingSucceeded(result) => transition_ble_pairing_succeeded(state, result),
@@ -1387,6 +1400,17 @@ fn transition_set_wifi_completed(
         }
     }
     batches
+}
+
+fn transition_wifi_config_applied(
+    state: &mut AppState,
+    fact: WifiConfigApplied,
+) -> Vec<EffectBatch> {
+    state.config.wifi_ssid = Some(fact.ssid);
+    state.config.wifi_has_password = fact.has_password;
+    state.connectivity.wifi_configured = state.config.wifi_configured();
+    state.render_generation = state.render_generation.next();
+    vec![render_batch(state)]
 }
 
 fn transition_boot(state: &mut AppState, snapshot: BootSnapshot) -> Vec<EffectBatch> {
@@ -4467,6 +4491,32 @@ mod tests {
         let mut state = AppState::default();
         let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
         assert!(!done
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
+    }
+
+    #[test]
+    fn background_wifi_config_applied_updates_facts_without_transport_reply() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::WifiConfigApplied(WifiConfigApplied {
+                ssid: "home-wifi".into(),
+                has_password: true,
+            }),
+        );
+
+        assert_eq!(state.config.wifi_ssid.as_deref(), Some("home-wifi"));
+        assert!(state.config.wifi_has_password);
+        assert!(state.connectivity.wifi_configured);
+        assert!(state.pending_usb_reply.is_none());
+        assert!(state.pending_ble_reply.is_none());
+        assert!(batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::Render(RenderRequest { .. })))
+        }));
+        assert!(!batches
             .iter()
             .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
     }

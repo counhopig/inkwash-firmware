@@ -91,6 +91,7 @@ pub struct DeviceContext<'a> {
     /// for a newer pairing session.
     pub ble_session_id: Option<u64>,
     pub ble_wifi_suspended: bool,
+    pub ble_set_wifi_after_resume: Option<WifiCreds>,
     pub ble_start_failure: Option<(u64, String)>,
     pub ble_start_cancelled: bool,
     /// The last id-tagged command `control::dispatch` actually executed
@@ -410,7 +411,10 @@ impl DeviceContext<'_> {
 
         // One op at a time; cursors were advanced when the previous one
         // dispatched, so the next boundary still fires on time.
-        if self.pending_wifi_op.is_some() {
+        if self.pending_wifi_op.is_some()
+            || self.ble_wifi_suspended
+            || self.ble_session_id.is_some()
+        {
             return false;
         }
 
@@ -447,7 +451,7 @@ impl DeviceContext<'_> {
     /// another Wi-Fi operation is already in flight (the caller replies
     /// busy / skips).
     pub fn start_sync(&mut self, now: DateTime) -> Result<bool> {
-        if self.pending_wifi_op.is_some() {
+        if self.pending_wifi_op.is_some() || self.ble_wifi_suspended {
             return Ok(false);
         }
         let reply = self.sync.sync_now(now)?;
@@ -457,12 +461,50 @@ impl DeviceContext<'_> {
 
     /// Dispatches a Wi-Fi verification + save to the sync task.
     pub fn start_set_wifi(&mut self, creds: WifiCreds) -> Result<bool> {
-        if self.pending_wifi_op.is_some() {
+        if self.pending_wifi_op.is_some() || self.ble_wifi_suspended {
             return Ok(false);
         }
         let reply = self.sync.set_wifi(creds)?;
         self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
         Ok(true)
+    }
+
+    /// Accepts a BLE-sent SetWifi while the BLE pairing screen owns the
+    /// radio. The BLE transport gets its ack before StopBlePairing is queued;
+    /// once BLE is torn down and Wi-Fi is restored, the saved credentials are
+    /// verified by the sync task in the background.
+    pub fn begin_ble_set_wifi_handoff(&mut self, creds: WifiCreds) -> bool {
+        if self.ble_session_id.is_none()
+            || !self.ble_wifi_suspended
+            || self.pending_wifi_op.is_some()
+            || self.ble_set_wifi_after_resume.is_some()
+        {
+            return false;
+        }
+        log::info!(
+            "BLE SetWifi accepted for '{}'; stopping BLE before Wi-Fi verification",
+            creds.ssid
+        );
+        self.ble_set_wifi_after_resume = Some(creds);
+        true
+    }
+
+    fn start_ble_set_wifi_after_resume(&mut self, creds: WifiCreds) {
+        let ssid = creds.ssid.clone();
+        let has_password = !creds.password.is_empty();
+        match self.sync.set_wifi(creds) {
+            Ok(reply) => {
+                log::info!("BLE SetWifi handoff: verifying saved credentials for '{ssid}'");
+                self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi {
+                    reply,
+                    ssid,
+                    has_password,
+                });
+            }
+            Err(err) => {
+                log::error!("BLE SetWifi handoff: failed to queue Wi-Fi verification: {err:#}");
+            }
+        }
     }
 
     /// Begins BLE radio arbitration without waiting on the sync task.  The
@@ -577,6 +619,33 @@ impl DeviceContext<'_> {
                 }
                 Err(_) => {}
             },
+            PendingWifiOp::PostBleSetWifi {
+                reply,
+                ssid,
+                has_password,
+            } => match reply.try_recv() {
+                Ok(Ok(())) => {
+                    log::info!("BLE SetWifi handoff: Wi-Fi credentials verified and saved");
+                    if let Err(err) =
+                        self.dispatch_event(inkwash_logic::app::Event::WifiConfigApplied(
+                            inkwash_logic::app::WifiConfigApplied { ssid, has_password },
+                        ))
+                    {
+                        log::warn!("Wi-Fi config fact dispatch failed after BLE handoff: {err}");
+                    }
+                }
+                Ok(Err(err)) => {
+                    log::warn!("BLE SetWifi handoff: Wi-Fi verification failed: {err:#}");
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi {
+                        reply,
+                        ssid,
+                        has_password,
+                    });
+                }
+                Err(_) => log::warn!("BLE SetWifi handoff: Wi-Fi verification task disconnected"),
+            },
             PendingWifiOp::UrgentPoll { reply } => match reply.try_recv() {
                 Ok(Ok(true)) => {
                     // The server keeps answering
@@ -653,10 +722,15 @@ impl DeviceContext<'_> {
             },
             PendingWifiOp::ResumeAfterBle { reply } => match reply.try_recv() {
                 Ok(Ok(())) => {
+                    let post_ble_set_wifi = self.ble_set_wifi_after_resume.take();
                     self.ble_wifi_suspended = false;
                     self.ble_session_id = None;
+                    if let Some(creds) = post_ble_set_wifi {
+                        self.start_ble_set_wifi_after_resume(creds);
+                    }
                 }
                 Ok(Err(err)) => {
+                    self.ble_set_wifi_after_resume = None;
                     log::error!("Wi-Fi resume after BLE failed: {err:#}");
                 }
                 Err(TryRecvError::Empty) => {

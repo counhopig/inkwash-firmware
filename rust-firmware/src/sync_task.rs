@@ -67,6 +67,11 @@ pub enum PendingWifiOp {
     SetWifi {
         reply: Receiver<Result<()>>,
     },
+    PostBleSetWifi {
+        reply: Receiver<Result<()>>,
+        ssid: String,
+        has_password: bool,
+    },
     UrgentPoll {
         reply: Receiver<Result<bool>>,
     },
