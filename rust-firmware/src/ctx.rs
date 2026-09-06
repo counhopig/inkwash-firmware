@@ -266,6 +266,19 @@ impl DeviceContext<'_> {
             return (false, false);
         };
         let changes_visible_state = !matches!(cmd, Command::GetStatus);
+        if let Command::SetRtc { epoch_secs } = cmd.clone() {
+            let reply = if self.pending_wifi_op.is_some() || self.ble_wifi_suspended {
+                Reply::Busy
+            } else {
+                self.set_rtc_from_epoch(epoch_secs)
+            };
+            if let Some(id_value) = id.as_deref() {
+                self.last_command = Some((id_value.to_string(), cmd, reply.clone()));
+            }
+            crate::usb_console::write_reply(&reply, id.as_deref());
+            let changed = matches!(reply, Reply::Ok);
+            return (changes_visible_state && changed, true);
+        }
         // Migrated commands run through the state machine (Stage 3): the
         // runner's effects (persist/RTC) execute and its Reply effect is
         // written back to USB with the frame's correlation id.
@@ -457,6 +470,44 @@ impl DeviceContext<'_> {
         let reply = self.sync.sync_now(now)?;
         self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
         Ok(true)
+    }
+
+    /// Sets the PCF8563 from a host-provided Unix timestamp. This stays on
+    /// the firmware main loop because the RTC executor is the sole I2C owner;
+    /// the host timestamp path is useful when NTP UDP is unavailable.
+    pub fn set_rtc_from_epoch(&mut self, epoch_secs: u64) -> Reply {
+        const MIN_EPOCH: u64 = 946_684_800; // 2000-01-01
+        const MAX_EPOCH: u64 = 4_102_444_800; // 2100-01-01
+        if !(MIN_EPOCH..MAX_EPOCH).contains(&epoch_secs) {
+            return Reply::Error {
+                message: "RTC timestamp must be between 2000-01-01 and 2100-01-01".into(),
+            };
+        }
+        let timezone_offset = self.counters.timezone_offset_minutes().unwrap_or(0);
+        let local_time = DateTime::from_unix(epoch_secs).shifted_minutes(timezone_offset as i32);
+        match self.rtc.write_time(&local_time) {
+            Ok(()) => {
+                if let Err(err) = self.counters.clear_rtc_align_epoch() {
+                    log::warn!("Failed to clear RTC alignment marker after host set: {err}");
+                }
+                log::info!(
+                    "Host RTC sync applied: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    local_time.year,
+                    local_time.month,
+                    local_time.day,
+                    local_time.hour,
+                    local_time.minute,
+                    local_time.second
+                );
+                if let Err(err) = self.dispatch_event(inkwash_logic::app::Event::Tick(local_time)) {
+                    log::warn!("Failed to refresh clock fact after host RTC sync: {err}");
+                }
+                Reply::Ok
+            }
+            Err(err) => Reply::Error {
+                message: format!("failed to write RTC: {err}"),
+            },
+        }
     }
 
     /// Dispatches a Wi-Fi verification + save to the sync task.

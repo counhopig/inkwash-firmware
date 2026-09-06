@@ -3183,6 +3183,18 @@ fn transition_command(
     }
 
     match request {
+        ControlRequest::SetRtc { .. } => {
+            // The firmware transport performs the RTC write directly on the
+            // main loop after validating the host timestamp. Keep a
+            // defensive reply for callers that bypass that path.
+            vec![reply_batch(
+                state,
+                channel,
+                Reply::Error {
+                    message: "RTC set command is handled by the firmware transport".into(),
+                },
+            )]
+        }
         ControlRequest::SyncNow => {
             // Single network operation at a time (SyncState arbitration): if
             // a sync is already running (from USB, BLE or the scheduler),

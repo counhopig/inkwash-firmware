@@ -630,6 +630,19 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            if let control::Command::SetRtc { epoch_secs } = cmd.clone() {
+                let reply = if ctx.pending_wifi_op.is_some() || ctx.ble_wifi_suspended {
+                    control::Reply::Busy
+                } else {
+                    ctx.set_rtc_from_epoch(epoch_secs)
+                };
+                if let Some(id_value) = id.as_deref() {
+                    ctx.last_command = Some((id_value.to_string(), cmd.clone(), reply.clone()));
+                }
+                ctx.ble_control.write_reply(&reply, id.as_deref());
+                ble_changed = matches!(reply, control::Reply::Ok);
+                continue;
+            }
             if let control::Command::SetWifi { ssid, password } = cmd.clone() {
                 let ble_pairing_ready = {
                     let runtime = app_runner.borrow();

@@ -118,6 +118,17 @@ difference from the previous offset. Valid range: -720 (UTC-12:00) through 840
 
 ---
 
+#### `{"cmd":"set_rtc","epoch_secs":1756000000}`
+
+Write a trusted Unix timestamp to the PCF8563 hardware RTC. The stored local
+UTC offset is applied before writing the local clock. This command is intended
+for host-assisted recovery when the device can reach Wi-Fi but NTP/UDP is not
+available; it does not require server configuration.
+
+**Reply:** `Ok` on success, or `Error { message }` on failure.
+
+---
+
 ### Request Correlation
 
 Any command may include an optional `id` field (any JSON string), e.g.

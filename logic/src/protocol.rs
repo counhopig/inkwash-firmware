@@ -36,6 +36,10 @@ pub enum Command {
     /// if either is unavailable.
     SyncNow,
 
+    /// Set the hardware RTC from a trusted host Unix timestamp. The firmware
+    /// applies the stored local UTC offset before writing the PCF8563 clock.
+    SetRtc { epoch_secs: u64 },
+
     /// Query the device's current configuration and connectivity state.
     GetStatus,
 
