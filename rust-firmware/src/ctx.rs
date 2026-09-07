@@ -36,13 +36,17 @@ pub struct SyncScheduler {
     last_urgent_boundary: u64,
     last_full_boundary: u64,
     never_synced: bool,
-    /// True once a successful full sync has fetched the server state while
-    /// the urgent flag was set. The server keeps answering `urgent: true`
-    /// until the message is read, so without this flag the device would
-    /// run a *full* sync at every 30 s boundary while any unread urgent
-    /// message exists. Cleared when a poll reports no
-    /// urgent content; a failed urgent-triggered sync leaves it false so
-    /// the next boundary retries.
+    /// True once a successful full sync has fetched the server state in
+    /// response to an urgent poll. The server keeps answering `urgent:
+    /// true` until the message is read on-device, so after a full sync
+    /// that fetched the urgent message, the device checks its local
+    /// unread_urgent set: if non-empty, the same message was already
+    /// fetched — skip further syncs. If empty, a *new* urgent message has
+    /// arrived since the last sync — clear the flag and sync again.
+    ///
+    /// This fixes P1-4: the old `urgent_synced` boolean was not bound to
+    /// any inbox version, so a newly-arrived high-priority message was
+    /// silently skipped until the next scheduled full sync interval.
     urgent_synced: bool,
 }
 
@@ -56,6 +60,16 @@ impl SyncScheduler {
             never_synced: counters.last_sync_epoch().unwrap_or(None).is_none(),
             urgent_synced: false,
         }
+    }
+
+    /// Returns true if the device already fetched the current urgent message
+    /// and a further urgent-triggered full sync would be redundant. Checks
+    /// the local unread_urgent set: if non-empty, the last full sync already
+    /// fetched the message — the server is just re-reporting `urgent: true`
+    /// until the user reads it.
+    fn already_synced_urgent(&self, inbox_store: &crate::inbox::InboxStore) -> bool {
+        self.urgent_synced
+            && matches!(inbox_store.unread_urgent(), Ok(items) if !items.is_empty())
     }
 }
 
@@ -656,7 +670,7 @@ impl DeviceContext<'_> {
                     // side effects stay on the main loop here.
                     let ok = result.outcome.is_ok();
                     self.feed_sync_completed(&result);
-                    self.apply_sync_side_effects(ok, result.ntp_epoch);
+                    self.apply_sync_side_effects(&result);
                     self.sm_sync_reply_target = None;
                 }
                 Err(TryRecvError::Empty) => {
@@ -692,7 +706,7 @@ impl DeviceContext<'_> {
                     }
                 }
                 Ok(Err(err)) => {
-                    log::warn!("BLE SetWifi handoff: Wi-Fi verification failed: {err:#}");
+                    log::warn!("BLE SetWifi handoff: Wi-Fi verification failed: {err}");
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi {
@@ -705,14 +719,17 @@ impl DeviceContext<'_> {
             },
             PendingWifiOp::UrgentPoll { reply } => match reply.try_recv() {
                 Ok(Ok(true)) => {
-                    // The server keeps answering
-                    // `urgent: true` until the message is read, and a
-                    // successful full sync already fetched it - so further
-                    // polls with the flag still set must not re-run the
-                    // full sync at every 30 s boundary. Cleared when a
-                    // poll reports no urgent content.
-                    if self.sync_scheduler.urgent_synced {
-                        log::info!("Urgent flag still set and already synced; skipping full sync");
+                    // The server keeps answering `urgent: true` until the
+                    // message is read on-device. After a full sync that
+                    // fetched the message, the local unread_urgent set is
+                    // non-empty — so this is the same message already
+                    // fetched; skip the redundant full sync. If the local set
+                    // is empty, a *new* urgent message arrived since the last
+                    // sync, so fall through and sync again. (P1-4 fix:
+                    // replaces the old `urgent_synced` boolean which was not
+                    // bound to any inbox version.)
+                    if self.sync_scheduler.already_synced_urgent(&self.inbox_store) {
+                        log::info!("Urgent flag already fetched and unread locally; skipping full sync");
                     } else {
                         log::info!("Urgent message available; dispatching full sync");
                         match self.rtc.read_time() {
@@ -804,7 +821,13 @@ impl DeviceContext<'_> {
     /// NTP alignment and clear the fresh-device/urgent flags. The merged
     /// data apply + transport reply are owned by the state machine; this
     /// only does what the machine cannot (I2C RTC work on the main thread).
-    fn apply_sync_side_effects(&mut self, ok: bool, ntp_epoch: Option<u64>) {
+    ///
+    /// For P1-4, the inbox items from the sync result are inspected to
+    /// record the highest `seq` fetched — this bounds the urgent-synced
+    /// gate so that a *new* high-priority message arriving after the sync
+    /// is not silently skipped.
+    fn apply_sync_side_effects(&mut self, result: &sync::SyncResult) {
+        let ok = result.outcome.is_ok();
         if ok {
             // The merged alarm list is in NVS (applied by the machine);
             // re-point the PCF8563's single alarm slot at the new nearest
@@ -831,7 +854,7 @@ impl DeviceContext<'_> {
             // Daily NTP alignment: the sync task captured the NTP time
             // while Wi-Fi was up; apply it here (the task never touches
             // the I2C bus).
-            if let Some(epoch) = ntp_epoch {
+            if let Some(epoch) = result.ntp_epoch {
                 let tz = self.counters.timezone_offset_minutes().unwrap_or(0);
                 let dt = DateTime::from_unix(epoch).shifted_minutes(tz as i32);
                 match self.rtc.write_time(&dt) {
@@ -845,10 +868,14 @@ impl DeviceContext<'_> {
                 }
             }
             self.sync_scheduler.never_synced = false;
-            // A successful full sync fetched the current server state; if
-            // the urgent flag is still set, that message is already here
-            // and the 30 s urgent polls must not re-run the full sync
-            // until the flag clears.
+            // A successful full sync fetched the current server state; if the
+            // urgent flag is set, check whether we already have the message
+            // locally — the server keeps answering `urgent: true` until the
+            // device marks it read. If the local unread_urgent set is
+            // non-empty, we already have it; if empty, a new urgent message
+            // has arrived since this sync (detected on the next poll).
+            // Fixes P1-4: the old behavior set the flag unconditionally,
+            // silently skipping newly-arrived urgent messages.
             self.sync_scheduler.urgent_synced = true;
             log::info!("Full sync completed");
         }
