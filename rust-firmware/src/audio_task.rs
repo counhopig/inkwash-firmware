@@ -115,13 +115,22 @@ impl AudioTask {
 
 fn run(mut codec: Es8311, mailbox: Arc<Mutex<VecDeque<AudioCommand>>>) {
     log::info!("Audio task running");
+    let watchdog_subscribed = match watchdog::subscribe() {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("Audio task watchdog subscribe failed: {err}");
+            false
+        }
+    };
     let mut reducer = AudioReducer::new();
     loop {
+        if watchdog_subscribed {
+            watchdog::feed();
+        }
         drain_commands(&mailbox, &mut reducer);
         match reducer.mode() {
             AudioMode::Idle => thread::sleep(Duration::from_millis(5)),
             AudioMode::AlarmRing => {
-                watchdog::feed();
                 // One burst + a short gap, re-checking for Stop between
                 // steps so dismiss latency stays ~the gap, not the tone.
                 if let Err(err) = codec.play_sine_stereo(ALARM_TONE_HZ, ALARM_TONE_BURST_SECS, 8000)
@@ -135,7 +144,6 @@ fn run(mut codec: Es8311, mailbox: Arc<Mutex<VecDeque<AudioCommand>>>) {
                 );
             }
             AudioMode::Siren => {
-                watchdog::feed();
                 for (freq, dur) in SIREN_NOTES {
                     if let Err(err) = codec.play_sine_stereo(freq, dur, SIREN_AMPLITUDE) {
                         log::warn!("Siren note failed: {err}");
