@@ -2955,6 +2955,19 @@ fn transition_effect_completed(
                 None => {}
             }
         }
+        EffectOutput::RtcTimeWritten => {
+            // A WriteRtcTime (SetTimezone clock write) confirmed: the wall
+            // clock moved, so the derived PCF8563 alarm register may now point
+            // at the wrong instant. Re-derive it from the new `now` so a time
+            // shift (host set RTC, timezone change, NTP alignment) never
+            // leaves the hardware slot lagging the clock. (P1-5 fix.)
+            // Guard against clobbering a concurrently in-flight program.
+            if state.pending_rtc.is_none() {
+                if let Some(now) = state.clock.now {
+                    batches.extend(program_alarm_for(state, &now));
+                }
+            }
+        }
         EffectOutput::Persisted(PersistTarget::Config) => {
             // A SetServer config persist confirmed: apply the status-visible
             // server facts now (NVS holds them authoritatively; the generic
@@ -4752,6 +4765,55 @@ mod tests {
         }));
         assert!(state.pending_usb_reply.is_none());
     }
+
+    #[test]
+    fn set_timezone_rtc_write_confirms_rearms_alarm() {
+        // After a WriteRtcTime (SetTimezone clock write) confirms, the
+        // wall clock has moved, so the state machine must re-derive the
+        // PCF8563 alarm register from the new time. Without this, a time
+        // shift leaves the hardware slot pointing at the old instant (P1-5).
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.timezone_offset_minutes = 0;
+        // An enabled Daily alarm at 10:30 — due today at 10:30.
+        state.alarms.alarms = vec![alarm(1, 10, 30)];
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetTimezone {
+                offset_minutes: 480,
+            }),
+        );
+        let rtc_op = batches
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::WriteRtcTime(_)))
+            })
+            .unwrap()
+            .operation_id;
+        // RTC write confirms — must emit a ProgramRtcAlarm (not just reply).
+        let confirmed = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                output: EffectOutput::RtcTimeWritten,
+            }),
+        );
+        assert!(
+            confirmed.iter().any(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
+            }),
+            "RtcTimeWritten must reprogram the hardware alarm after a clock shift"
+        );
+    }
+
+    #[test]
 
     #[test]
     fn set_timezone_rtc_failure_replies_error_and_leaves_offset_unchanged() {

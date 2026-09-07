@@ -522,6 +522,18 @@ impl DeviceContext<'_> {
                 if let Err(err) = self.dispatch_event(inkwash_logic::app::Event::Tick(local_time)) {
                     log::warn!("Failed to refresh clock fact after host RTC sync: {err}");
                 }
+                // The wall clock moved — the PCF8563 hardware alarm slot may
+                // now point at the wrong instant. Re-derive it from the new
+                // RTC time so a host-set timestamp never leaves the hardware
+                // alarm lagging (P1-5 fix).
+                match self.alarm_store.load().and_then(|list| {
+                    crate::alarms::program_hardware_alarm_via(self.rtc, &list, &local_time)
+                }) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        log::warn!("Failed to re-arm hardware alarm after host RTC sync: {err}")
+                    }
+                }
                 Reply::Ok
             }
             Err(err) => Reply::Error {
@@ -818,14 +830,10 @@ impl DeviceContext<'_> {
     /// The RTC/NVS-maintenance half of a completed sync: re-point the
     /// PCF8563 alarm slot at the newly-synced alarm list (the executor's
     /// `ApplySyncedData` already wrote the list to NVS), apply the daily
-    /// NTP alignment and clear the fresh-device/urgent flags. The merged
-    /// data apply + transport reply are owned by the state machine; this
-    /// only does what the machine cannot (I2C RTC work on the main thread).
-    ///
-    /// For P1-4, the inbox items from the sync result are inspected to
-    /// record the highest `seq` fetched — this bounds the urgent-synced
-    /// gate so that a *new* high-priority message arriving after the sync
-    /// is not silently skipped.
+    /// NTP alignment, and clear the fresh-device/urgent-gate flags. The
+    /// merged data apply + transport reply are owned by the state machine;
+    /// this only does what the machine cannot (I2C RTC work on the main
+    /// thread).
     fn apply_sync_side_effects(&mut self, result: &sync::SyncResult) {
         let ok = result.outcome.is_ok();
         if ok {
@@ -850,7 +858,6 @@ impl DeviceContext<'_> {
                     }
                 }
                 Err(err) => log::warn!("RTC read failed after sync (alarm not re-armed): {err}"),
-            }
             // Daily NTP alignment: the sync task captured the NTP time
             // while Wi-Fi was up; apply it here (the task never touches
             // the I2C bus).
@@ -862,6 +869,18 @@ impl DeviceContext<'_> {
                         log::info!("NTP alignment applied to RTC");
                         if let Err(err) = self.counters.set_rtc_align_epoch(epoch) {
                             log::warn!("Failed to record RTC alignment time: {err}");
+                        }
+                        // NTP just shifted the wall clock — re-point the PCF8563
+                        // hardware alarm at the new instant. The alarm above
+                        // was computed from the pre-NTP RTC read, so without
+                        // this re-arm the slot lags the true time. (P1-6 fix.)
+                        match self.alarm_store.load().and_then(|list| {
+                            crate::alarms::program_hardware_alarm_via(self.rtc, &list, &dt)
+                        }) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                log::warn!("Failed to re-arm hardware alarm after NTP alignment: {err}")
+                            }
                         }
                     }
                     Err(err) => log::warn!("Failed to write NTP time to RTC: {err}"),
