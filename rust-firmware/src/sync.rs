@@ -122,6 +122,11 @@ struct DeviceTodoState {
 /// small chunks in - never hitting the idle timeout, but also never handing
 /// control back for long enough between chunks - still cannot starve the
 /// TWDT the way one unbroken `try_read_full` call could.
+///
+/// Returns `Err` when the buffer fills but the server still has more data —
+/// a truncated body would fail JSON parsing downstream with a misleading
+/// "format corrupted" error; detecting it here surfaces "response too large"
+/// instead so the user can trim their alarm/todo/inbox list.
 fn read_body_fully(response: &mut impl embedded_svc::io::Read, buf: &mut [u8]) -> Result<usize> {
     let mut offset = 0;
     while offset < buf.len() {
@@ -133,6 +138,18 @@ fn read_body_fully(response: &mut impl embedded_svc::io::Read, buf: &mut [u8]) -
             break;
         }
         offset += n;
+    }
+    // Buffer is full — check whether the server still has more data.
+    if offset == buf.len() {
+        let probe = response.read(&mut [0u8; 1])
+            .map_err(|e| anyhow!("HTTP response read failed during overflow probe: {e:?}"))?;
+        if probe > 0 {
+            return Err(anyhow!(
+                "sync response exceeded the {} byte buffer; \
+                 server payload too large for firmware (reduce alarms, todos, or inbox items)",
+                buf.len()
+            ));
+        }
     }
     Ok(offset)
 }
