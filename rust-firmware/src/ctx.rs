@@ -116,14 +116,13 @@ pub struct DeviceContext<'a> {
     /// not just `id`.
     pub last_command: Option<(String, Command, Reply)>,
     /// When a state-machine-routed SyncNow started a network sync, this
-    /// remembers where to write the SM's eventual `Reply` (the transport +
-    /// correlation id of the frame that requested it). `None` when no
-    /// SM-routed sync is awaiting its receipt. Cleared when the receipt
-    /// arrives (or the sync is superseded).
-    pub sm_sync_reply_target: Option<(Channel, String)>,
-    /// Same as `sm_sync_reply_target` for a state-machine-routed SetWifi:
-    /// where to write the machine's eventual reply for the wifi receipt.
-    pub sm_wifi_reply_target: Option<(Channel, String)>,
+    /// remembers the transport + correlation id AND the original command so
+    /// the final reply (Ok/Error) can be cached in `last_command` for dedup.
+    /// `None` when no SM-routed sync is awaiting its receipt. Cleared when
+    /// the receipt arrives (or the sync is superseded).
+    pub sm_sync_reply_target: Option<(Channel, String, Command)>,
+    /// Same as `sm_sync_reply_target` for a state-machine-routed SetWifi.
+    pub sm_wifi_reply_target: Option<(Channel, String, Command)>,
     /// [[`DeviceContext::poll_alarm_snapshot`]] dispatches to AppRunner so
     /// the bounded alert loops (reminder overlays, which briefly own the
     /// main thread) can still ring an alarm through the same state machine.
@@ -201,19 +200,15 @@ pub(crate) fn dispatch_migrated_command(
         }
     }
     for kick in runner.borrow_mut().take_kicks() {
-        // A StartSync kick means the state machine accepted a SyncNow and a
-        // network sync is now running. Its eventual reply arrives with the
-        // sync receipt; remember the transport + correlation id to write it
-        // to then (there is no synchronous reply for an accepted SyncNow).
         match &kick.effect {
             inkwash_logic::app::Effect::StartSync(_) => {
                 if let Some(id) = id {
-                    ctx.sm_sync_reply_target = Some((channel, id.to_string()));
+                    ctx.sm_sync_reply_target = Some((channel, id.to_string(), request.clone()));
                 }
             }
             inkwash_logic::app::Effect::StartSetWifi(_) => {
                 if let Some(id) = id {
-                    ctx.sm_wifi_reply_target = Some((channel, id.to_string()));
+                    ctx.sm_wifi_reply_target = Some((channel, id.to_string(), request.clone()));
                 }
             }
             _ => {}
@@ -683,7 +678,6 @@ impl DeviceContext<'_> {
                     let ok = result.outcome.is_ok();
                     self.feed_sync_completed(&result);
                     self.apply_sync_side_effects(&result);
-                    self.sm_sync_reply_target = None;
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
@@ -695,7 +689,6 @@ impl DeviceContext<'_> {
                     // Every SetWifi is state-machine-routed (its reply is
                     // delivered through the machine when a slot awaits).
                     self.feed_set_wifi_completed(result.map_err(|e| e.to_string()));
-                    self.sm_wifi_reply_target = None;
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
@@ -858,6 +851,7 @@ impl DeviceContext<'_> {
                     }
                 }
                 Err(err) => log::warn!("RTC read failed after sync (alarm not re-armed): {err}"),
+            }
             // Daily NTP alignment: the sync task captured the NTP time
             // while Wi-Fi was up; apply it here (the task never touches
             // the I2C bus).
@@ -934,23 +928,30 @@ impl DeviceContext<'_> {
         let target = self.sm_sync_reply_target.take();
         let runner = self.app_runner.clone();
         let result = self.dispatch_sync_completed(&runner, sm_result);
-        if let (Some(reply), Some((channel, id))) = (result, target) {
+        if let (Some(reply), Some((channel, id, cmd))) = (result, target) {
             write_reply_to_channel(self, channel, &reply, Some(&id));
+            // Cache the final result for async-command dedup: a resent
+            // SyncNow with the same correlation id replays this reply
+            // instead of re-dispatching. (P1-7 fix.)
+            self.last_command = Some((id, cmd, reply));
         }
     }
 
     /// Feeds a completed SetWifi result into the state machine as
-    /// `Event::SetWifiCompleted`, then writes the machine's Reply effect to
     /// the transport that requested the SetWifi (stored in
-    /// `sm_wifi_reply_target`).
+    /// `sm_wifi_reply_target`) and caches it for async-command dedup.
     fn feed_set_wifi_completed(&mut self, result: Result<(), String>) {
-        let Some((channel, id)) = self.sm_wifi_reply_target.take() else {
+        let Some((channel, id, cmd)) = self.sm_wifi_reply_target.take() else {
             return;
         };
         let runner = self.app_runner.clone();
         let reply = self.dispatch_set_wifi_completed(&runner, result);
-        if let Some(reply) = reply {
-            write_reply_to_channel(self, channel, &reply, Some(&id));
+        if let Some(reply) = &reply {
+            write_reply_to_channel(self, channel, reply, Some(&id));
+            // Cache the final result for async-command dedup: a resent
+            // SetWifi with the same correlation id replays this reply
+            // instead of re-dispatching. (P1-7 fix.)
+            self.last_command = Some((id, cmd, reply.clone()));
         }
     }
 
