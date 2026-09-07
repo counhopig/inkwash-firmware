@@ -709,6 +709,12 @@ pub struct SyncedData {
     pub inbox_read_acked: Vec<u64>,
     pub inbox_truncated: bool,
     pub etag: Option<String>,
+    /// Alarm `local_id`s that were uploaded in this sync snapshot. On apply,
+    /// only these IDs are cleared from the dirty set so edits made during
+    /// the network round-trip survive (P1-3 race fix).
+    pub uploaded_alarm_ids: Vec<u8>,
+    /// Todo `local_id`s uploaded in this sync snapshot — same semantics.
+    pub uploaded_todo_ids: Vec<u8>,
 }
 
 /// Failure of an effect, fed back via `Event::EffectFailed`.
@@ -3726,7 +3732,6 @@ mod tests {
             label: String::new(),
         }
     }
-
     fn synced_data(alarms: Vec<StoredAlarm>) -> SyncedData {
         SyncedData {
             alarms,
@@ -3735,6 +3740,8 @@ mod tests {
             inbox_read_acked: vec![],
             inbox_truncated: false,
             etag: None,
+            uploaded_alarm_ids: vec![],
+            uploaded_todo_ids: vec![],
         }
     }
 

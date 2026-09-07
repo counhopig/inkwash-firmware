@@ -92,6 +92,13 @@ pub enum SyncOutcome {
         inbox_read_acked: Vec<u64>,
         inbox_truncated: bool,
         etag: Option<String>,
+        /// Alarm `local_id`s uploaded during this sync — the snapshot taken
+        /// before the request. On apply, only these IDs are cleared from the
+        /// dirty set so edits made during the round-trip survive (P1-3).
+        uploaded_alarm_ids: Vec<u8>,
+        /// Todo `local_id`s uploaded during this sync — same snapshot
+        /// semantics as above.
+        uploaded_todo_ids: Vec<u8>,
     },
 }
 
@@ -322,6 +329,11 @@ pub fn fetch_and_apply(
         inbox_read_acked: parsed.inbox_read_acked,
         inbox_truncated: parsed.inbox_truncated,
         etag: new_etag,
+        // Snapshot of dirty IDs captured before the request — passed
+        // through to ApplySyncedData so only these are cleared on apply,
+        // preserving any local edits made during the round-trip (P1-3).
+        uploaded_alarm_ids: dirty_alarms,
+        uploaded_todo_ids: dirty_todos,
     })
 }
 

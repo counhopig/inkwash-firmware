@@ -117,4 +117,19 @@ impl<'a> DirtySet<'a> {
             .map(|_| ())
             .map_err(|e| anyhow!("NVS remove({}) failed: {e}", self.key))
     }
+    /// Removes only the given `ids` from the dirty set, preserving any
+    /// entries made *after* the sync snapshot was taken (e.g. a user toggle
+    /// during the network round-trip). Replaces `clear()` at sync-apply time
+    /// so concurrent local edits aren't silently lost.
+    pub fn clear_ids(&self, ids: &[u8]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let remaining: Vec<u8> = self
+            .ids()?
+            .into_iter()
+            .filter(|id| !ids.contains(id))
+            .collect();
+        write_blob::<DIRTY_SET_BUF_LEN, _>(self.nvs, self.key, &remaining)
+    }
 }

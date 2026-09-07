@@ -115,10 +115,12 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     self.ctx.todo_store.save(&data.todos)?;
                     self.ctx.inbox_store.save(&data.inbox)?;
                     self.ctx.inbox_store.ack_read(&data.inbox_read_acked)?;
-                    // The merged server state reflects everything uploaded,
-                    // so the pending local changes are spent.
-                    self.ctx.alarm_store.clear_dirty()?;
-                    self.ctx.todo_store.clear_dirty()?;
+                    // Clear only the dirty IDs that were uploaded in this
+                    // sync snapshot, not the entire dirty set — any local
+                    // edits made during the network round-trip must survive
+                    // to be re-uploaded on the next sync (P1-3 race fix).
+                    self.ctx.alarm_store.clear_dirty_ids(&data.uploaded_alarm_ids)?;
+                    self.ctx.todo_store.clear_dirty_ids(&data.uploaded_todo_ids)?;
                     if let Some(etag) = data.etag.as_deref() {
                         self.ctx.counters.save_sync_etag(etag)?;
                     }

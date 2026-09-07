@@ -869,6 +869,8 @@ impl DeviceContext<'_> {
                 inbox_read_acked,
                 inbox_truncated,
                 etag,
+                uploaded_alarm_ids,
+                uploaded_todo_ids,
             }) => inkwash_logic::app::SyncResult::Ok {
                 data: inkwash_logic::app::SyncedData {
                     alarms: alarms.clone(),
@@ -877,6 +879,8 @@ impl DeviceContext<'_> {
                     inbox_read_acked: inbox_read_acked.clone(),
                     inbox_truncated: *inbox_truncated,
                     etag: etag.clone(),
+                    uploaded_alarm_ids: uploaded_alarm_ids.clone(),
+                    uploaded_todo_ids: uploaded_todo_ids.clone(),
                 },
             },
             Err(err) => inkwash_logic::app::SyncResult::Failed(err.to_string()),
