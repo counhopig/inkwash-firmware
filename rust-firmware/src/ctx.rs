@@ -272,12 +272,18 @@ impl DeviceContext<'_> {
             } else {
                 self.set_rtc_from_epoch(epoch_secs)
             };
-            if let Some(id_value) = id.as_deref() {
-                self.last_command = Some((id_value.to_string(), cmd, reply.clone()));
+            if !matches!(reply, Reply::Busy) {
+                if let Some(id_value) = id.as_deref() {
+                    self.last_command = Some((id_value.to_string(), cmd, reply.clone()));
+                }
             }
             crate::usb_console::write_reply(&reply, id.as_deref());
             let changed = matches!(reply, Reply::Ok);
             return (changes_visible_state && changed, true);
+        }
+        if matches!(cmd, Command::SyncNow) && self.pending_wifi_op.is_some() {
+            crate::usb_console::write_reply(&Reply::Busy, id.as_deref());
+            return (false, true);
         }
         // Migrated commands run through the state machine (Stage 3): the
         // runner's effects (persist/RTC) execute and its Reply effect is

@@ -636,11 +636,18 @@ fn main() -> Result<()> {
                 } else {
                     ctx.set_rtc_from_epoch(epoch_secs)
                 };
-                if let Some(id_value) = id.as_deref() {
-                    ctx.last_command = Some((id_value.to_string(), cmd.clone(), reply.clone()));
+                if !matches!(reply, control::Reply::Busy) {
+                    if let Some(id_value) = id.as_deref() {
+                        ctx.last_command = Some((id_value.to_string(), cmd.clone(), reply.clone()));
+                    }
                 }
                 ctx.ble_control.write_reply(&reply, id.as_deref());
                 ble_changed = matches!(reply, control::Reply::Ok);
+                continue;
+            }
+            if matches!(cmd, control::Command::SyncNow) && ctx.pending_wifi_op.is_some() {
+                ctx.ble_control
+                    .write_reply(&control::Reply::Busy, id.as_deref());
                 continue;
             }
             if let control::Command::SetWifi { ssid, password } = cmd.clone() {

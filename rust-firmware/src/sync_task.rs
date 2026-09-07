@@ -26,11 +26,11 @@ use crate::sync::{self, SyncResult};
 use crate::todos::TodoStore;
 use crate::wifi::WifiManager;
 
-/// 24 KiB stack: the HTTPS + TLS (mbedTLS) stack is the deepest caller on
-/// this thread. 16 KiB overflowed after Wi-Fi obtained DHCP, while 32 KiB
-/// overran internal RAM at boot (`pthread: Failed to create task!` /
-/// `Not enough space` - pthread stacks are forced to MALLOC_CAP_INTERNAL).
-const SYNC_TASK_STACK: usize = 24 * 1024;
+/// 16 KiB stack: HTTPS control flow stays here, while its 16 KiB response
+/// buffer is explicitly allocated in PSRAM. This preserves internal RAM for
+/// mbedTLS/AES without returning to the old stack overflow caused by placing
+/// that response buffer on this stack.
+const SYNC_TASK_STACK: usize = 16 * 1024;
 
 /// Commands the main loop dispatches to the sync task.
 pub enum SyncCommand {

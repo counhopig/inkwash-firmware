@@ -12,6 +12,7 @@ use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 use serde::Serialize;
+use std::ptr::NonNull;
 use std::time::Duration;
 
 use crate::alarms::AlarmStore;
@@ -30,9 +31,37 @@ use inkwash_logic::sync_validate::{validate_sync_response, SyncResponse};
 
 /// Response bodies from a compliant server are small (alarms/todos are
 /// themselves capped to a couple KB each in NVS - see `alarms::BLOB_BUF_LEN`
-/// / `todos::BLOB_BUF_LEN`); the inbox adds up to 20 small items. A fixed
-/// buffer avoids a heap-growing read loop for a payload this bounded.
+/// / `todos::BLOB_BUF_LEN`); the inbox adds up to 20 small items.
 const RESPONSE_BUF_LEN: usize = 16384;
+
+/// Fixed-capacity response storage allocated explicitly in PSRAM. Keeping
+/// this 16 KiB buffer off the pthread stack leaves scarce internal RAM for
+/// mbedTLS and the hardware AES driver during the response read.
+struct PsramBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl PsramBuffer {
+    fn new(len: usize) -> Result<Self> {
+        let caps = esp_idf_svc::sys::MALLOC_CAP_SPIRAM | esp_idf_svc::sys::MALLOC_CAP_8BIT;
+        let ptr = unsafe { esp_idf_svc::sys::heap_caps_calloc(len, 1, caps) } as *mut u8;
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            anyhow!("failed to allocate {len}-byte sync response buffer in PSRAM")
+        })?;
+        Ok(Self { ptr, len })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for PsramBuffer {
+    fn drop(&mut self) {
+        unsafe { esp_idf_svc::sys::heap_caps_free(self.ptr.as_ptr().cast()) };
+    }
+}
 
 /// Explicit socket timeout for every HTTP client used in this module.
 /// `Configuration::timeout` defaults to `None`, which leaves the native
@@ -244,16 +273,16 @@ pub fn fetch_and_apply(
     // The full HTTP round-trip (config, headers, body write, status check,
     // watchdog-feeding body read) lives in `https_post` - see its doc
     // comment for why the body read must keep feeding the task watchdog.
-    let mut buf = [0u8; RESPONSE_BUF_LEN];
+    let mut buf = PsramBuffer::new(RESPONSE_BUF_LEN)?;
     let (bytes_read, new_etag) = https_post(
         server_url,
         token,
         &[],
         &request_body,
-        &mut buf,
+        buf.as_mut_slice(),
         "sync request failed",
     )?;
-    let body = &buf[..bytes_read];
+    let body = &buf.as_mut_slice()[..bytes_read];
     watchdog::feed();
 
     let parsed: SyncResponse = serde_json::from_slice(body)
