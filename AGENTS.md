@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-08 · **Updated:** 2026-09-08 · **Commit:** eacb3db · **Branch:** main
+**Generated:** 2026-09-08 · **Updated:** 2026-09-08 · **Commit:** 5f99bc0 · **Branch:** main
 
 ## OVERVIEW
 Firmware for ZECTRIX NOTE4 b/w (ESP32-S3-WROOM-1 N16R8, 4.2" 400×300 SSD2683 EPD). One of four independent repos; siblings out-of-scope. Two Rust crates (`rust-firmware/` + `logic/`), no root Cargo.toml, no workspace.
