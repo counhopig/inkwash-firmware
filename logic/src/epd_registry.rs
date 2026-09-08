@@ -41,8 +41,7 @@ pub enum FeedOutcome {
 /// The shared render-request registry, plus the renderer's private
 /// ViewModel cache (Stage 5).
 ///
-/// The cache holds the last *successfully shown* ViewModel and the number
-/// of consecutive partial refreshes since the last Full. It is private to
+/// The cache holds the last *successfully shown* ViewModel. It is private to
 /// the renderer - never part of `AppState`, never read or written by the
 /// business layer. Rules enforced here (and host-tested):
 ///
@@ -55,15 +54,11 @@ pub enum FeedOutcome {
 /// - A superseded completion does not touch the cache: the replaced
 ///   request's pixels never reached the panel; the replacement request
 ///   updates the cache on its own completion.
-/// - Each successful Full resets the partial counter; each successful
-///   Partial increments it toward `PARTIAL_MAINTENANCE_LIMIT`.
 #[derive(Debug, Default)]
 pub struct RenderRegistry {
     pub pending: Vec<AsyncKick>,
     /// Last successfully-shown ViewModel (renderer-private cache).
     pub last_shown: Option<ViewModel>,
-    /// Consecutive successful partial refreshes since the last Full.
-    pub partials_since_maintenance: u32,
 }
 
 impl RenderRegistry {
@@ -74,11 +69,7 @@ impl RenderRegistry {
     /// Decide the refresh plan for a request carrying `vm`, against the
     /// cached last-shown ViewModel. Does not mutate the cache.
     pub fn plan_for(&self, vm: &ViewModel) -> RenderPlan {
-        plan_render(
-            self.last_shown.as_ref(),
-            vm,
-            self.partials_since_maintenance,
-        )
+        plan_render(self.last_shown.as_ref(), vm)
     }
 
     /// Apply the terminal outcome of a render to the cache. `success` is
@@ -96,7 +87,6 @@ impl RenderRegistry {
             // Partial-failure recovery: forget what the panel shows so the
             // next render is a Full from a clean slate.
             self.last_shown = None;
-            self.partials_since_maintenance = 0;
             return;
         }
         if !generation_is_current {
@@ -107,11 +97,9 @@ impl RenderRegistry {
         match plan {
             RenderPlan::Full { .. } => {
                 self.last_shown = Some(vm.clone());
-                self.partials_since_maintenance = 0;
             }
             RenderPlan::Partial { .. } => {
                 self.last_shown = Some(vm.clone());
-                self.partials_since_maintenance = self.partials_since_maintenance.saturating_add(1);
             }
             RenderPlan::Noop => {
                 // Nothing changed on screen; the cache already equals vm.
@@ -123,7 +111,6 @@ impl RenderRegistry {
     /// it can no longer trust, e.g. a boot-after-failure).
     pub fn invalidate_cache(&mut self) {
         self.last_shown = None;
-        self.partials_since_maintenance = 0;
     }
 
     /// Apply a completed render kick's terminal outcome to the cache.
@@ -313,7 +300,6 @@ mod tests {
         // Completing it (current generation) caches the VM.
         reg.note_terminal(&home_vm(0, None), &plan, true, true);
         assert_eq!(reg.last_shown.as_ref(), Some(&home_vm(0, None)));
-        assert_eq!(reg.partials_since_maintenance, 0);
     }
 
     #[test]
@@ -342,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn home_minute_change_is_clock_partial_and_counts() {
+    fn home_minute_change_is_clock_partial() {
         let mut reg = RenderRegistry::new();
         let t0 = home_vm(0, Some(8 * 60));
         let p0 = reg.plan_for(&t0);
@@ -357,7 +343,6 @@ mod tests {
             }
         );
         reg.note_terminal(&t1, &plan, true, true);
-        assert_eq!(reg.partials_since_maintenance, 1);
         assert_eq!(reg.last_shown.as_ref(), Some(&t1));
     }
 
@@ -415,7 +400,6 @@ mod tests {
         let plan = reg.plan_for(&t1);
         reg.note_terminal(&t1, &plan, false, true);
         assert!(reg.last_shown.is_none());
-        assert_eq!(reg.partials_since_maintenance, 0);
         // Next render has no previous -> Full (recovery).
         assert!(matches!(reg.plan_for(&t1), RenderPlan::Full { .. }));
     }
@@ -434,35 +418,20 @@ mod tests {
         };
         reg.note_terminal(&stale, &plan, true, false);
         assert_eq!(reg.last_shown.as_ref(), Some(&t0));
-        assert_eq!(reg.partials_since_maintenance, 0);
     }
 
     #[test]
-    fn maintenance_threshold_forces_full_and_resets_on_full() {
+    fn home_minute_changes_stay_partial_without_maintenance_full() {
         let mut reg = RenderRegistry::new();
         let t0 = home_vm(0, Some(8 * 60));
         let p0 = reg.plan_for(&t0);
         reg.note_terminal(&t0, &p0, true, true);
-        // Push LIMIT successful partials (each minute change).
-        for gen in 1..=crate::render_plan::PARTIAL_MAINTENANCE_LIMIT {
+        for gen in 1..=256 {
             let t = home_vm(u64::from(gen), Some(8 * 60 + gen));
             let plan = reg.plan_for(&t);
             assert!(matches!(plan, RenderPlan::Partial { .. }));
             reg.note_terminal(&t, &plan, true, true);
         }
-        assert_eq!(
-            reg.partials_since_maintenance,
-            crate::render_plan::PARTIAL_MAINTENANCE_LIMIT
-        );
-        // The next minute change is past the limit -> Full.
-        let next = home_vm(
-            u64::from(crate::render_plan::PARTIAL_MAINTENANCE_LIMIT + 1),
-            Some(8 * 60 + crate::render_plan::PARTIAL_MAINTENANCE_LIMIT + 1),
-        );
-        let plan = reg.plan_for(&next);
-        assert!(matches!(plan, RenderPlan::Full { .. }));
-        reg.note_terminal(&next, &plan, true, true);
-        assert_eq!(reg.partials_since_maintenance, 0);
     }
 
     #[test]

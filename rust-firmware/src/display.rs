@@ -7,9 +7,9 @@
 //! The canvas lives on the app thread only. A refresh request snapshots
 //! the whole frame under the canvas lock at request time, so the EPD task
 //! never reads the canvas and a pending refresh is
-//! immune to later drawing. Requests go through a single latest-wins slot,
-//! and partial-vs-full promotion is decided here,
-//! keeping the refresh policy in one place.
+//! immune to later drawing. Requests go through a single latest-wins slot;
+//! the caller decides whether an explicit full refresh is needed, while
+//! partial requests stay partial.
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -23,19 +23,11 @@ use crate::rtc::DateTime;
 
 pub use crate::canvas::Rect;
 
-/// Consecutive partial refreshes before the scheduler promotes the next
-/// one to a full refresh (matching the reference demo's
-/// ghosting guard: 8 UI partials then a full refresh).
-const PARTIALS_BEFORE_FULL: u32 = 8;
-
 /// Main-thread handle to the EPD subsystem: a lockable view of the frame
 /// buffer plus the request slot into [`crate::epd_task`].
 pub struct EpdClient {
     canvas: Mutex<Canvas>,
     handle: EpdHandle,
-    /// Partial refreshes executed since the last full refresh; drives the
-    /// full-refresh promotion.
-    partials_since_full: u32,
 }
 
 impl EpdClient {
@@ -44,11 +36,7 @@ impl EpdClient {
     pub fn new() -> Result<Self> {
         let canvas = Mutex::new(Canvas::new());
         let handle = epd_task::spawn()?;
-        Ok(Self {
-            canvas,
-            handle,
-            partials_since_full: 0,
-        })
+        Ok(Self { canvas, handle })
     }
 
     /// Direct canvas access for screens that don't fit the fixed
@@ -98,12 +86,9 @@ impl EpdClient {
 
     /// Queues a full-screen refresh of the current canvas contents; the
     /// frame is snapshotted now, so the panel shows exactly this frame.
-    /// Resets the partial-refresh promotion counter.
     pub fn refresh_full(&mut self) -> Result<u64> {
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
-        let id = self.handle.request_full(frame);
-        self.partials_since_full = 0;
-        Ok(id)
+        Ok(self.handle.request_full(frame))
     }
 
     /// Always refreshes only `rect`, never promotes to a full refresh.
@@ -111,20 +96,12 @@ impl EpdClient {
     /// only when its displayed minute changes; boot and alarm-ring still use
     /// `refresh_full` explicitly. Callers re-render the whole canvas
     /// before refreshing, so the partial rect always shows fresh pixels.
-    /// The scheduler merges consecutive partials into one pending request
-    /// and promotes to a full refresh after [`PARTIALS_BEFORE_FULL`] of
-    /// them; `refresh_full` is for the deliberate full
-    /// refreshes (boot, alarm ring).
+    /// The scheduler merges consecutive partials into one pending request;
+    /// `refresh_full` is reserved for deliberate full refreshes such as boot,
+    /// page transitions, overlays, and recovery.
     pub fn refresh_partial(&mut self, rect: Rect) -> Result<u64> {
-        if self.partials_since_full >= PARTIALS_BEFORE_FULL {
-            self.partials_since_full = 0;
-            log::info!("{PARTIALS_BEFORE_FULL} consecutive partial refreshes; promoting to full");
-            return self.refresh_full();
-        }
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
-        let id = self.handle.request_partial(rect, frame);
-        self.partials_since_full += 1;
-        Ok(id)
+        Ok(self.handle.request_partial(rect, frame))
     }
 
     /// Non-blocking drain of completed refreshes: the app

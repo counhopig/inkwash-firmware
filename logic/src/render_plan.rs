@@ -16,9 +16,7 @@
 //!   after a failure);
 //! - the page *type* changed;
 //! - an alarm/reminder overlay entered or exited;
-//! - a partial refresh failed and the renderer is recovering;
-//! - the number of consecutive partial refreshes reached the panel
-//!   maintenance threshold.
+//! - a partial refresh failed and the renderer is recovering.
 //!
 //! This module is pure and lives in `inkwash-logic` so the decision rule is
 //! unit-tested on the host. The firmware renderer holds the previous
@@ -104,11 +102,6 @@ pub enum Overlay {
     Reminder,
 }
 
-/// Maximum consecutive partial refreshes before a maintenance Full refresh
-/// is forced (panel ghosting / wear mitigation). Mirrors the firmware's
-/// e-paper maintenance cadence.
-pub const PARTIAL_MAINTENANCE_LIMIT: u32 = 200;
-
 impl ViewModel {
     /// A bare Home ViewModel with no clock and no data - for fixtures and
     /// for "nothing known yet" renderer caches.
@@ -178,16 +171,10 @@ impl ViewModel {
 }
 
 /// Decide the refresh plan from the last successfully-shown ViewModel (if
-/// any) and the current one.
-///
-/// `partials_since_maintenance` counts consecutive partial refreshes since
-/// the last Full; the renderer tracks it and passes it in so a maintenance
-/// Full is forced after `PARTIAL_MAINTENANCE_LIMIT`.
-pub fn plan_render(
-    previous: Option<&ViewModel>,
-    current: &ViewModel,
-    partials_since_maintenance: u32,
-) -> RenderPlan {
+/// any) and the current one. Full refreshes are reserved for transitions,
+/// overlays, first render, and recovery; ordinary Home clock changes remain
+/// partial refreshes indefinitely.
+pub fn plan_render(previous: Option<&ViewModel>, current: &ViewModel) -> RenderPlan {
     let frame = Frame(current.generation.0 as u32);
 
     // First render / cache was reset after a failure -> Full.
@@ -206,11 +193,6 @@ pub fn plan_render(
 
     // An overlay entered/exited -> Full.
     if current.overlay != prev.overlay {
-        return RenderPlan::Full { frame };
-    }
-
-    // Maintenance threshold reached -> Full.
-    if partials_since_maintenance >= PARTIAL_MAINTENANCE_LIMIT {
         return RenderPlan::Full { frame };
     }
 
@@ -405,7 +387,7 @@ mod tests {
             overlay: Overlay::None,
             data_fingerprint: 42,
         };
-        assert_eq!(plan_render(Some(&vm), &vm, 0), RenderPlan::Noop);
+        assert_eq!(plan_render(Some(&vm), &vm), RenderPlan::Noop);
     }
 
     #[test]
@@ -417,10 +399,7 @@ mod tests {
             overlay: Overlay::None,
             data_fingerprint: 0,
         };
-        assert_eq!(
-            plan_render(None, &vm, 0),
-            RenderPlan::Full { frame: Frame(0) }
-        );
+        assert_eq!(plan_render(None, &vm), RenderPlan::Full { frame: Frame(0) });
     }
 
     #[test]
@@ -430,7 +409,7 @@ mod tests {
         cur.generation = crate::app::RenderGeneration(2);
         cur.clock_minute = Some(8 * 60 + 1);
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Partial {
                 frame: Frame(2),
                 region: PartialRegion::Clock
@@ -455,7 +434,7 @@ mod tests {
             data_fingerprint: 0,
         };
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Full { frame: Frame(2) }
         );
     }
@@ -474,7 +453,7 @@ mod tests {
         ringing.generation = crate::app::RenderGeneration(2);
         ringing.overlay = Overlay::AlarmRinging;
         assert_eq!(
-            plan_render(Some(&base), &ringing, 0),
+            plan_render(Some(&base), &ringing),
             RenderPlan::Full { frame: Frame(2) }
         );
         // Dismiss back to the same underlying page -> Full (no CLOCK_RECT
@@ -483,7 +462,7 @@ mod tests {
         dismissed.generation = crate::app::RenderGeneration(3);
         dismissed.overlay = Overlay::None;
         assert_eq!(
-            plan_render(Some(&ringing), &dismissed, 0),
+            plan_render(Some(&ringing), &dismissed),
             RenderPlan::Full { frame: Frame(3) }
         );
     }
@@ -536,22 +515,29 @@ mod tests {
             data_fingerprint: 0,
         };
         assert_eq!(
-            plan_render(None, &cur, 0),
+            plan_render(None, &cur),
             RenderPlan::Full { frame: Frame(9) }
         );
     }
 
     #[test]
-    fn maintenance_threshold_forces_full() {
-        let prev = home_vm(8 * 60);
-        let mut cur = prev.clone();
-        cur.generation = crate::app::RenderGeneration(3);
-        cur.clock_minute = Some(8 * 60 + 1);
-        // Same minute-change diff, but the partial budget is exhausted.
-        assert_eq!(
-            plan_render(Some(&prev), &cur, PARTIAL_MAINTENANCE_LIMIT),
-            RenderPlan::Full { frame: Frame(3) }
-        );
+    fn home_minute_changes_stay_partial_without_maintenance_full() {
+        let mut previous = home_vm(8 * 60);
+        for generation in 1_u64..=256 {
+            let current = ViewModel {
+                generation: crate::app::RenderGeneration(generation),
+                clock_minute: Some(8 * 60 + generation as u32),
+                ..previous.clone()
+            };
+            assert!(matches!(
+                plan_render(Some(&previous), &current),
+                RenderPlan::Partial {
+                    region: PartialRegion::Clock,
+                    ..
+                }
+            ));
+            previous = current;
+        }
     }
 
     #[test]
@@ -567,7 +553,7 @@ mod tests {
         cur.generation = crate::app::RenderGeneration(2);
         cur.view = RenderView::AlarmList { selected: 1 };
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Partial {
                 frame: Frame(2),
                 region: PartialRegion::List
@@ -588,7 +574,7 @@ mod tests {
         cur.generation = crate::app::RenderGeneration(2);
         cur.view = RenderView::AlarmList { selected: 7 };
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Partial {
                 frame: Frame(2),
                 region: PartialRegion::List
@@ -609,7 +595,7 @@ mod tests {
         cur.generation = crate::app::RenderGeneration(2);
         cur.data_fingerprint = 8; // an alarm's enabled flag flipped
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Partial {
                 frame: Frame(2),
                 region: PartialRegion::List
@@ -636,7 +622,7 @@ mod tests {
             underlying: Box::new(RenderView::Home),
         };
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Partial {
                 frame: Frame(2),
                 region: PartialRegion::NavBar
@@ -672,7 +658,7 @@ mod tests {
                 ..source_vm.clone()
             };
             assert_eq!(
-                plan_render(Some(&source_vm), &open_vm, 0),
+                plan_render(Some(&source_vm), &open_vm),
                 RenderPlan::Partial {
                     frame: Frame(2),
                     region: PartialRegion::NavBar,
@@ -688,7 +674,7 @@ mod tests {
                 ..open_vm.clone()
             };
             assert_eq!(
-                plan_render(Some(&open_vm), &moved_vm, 0),
+                plan_render(Some(&open_vm), &moved_vm),
                 RenderPlan::Partial {
                     frame: Frame(3),
                     region: PartialRegion::NavBar,
@@ -701,7 +687,7 @@ mod tests {
                 ..moved_vm.clone()
             };
             assert_eq!(
-                plan_render(Some(&moved_vm), &close_vm, 0),
+                plan_render(Some(&moved_vm), &close_vm),
                 RenderPlan::Partial {
                     frame: Frame(4),
                     region: PartialRegion::NavBar,
@@ -734,7 +720,7 @@ mod tests {
             ..prev.clone()
         };
         assert!(matches!(
-            plan_render(Some(&prev), &destination, 0),
+            plan_render(Some(&prev), &destination),
             RenderPlan::Full { .. }
         ));
 
@@ -742,7 +728,7 @@ mod tests {
         data_changed.generation = RenderGeneration(3);
         data_changed.data_fingerprint += 1;
         assert!(matches!(
-            plan_render(Some(&prev), &data_changed, 0),
+            plan_render(Some(&prev), &data_changed),
             RenderPlan::Full { .. }
         ));
 
@@ -750,7 +736,7 @@ mod tests {
         clock_changed.generation = RenderGeneration(4);
         clock_changed.clock_minute = Some(12 * 60 + 1);
         assert!(matches!(
-            plan_render(Some(&prev), &clock_changed, 0),
+            plan_render(Some(&prev), &clock_changed),
             RenderPlan::Full { .. }
         ));
 
@@ -761,7 +747,7 @@ mod tests {
             underlying: Box::new(RenderView::Inbox { selected: 1 }),
         };
         assert!(matches!(
-            plan_render(Some(&prev), &different_source, 0),
+            plan_render(Some(&prev), &different_source),
             RenderPlan::Full { .. }
         ));
     }
@@ -788,7 +774,7 @@ mod tests {
             value: 10,
         };
         assert_eq!(
-            plan_render(Some(&prev), &cur, 0),
+            plan_render(Some(&prev), &cur),
             RenderPlan::Partial {
                 frame: Frame(2),
                 region: PartialRegion::Surface

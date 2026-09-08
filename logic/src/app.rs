@@ -5279,7 +5279,7 @@ mod tests {
             );
             let moved_vm = crate::render_plan::ViewModel::from_state(&state);
             assert_eq!(
-                crate::render_plan::plan_render(Some(&opened_vm), &moved_vm, 0),
+                crate::render_plan::plan_render(Some(&opened_vm), &moved_vm),
                 crate::render_plan::RenderPlan::Partial {
                     frame: crate::render_plan::Frame(moved_vm.generation.0 as u32),
                     region: crate::render_plan::PartialRegion::NavBar,
