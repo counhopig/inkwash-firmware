@@ -4814,8 +4814,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn set_timezone_rtc_failure_replies_error_and_leaves_offset_unchanged() {
         let mut state = AppState::default();
         state.clock.now = Some(dt(10, 0));

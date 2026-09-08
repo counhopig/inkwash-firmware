@@ -31,6 +31,10 @@ pub enum RenderTerminal {
 /// kick (so the caller can `feed_completion_back` it) plus its terminal
 /// state.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// AsyncKick is intentionally kept inline: it is moved through the render
+// registry's existing Vec and single-slot EPD handoff, so boxing it here
+// would add an allocation to every render request without changing ownership.
+#[allow(clippy::large_enum_variant)]
 pub enum FeedOutcome {
     /// A matching kick was found, consumed, and terminated.
     Matched(AsyncKick, RenderTerminal),
