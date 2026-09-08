@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-02 · **Updated:** 2026-09-02 · **Commit:** e9224a1 (working tree dirty) · **Branch:** feature/power-and-response
+**Generated:** 2026-09-08 · **Updated:** 2026-09-08 · **Commit:** eacb3db · **Branch:** main
 
 ## OVERVIEW
 Firmware for ZECTRIX NOTE4 b/w (ESP32-S3-WROOM-1 N16R8, 4.2" 400×300 SSD2683 EPD). One of four independent repos; siblings out-of-scope. Two Rust crates (`rust-firmware/` + `logic/`), no root Cargo.toml, no workspace.
@@ -103,5 +103,5 @@ Built **locally** (CI impractical with full ESP-IDF) via `scripts/release.sh <ta
 ## NOTES
 - `rust-firmware/.cargo/config.toml` keeps no machine-specific paths: `IDF_PATH` / `LIBCLANG_PATH` are resolved dynamically by `scripts/build-rust.sh` / `build-rust.ps1` (honoring `$IDF_PATH`/`$LIBCLANG_PATH` when set, then probing conventional install locations; newest match wins). A bare `cargo build` still requires a sourced ESP-IDF environment — always use the scripts.
 - **rust-analyzer availability depends on two per-machine pieces**: ① `esp-ra` toolchain (`rustup toolchain link esp-ra ~/esp/esp-ra`): `bin/cargo` is a wrapper (`--version` reports 1.96.0, forwarding to esp cargo), `rustc`/`rustdoc` are symlinks to the esp toolchain — must be rebuilt after an espup reinstall; ② the ESP-IDF environment must come from the parent process — launch the editor from a shell where `source ~/esp/esp-idf/export.sh` has run (or set `IDF_PATH` globally); tracked `.vscode/settings.json` injects only `RUSTUP_TOOLCHAIN=esp-ra` and no absolute paths. Root cause: rust-analyzer 0.3.3016 classifies esp cargo's `1.95.0-nightly` as <1.95.0, falls back to the removed `--lockfile-path` arg, which makes `cargo metadata` degrade to `--no-deps` (spurious unresolved imports); the wrapper guides it to the `-Zlockfile-path` branch (supported by esp cargo). Once upstream rustup ships rustc ≥1.96.0-nightly, the hack can be removed.
-- Working tree dirty on `feature/power-and-response`: `rust-firmware/src/main.rs` (uncommitted edits in flight).
-- Not yet verified on device: full alarm-ringing flow end-to-end; BLE end-to-end pairing.
+- Current release: `v0.6.0` (2026-09-08), with the power/response overhaul documented in `CHANGELOG.md`.
+- v0.6.0 device evidence still does not cover idle power / response latency measurements, the full alarm-ringing flow end-to-end, or BLE end-to-end pairing.

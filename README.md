@@ -11,6 +11,10 @@ server and PC tool in sibling repos.
 
 ![Home](docs/screenshots/home.png)
 
+## Current release
+
+The current firmware release is **v0.6.0** ([GitHub Release](https://github.com/counhopig/inkwash-firmware/releases/tag/v0.6.0)), released 2026-09-08. Its power and response work moves EPD refresh and Wi-Fi operations into dedicated tasks, adds tiered sleep and wake handling, and keeps the existing offline-first calendar, alarm, todo, inbox, and USB/BLE control features. See [`CHANGELOG.md`](CHANGELOG.md) for the release scope and known hardware-validation limits.
+
 ## What it is
 
 A real, usable e-ink device firmware — not a button-counter demo. It is
@@ -104,7 +108,7 @@ espflash flash --port /dev/tty.usbmodem1101 \
   proportional ASCII fonts.
 - **USB + BLE control** — the same command protocol over both transports
   (`set_wifi`, `set_server`, `sync_now`, `get_status`, `clear_alarms`,
-  `set_timezone`), see [`docs/control-protocol.md`](docs/control-protocol.md).
+  `set_timezone`, `set_rtc`), see [`docs/control-protocol.md`](docs/control-protocol.md).
 - **Inbox** — the device pulls notifications from the server over the same
   sync endpoint; the server accepts webhook deliveries per channel (see the
   server repo's `channels.md`).
@@ -127,13 +131,15 @@ inkwash-firmware/
 
 ## Status
 
-Runs on real hardware. Calendar, alarms, todos, sync, USB/BLE config all
-implemented. Known workarounds (e.g. the ESP-IDF Wi-Fi reconnect crash)
-are documented in
+Calendar, alarms, todos, sync, USB/BLE config, and the v0.6.0 power/response
+architecture are implemented. Known workarounds (e.g. the ESP-IDF Wi-Fi
+reconnect crash) are documented in
 [`rust-firmware/src/wifi.rs`](rust-firmware/src/wifi.rs). The
 host-testable `logic/` crate is checked in CI (`cargo test` + rustfmt +
 clippy on every push/PR); the firmware crate itself needs the ESP-IDF
-toolchain and is verified on device (see `docs/development-guide.md`).
+toolchain. Reproducible device evidence for v0.6.0 idle power/response
+measurements, the full alarm-ringing flow, and BLE end-to-end pairing is still
+pending; see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
