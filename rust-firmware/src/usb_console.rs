@@ -29,6 +29,21 @@ const COMMAND_PREFIX: &str = ">>IW ";
 /// responses from ordinary log output.
 const REPLY_PREFIX: &str = "<<IW ";
 const MAX_COMMAND_LINE_BYTES: usize = 512;
+/// Explicit stacks for the two console workers, kept in internal RAM by the
+/// pthread default caps.
+///
+/// Neither thread may inherit `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT` (4096):
+/// the reader runs `control::parse_command`, whose recursive deserialization is
+/// driven by the frame's nesting rather than its length (see
+/// `MAX_COMMAND_NESTING` for the measurements). The pre-parse nesting limit is
+/// the actual fix; these sizes are defence in depth, so a future change to the
+/// protocol cannot quietly reintroduce the hazard on an undersized stack.
+///
+/// The writer only serializes and writes, so it needs far less — but it gets an
+/// explicit size for the same reason: silence about the budget is what made the
+/// original hazard invisible to review.
+const READER_TASK_STACK_SIZE: usize = 12 * 1024;
+const WRITER_TASK_STACK_SIZE: usize = 8 * 1024;
 /// The reader channel and this staging queue are both bounded. Once both are
 /// full, the reader thread blocks on `SyncSender::send`, preserving command
 /// ownership instead of silently dropping a parsed request.
@@ -56,6 +71,7 @@ impl UsbConsole {
         let (tx, rx) = mpsc::sync_channel(PENDING_COMMAND_CAPACITY);
         thread::Builder::new()
             .name("usb-console-rx".into())
+            .stack_size(READER_TASK_STACK_SIZE)
             .spawn(move || read_commands(tx))
             .expect("USB console receiver thread must start");
         Self {
@@ -175,6 +191,7 @@ impl UsbReplyWriter {
         let (completion_tx, completion_rx) = mpsc::sync_channel(REPLY_WRITER_CAPACITY);
         thread::Builder::new()
             .name("usb-console-writer".into())
+            .stack_size(WRITER_TASK_STACK_SIZE)
             .spawn(move || run_reply_writer(rx, completion_tx))?;
         Ok(Self {
             tx,

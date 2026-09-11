@@ -345,6 +345,12 @@ bounded retry buffer until delivery, termination, or disconnect.
 ## Error Handling
 
 - **Malformed JSON:** Logged as a warning; command is dropped; no reply is sent.
+- **Excessive nesting:** A frame nesting JSON containers deeper than 4 is
+  rejected before parsing, logged as a warning, and dropped; no reply is sent.
+  Every command here is a flat object, so no valid frame is affected. The limit
+  exists because deserializer recursion depth follows the frame's *shape* rather
+  than its length, and the parsing worker's stack is small; see
+  `MAX_COMMAND_NESTING` in `logic/src/protocol.rs` for the measurements.
 - **Unknown command field:** JSON parse error; handled as above.
 - **Missing required field:** JSON parse error; handled as above.
 - **Command execution failure:** Command completes but returns `Error { message }`.
