@@ -81,7 +81,15 @@ const NOTICE_CHANNEL_CAP: usize = 8;
 
 /// Stack size for the effect task. Covers NVS serde + I2C blocking waits
 /// without overrunning the ESP32-S3's limited internal-RAM stack.
-const EFFECT_TASK_STACK: usize = 8 * 1024;
+///
+/// Sized from on-device `uxTaskGetStackHighWaterMark` readings: the deepest
+/// observed effect is `CollectReminderFacts`, which reaches `read_blob::<4096>`
+/// (a 4 KiB stack array) and left only 1032 of 8192 bytes free. That is too
+/// little headroom for a task that also runs `PersistInbox` against the same
+/// 4 KiB buffer, so the budget here is doubled and the stack is pinned to
+/// internal RAM (flash writes run with the cache disabled, where a PSRAM
+/// stack is not safe - the same rule the BLE worker follows).
+const EFFECT_TASK_STACK: usize = 16 * 1024;
 
 /// The completion envelope for exactly one worker batch.
 ///
@@ -385,10 +393,9 @@ impl EffectTask {
         let (batch_tx, batch_rx) = sync_channel::<EffectBatch>(BATCH_CHANNEL_CAP);
         let (notice_tx, notice_rx) = sync_channel::<BatchResult>(NOTICE_CHANNEL_CAP);
 
-        std::thread::Builder::new()
-            .name("effect-task".to_string())
-            .stack_size(EFFECT_TASK_STACK)
-            .spawn(move || run(TaskExecutor { drivers }, batch_rx, notice_tx))?;
+        crate::tasks::spawn_internal_stack("effect-task", EFFECT_TASK_STACK, move || {
+            run(TaskExecutor { drivers }, batch_rx, notice_tx)
+        })?;
 
         Ok(Self {
             batch_tx,

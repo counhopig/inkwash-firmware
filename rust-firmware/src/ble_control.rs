@@ -321,6 +321,15 @@ struct PendingReply {
     retry_count: u8,
 }
 
+/// Worker-thread ownership that is held back until the radio is actually
+/// needed. Every field is `Send`; `ensure_worker` moves them into the thread.
+struct WorkerLaunch {
+    command_rx: mpsc::Receiver<WorkerCommand>,
+    tx: mpsc::SyncSender<BleCommand>,
+    lifecycle_sender: LifecycleSender,
+    result_tx: mpsc::SyncSender<BleTaskResult>,
+}
+
 /// Main-loop handle for the BLE worker. No NimBLE handle crosses this type's
 /// thread boundary; the worker owns the session for its whole lifetime.
 pub struct BleControl {
@@ -328,6 +337,8 @@ pub struct BleControl {
     rx: mpsc::Receiver<BleCommand>,
     lifecycle_mailbox: StdArc<(StdMutex<LifecycleMailbox>, Condvar)>,
     result_rx: mpsc::Receiver<BleTaskResult>,
+    /// `Some` until the worker thread has been created on demand.
+    worker_launch: Option<WorkerLaunch>,
     pending_replies: Vec<PendingReply>,
     pending_stop: Option<u64>,
     next_reply_id: u64,
@@ -344,52 +355,53 @@ impl BleControl {
             StdArc::new((StdMutex::new(LifecycleMailbox::default()), Condvar::new()));
         let lifecycle_mailbox_for_worker = StdArc::clone(&lifecycle_mailbox);
         let (result_tx, result_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        // Keep this worker's stack in internal RAM: controller init runs with
-        // the cache disabled, where a PSRAM stack is not safe. Wi-Fi has
-        // already been deinitialized by the sync owner before this command
-        // can start NimBLE, preserving the controller's internal heap budget.
-        let mut pthread_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
-        pthread_cfg.stack_size = BLE_TASK_STACK;
-        pthread_cfg.stack_alloc_caps =
-            esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
-        pthread_cfg.inherit_cfg = false;
-        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_pthread_set_cfg(&pthread_cfg) })
-            .map_err(|e| anyhow!("BLE worker internal stack configuration failed: {e:?}"))?;
-        let worker = std::thread::Builder::new()
-            .name("ble".to_string())
-            .stack_size(BLE_TASK_STACK)
-            .spawn(move || {
-                run(
-                    command_rx,
-                    tx,
-                    LifecycleSender {
-                        mailbox: lifecycle_mailbox_for_worker,
-                    },
-                    result_tx,
-                )
-            });
-        // Do not leak the BLE-specific pthread policy into any later thread
-        // creation on the main task.
-        let default_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
-        if let Err(err) =
-            esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_pthread_set_cfg(&default_cfg) })
-        {
-            log::warn!("BLE worker pthread policy restore failed: {err:?}");
-        }
-        worker?;
+        // The worker thread is NOT created here. Bleeding 16 KiB of internal
+        // RAM plus a permanently parked pthread from boot, for a radio that is
+        // unused until the user opens the pairing screen, is waste on a device
+        // whose scarcest resource is internal RAM. The channel ends still
+        // exist, so no command can be lost; the OS thread is created by
+        // `ensure_worker` on the first `Start`.
         Ok(Self {
             command_tx,
             rx,
             lifecycle_mailbox,
             result_rx,
+            worker_launch: Some(WorkerLaunch {
+                command_rx,
+                tx,
+                lifecycle_sender: LifecycleSender {
+                    mailbox: lifecycle_mailbox_for_worker,
+                },
+                result_tx,
+            }),
             pending_replies: Vec::new(),
             pending_stop: None,
             next_reply_id: 1,
         })
     }
 
-    /// Queue radio initialization without blocking the main loop.
-    pub fn start(&self, name: &str, session_id: u64) -> Result<()> {
+    /// Creates the worker thread the first time it is needed. The worker is
+    /// never torn down once spawned (it parks between sessions), so the launch
+    /// material is consumed exactly once.
+    fn ensure_worker(&mut self) -> Result<()> {
+        let Some(launch) = self.worker_launch.take() else {
+            return Ok(());
+        };
+        log::info!("BLE worker thread starting on demand");
+        crate::tasks::spawn_internal_stack("ble", BLE_TASK_STACK, move || {
+            run(
+                launch.command_rx,
+                launch.tx,
+                launch.lifecycle_sender,
+                launch.result_tx,
+            )
+        })
+    }
+
+    /// Queue radio initialization without blocking the main loop. The worker
+    /// thread is created here on first use, not at boot.
+    pub fn start(&mut self, name: &str, session_id: u64) -> Result<()> {
+        self.ensure_worker()?;
         self.command_tx
             .try_send(WorkerCommand::Start {
                 name: name.to_string(),

@@ -52,6 +52,8 @@ mod ble_memory_contract {
     // The hardware crate cannot be built for the host, but these invariants
     // must stay coupled to its ESP-IDF memory configuration.
     const BLE_SOURCE: &str = include_str!("../../rust-firmware/src/ble_control.rs");
+    const EFFECT_SOURCE: &str = include_str!("../../rust-firmware/src/effect_task.rs");
+    const TASKS_SOURCE: &str = include_str!("../../rust-firmware/src/tasks.rs");
     const SDKCONFIG: &str = include_str!("../../rust-firmware/sdkconfig.defaults");
 
     fn config_is(name: &str, value: &str) -> bool {
@@ -63,8 +65,21 @@ mod ble_memory_contract {
     #[test]
     fn ble_worker_uses_internal_stack_and_checks_internal_heap_before_init() {
         assert!(BLE_SOURCE.contains("const BLE_TASK_STACK: usize = 16 * 1024"));
-        assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT"));
-        assert!(!BLE_SOURCE.contains("MALLOC_CAP_SPIRAM"));
+        // The internal-RAM stack caps moved into the shared spawner when the
+        // effect task needed the same guarantee; assert them there.
+        assert!(
+            TASKS_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT"),
+            "the shared spawner must pin worker stacks to internal RAM"
+        );
+        assert!(!TASKS_SOURCE.contains("MALLOC_CAP_SPIRAM"));
+        assert!(
+            TASKS_SOURCE.contains("esp_pthread_set_cfg(&default_cfg)"),
+            "the spawner must restore the default pthread policy"
+        );
+        assert!(
+            BLE_SOURCE.contains("spawn_internal_stack(\"ble\", BLE_TASK_STACK"),
+            "the BLE worker must be spawned through the internal-stack helper"
+        );
         assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA"));
         assert!(BLE_SOURCE.contains("heap_caps_get_free_size(BLE_INTERNAL_CAPS)"));
         assert!(BLE_SOURCE.contains("heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS)"));
@@ -72,6 +87,52 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("if !inkwash_logic::ble_memory::sufficient_internal_heap"));
         assert!(BLE_SOURCE.contains("log_stack_high_watermark(\"before BLE init\")"));
         assert!(BLE_SOURCE.contains("log_stack_high_watermark(\"after BLE init\")"));
+    }
+
+    /// The effect task runs the NVS/flash-write path that used to live on the
+    /// 32 KiB main task, so its stack must be internal RAM too: flash writes
+    /// execute with the cache disabled, where a PSRAM stack is unreachable.
+    /// It must also stay large enough for `read_blob::<4096>` plus the serde
+    /// frames around it (8 KiB measured only 1032 bytes of headroom on device).
+    #[test]
+    fn effect_worker_uses_an_internal_stack_with_blob_headroom() {
+        assert!(
+            EFFECT_SOURCE.contains("spawn_internal_stack(\"effect-task\", EFFECT_TASK_STACK"),
+            "the effect worker must be spawned through the internal-stack helper"
+        );
+        let stack = EFFECT_SOURCE
+            .split("const EFFECT_TASK_STACK: usize = ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .expect("EFFECT_TASK_STACK must stay a literal so this budget is checkable");
+        assert!(
+            stack.contains("16 * 1024"),
+            "effect task stack must stay at/above 16 KiB, found `{stack}`"
+        );
+        assert!(!EFFECT_SOURCE.contains("MALLOC_CAP_SPIRAM"));
+    }
+
+    /// The BLE worker must be created on first use rather than at boot: a
+    /// permanently parked 16 KiB internal-RAM thread is what boot-looped this
+    /// device, and the radio is unused until the pairing screen opens.
+    #[test]
+    fn ble_worker_thread_is_created_on_demand() {
+        assert!(
+            BLE_SOURCE.contains("fn ensure_worker"),
+            "the BLE worker must be spawned lazily"
+        );
+        assert!(
+            BLE_SOURCE.contains("worker_launch: Some(WorkerLaunch"),
+            "spawn() must only prepare the channel ends, not start a thread"
+        );
+        let start_body = BLE_SOURCE
+            .split("pub fn start(")
+            .nth(1)
+            .expect("BleControl::start must exist");
+        assert!(
+            start_body.contains("self.ensure_worker()"),
+            "start() must create the worker thread on first use"
+        );
     }
 
     #[test]

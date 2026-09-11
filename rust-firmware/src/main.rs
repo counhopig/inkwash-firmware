@@ -27,6 +27,7 @@ mod screens;
 mod storage;
 mod sync;
 mod sync_task;
+mod tasks;
 mod todos;
 mod ui;
 mod usb_console;
