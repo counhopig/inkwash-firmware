@@ -5,6 +5,11 @@
 //! pending sequence instead of treating the arrival of any command as an
 //! implicit stop.
 
+use std::collections::VecDeque;
+
+/// Maximum number of audio commands waiting behind the codec task.
+pub const AUDIO_MAILBOX_CAPACITY: usize = 8;
+
 /// A sound request from the application executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioCommand {
@@ -12,6 +17,55 @@ pub enum AudioCommand {
     StartSiren,
     BeepTodo,
     Stop,
+}
+
+/// Fixed-capacity audio command mailbox. Critical alarm starts and Stop use
+/// explicit coalescing when full; lower-priority reminder commands return to
+/// the caller so ownership is retained for backpressure/error handling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioMailbox {
+    queue: VecDeque<AudioCommand>,
+}
+
+impl Default for AudioMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioMailbox {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(AUDIO_MAILBOX_CAPACITY),
+        }
+    }
+
+    /// Enqueue without dropping a command. The newest Stop supersedes all
+    /// queued starts; a new alarm start supersedes queued reminder/stop
+    /// intent. Lower-priority reminders apply backpressure when full.
+    pub fn enqueue(&mut self, command: AudioCommand) -> Result<(), AudioCommand> {
+        if self.queue.len() < AUDIO_MAILBOX_CAPACITY {
+            self.queue.push_back(command);
+            return Ok(());
+        }
+        match command {
+            AudioCommand::Stop | AudioCommand::StartAlarmTone => {
+                self.queue.clear();
+                self.queue.push_back(command);
+                Ok(())
+            }
+            AudioCommand::StartSiren | AudioCommand::BeepTodo => Err(command),
+        }
+    }
+
+    pub fn drain(&mut self) -> impl Iterator<Item = AudioCommand> + '_ {
+        self.queue.drain(..)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 /// The sound currently desired by the application.
@@ -76,6 +130,42 @@ impl AudioReducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_backpressures_reminders_at_fixed_capacity() {
+        let mut mailbox = AudioMailbox::new();
+        for _ in 0..AUDIO_MAILBOX_CAPACITY {
+            mailbox.enqueue(AudioCommand::StartSiren).unwrap();
+        }
+        assert_eq!(mailbox.len(), AUDIO_MAILBOX_CAPACITY);
+        assert_eq!(
+            mailbox.enqueue(AudioCommand::BeepTodo),
+            Err(AudioCommand::BeepTodo)
+        );
+        assert_eq!(mailbox.len(), AUDIO_MAILBOX_CAPACITY);
+    }
+
+    #[test]
+    fn mailbox_full_still_accepts_stop_and_alarm_start() {
+        let mut mailbox = AudioMailbox::new();
+        for _ in 0..AUDIO_MAILBOX_CAPACITY {
+            mailbox.enqueue(AudioCommand::StartSiren).unwrap();
+        }
+        mailbox.enqueue(AudioCommand::Stop).unwrap();
+        assert_eq!(
+            mailbox.drain().collect::<Vec<_>>(),
+            vec![AudioCommand::Stop]
+        );
+
+        for _ in 0..AUDIO_MAILBOX_CAPACITY {
+            mailbox.enqueue(AudioCommand::BeepTodo).unwrap();
+        }
+        mailbox.enqueue(AudioCommand::StartAlarmTone).unwrap();
+        assert_eq!(
+            mailbox.drain().collect::<Vec<_>>(),
+            vec![AudioCommand::StartAlarmTone]
+        );
+    }
 
     #[test]
     fn alarm_preempts_reminder_and_cannot_be_overwritten() {

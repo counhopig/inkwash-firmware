@@ -574,7 +574,59 @@ The lower-level rules remain:
 
 This is normal. An e-paper display holds its image when powered off; only a valid refresh waveform changes the content.
 
-## 12. Pre-Commit Checks
+## 12. Effect batches and backpressure
+
+The effect worker accepts at most one batch at a time. Each accepted batch
+returns one owned `BatchResult`, even when `AbortBatch` stops after its first
+failure; the number of notices is not used as the worker completion signal.
+The main loop feeds those notices back to the bounded runtime queue in order
+and retains the unsubmitted suffix in the worker's bounded notice slot when
+the queue is full. A producer keeps its owned event in the context's fixed
+capacity pending-event FIFO and returns to collection; it does not wait for
+the worker or log and drop a saturated event. A later service turn admits the
+FIFO in order after the worker notice has freed queue capacity. A closed
+worker channel is an unrecoverable error and must surface to the main loop.
+Batch, event, and notice ownership must remain explicit on every full-queue
+path.
+
+Command correlation is transport-scoped: USB and BLE keep separate session
+state, and a deferred `(id, command)` remains pending until its terminal reply
+is accepted by the transport. BLE acceptance is the NimBLE notify-tx
+`SuccessNotify` callback for the same pairing session, connection generation,
+and connection handle; notify-tx status failures retry while that connection
+is current. Immediate notify errors, timeout, and disconnect terminate that
+transport delivery and clear the pending command. BLE allows one connected
+client at a time, and its private reply id keeps no-id
+commands individually trackable without changing their JSON replies. All production event sources, including command
+and worker completions, enter through `dispatch_app_runner`. That dispatcher
+retains producer-owned events under backpressure, routes worker-safe batches to
+the effect task, executes main-thread batches in order, and feeds completion
+notices back into the runtime before reducing their derived events. The same
+path owns render and sleep kicks, so no producer may bypass the bounded queue
+or discard an asynchronous kick.
+
+Peripheral mailboxes are bounded independently of the runtime queue. The audio
+mailbox holds eight commands: `Stop` and alarm starts coalesce queued intent
+when full, while reminder commands return an error to their owner for retry or
+explicit failure reporting. The USB reader has an eight-entry synchronous
+channel and an eight-entry staging queue; once both are full, the reader blocks
+on send and retains the parsed command. The EPD task has one pending render
+slot and a sixteen-entry completion mailbox. A superseded render reserves its
+completion slot before replacing the pending command, and the EPD worker waits
+for space before publishing a terminal result. These paths must not use an
+unbounded queue or log-and-drop handling for owned commands or completions.
+Outbound USB replies use the same bounded-task rule: `UsbReplyWriter` accepts
+at most eight owned frames, and its sequence-numbered ACK reports write
+success or failure so a failed frame can be retried without re-running the
+command. The main loop retains the session, id, command, and reply metadata
+until a successful ACK, then completes the command-session cache; a stale
+session completion cannot clear a newer request with a reused id.
+The Sync task command queue is fixed at four entries and the RTC executor
+command queue at eight; a full queue returns ownership to the caller as an
+error. Their per-request reply channels are one-shot channels, with the
+main-loop pending-operation slots limiting the number of live receivers.
+
+## 13. Pre-Commit Checks
 
 ```bash
 cargo +esp fmt --manifest-path rust-firmware/Cargo.toml -- --check
@@ -592,7 +644,7 @@ Do not commit `sdkconfig`, build directories, factory backups, or logs containin
 
 For each new peripheral, run standalone tests first, then integrate it into the main application. Display, power, and sleep changes carry the highest risk; always keep a recoverable serial path and the factory backup.
 
-## 13. Physical-Hardware Test Procedure
+## 14. Physical-Hardware Test Procedure
 
 This procedure is the release gate for behavior that host tests cannot
 exercise: power retention, USB reset behavior, I2C peripherals, the real EPD
@@ -737,6 +789,9 @@ hardware.
 - [ ] Open the BLE pairing page, connect, send `get_status`, and receive a
       reply. Leave the page and verify advertising stops; reconnect in a fresh
       pairing session.
+- [ ] Verify BLE replies are retained until the notify-tx completion callback;
+      exercise an unsubscribed client, a disconnect during a pending reply, a
+      reconnect with a reused wire id, and a second-client connection attempt.
 - [ ] Perform three controlled USB unplug/replug cycles, running one `--status`
       after each. Then perform BLE connect/disconnect and a Wi-Fi sync; all
       transports remain usable.
@@ -762,7 +817,7 @@ loss, or missed scheduled action. Mark each stage `PASS`, `FAIL`, or `BLOCKED`;
 pass on the target NOTE4. For a narrow change, record exactly which stages were
 rerun and keep untouched stages tied to their most recent build/device record.
 
-## 14. Restoring Factory Firmware
+## 15. Restoring Factory Firmware
 
 Only use the full backup **of that specific device**:
 
@@ -774,7 +829,7 @@ esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 \
 
 After restoring, re-read the Flash or compute the backup file hash to confirm the correct image was used. Never write another device's or a NOTE4C's backup into this device.
 
-## 15. References
+## 16. References
 
 - ZECTRIX support and USB tool: <https://zectrix.com/support.html#firmware-updater>
 - ZECTRIX firmware updater: <https://zectrix.com/firmware-updater.html>

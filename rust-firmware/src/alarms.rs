@@ -1,13 +1,11 @@
-//! Multi-alarm store, backed by one NVS blob. The PCF8563 only has a single
-//! live hardware alarm slot, so `program_hardware_alarm_via` always figures
-//! out which stored alarm is chronologically nearest and reprograms the RTC
-//! to just that one through the executor - see `rtc::Pcf8563::set_alarm`.
+//! Multi-alarm store, backed by one NVS blob. The PCF8563 has one live
+//! hardware alarm slot; the application state machine derives and programs it
+//! through the RTC effect executor.
 
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 
 use crate::nvs_blob::{read_blob, write_blob, DirtySet};
-use crate::rtc::DateTime;
 
 const NAMESPACE: &str = "inkwash_alrm";
 const KEY_ALARMS: &str = "alarms";
@@ -22,8 +20,8 @@ const BLOB_BUF_LEN: usize = 1024;
 /// existing `alarms::Repeat` / `alarms::StoredAlarm` / `alarms::next_due`
 /// call site keeps working unchanged.
 pub use inkwash_logic::alarm_schedule::{
-    date_from_days, days_since_epoch, days_until, maintenance_wakeup_delay, next_due,
-    next_occurrence_date, Repeat, StoredAlarm,
+    date_from_days, days_since_epoch, days_until, next_due, next_occurrence_date, Repeat,
+    StoredAlarm,
 };
 
 pub struct AlarmStore {
@@ -70,61 +68,9 @@ impl AlarmStore {
         self.dirty().ids()
     }
 
-    /// Drops the dirty set after a successful sync.
-    pub fn clear_dirty(&self) -> Result<()> {
-        self.dirty().clear()
-    }
-
     /// Clears only the IDs that were uploaded in this sync, preserving any
     /// dirty flags set during the round-trip (P1-3 race fix).
     pub fn clear_dirty_ids(&self, ids: &[u8]) -> Result<()> {
         self.dirty().clear_ids(ids)
     }
-
-}
-
-/// Reprograms the PCF8563's single hardware alarm slot to whichever stored
-/// alarm is nearest, or clears it if none are enabled. All RTC I2C goes
-/// through the executor client (`rtc_executor::RtcExecutor`) — the only
-/// owner of the driver — so this function takes the client instead of a
-/// `&mut Pcf8563`.
-pub fn program_hardware_alarm_via(
-    rtc: &crate::rtc_executor::RtcExecutor,
-    alarms: &[StoredAlarm],
-    now: &DateTime,
-) -> Result<()> {
-    match next_due(alarms, now) {
-        Some(alarm) => {
-            // The once-outside-month case (defer arm to avoid a false ring)
-            // and the register fields for each repeat are pure logic in
-            // inkwash-logic; issue the executor command for the target.
-            let regs = inkwash_logic::alarm_schedule::alarm_regs_for(alarm, now);
-            match regs {
-                Some(regs) => {
-                    rtc.program(&regs)?;
-                    log::info!(
-                        "Hardware alarm armed via executor: id={} {:02}:{:02} ({:?})",
-                        alarm.id,
-                        alarm.hour,
-                        alarm.minute,
-                        alarm.repeat
-                    );
-                }
-                None => {
-                    log::info!(
-                        "Once alarm id={} is outside the current month ({:04}-{:02}); deferring hardware arm to avoid an early false ring",
-                        alarm.id,
-                        now.year,
-                        now.month
-                    );
-                    rtc.disable()?;
-                }
-            }
-        }
-        None => {
-            rtc.disable()?;
-            log::info!("No enabled alarms; hardware alarm cleared via executor");
-        }
-    }
-    Ok(())
 }

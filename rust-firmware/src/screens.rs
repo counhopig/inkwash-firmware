@@ -1,15 +1,14 @@
-//! Menu/Calendar/Alarms/Todos screens, entered from the Home screen's
-//! long UP/DOWN navigation drawer (see `main.rs`). Each screen is a
-//! self-contained blocking function.
+//! Menu/Calendar/Alarms/Todos surfaces. The state machine owns navigation and
+//! the renderer receives already-collected AppState facts for each surface.
 
-use crate::alarms::{self, AlarmStore, Repeat, StoredAlarm};
+use crate::alarms::{self, Repeat, StoredAlarm};
 use crate::board::Note4Board;
 use crate::canvas::Canvas;
 use crate::ctx::DeviceContext;
 use crate::display::Rect;
-use crate::inbox::{InboxItem, InboxStore};
+use crate::inbox::InboxItem;
 use crate::rtc::{is_leap, DateTime};
-use crate::todos::{Importance, TodoStore};
+use crate::todos::Importance;
 use crate::ui::{draw_rows, footer, header};
 
 /// Text column width for list rows: rows start at `ui`'s `LIST_TEXT_X` (50)
@@ -145,25 +144,23 @@ pub(crate) fn draw_sync_interval(canvas: &mut Canvas, selected: usize) {
     footer(canvas, "UP/DOWN MOVE   ENTER OK   HOLD ENTER BACK");
 }
 
-/// Opens one Settings row action selected through the state-machine
-/// Settings screen (Stage 4, slice 2): rows 0-3 are still legacy blocking
+/// Draws the state-machine Settings screen (Stage 4, slice 2).
 /// Draws the state-machine Calendar grid screen (Stage 4, slice 6): the
 /// read-only current-month grid with day marks read from the todo store and
 /// the day cursor drawn from state. The SM owns the cursor (UP/DOWN), ENTER
-/// opens a day's week view through a deferred legacy wedge. Same layout the
-/// legacy browse_page calendar block used, so the SM-drawn grid is
+/// opens a day's week view through a deferred render. The SM-drawn grid is
 /// pixel-consistent. `selected_day` is clamped to the month here too (belt
 /// and braces; the SM clamps on transitions).
 pub(crate) fn draw_calendar_grid(
     ctx: &mut DeviceContext,
     now: Option<&DateTime>,
     selected_day: u8,
+    todos: &[crate::todos::Todo],
 ) {
     let mut canvas = ctx.board.display.canvas_mut();
     canvas.clear();
     header(&mut canvas, "CALENDAR");
     if let Some(dt) = now {
-        let todos = ctx.todo_store.load().unwrap_or_default();
         // Day markers for the visible month: whether a todo is due that day
         // (repeat schedule, or its single due date), carrying importance so
         // the marker can be sized by it. Alarms don't get a mark here - the
@@ -171,7 +168,7 @@ pub(crate) fn draw_calendar_grid(
         // view for the specifics, and alarms already have their own page.
         let mut marks = [DayMark::default(); 32];
         let dim = days_in_month(dt.year, dt.month);
-        for todo in todos.iter() {
+        for todo in todos {
             for day in 1..=dim {
                 let fires = match &todo.repeat {
                     Some(r) => {
@@ -383,12 +380,12 @@ fn wrap_text_prop(text: &str, max_width: usize) -> Vec<String> {
 /// paths are pixel-consistent.
 pub(crate) fn draw_week_view(
     ctx: &mut DeviceContext,
+    todos: &[crate::todos::Todo],
     year: u16,
     month: u8,
     day: u8,
     now: Option<&DateTime>,
 ) {
-    let todos = ctx.todo_store.load().unwrap_or_default();
     let start = alarms::days_since_epoch(year, month, day) - weekday_of(year, month, day) as i64;
     let (_, sm, sd) = alarms::date_from_days(start);
     let (_, em, ed) = alarms::date_from_days(start + 6);
@@ -562,13 +559,8 @@ fn format_alarm_row(alarm: &StoredAlarm) -> String {
 
 const WEEKDAY_SHORT: [&str; 7] = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 
-fn render_alarm_page(board: &mut Note4Board, store: &AlarmStore, selected: usize) {
-    let mut items: Vec<String> = store
-        .load()
-        .unwrap_or_default()
-        .iter()
-        .map(format_alarm_row)
-        .collect();
+fn render_alarm_page(board: &mut Note4Board, alarms: &[StoredAlarm], selected: usize) {
+    let mut items: Vec<String> = alarms.iter().map(format_alarm_row).collect();
     items.push("+ ADD ALARM".to_string());
     let mut canvas = board.display.canvas_mut();
     draw_rows(&mut canvas, "ALARMS", &items, selected);
@@ -579,8 +571,8 @@ fn render_alarm_page(board: &mut Note4Board, store: &AlarmStore, selected: usize
 /// alarm rows (from the store; the SM owns toggling, the executor renders)
 /// plus the trailing "+ ADD ALARM" row. Same layout the legacy alarm page
 /// used, so the SM-drawn list is pixel-consistent.
-pub(crate) fn draw_alarm_list(board: &mut Note4Board, store: &AlarmStore, selected: usize) {
-    render_alarm_page(board, store, selected);
+pub(crate) fn draw_alarm_list(board: &mut Note4Board, alarms: &[StoredAlarm], selected: usize) {
+    render_alarm_page(board, alarms, selected);
 }
 
 /// Draws the state-machine ADD-ALARM number picker (Stage 4, slice 9): the
@@ -695,25 +687,20 @@ pub(crate) fn draw_number_pick(
 /// displayed as part of each row. The executor renders the screen.
 pub(crate) fn draw_todo_list(
     board: &mut Note4Board,
-    store: &TodoStore,
+    todos: &[crate::todos::Todo],
     selected: usize,
     now: Option<&DateTime>,
 ) {
-    render_todo_page(board, store, selected, now);
+    render_todo_page(board, todos, selected, now);
 }
 
 fn render_todo_page(
     board: &mut Note4Board,
-    store: &TodoStore,
+    todos: &[crate::todos::Todo],
     selected: usize,
     now: Option<&DateTime>,
 ) {
-    let items: Vec<String> = store
-        .load()
-        .unwrap_or_default()
-        .iter()
-        .map(|t| format_todo_row(t, now))
-        .collect();
+    let items: Vec<String> = todos.iter().map(|t| format_todo_row(t, now)).collect();
     let mut canvas = board.display.canvas_mut();
     draw_rows(&mut canvas, "TODOS", &items, selected);
     footer(&mut canvas, "ENTER DONE   HOLD ENTER HOME");
@@ -765,17 +752,12 @@ fn format_inbox_row(item: &InboxItem) -> String {
 /// inbox rows (read/unread markers) rendered from the store; ENTER opens an
 /// item's detail through a deferred legacy wedge. Same layout the legacy
 /// inbox page used.
-pub(crate) fn draw_inbox_list(board: &mut Note4Board, store: &InboxStore, selected: usize) {
-    render_inbox_page(board, store, selected);
+pub(crate) fn draw_inbox_list(board: &mut Note4Board, items: &[InboxItem], selected: usize) {
+    render_inbox_page(board, items, selected);
 }
 
-fn render_inbox_page(board: &mut Note4Board, store: &InboxStore, selected: usize) {
-    let items: Vec<String> = store
-        .load()
-        .unwrap_or_default()
-        .iter()
-        .map(format_inbox_row)
-        .collect();
+fn render_inbox_page(board: &mut Note4Board, inbox: &[InboxItem], selected: usize) {
+    let items: Vec<String> = inbox.iter().map(format_inbox_row).collect();
     let mut canvas = board.display.canvas_mut();
     if items.is_empty() {
         draw_rows(&mut canvas, "INBOX", &["NO MESSAGES".to_string()], selected);
@@ -788,17 +770,11 @@ fn render_inbox_page(board: &mut Note4Board, store: &InboxStore, selected: usize
 /// Draws the state-machine InboxItem screen (Stage 4, slice 7): the opened
 /// item's title + body from the store (carries only the index). The SM owns
 /// open/close and the optimistic read-mark; the executor draws from state.
-pub(crate) fn draw_inbox_item_detail(
-    ctx: &mut DeviceContext,
-    selected: usize,
-    now: Option<&DateTime>,
-) {
-    let list = ctx.inbox_store.load().unwrap_or_default();
-    let Some(item) = list.get(selected).cloned() else {
+pub(crate) fn draw_inbox_item_detail(board: &mut Note4Board, items: &[InboxItem], selected: usize) {
+    let Some(item) = items.get(selected).cloned() else {
         return;
     };
-    let _ = now;
-    let mut canvas = ctx.board.display.canvas_mut();
+    let mut canvas = board.display.canvas_mut();
     canvas.clear();
     header(&mut canvas, "INBOX");
     // Title: scale 2 when it fits, otherwise wrap to up to two scale-1
@@ -848,15 +824,8 @@ pub struct NextAlarmLabel {
     pub days_left: i64,
 }
 
-pub fn next_alarm_label(store: &AlarmStore, now: &DateTime) -> Option<NextAlarmLabel> {
-    let list = match store.load() {
-        Ok(list) => list,
-        Err(err) => {
-            log::warn!("Failed to load alarms for next-alarm label: {err}");
-            return None;
-        }
-    };
-    alarms::next_due(&list, now).map(|alarm| {
+pub fn next_alarm_label_from(list: &[StoredAlarm], now: &DateTime) -> Option<NextAlarmLabel> {
+    alarms::next_due(list, now).map(|alarm| {
         let time = format!("{:02}:{:02}", alarm.hour, alarm.minute);
         let (date, days_left) = match &alarm.repeat {
             Repeat::Daily => (None, 0),
@@ -896,18 +865,12 @@ pub struct TodoSummary {
     pub due_today: usize,
 }
 
-pub fn todo_summary(store: &TodoStore, now: Option<&DateTime>) -> TodoSummary {
-    let Ok(list) = store.load() else {
-        return TodoSummary {
-            pending: 0,
-            due_today: 0,
-        };
-    };
+pub fn todo_summary_from(list: &[crate::todos::Todo], now: Option<&DateTime>) -> TodoSummary {
     let mut summary = TodoSummary {
         pending: 0,
         due_today: 0,
     };
-    for todo in &list {
+    for todo in list {
         if todo.done {
             continue;
         }

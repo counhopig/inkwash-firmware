@@ -16,8 +16,53 @@
 //! This module implements that registry rule as pure orchestration so a
 //! host harness drives the same logic the firmware's main loop runs.
 
+use crate::app::{Effect, RenderGeneration, RenderView};
 use crate::render_plan::{plan_render, RenderPlan, ViewModel};
 use crate::runner::AsyncKick;
+
+/// Maximum number of render requests retained while the EPD task drains its
+/// single latest-wins slot. A caller that cannot register within this window
+/// keeps the returned kick and applies its own backpressure policy.
+pub const RENDER_REGISTRY_CAPACITY: usize = 16;
+
+/// Select a retry entry that can be safely superseded by `incoming` when the
+/// bounded retry mailbox is full. A newer generation always wins; for equal
+/// generations, only the same visible surface may be merged. Returning no
+/// index means the incoming kick is already stale relative to every retained
+/// retry and can be discarded as a rebuildable render request.
+pub fn retry_replacement_index(pending: &[AsyncKick], incoming: &AsyncKick) -> Option<usize> {
+    let (incoming_generation, incoming_view) = render_key(incoming)?;
+    let same_view = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, kick)| {
+            let (generation, view) = render_key(kick)?;
+            (view == incoming_view && generation.0 <= incoming_generation.0)
+                .then_some((index, generation))
+        })
+        .min_by_key(|(_, generation)| generation.0);
+    same_view.map(|(index, _)| index).or_else(|| {
+        pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kick)| {
+                let (generation, _) = render_key(kick)?;
+                (generation.0 < incoming_generation.0).then_some((index, generation))
+            })
+            .min_by_key(|(_, generation)| generation.0)
+            .map(|(index, _)| index)
+    })
+}
+
+fn render_key(kick: &AsyncKick) -> Option<(RenderGeneration, &RenderView)> {
+    let Effect::Render(request) = &kick.effect else {
+        return None;
+    };
+    Some((
+        kick.render_generation.unwrap_or(request.generation),
+        &request.view,
+    ))
+}
 
 /// Terminal outcome of a render request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +77,8 @@ pub enum RenderTerminal {
 /// state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 // AsyncKick is intentionally kept inline: it is moved through the render
-// registry's existing Vec and single-slot EPD handoff, so boxing it here
-// would add an allocation to every render request without changing ownership.
+// registry's bounded Vec and single-slot EPD handoff, so boxing it here would
+// add an allocation to every render request without changing ownership.
 #[allow(clippy::large_enum_variant)]
 pub enum FeedOutcome {
     /// A matching kick was found, consumed, and terminated.
@@ -58,11 +103,20 @@ pub enum FeedOutcome {
 /// - A superseded completion does not touch the cache: the replaced
 ///   request's pixels never reached the panel; the replacement request
 ///   updates the cache on its own completion.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RenderRegistry {
     pub pending: Vec<AsyncKick>,
     /// Last successfully-shown ViewModel (renderer-private cache).
     pub last_shown: Option<ViewModel>,
+}
+
+impl Default for RenderRegistry {
+    fn default() -> Self {
+        Self {
+            pending: Vec::with_capacity(RENDER_REGISTRY_CAPACITY),
+            last_shown: None,
+        }
+    }
 }
 
 impl RenderRegistry {
@@ -140,9 +194,15 @@ impl RenderRegistry {
         self.note_terminal(&req.view_model, &plan, success, generation_is_current);
     }
 
-    /// Register an in-flight render kick.
-    pub fn register(&mut self, kick: AsyncKick) {
+    /// Register an in-flight render kick. The kick is returned unchanged when
+    /// the bounded registry is full, so the caller retains ownership and can
+    /// retry or report backpressure without stranding its completion.
+    pub fn register(&mut self, kick: AsyncKick) -> Result<(), Box<AsyncKick>> {
+        if self.pending.len() >= RENDER_REGISTRY_CAPACITY {
+            return Err(Box::new(kick));
+        }
         self.pending.push(kick);
+        Ok(())
     }
 
     /// Feed an EPD completion (identified by `request_id`) into the
@@ -172,9 +232,13 @@ impl RenderRegistry {
     /// slot: the older kick is terminally `Superseded` (removed from the
     /// registry) and the newer one is registered. Mirrors the firmware's
     /// EPD task emitting a superseded completion for the replaced id.
-    pub fn supersede_then_register(&mut self, replaced_id: u64, replacement: AsyncKick) {
+    pub fn supersede_then_register(
+        &mut self,
+        replaced_id: u64,
+        replacement: AsyncKick,
+    ) -> Result<(), Box<AsyncKick>> {
         self.feed(replaced_id, false, true);
-        self.register(replacement);
+        self.register(replacement)
     }
 
     pub fn len(&self) -> usize {
@@ -226,7 +290,7 @@ mod tests {
     #[test]
     fn each_request_id_gets_exactly_one_terminal() {
         let mut reg = RenderRegistry::new();
-        reg.register(kick(1));
+        reg.register(kick(1)).unwrap();
         // First completion matches -> terminal; second (duplicate) ignored.
         assert!(matches!(
             reg.feed(1, true, false),
@@ -239,9 +303,9 @@ mod tests {
     #[test]
     fn superseded_terminates_replaced_request() {
         let mut reg = RenderRegistry::new();
-        reg.register(kick(1));
+        reg.register(kick(1)).unwrap();
         // A newer request replaces 1: 1 is superseded, 2 is registered.
-        reg.supersede_then_register(1, kick(2));
+        reg.supersede_then_register(1, kick(2)).unwrap();
         assert_eq!(reg.len(), 1);
         // 1 has its terminal; a late completion for it is ignored.
         assert_eq!(reg.feed(1, true, false), FeedOutcome::Ignored);
@@ -256,12 +320,56 @@ mod tests {
     #[test]
     fn failed_completion_is_terminal() {
         let mut reg = RenderRegistry::new();
-        reg.register(kick(7));
+        reg.register(kick(7)).unwrap();
         assert!(matches!(
             reg.feed(7, false, false),
             FeedOutcome::Matched(_, RenderTerminal::Failed)
         ));
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn full_registry_returns_the_owned_kick_for_retry() {
+        let mut reg = RenderRegistry::new();
+        for request_id in 0..RENDER_REGISTRY_CAPACITY as u64 {
+            reg.register(kick(request_id)).unwrap();
+        }
+        let rejected = reg.register(kick(999)).unwrap_err();
+        assert_eq!(rejected.request_id, Some(999));
+        assert_eq!(reg.len(), RENDER_REGISTRY_CAPACITY);
+        assert!(reg.feed(0, false, true) != FeedOutcome::Ignored);
+        reg.register(*rejected).unwrap();
+        assert_eq!(reg.len(), RENDER_REGISTRY_CAPACITY);
+    }
+
+    #[test]
+    fn retry_replacement_keeps_newer_generation_and_surface() {
+        let mut old = kick(1);
+        old.render_generation = Some(RenderGeneration(3));
+        if let Effect::Render(request) = &mut old.effect {
+            request.generation = RenderGeneration(3);
+        }
+        let mut newer = kick(2);
+        newer.render_generation = Some(RenderGeneration(4));
+        if let Effect::Render(request) = &mut newer.effect {
+            request.generation = RenderGeneration(4);
+        }
+        assert_eq!(retry_replacement_index(&[old.clone()], &newer), Some(0));
+
+        let mut stale = kick(3);
+        stale.render_generation = Some(RenderGeneration(2));
+        if let Effect::Render(request) = &mut stale.effect {
+            request.generation = RenderGeneration(2);
+        }
+        assert_eq!(retry_replacement_index(&[newer], &stale), None);
+
+        let mut different_surface = kick(4);
+        different_surface.render_generation = Some(RenderGeneration(5));
+        if let Effect::Render(request) = &mut different_surface.effect {
+            request.generation = RenderGeneration(5);
+            request.view = RenderView::Settings { selected: 0 };
+        }
+        assert_eq!(retry_replacement_index(&[old], &different_surface), Some(0));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Which transport a command arrived on. Long operations (SyncNow,
 /// SetWifi) defer their reply; the deferred reply must be written back to
 /// the same channel the command came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
     Usb,
     Ble,

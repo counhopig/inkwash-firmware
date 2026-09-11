@@ -12,7 +12,9 @@
 //! merged sync data is persisted by the state machine (the task never
 //! writes the alarm/todo/inbox stores itself).
 
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{
+    channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
+};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -31,6 +33,11 @@ use crate::wifi::WifiManager;
 /// mbedTLS/AES without returning to the old stack overflow caused by placing
 /// that response buffer on this stack.
 const SYNC_TASK_STACK: usize = 16 * 1024;
+/// The main loop owns one pending Wi-Fi operation, while BLE handoff can
+/// transiently add a stop/start command. Keep a small explicit queue so a
+/// caller receives an explicit saturation error instead of growing memory;
+/// the pending operation slot owns the retry decision.
+const SYNC_COMMAND_CAPACITY: usize = 4;
 
 /// Commands the main loop dispatches to the sync task.
 pub enum SyncCommand {
@@ -40,10 +47,10 @@ pub enum SyncCommand {
         now: DateTime,
         reply: Sender<SyncResult>,
     },
-    /// Verify credentials by connecting, then persist them to NVS.
+    /// Verify credentials by connecting; persistence is a state-machine effect.
     SetWifi {
         creds: WifiCreds,
-        reply: Sender<Result<()>>,
+        reply: Sender<Result<WifiCreds>>,
     },
     /// Lightweight urgent-message poll; `true` when the server has urgent
     /// content (the scheduler then dispatches a full sync).
@@ -64,12 +71,10 @@ pub enum PendingWifiOp {
         reply: Receiver<SyncResult>,
     },
     SetWifi {
-        reply: Receiver<Result<()>>,
+        reply: Receiver<Result<WifiCreds>>,
     },
     PostBleSetWifi {
-        reply: Receiver<Result<()>>,
-        ssid: String,
-        has_password: bool,
+        reply: Receiver<Result<WifiCreds>>,
     },
     UrgentPoll {
         reply: Receiver<Result<bool>>,
@@ -87,7 +92,7 @@ pub enum PendingWifiOp {
 /// Client handle kept by the main loop: the command sender. The task owns
 /// the Wi-Fi driver, so the main loop never touches Wi-Fi directly.
 pub struct SyncTask {
-    tx: Sender<SyncCommand>,
+    tx: SyncSender<SyncCommand>,
 }
 
 impl SyncTask {
@@ -95,7 +100,7 @@ impl SyncTask {
     /// clone of the shared NVS partition into it. Call after boot-time
     /// Wi-Fi work (the boot NTP resync) is done.
     pub fn spawn(partition: EspDefaultNvsPartition, wifi: WifiManager) -> Result<Self> {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(SYNC_COMMAND_CAPACITY);
         std::thread::Builder::new()
             .name("sync".to_string())
             .stack_size(SYNC_TASK_STACK)
@@ -105,16 +110,16 @@ impl SyncTask {
 
     pub fn sync_now(&self, now: DateTime) -> Result<Receiver<SyncResult>> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(SyncCommand::SyncNow {
+        self.try_send(SyncCommand::SyncNow {
             now,
             reply: reply_tx,
         })?;
         Ok(reply_rx)
     }
 
-    pub fn set_wifi(&self, creds: WifiCreds) -> Result<Receiver<Result<()>>> {
+    pub fn set_wifi(&self, creds: WifiCreds) -> Result<Receiver<Result<WifiCreds>>> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(SyncCommand::SetWifi {
+        self.try_send(SyncCommand::SetWifi {
             creds,
             reply: reply_tx,
         })?;
@@ -123,22 +128,27 @@ impl SyncTask {
 
     pub fn poll_urgent(&self) -> Result<Receiver<Result<bool>>> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(SyncCommand::UrgentPoll { reply: reply_tx })?;
+        self.try_send(SyncCommand::UrgentPoll { reply: reply_tx })?;
         Ok(reply_rx)
     }
 
     pub fn suspend_for_ble(&self) -> Result<Receiver<Result<()>>> {
         let (reply_tx, reply_rx) = channel();
-        self.tx
-            .send(SyncCommand::SuspendForBle { reply: reply_tx })?;
+        self.try_send(SyncCommand::SuspendForBle { reply: reply_tx })?;
         Ok(reply_rx)
     }
 
     pub fn resume_after_ble(&self) -> Result<Receiver<Result<()>>> {
         let (reply_tx, reply_rx) = channel();
-        self.tx
-            .send(SyncCommand::ResumeAfterBle { reply: reply_tx })?;
+        self.try_send(SyncCommand::ResumeAfterBle { reply: reply_tx })?;
         Ok(reply_rx)
+    }
+
+    fn try_send(&self, command: SyncCommand) -> Result<()> {
+        self.tx.try_send(command).map_err(|err| match err {
+            TrySendError::Full(_) => anyhow::anyhow!("sync command queue is full"),
+            TrySendError::Disconnected(_) => anyhow::anyhow!("sync task disconnected"),
+        })
     }
 }
 
@@ -197,7 +207,7 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
                 let result = if wifi_suspended {
                     Err(anyhow::anyhow!("Wi-Fi is suspended for BLE pairing"))
                 } else {
-                    verify_and_save(&mut wifi, &counters, &creds)
+                    verify_credentials(&mut wifi, &creds)
                 };
                 let _ = reply.send(result);
             }
@@ -220,6 +230,12 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
                 let result = wifi.resume_after_ble();
                 if result.is_ok() {
                     wifi_suspended = false;
+                } else {
+                    // The BLE hand-off is terminal even when reconstruction
+                    // fails: discard the failed driver state so the next
+                    // normal connect can build a fresh instance.
+                    wifi.abort_ble_resume();
+                    wifi_suspended = false;
                 }
                 let _ = reply.send(result);
             }
@@ -237,15 +253,10 @@ fn open_stores(
     Ok((counters, alarm_store, todo_store, inbox_store))
 }
 
-fn verify_and_save(
-    wifi: &mut WifiManager,
-    counters: &PersistedCounters,
-    creds: &WifiCreds,
-) -> Result<()> {
-    // Attempt to connect and verify the credentials work before saving.
-    // Only credentials we know are valid end up in NVS; if the connection
-    // fails, return an error without persisting.
+fn verify_credentials(wifi: &mut WifiManager, creds: &WifiCreds) -> Result<WifiCreds> {
+    // Attempt to connect and verify the credentials. The state machine emits
+    // the separate persistence effect only after this fact succeeds.
     wifi.connect(creds)?;
     wifi.disconnect();
-    counters.save_wifi_creds(creds)
+    Ok(creds.clone())
 }

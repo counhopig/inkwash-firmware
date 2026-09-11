@@ -83,8 +83,8 @@ const DIRTY_SET_BUF_LEN: usize = 1024;
 /// Two-way-sync dirty-`local_id`-set tracking: only ids changed *locally*
 /// since the last successful sync are uploaded, so a Server/Desktop edit
 /// isn't clobbered by the device's stale copy on the next sync. The set is
-/// cleared only after a successful sync. Same contract for both
-/// `AlarmStore` (dirty = `enabled` changed) and `TodoStore` (dirty =
+/// cleared only after a successful sync (via `clear_ids`). Same contract for
+/// both `AlarmStore` (dirty = `enabled` changed) and `TodoStore` (dirty =
 /// `done` changed).
 pub struct DirtySet<'a> {
     nvs: &'a EspDefaultNvs,
@@ -110,17 +110,10 @@ impl<'a> DirtySet<'a> {
         Ok(read_blob::<DIRTY_SET_BUF_LEN, _>(self.nvs, self.key)?.unwrap_or_default())
     }
 
-    /// Drops the dirty set after a successful sync.
-    pub fn clear(&self) -> Result<()> {
-        self.nvs
-            .remove(self.key)
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS remove({}) failed: {e}", self.key))
-    }
     /// Removes only the given `ids` from the dirty set, preserving any
     /// entries made *after* the sync snapshot was taken (e.g. a user toggle
-    /// during the network round-trip). Replaces `clear()` at sync-apply time
-    /// so concurrent local edits aren't silently lost.
+    /// during the network round-trip), so concurrent local edits aren't
+    /// silently lost.
     pub fn clear_ids(&self, ids: &[u8]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());

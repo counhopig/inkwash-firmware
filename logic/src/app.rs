@@ -30,6 +30,7 @@ use crate::button_event::{ButtonEvent, ButtonId};
 use crate::datetime::{days_in_month, DateTime};
 use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
+use crate::power_state::{SleepInputs, SleepKind, SleepState, SleepToken};
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
 use crate::todo::Todo;
 use crate::wake_cause::WakeCause;
@@ -424,6 +425,13 @@ pub enum SyncState {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncSchedulerConfig {
+    pub now_unix: u64,
+    pub interval_minutes: u16,
+    pub last_sync_epoch: Option<u64>,
+}
+
 /// How a batch's effects behave on failure. `AbortBatch` stops effects that
 /// have not yet run but never rolls back writes that already succeeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -462,6 +470,10 @@ pub enum Effect {
     /// Separate from `PersistSyncMetadata` because that effect's `etag:
     /// None` means "don't touch"; clearing needs its own confirmable op.
     ClearSyncEtag,
+    /// Invalidate the stale RTC alignment marker after a host-set or NTP
+    /// time write (SetRtc, time shift). Fire-and-forget: the executor
+    /// removes the NVS key; the machine does not track the value.
+    ClearRtcAlignEpoch,
     /// Persist the UTC-offset minutes (SetTimezone's NVS write).
     PersistTimezone(i16),
     /// Write the RTC clock to an absolute time (SetTimezone's hardware
@@ -489,9 +501,18 @@ pub enum Effect {
         edited_id: u8,
     },
     StartSync(SyncRequest),
-    /// Ask the network executor to verify + save Wi-Fi credentials (it owns
-    /// the Wi-Fi driver). Completes via `Event::SetWifiCompleted`.
+    /// Probe the server for urgent content; completion returns as a fact.
+    PollUrgent,
+    /// Collect reminder data from the persistence worker. The application
+    /// receives the resulting payload as an effect completion and never reads
+    /// NVS while collecting runtime events.
+    CollectReminderFacts(DateTime),
+    /// Ask the network executor to verify Wi-Fi credentials (it owns the
+    /// Wi-Fi driver). A successful verification returns a fact; persistence
+    /// is a separate confirmable effect.
     StartSetWifi(WifiCreds),
+    /// Persist credentials after the network executor has verified them.
+    PersistWifiCredentials(WifiCreds),
     StartTone,
     /// Start the reminder's attention tone (siren for urgent, beep for
     /// todo). Distinct from StartTone so the executor can pick the right
@@ -511,7 +532,19 @@ pub enum Effect {
     StartBlePairing(BlePairingRequest),
     StopBlePairing,
     EnterLightSleep(LightSleepPlan),
+    /// Disable the platform's light-sleep mode after activity wakes the
+    /// committed light-sleep session.
+    DisableLightSleep,
     EnterDeepSleep(WakeupPlan),
+    PrepareSleep {
+        token: SleepToken,
+        /// Deep-sleep maintenance timer selected during admission. It is
+        /// carried into the platform prepare step so wake configuration is
+        /// complete before the token can be committed.
+        maintenance: Option<std::time::Duration>,
+        light_wake_after_ms: u64,
+    },
+    CommitSleep(SleepToken),
     /// The user opened an inbox item (ENTER on an Inbox row). Fire-and-forget
     /// local persistence of the read mark: the executor marks `seq` read and
     /// adds it to the pending-read set (two-way sync uploads it later). The
@@ -521,10 +554,13 @@ pub enum Effect {
         /// The inbox item `seq` to mark read (from `state.inbox.items`).
         seq: u64,
     },
+    /// Persist the reminder de-duplication facts before presenting the
+    /// reminder overlay. The effect is kept as one worker-safe operation so
+    /// a slow NVS write never runs on the application loop.
+    PersistReminder(ReminderPersistence),
     /// The user confirmed a SYNC INTERVAL choice on the SM picker (Stage 4).
-    /// Fire-and-forget persistence of the sync interval (minutes); the
-    /// executor writes it to NVS. The state machine does not track the
-    /// value itself - the firmware's sync scheduler owns the cadence.
+    /// Persist the sync interval after the state machine updates its
+    /// scheduler cursor.
     SetSyncInterval {
         /// Interval in minutes (one of the fixed five: 1/5/10/30/60).
         minutes: u16,
@@ -551,7 +587,7 @@ pub enum RenderView {
     /// The alarm list (Stage 4): rows browsed in the state machine, ENTER
     /// toggles a row's enabled flag (confirmable SM edit); the trailing
     /// "+ ADD ALARM" row is a deferred executor wedge. Carries the selected
-    /// row; the executor loads the rows from the store.
+    /// row; the executor draws the rows from the collected AppState snapshot.
     AlarmList { selected: usize },
     /// The todo list (Stage 4): rows browsed in the state machine; short
     /// ENTER toggles a row's done flag and long ENTER returns Home. Carries
@@ -559,26 +595,26 @@ pub enum RenderView {
     TodoList { selected: usize },
     /// The inbox list (Stage 4): rows browsed in the state machine, ENTER
     /// opens an item's detail (an SM screen). Carries the selected row; the
-    /// executor loads the rows from the store.
+    /// executor draws the rows from the collected AppState snapshot.
     Inbox { selected: usize },
     /// The inbox item detail (Stage 4): title + body of the selected item,
-    /// drawn by the executor from the store (carries only the index). ENTER
+    /// drawn by the executor from the collected AppState snapshot (carries only the index). ENTER
     /// on an Inbox row opens it (and marks it read); any button closes it
     /// back to the list.
     InboxItem { index: usize },
     /// The calendar month grid (Stage 4): a read-only grid of the current
     /// month with a day cursor the state machine moves; ENTER opens the
-    /// day's week view through a deferred legacy wedge. Carries the year /
+    /// day's week view through a deferred render. Carries the year /
     /// month and selected day so the executor can draw the grid from state
-    /// (day marks are read from the todo store by the executor).
+    /// (day marks come from the AppState snapshot).
     Calendar {
         year: u16,
         month: u8,
         selected_day: u8,
     },
     /// The week view (Stage 4): the Sun-Sat week containing the opened day,
-    /// one column per day with each day's open todos read from the todo
-    /// store by the executor. Full refresh on open/close.
+    /// one column per day with each day's open todos from the AppState
+    /// snapshot. Full refresh on open/close.
     WeekView { year: u16, month: u8, day: u8 },
     /// The ADD-ALARM number picker (Stage 4): a big digit stepped by
     /// UP/DOWN (wrapping). Carries the active stage (the executor maps it
@@ -600,9 +636,7 @@ pub enum RenderView {
     /// ring owns this frame anymore.
     AlarmRinging,
     /// The full-screen reminder overlay (urgent or todo). Carries the final
-    /// visible lines to draw (the fact layer already applied read/date
-    /// persistence); the executor draws them verbatim - it does not re-read
-    /// the stores.
+    /// visible lines to draw; the executor draws them verbatim.
     Reminder {
         kind: ReminderKind,
         lines: Vec<String>,
@@ -620,7 +654,7 @@ pub struct RenderRequest {
     /// The visible-state snapshot this request was projected from
     /// (Stage 5). The renderer compares it with its privately-held previous
     /// ViewModel via `plan_render` to decide Noop / Partial / Full; it is
-    /// NOT a rendering payload (the executor draws from the stores), only
+    /// NOT a rendering payload (the executor draws from the AppState snapshot), only
     /// the diff input.
     pub view_model: crate::render_plan::ViewModel,
 }
@@ -668,6 +702,8 @@ pub enum PersistTarget {
     SyncApply,
     /// SetTimezone's timezone-offset NVS write.
     Timezone,
+    /// SetWifi's verified credential NVS write.
+    WifiCredentials,
 }
 
 /// Outcome of a completed effect, fed back to `update` via
@@ -675,15 +711,20 @@ pub enum PersistTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectOutput {
     RenderDone,
+    ReminderFacts(Option<ReminderPayload>),
+    ReminderPersisted,
     SyncDone(SyncResult),
     Persisted(PersistTarget),
     RtcProgrammed,
-    /// A `WriteRtcTime` (SetTimezone clock write) confirmed.
-    RtcTimeWritten,
+    /// A `WriteRtcTime` (SetTimezone/SetRtc clock write) confirmed.
+    /// Carries the time that was actually written so the state machine can
+    /// re-derive the hardware alarm from the correct instant.
+    RtcTimeWritten(DateTime),
     AckDone,
     ToneDone,
     BlePairingDone,
     LightSleepEntered,
+    LightSleepDisabled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -692,6 +733,11 @@ pub enum SyncResult {
         /// Merged server data the state machine applies (persist is
         /// ordered by the machine; the network task never writes NVS).
         data: SyncedData,
+    },
+    OkWithMetadata {
+        data: SyncedData,
+        last_sync_epoch: u64,
+        ntp_epoch: Option<u64>,
     },
     Failed(String),
 }
@@ -795,6 +841,23 @@ pub struct BlePairingFailure {
     pub message: String,
 }
 
+/// Mechanical facts collected by the platform loop. Business facts such as
+/// the current page, pending replies and RTC plan are filled from `AppState`
+/// when `PowerPoll` is reduced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerPoll {
+    pub now_ticks: u64,
+    pub activity_observed: bool,
+    pub final_display_pending: bool,
+    pub final_persist_pending: bool,
+    pub usb_connected: bool,
+    pub event_queue_empty: bool,
+    pub input_latch_clear: bool,
+    pub wake_plan_confirmed: bool,
+    pub network_resumable: bool,
+    pub light_wake_after_ms: u64,
+}
+
 /// All events flow through one entry. Every variant is a fact collected by
 /// the event sources; `update` alone decides what it means.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -816,16 +879,41 @@ pub enum Event {
     /// stores or decides presentation on stale data.
     ReminderDue(ReminderPayload),
     SyncCompleted(SyncResult),
-    /// A `StartSetWifi` verification+save finished (Ok when the credentials
-    /// were verified and persisted; Err carries the failure message).
-    SetWifiCompleted(Result<(), String>),
+    /// The network worker completed SetWifi credential verification. The
+    /// state machine emits `PersistWifiCredentials` only for the Ok fact.
+    SetWifiVerified(Result<WifiCreds, String>),
+    /// The network worker completed the lightweight urgent-content probe.
+    /// The application decides whether this fact warrants a full sync.
+    UrgentPollCompleted {
+        available: bool,
+    },
+    /// The urgent probe failed before producing a server answer. The
+    /// scheduler keeps that wall-clock boundary retryable.
+    UrgentPollFailed,
+    /// The persistence worker completed runtime reminder fact collection.
+    ReminderFacts(Option<ReminderPayload>),
     /// A background credential verification (currently BLE handoff after the
     /// reply/disconnect window) confirmed the Wi-Fi config was saved.
     WifiConfigApplied(WifiConfigApplied),
+    /// Mechanical sleep facts from the platform loop. `update` supplies the
+    /// business-owned sleep gates and starts a tokenized prepare handshake.
+    PowerPoll(PowerPoll),
+    /// Platform completed the prepare handshake for the matching token.
+    SleepPrepared {
+        token: SleepToken,
+        inputs: SleepInputs,
+    },
+    /// Platform completed the commit handshake for the matching token.
+    SleepCommitted(SleepToken),
+    /// Cancels a pending sleep handshake; normally emitted by platform code
+    /// when it observes a new activity fact before commit.
+    SleepCancelled(SleepToken),
     /// The wall-clock full-sync boundary is due (the event-collection layer
     /// detected the minute crossed the interval boundary; it only reports
     /// the fact - the state machine decides whether a sync may start).
     SyncBoundaryDue,
+    /// Persisted scheduler inputs collected by the platform during boot.
+    SyncSchedulerConfigured(SyncSchedulerConfig),
     EffectCompleted(EffectCompletion),
     EffectFailed(EffectFailure),
 }
@@ -963,6 +1051,7 @@ pub struct AppState {
     pub todos: TodoState,
     pub inbox: InboxState,
     pub sync: SyncState,
+    pub sync_scheduler: crate::scheduler::SyncScheduler,
     pub connectivity: ConnectivityState,
     /// Device configuration (server endpoint + Wi-Fi presence flags). Holds
     /// only what the UI/status layer needs; the secrets (auth token,
@@ -971,6 +1060,28 @@ pub struct AppState {
     pub config: ConfigState,
     pub pending_usb_reply: Option<PendingReply>,
     pub pending_ble_reply: Option<PendingReply>,
+    /// Reminder persistence is completed before its tone/render batch is
+    /// released. This keeps reminder NVS writes off the app loop while
+    /// retaining the visible overlay state.
+    pending_reminder_operation: Option<OperationId>,
+    pending_reminder_facts: Option<OperationId>,
+    /// Token lifecycle for shallow/deep sleep admission. The platform owns
+    /// only mechanical facts; this state remains the business owner.
+    pub sleep: SleepState,
+    /// Manual Settings sleep and idle sleep requests wait for the next
+    /// `PowerPoll`, which supplies the platform facts needed for admission.
+    pub requested_sleep: Option<SleepKind>,
+    pending_sleep_inputs: Option<SleepInputs>,
+    pending_sleep_light_wake_after_ms: u64,
+    pending_sleep_maintenance: Option<std::time::Duration>,
+    pending_sleep_page_allows: bool,
+    /// Operation id for the current platform sleep handshake/effect. Sleep
+    /// failures must match this id so a stale worker notice cannot cancel a
+    /// newer token.
+    pending_sleep_operation: Option<OperationId>,
+    pending_light_sleep_disable: Option<OperationId>,
+    last_activity_ticks: Option<u64>,
+    idle_since_ticks: Option<u64>,
     op_counter: u64,
     batch_counter: u64,
     screen_before_ring: Screen,
@@ -999,6 +1110,12 @@ pub struct AppState {
     /// dirty); a failure rolls the row back to its previous state. One edit
     /// at a time.
     pending_todo_list_edit: Option<PendingTodoListEdit>,
+    pending_sync_metadata: Option<PendingSyncMetadata>,
+    pending_sync_data: Option<SyncedData>,
+    pending_sync_rtc_op: Option<OperationId>,
+    pending_sync_apply_op: Option<OperationId>,
+    pending_sync_metadata_op: Option<OperationId>,
+    pending_urgent_poll: Option<OperationId>,
     retries: Vec<RetryPending>,
 }
 
@@ -1008,6 +1125,12 @@ struct PendingTodoListEdit {
     operation_id: OperationId,
     index: usize,
     previous_done: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSyncMetadata {
+    last_sync_epoch: u64,
+    ntp_epoch: Option<u64>,
 }
 
 /// An in-flight single-row enabled-toggle from the AlarmList screen.
@@ -1029,15 +1152,34 @@ impl Default for AppState {
             todos: TodoState::default(),
             inbox: InboxState::default(),
             sync: SyncState::Idle,
+            sync_scheduler: crate::scheduler::SyncScheduler::new(0, 60, None),
             connectivity: ConnectivityState::default(),
             config: ConfigState::default(),
             pending_usb_reply: None,
             pending_ble_reply: None,
+            pending_reminder_operation: None,
+            pending_reminder_facts: None,
+            sleep: SleepState::new(),
+            requested_sleep: None,
+            pending_sleep_inputs: None,
+            pending_sleep_light_wake_after_ms: 1_000,
+            pending_sleep_maintenance: None,
+            pending_sleep_page_allows: false,
+            pending_sleep_operation: None,
+            pending_light_sleep_disable: None,
+            last_activity_ticks: None,
+            idle_since_ticks: None,
             pending_residue_ack: None,
             pending_residue_time: None,
             pending_alarm_list_edit: None,
             pending_alarm_add: None,
             pending_todo_list_edit: None,
+            pending_sync_metadata: None,
+            pending_sync_data: None,
+            pending_sync_rtc_op: None,
+            pending_sync_apply_op: None,
+            pending_sync_metadata_op: None,
+            pending_urgent_poll: None,
             retries: Vec::new(),
             op_counter: 0,
             batch_counter: 0,
@@ -1137,12 +1279,44 @@ impl AppState {
             | AlarmRuntimeState::Degraded { .. } => false,
         }
     }
+
+    /// True while the lightweight urgent-content probe is still awaiting its
+    /// completion fact. The probe is an in-flight network operation even
+    /// though `SyncState` remains `Idle` until the probe elects a full sync.
+    pub fn urgent_poll_in_flight(&self) -> bool {
+        self.pending_urgent_poll.is_some()
+    }
 }
 
 /// The single state transition entry point. Mutates `state` and returns the
 /// effects the side-effect execution layer must run.
 pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
-    match event {
+    let tick_cancels_prepared =
+        matches!(event, Event::Tick(_)) && state.sleep.prepared_token().is_some();
+    let tick_wakes_light_sleep =
+        matches!(event, Event::Tick(_)) && state.sleep.committed_kind() == Some(SleepKind::Light);
+    let light_sleep_was_committed = state.sleep.committed_kind() == Some(SleepKind::Light)
+        && (sleep_activity_event(&event) || tick_wakes_light_sleep);
+    let mut wake_effects = if light_sleep_was_committed {
+        disable_light_sleep_batch(state)
+    } else {
+        Vec::new()
+    };
+    if sleep_activity_event(&event) || tick_cancels_prepared || tick_wakes_light_sleep {
+        state.sleep.activity();
+        state.pending_sleep_operation = None;
+        // A real application event invalidates an in-flight handshake.  A
+        // pending manual request is deliberately retained across the button
+        // release that follows Settings/SLEEP and the next Tick; those are
+        // bookkeeping, not new user intent. A real event clears it below.
+        state.requested_sleep = None;
+        if state.pending_sleep_inputs.is_some() {
+            state.pending_sleep_inputs = None;
+            state.pending_sleep_page_allows = false;
+            state.pending_sleep_maintenance = None;
+        }
+    }
+    let mut batches = match event {
         Event::Boot(snapshot) => transition_boot(state, snapshot),
         Event::RtcAlarmSnapshotReady(snapshot) => transition_rtc_snapshot(state, snapshot),
         Event::Tick(now) => transition_tick(state, now),
@@ -1152,15 +1326,298 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::UsbCommand(request) => transition_command(state, Channel::Usb, request),
         Event::BleCommand(request) => transition_command(state, Channel::Ble, request),
         Event::SyncCompleted(result) => transition_sync_completed(state, result),
-        Event::SetWifiCompleted(result) => transition_set_wifi_completed(state, result),
+        Event::SetWifiVerified(result) => transition_set_wifi_verified(state, result),
+        Event::UrgentPollCompleted { available } => {
+            transition_urgent_poll_completed(state, available)
+        }
+        Event::UrgentPollFailed => transition_urgent_poll_failed(state),
+        Event::ReminderFacts(payload) => payload
+            .map(|payload| transition_reminder_due(state, payload))
+            .unwrap_or_default(),
         Event::WifiConfigApplied(fact) => transition_wifi_config_applied(state, fact),
+        Event::PowerPoll(poll) => transition_power_poll(state, poll),
+        Event::SleepPrepared { token, inputs } => transition_sleep_prepared(state, token, inputs),
+        Event::SleepCommitted(token) => transition_sleep_committed(state, token),
+        Event::SleepCancelled(token) => transition_sleep_cancelled(state, token),
         Event::SyncBoundaryDue => transition_sync_boundary_due(state),
+        Event::SyncSchedulerConfigured(config) => {
+            state.sync_scheduler = crate::scheduler::SyncScheduler::new(
+                config.now_unix,
+                config.interval_minutes,
+                config.last_sync_epoch,
+            );
+            state.pending_urgent_poll = None;
+            vec![]
+        }
         Event::BlePairingStarted => transition_ble_pairing_started(state),
         Event::BlePairingSucceeded(result) => transition_ble_pairing_succeeded(state, result),
         Event::BlePairingFailed(failure) => transition_ble_pairing_failed(state, failure),
         Event::BleDisconnected => transition_ble_disconnected(state),
         Event::ReminderDue(payload) => transition_reminder_due(state, payload),
+    };
+    wake_effects.append(&mut batches);
+    wake_effects
+}
+
+fn sleep_activity_event(event: &Event) -> bool {
+    match event {
+        Event::PowerPoll(_)
+        | Event::Tick(_)
+        | Event::SleepPrepared { .. }
+        | Event::SleepCommitted(_)
+        | Event::SleepCancelled(_) => false,
+        Event::EffectCompleted(completion)
+            if matches!(
+                completion.output,
+                EffectOutput::LightSleepEntered | EffectOutput::LightSleepDisabled
+            ) =>
+        {
+            false
+        }
+        // Sleep failures are control-plane results, not new activity. The
+        // transition below cancels only when the failure matches the current
+        // sleep operation, preserving a newer token from stale notices.
+        Event::EffectFailed(failure) if matches!(failure.error, EffectError::Sleep(_)) => false,
+        Event::Button(button) => matches!(
+            button,
+            ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_)
+        ),
+        _ => true,
     }
+}
+
+fn app_sleep_inputs(state: &AppState, poll: PowerPoll) -> SleepInputs {
+    let network_in_flight = state.sync != SyncState::Idle;
+    let operation_in_flight = state.pending_rtc.is_some()
+        || state.pending_light_sleep_disable.is_some()
+        || state.pending_residue_ack.is_some()
+        || state.pending_alarm_list_edit.is_some()
+        || state.pending_alarm_add.is_some()
+        || state.pending_todo_list_edit.is_some()
+        || state.pending_sync_data.is_some()
+        || state.pending_sync_metadata.is_some()
+        || state.pending_sync_rtc_op.is_some()
+        || state.pending_sync_apply_op.is_some()
+        || state.pending_sync_metadata_op.is_some()
+        || state.pending_urgent_poll.is_some()
+        || !state.retries.is_empty();
+    SleepInputs {
+        input_pending: false,
+        page_allows_sleep: matches!(state.screen, Screen::Home)
+            || state.requested_sleep.is_some()
+            || state.pending_sleep_page_allows,
+        final_display_pending: poll.final_display_pending,
+        final_persist_pending: poll.final_persist_pending,
+        network_in_flight,
+        protocol_reply_pending: state.pending_usb_reply.is_some()
+            || state.pending_ble_reply.is_some(),
+        operation_in_flight,
+        rtc_plan_confirmed: state.rtc_alarm_plan_confirmed(),
+        wake_plan_confirmed: poll.wake_plan_confirmed,
+        usb_connected: poll.usb_connected,
+        event_queue_empty: poll.event_queue_empty,
+        input_latch_clear: poll.input_latch_clear,
+        network_resumable: poll.network_resumable,
+    }
+}
+
+fn transition_power_poll(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
+    if poll.activity_observed {
+        state.last_activity_ticks = Some(poll.now_ticks);
+        state.idle_since_ticks = None;
+        // The poll is sampled after the button/transport queues.  It may
+        // therefore describe the same activity that requested manual sleep.
+        // Preserve a manual request; an already prepared token is cancelled
+        // because this is a genuinely new platform activity observation.
+        let disable = state.sleep.committed_kind() == Some(SleepKind::Light);
+        if state.sleep.prepared_token().is_some() || state.sleep.committed_kind().is_some() {
+            state.sleep.activity();
+            state.pending_sleep_operation = None;
+            state.pending_sleep_inputs = None;
+            state.pending_sleep_page_allows = false;
+            state.pending_sleep_maintenance = None;
+        }
+        return if disable {
+            disable_light_sleep_batch(state)
+        } else {
+            vec![]
+        };
+    }
+    if state.sleep.committed_kind().is_some() {
+        return vec![];
+    }
+    if state.pending_sleep_inputs.is_some() {
+        return vec![];
+    }
+    let last = *state.last_activity_ticks.get_or_insert(poll.now_ticks);
+    let idle_for = poll.now_ticks.saturating_sub(last);
+    let idle_since = if idle_for >= 2_000 {
+        *state.idle_since_ticks.get_or_insert(last + 2_000)
+    } else {
+        return vec![];
+    };
+    let automatic_kind = (poll.now_ticks.saturating_sub(idle_since) >= 300_000)
+        .then_some(SleepKind::Deep)
+        .or(Some(SleepKind::Light));
+    let kind = state.requested_sleep.or(automatic_kind);
+    let Some(kind) = kind else {
+        return vec![];
+    };
+    let inputs = app_sleep_inputs(state, poll);
+    let maintenance = (kind == SleepKind::Deep)
+        .then(|| {
+            state
+                .clock
+                .now
+                .and_then(|now| maintenance_wakeup_delay(&state.alarms.alarms, &now))
+                .map(|delay| delay.min(std::time::Duration::from_secs(600)))
+                .or(Some(std::time::Duration::from_secs(600)))
+        })
+        .flatten();
+    let manual_request = state.requested_sleep.is_some();
+    state.requested_sleep = None;
+    let Ok(token) = state.sleep.prepare(kind, poll.now_ticks, inputs) else {
+        if manual_request {
+            state.requested_sleep = Some(kind);
+        }
+        return vec![];
+    };
+    state.pending_sleep_inputs = Some(inputs);
+    state.pending_sleep_operation = Some(state.next_operation_id());
+    state.pending_sleep_light_wake_after_ms = poll.light_wake_after_ms;
+    state.pending_sleep_maintenance = maintenance;
+    state.pending_sleep_page_allows = inputs.page_allows_sleep;
+    vec![batch(
+        state,
+        state
+            .pending_sleep_operation
+            .expect("sleep prepare operation"),
+        // Prepare/commit are platform handshakes whose completion arrives
+        // as a fact from the event collector.  They are therefore async at
+        // the effect boundary and must never be placed in AbortBatch.
+        FailurePolicy::Continue,
+        vec![Effect::PrepareSleep {
+            token,
+            maintenance,
+            light_wake_after_ms: poll.light_wake_after_ms,
+        }],
+    )]
+}
+
+fn transition_sleep_prepared(
+    state: &mut AppState,
+    token: SleepToken,
+    inputs: SleepInputs,
+) -> Vec<EffectBatch> {
+    let Some(_prepared_inputs) = state.pending_sleep_inputs else {
+        return vec![];
+    };
+    if state.sleep.prepared_token() != Some(token) || state.pending_sleep_operation.is_none() {
+        return vec![];
+    }
+    let confirmed_inputs = app_sleep_inputs_from_facts(state, inputs);
+    if state.sleep.commit(token, confirmed_inputs).is_err() {
+        state.pending_sleep_inputs = None;
+        state.pending_sleep_page_allows = false;
+        state.pending_sleep_maintenance = None;
+        state.pending_sleep_operation = None;
+        return vec![];
+    }
+    let operation_id = state.next_operation_id();
+    state.pending_sleep_operation = Some(operation_id);
+    vec![batch(
+        state,
+        operation_id,
+        // See PrepareSleep above: the collector owns the final mechanical
+        // check and feeds SleepCommitted back as an event.
+        FailurePolicy::Continue,
+        vec![Effect::CommitSleep(token)],
+    )]
+}
+
+fn app_sleep_inputs_from_facts(state: &AppState, facts: SleepInputs) -> SleepInputs {
+    SleepInputs {
+        page_allows_sleep: matches!(state.screen, Screen::Home)
+            || state.requested_sleep.is_some()
+            || state.pending_sleep_page_allows,
+        network_in_flight: state.sync != SyncState::Idle,
+        protocol_reply_pending: state.pending_usb_reply.is_some()
+            || state.pending_ble_reply.is_some(),
+        operation_in_flight: state.pending_rtc.is_some()
+            || state.pending_light_sleep_disable.is_some()
+            || state.pending_residue_ack.is_some()
+            || state.pending_alarm_list_edit.is_some()
+            || state.pending_alarm_add.is_some()
+            || state.pending_todo_list_edit.is_some()
+            || state.pending_sync_data.is_some()
+            || state.pending_sync_metadata.is_some()
+            || state.pending_sync_rtc_op.is_some()
+            || state.pending_sync_apply_op.is_some()
+            || state.pending_sync_metadata_op.is_some()
+            || state.pending_urgent_poll.is_some()
+            || !state.retries.is_empty(),
+        rtc_plan_confirmed: state.rtc_alarm_plan_confirmed(),
+        ..facts
+    }
+}
+
+fn transition_sleep_committed(state: &mut AppState, token: SleepToken) -> Vec<EffectBatch> {
+    // `pending_sleep_inputs` is cleared when this transition consumes the
+    // platform commit fact. A duplicate SleepCommitted must not start a
+    // second EnterLight/DeepSleep effect for the same token.
+    if !state.sleep.is_committed(token)
+        || state.pending_sleep_operation.is_none()
+        || state.pending_sleep_inputs.is_none()
+    {
+        return vec![];
+    }
+    state.pending_sleep_inputs = None;
+    state.pending_sleep_page_allows = false;
+    let maintenance = state.pending_sleep_maintenance.take();
+    let effect = match token.kind {
+        SleepKind::Light => Effect::EnterLightSleep(LightSleepPlan {
+            wake_after_ms: state.pending_sleep_light_wake_after_ms,
+        }),
+        SleepKind::Deep => Effect::EnterDeepSleep(WakeupPlan { maintenance }),
+    };
+    let operation_id = state.next_operation_id();
+    state.pending_sleep_operation = Some(operation_id);
+    vec![batch(
+        state,
+        operation_id,
+        FailurePolicy::AbortBatch,
+        vec![effect],
+    )]
+}
+
+fn transition_sleep_cancelled(state: &mut AppState, token: SleepToken) -> Vec<EffectBatch> {
+    let disable = state.sleep.is_committed(token) && token.kind == SleepKind::Light;
+    if state.sleep.prepared_token() == Some(token) || state.sleep.is_committed(token) {
+        state.sleep.cancel();
+        state.pending_sleep_inputs = None;
+        state.pending_sleep_page_allows = false;
+        state.pending_sleep_maintenance = None;
+        state.pending_sleep_operation = None;
+    }
+    if disable {
+        disable_light_sleep_batch(state)
+    } else {
+        vec![]
+    }
+}
+
+fn disable_light_sleep_batch(state: &mut AppState) -> Vec<EffectBatch> {
+    if state.pending_light_sleep_disable.is_some() {
+        return vec![];
+    }
+    let operation_id = state.next_operation_id();
+    state.pending_light_sleep_disable = Some(operation_id);
+    vec![batch(
+        state,
+        operation_id,
+        FailurePolicy::Continue,
+        vec![Effect::DisableLightSleep],
+    )]
 }
 
 /// Returns whether a completion from the BLE worker belongs to the pairing
@@ -1194,6 +1651,80 @@ fn transition_sync_boundary_due(state: &mut AppState) -> Vec<EffectBatch> {
         op,
         FailurePolicy::Continue,
         vec![Effect::StartSync(SyncRequest { now })],
+    )]
+}
+
+fn transition_urgent_poll_completed(state: &mut AppState, available: bool) -> Vec<EffectBatch> {
+    let Some(op) = state.pending_urgent_poll.take() else {
+        return vec![];
+    };
+    let _ = op;
+    if !available {
+        state.sync_scheduler.clear_urgent_synced();
+        return vec![];
+    }
+    if state.sync != SyncState::Idle
+        || !state.connectivity.wifi_configured
+        || !state.connectivity.server_configured
+        || state.sync_scheduler.already_synced_urgent(&state.inbox)
+    {
+        return vec![];
+    }
+    let Some(now) = state.clock.now else {
+        return vec![];
+    };
+    let request_id = state.next_operation_id();
+    state.sync = SyncState::Running { request_id };
+    vec![batch(
+        state,
+        request_id,
+        FailurePolicy::Continue,
+        vec![Effect::StartSync(SyncRequest { now })],
+    )]
+}
+
+fn transition_urgent_poll_failed(state: &mut AppState) -> Vec<EffectBatch> {
+    if state.pending_urgent_poll.take().is_some() {
+        state.sync_scheduler.rollback_urgent_boundary();
+    }
+    vec![]
+}
+
+fn schedule_sync_from_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
+    if state.sync != SyncState::Idle
+        || state.pending_urgent_poll.is_some()
+        || !state.connectivity.wifi_configured
+        || !state.connectivity.server_configured
+    {
+        return vec![];
+    }
+    let unix = now.to_unix();
+    let interval = state.sync_scheduler.interval_minutes();
+    let urgent_due = state.sync_scheduler.urgent_due(unix);
+    let full_due = state.sync_scheduler.full_due(unix, interval);
+    if !urgent_due && !full_due {
+        return vec![];
+    }
+    if full_due || (state.sync_scheduler.is_never_synced() && urgent_due) {
+        state.sync_scheduler.advance_full_boundary(unix, interval);
+        state.sync_scheduler.advance_urgent_boundary(unix);
+        let request_id = state.next_operation_id();
+        state.sync = SyncState::Running { request_id };
+        return vec![batch(
+            state,
+            request_id,
+            FailurePolicy::Continue,
+            vec![Effect::StartSync(SyncRequest { now })],
+        )];
+    }
+    state.sync_scheduler.advance_urgent_boundary(unix);
+    let request_id = state.next_operation_id();
+    state.pending_urgent_poll = Some(request_id);
+    vec![batch(
+        state,
+        request_id,
+        FailurePolicy::Continue,
+        vec![Effect::PollUrgent],
     )]
 }
 
@@ -1319,42 +1850,21 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
     let mut batches = Vec::new();
     match result {
         SyncResult::Ok { data } => {
-            let apply_op = state.next_operation_id();
-            // Adopt the merged data into state (the state machine is the
-            // single owner of the alarm/todo/inbox lists) and persist it via
-            // one confirmable apply - for BOTH on-demand and scheduled
-            // syncs, so the network task never writes NVS itself.
-            state.alarms.alarms = data.alarms.clone();
-            state.todos.todos = data.todos.clone();
-            state.inbox.items = data.inbox.clone();
-            // A successful sync proves the network was up; record the
-            // last-known connectivity fact (GetStatus reports it).
-            state.connectivity.wifi_connected = true;
-            // Release the single-flight lock; the sync itself is done, only
-            // its apply (below) remains confirmable.
-            state.sync = SyncState::Idle;
-            // If a transport's SyncNow slot awaits this sync, re-point it at
-            // the apply op so the final Ok waits for the apply confirm.
-            let _ = [Channel::Usb, Channel::Ble]
-                .iter()
-                .copied()
-                .any(|channel| repoint_sync_to_apply(state, channel, apply_op));
-            // Always apply the merged data (a scheduled sync has no pending
-            // transport; its `Persisted(SyncApply)` completion is observed
-            // by the executor path with no reply to send).
-            batches.push(batch(
+            batches.extend(transition_sync_apply(state, data, None));
+        }
+        SyncResult::OkWithMetadata {
+            data,
+            last_sync_epoch,
+            ntp_epoch,
+        } => {
+            batches.extend(transition_sync_apply(
                 state,
-                apply_op,
-                FailurePolicy::AbortBatch,
-                vec![Effect::ApplySyncedData(data)],
+                data,
+                Some(PendingSyncMetadata {
+                    last_sync_epoch,
+                    ntp_epoch,
+                }),
             ));
-            // Stage 5: adopting merged server data may have changed what the
-            // current screen shows (alarm/todo/inbox lists). Emit a render
-            // request - the renderer diffs the ViewModel against its cache
-            // and refreshes (or Noops if nothing visible actually changed),
-            // so a sync that changed no on-screen data costs nothing.
-            state.render_generation = state.render_generation.next();
-            batches.push(render_batch(state));
         }
         SyncResult::Failed(message) => {
             state.sync = SyncState::Idle;
@@ -1371,37 +1881,97 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
     batches
 }
 
-fn transition_set_wifi_completed(
+fn transition_sync_apply(
     state: &mut AppState,
-    result: Result<(), String>,
+    data: SyncedData,
+    metadata: Option<PendingSyncMetadata>,
+) -> Vec<EffectBatch> {
+    // Guard: only stage merged data when there is a running sync to resolve.
+    // A stale / unsolicited completion (e.g. replayed after a deep-sleep
+    // restart) arriving from Idle must be harmless — no data adoption, no
+    // reply, sync stays Idle.
+    let SyncState::Running { request_id } = state.sync else {
+        return Vec::new();
+    };
+    let _request_id = request_id;
+
+    let mut batches = Vec::new();
+    let apply_op = state.next_operation_id();
+
+    // A successful sync proves the network was up; record the last-known
+    // connectivity fact (GetStatus reports it).
+    state.connectivity.wifi_connected = true;
+
+    // Keep the network result private until ApplySyncedData confirms its
+    // local commit. A failed apply must leave the visible lists untouched.
+    state.pending_sync_data = Some(data.clone());
+    state.pending_sync_metadata = metadata.clone();
+    state.pending_sync_rtc_op = None;
+    state.pending_sync_apply_op = Some(apply_op);
+
+    // Keep the whole local commit pipeline in-flight. This blocks a second
+    // SyncNow and deep sleep until Apply, RTC planning, and metadata (when
+    // present) have all reached their matching completion events.
+    state.sync = SyncState::Applying {
+        request_id: apply_op,
+    };
+    let _ = [Channel::Usb, Channel::Ble]
+        .iter()
+        .copied()
+        .any(|channel| repoint_sync_to_apply(state, channel, apply_op));
+
+    // The confirmable ApplySyncedData persist: its completion (Persisted)
+    // or failure resolves the pending transport reply.
+    batches.push(batch(
+        state,
+        apply_op,
+        FailurePolicy::AbortBatch,
+        vec![Effect::ApplySyncedData(data)],
+    ));
+
+    batches
+}
+
+fn mark_sync_scheduler_completed(state: &mut AppState) {
+    state.sync_scheduler.mark_full_sync_completed();
+    if crate::scheduler::SyncScheduler::has_unread_urgent(&state.inbox) {
+        state.sync_scheduler.mark_urgent_synced();
+    } else {
+        state.sync_scheduler.clear_urgent_synced();
+    }
+}
+
+fn transition_set_wifi_verified(
+    state: &mut AppState,
+    result: Result<WifiCreds, String>,
 ) -> Vec<EffectBatch> {
     let mut batches = Vec::new();
     for channel in [Channel::Usb, Channel::Ble] {
-        let Some((found_channel, creds)) = take_set_wifi_pending(state, channel) else {
+        let Some(_pending_creds) = pending_set_wifi_creds(state, channel) else {
             continue;
         };
         match &result {
-            Ok(()) => {
-                // The network executor verified + persisted the
-                // credentials: apply the status-visible wifi facts (SSID +
-                // has-password; the password value never enters AppState).
-                state.config.wifi_ssid = Some(creds.ssid);
-                state.config.wifi_has_password = !creds.password.is_empty();
-                state.connectivity.wifi_configured = state.config.wifi_configured();
-                batches.push(reply_batch(state, found_channel, Reply::Ok));
-                // Stage 5: the applied wifi facts may show on Home's status
-                // card / GetStatus-driven UI - emit a render (renderer diff
-                // Noops if nothing visible changed).
-                state.render_generation = state.render_generation.next();
-                batches.push(render_batch(state));
+            Ok(verified) => {
+                let persist_op = state.next_operation_id();
+                if let Some(pending) = pending_reply_mut(state, channel) {
+                    pending.awaiting_ops = vec![persist_op];
+                }
+                batches.push(batch(
+                    state,
+                    persist_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::PersistWifiCredentials(verified.clone())],
+                ));
             }
             Err(message) => {
                 let msg = format!("Connection verification failed: {message}");
-                batches.push(reply_batch(
-                    state,
-                    found_channel,
-                    Reply::Error { message: msg },
-                ));
+                if let Some(pending) = take_pending_reply(state, channel) {
+                    batches.push(reply_batch(
+                        state,
+                        pending.channel,
+                        Reply::Error { message: msg },
+                    ));
+                }
             }
         }
     }
@@ -1695,6 +2265,7 @@ fn transition_reminder_due(state: &mut AppState, payload: ReminderPayload) -> Ve
     // A reminder never preempts a ring; if an alarm is already ringing the
     // fact is dropped (the alarm is the higher-priority alert).
     if state.screen == Screen::AlarmRinging
+        || matches!(state.screen, Screen::Reminder(_))
         || matches!(state.alarm_runtime, AlarmRuntimeState::Firing { .. })
     {
         return vec![];
@@ -1711,6 +2282,19 @@ fn transition_reminder_due(state: &mut AppState, payload: ReminderPayload) -> Ve
         deadline_unix: deadline,
     });
     state.render_generation = state.render_generation.next();
+    if !payload.urgent_read_ids.is_empty() || payload.todo_date.is_some() {
+        let operation_id = state.next_operation_id();
+        state.pending_reminder_operation = Some(operation_id);
+        return vec![batch(
+            state,
+            operation_id,
+            FailurePolicy::Continue,
+            vec![Effect::PersistReminder(ReminderPersistence {
+                urgent_read_ids: payload.urgent_read_ids,
+                todo_date: payload.todo_date,
+            })],
+        )];
+    }
     vec![
         batch(
             state,
@@ -1999,23 +2583,12 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_SLEEP_ROW {
-                        // SLEEP (row 3): an SM-owned effect - deep sleep with
-                        // the maintenance wake needed for a far-future
-                        // one-shot alarm (mirrors the idle deep-sleep plan).
-                        let maintenance = state
-                            .clock
-                            .now
-                            .and_then(|now| maintenance_wakeup_delay(&state.alarms.alarms, &now));
+                        // SLEEP (row 3): request the same tokenized admission
+                        // path used by idle sleep. The next PowerPoll supplies
+                        // USB/input/wake facts before any platform effect.
+                        state.requested_sleep = Some(SleepKind::Deep);
                         state.render_generation = state.render_generation.next();
-                        vec![
-                            batch(
-                                state,
-                                OperationId(0),
-                                FailurePolicy::Continue,
-                                vec![Effect::EnterDeepSleep(WakeupPlan { maintenance })],
-                            ),
-                            render_batch(state),
-                        ]
+                        vec![render_batch(state)]
                     } else if cur == SETTINGS_BLE_PAIRING_ROW {
                         // BLE PAIRING (row 2): an SM screen now. Enter the
                         // pairing session (Waiting) and ask the executor to
@@ -2132,10 +2705,14 @@ fn transition_sync_interval_pick_button(
             vec![render_batch(state)]
         }
         ButtonEvent::Pressed(ButtonId::Enter) => {
-            // Confirm: fire-and-forget the interval write, return to
-            // Settings (the executor persists to NVS; the firmware sync
-            // scheduler picks the new cadence up on its next poll).
+            // Update cadence in the state machine and persist the same value
+            // through the executor.
             let minutes = SYNC_INTERVAL_MINUTES[selected];
+            if let Some(now) = state.clock.now {
+                state
+                    .sync_scheduler
+                    .set_interval_minutes(now.to_unix(), minutes);
+            }
             state.screen = Screen::Settings {
                 selected: SETTINGS_SYNC_INTERVAL_ROW,
             };
@@ -2642,6 +3219,16 @@ fn transition_week_view_button(state: &mut AppState, button: ButtonEvent) -> Vec
 
 fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
     let mut batches = Vec::new();
+    if state.pending_reminder_facts.is_none() {
+        let operation_id = state.next_operation_id();
+        state.pending_reminder_facts = Some(operation_id);
+        batches.push(batch(
+            state,
+            operation_id,
+            FailurePolicy::Continue,
+            vec![Effect::CollectReminderFacts(now)],
+        ));
+    }
     let changed = state
         .clock
         .now
@@ -2655,6 +3242,7 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
         .unwrap_or(true);
     state.clock.now = Some(now);
     let current_minute = now.to_unix() / 60;
+    batches.extend(schedule_sync_from_tick(state, now));
 
     // The calendar grid always shows the current month: when the clock rolls
     // into a new month while the Calendar screen is current, adopt the new
@@ -2887,6 +3475,68 @@ fn transition_effect_completed(
     // Exact-match gate: only touch the commit state whose op id matches.
     let mut batches = Vec::new();
     match completion.output {
+        EffectOutput::Persisted(PersistTarget::SyncMetadata)
+            if state.pending_sync_metadata_op == Some(completion.operation_id) =>
+        {
+            state.pending_sync_metadata_op = None;
+            state.pending_sync_metadata = None;
+            state.pending_sync_rtc_op = None;
+            state.sync = SyncState::Idle;
+            mark_sync_scheduler_completed(state);
+        }
+        EffectOutput::Persisted(PersistTarget::SyncApply)
+            if state.pending_sync_apply_op == Some(completion.operation_id) =>
+        {
+            state.pending_sync_apply_op = None;
+            if let Some(data) = state.pending_sync_data.take() {
+                state.alarms.alarms = data.alarms;
+                state.todos.todos = data.todos;
+                state.inbox.items = data.inbox;
+                state.render_generation = state.render_generation.next();
+                batches.push(render_batch(state));
+            }
+            // Apply must be followed by a confirmed RTC plan. If metadata
+            // indicates an NTP time write, stage that first; otherwise plan
+            // the alarm directly from the newly adopted data.
+            let ntp_staged = if let Some(metadata) = state.pending_sync_metadata.clone() {
+                if let Some(epoch) = metadata.ntp_epoch {
+                    let target = DateTime::from_unix(epoch)
+                        .shifted_minutes(state.config.timezone_offset_minutes as i32);
+                    let write_op = state.next_operation_id();
+                    state.pending_sync_metadata_op = Some(write_op);
+                    state.sync = SyncState::Applying {
+                        request_id: write_op,
+                    };
+                    for channel in [Channel::Usb, Channel::Ble] {
+                        let _ = repoint_sync_to_apply(state, channel, write_op);
+                    }
+                    batches.push(batch(
+                        state,
+                        write_op,
+                        FailurePolicy::AbortBatch,
+                        vec![Effect::WriteRtcTime(target)],
+                    ));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !ntp_staged {
+                if let Some(now) = state.clock.now {
+                    let rtc_batches = program_alarm_for(state, &now);
+                    state.pending_sync_rtc_op = rtc_batches.first().map(|b| b.operation_id);
+                    if let Some(rtc_op) = state.pending_sync_rtc_op {
+                        state.sync = SyncState::Applying { request_id: rtc_op };
+                        for channel in [Channel::Usb, Channel::Ble] {
+                            let _ = repoint_sync_to_apply(state, channel, rtc_op);
+                        }
+                    }
+                    batches.extend(rtc_batches);
+                }
+            }
+        }
         EffectOutput::Persisted(PersistTarget::Alarms) => {
             if let Some(commit) = state.commit_for_operation(completion.operation_id) {
                 *commit = CommitState::Succeeded;
@@ -2954,18 +3604,89 @@ fn transition_effect_completed(
                 }
                 None => {}
             }
-        }
-        EffectOutput::RtcTimeWritten => {
-            // A WriteRtcTime (SetTimezone clock write) confirmed: the wall
-            // clock moved, so the derived PCF8563 alarm register may now point
-            // at the wrong instant. Re-derive it from the new `now` so a time
-            // shift (host set RTC, timezone change, NTP alignment) never
-            // leaves the hardware slot lagging the clock. (P1-5 fix.)
-            // Guard against clobbering a concurrently in-flight program.
-            if state.pending_rtc.is_none() {
-                if let Some(now) = state.clock.now {
-                    batches.extend(program_alarm_for(state, &now));
+            if state.pending_sync_rtc_op == Some(completion.operation_id) {
+                state.pending_sync_rtc_op = None;
+                if let Some(metadata) = state.pending_sync_metadata.clone() {
+                    let metadata_op = state.next_operation_id();
+                    state.pending_sync_metadata_op = Some(metadata_op);
+                    state.sync = SyncState::Applying {
+                        request_id: metadata_op,
+                    };
+                    for channel in [Channel::Usb, Channel::Ble] {
+                        let _ = repoint_sync_to_apply(state, channel, metadata_op);
+                    }
+                    batches.push(batch(
+                        state,
+                        metadata_op,
+                        FailurePolicy::AbortBatch,
+                        vec![Effect::PersistSyncMetadata(SyncMetadata {
+                            etag: None,
+                            last_sync_epoch: Some(metadata.last_sync_epoch),
+                            rtc_align_epoch: metadata.ntp_epoch,
+                        })],
+                    ));
+                } else {
+                    state.sync = SyncState::Idle;
+                    mark_sync_scheduler_completed(state);
                 }
+            }
+        }
+        EffectOutput::RtcTimeWritten(written_time)
+            if state.pending_sync_metadata.is_none()
+                || state.pending_sync_metadata_op == Some(completion.operation_id) =>
+        {
+            // A WriteRtcTime (SetTimezone/SetRtc clock write) confirmed: the
+            // wall clock moved, so the derived PCF8563 alarm register may now
+            // point at the wrong instant. Re-derive it from the time that was
+            // actually written (carried in `written_time`) so a time shift
+            // never leaves the hardware slot lagging the clock. (P1-5 fix.)
+            // Guard against clobbering a concurrently in-flight program.
+            state.clock.now = Some(written_time);
+            if state.pending_rtc.is_none() {
+                let rtc_batches = program_alarm_for(state, &written_time);
+                if state.pending_sync_metadata.is_some() {
+                    state.pending_sync_rtc_op = rtc_batches.first().map(|b| b.operation_id);
+                    if let Some(rtc_op) = state.pending_sync_rtc_op {
+                        state.sync = SyncState::Applying { request_id: rtc_op };
+                        for channel in [Channel::Usb, Channel::Ble] {
+                            let _ = repoint_sync_to_apply(state, channel, rtc_op);
+                        }
+                    }
+                }
+                batches.extend(rtc_batches);
+            }
+        }
+        EffectOutput::LightSleepEntered
+            if state.pending_sleep_operation == Some(completion.operation_id) =>
+        {
+            // The platform has accepted the light-sleep configuration. Keep
+            // the committed token while the idle loop is parked; a later
+            // input/activity event invalidates it and disables the platform
+            // mode. Clearing the operation id prevents a late completion from
+            // touching a newer sleep request.
+            state.pending_sleep_operation = None;
+        }
+        EffectOutput::ReminderFacts(ref payload)
+            if state.pending_reminder_facts == Some(completion.operation_id) =>
+        {
+            state.pending_reminder_facts = None;
+            if let Some(payload) = payload.clone() {
+                batches.extend(transition_reminder_due(state, payload));
+            }
+        }
+        EffectOutput::ReminderPersisted
+            if state.pending_reminder_operation == Some(completion.operation_id) =>
+        {
+            state.pending_reminder_operation = None;
+            if let Screen::Reminder(reminder) = &state.screen {
+                let kind = reminder.kind;
+                batches.push(batch(
+                    state,
+                    OperationId(0),
+                    FailurePolicy::Continue,
+                    vec![Effect::StartReminderTone(kind)],
+                ));
+                batches.push(render_batch(state));
             }
         }
         EffectOutput::Persisted(PersistTarget::Config) => {
@@ -2988,15 +3709,38 @@ fn transition_effect_completed(
             state.render_generation = state.render_generation.next();
             batches.push(render_batch(state));
         }
+        EffectOutput::Persisted(PersistTarget::WifiCredentials) => {
+            for channel in [Channel::Usb, Channel::Ble] {
+                let Some(pending) = pending_reply_ref(state, channel) else {
+                    continue;
+                };
+                if !matches!(&pending.request, ControlRequest::SetWifi { .. }) {
+                    continue;
+                }
+                if pending.awaiting_ops == [completion.operation_id] {
+                    if let Some(creds) = pending_set_wifi_creds(state, channel) {
+                        state.config.wifi_ssid = Some(creds.ssid);
+                        state.config.wifi_has_password = !creds.password.is_empty();
+                        state.connectivity.wifi_configured = state.config.wifi_configured();
+                        state.render_generation = state.render_generation.next();
+                        batches.push(render_batch(state));
+                    }
+                }
+            }
+        }
+        EffectOutput::LightSleepDisabled
+            if state.pending_light_sleep_disable == Some(completion.operation_id) =>
+        {
+            state.pending_light_sleep_disable = None;
+        }
         _ => {}
     }
     if matches!(
         completion.output,
-        EffectOutput::Persisted(_)
-            | EffectOutput::RtcProgrammed
-            | EffectOutput::RtcTimeWritten
-            | EffectOutput::AckDone
-    ) {
+        EffectOutput::Persisted(_) | EffectOutput::RtcProgrammed | EffectOutput::RtcTimeWritten(_)
+    ) && state.pending_sync_metadata.is_none()
+        && state.pending_sync_rtc_op.is_none()
+    {
         for channel in [Channel::Usb, Channel::Ble] {
             if let Some((found_channel, reply)) =
                 resolve_command_confirmation(state, completion.operation_id, channel)
@@ -3021,6 +3765,26 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
     // current minute comes from the clock so the due window is sane.
     let now_minute = state.clock.now.map(|t| t.to_unix() / 60).unwrap_or(0);
     let mut render_after_failure = false;
+    if state.pending_reminder_facts == Some(failure.operation_id) {
+        state.pending_reminder_facts = None;
+    }
+    if state.pending_light_sleep_disable == Some(failure.operation_id) {
+        state.pending_light_sleep_disable = None;
+    }
+    if state.pending_reminder_operation == Some(failure.operation_id) {
+        state.pending_reminder_operation = None;
+        let mut batches = Vec::new();
+        if let Screen::Reminder(reminder) = &state.screen {
+            batches.push(batch(
+                state,
+                OperationId(0),
+                FailurePolicy::Continue,
+                vec![Effect::StartReminderTone(reminder.kind)],
+            ));
+            batches.push(render_batch(state));
+        }
+        return batches;
+    }
     match failure.error {
         // ACK / persistence failure: mark that exact commit failed and
         // schedule a retry (it stays in the alarm runtime so a later
@@ -3096,6 +3860,19 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
                 render_after_failure = true;
             }
         }
+        EffectError::Sync(_) => {
+            if state.pending_urgent_poll == Some(failure.operation_id) {
+                state.pending_urgent_poll = None;
+                state.sync_scheduler.rollback_urgent_boundary();
+            }
+            if matches!(state.sync, SyncState::Running { .. })
+                && state.pending_usb_reply.is_none()
+                && state.pending_ble_reply.is_none()
+            {
+                state.sync_scheduler.rollback_full_boundary();
+                state.sync_scheduler.rollback_urgent_boundary();
+            }
+        }
         // RTC program/disable failure (or a startup re-arm failure): NVS
         // stays authoritative, the derived register degrades, and a later
         // retry rebuilds it.
@@ -3130,6 +3907,15 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
         // surfaced but do not alter the alarm commit state in step 1.
         _ => {}
     }
+    if matches!(failure.error, EffectError::Sleep(_))
+        && state.pending_sleep_operation == Some(failure.operation_id)
+    {
+        state.sleep.cancel();
+        state.pending_sleep_inputs = None;
+        state.pending_sleep_page_allows = false;
+        state.pending_sleep_maintenance = None;
+        state.pending_sleep_operation = None;
+    }
     // A StartBlePairing failure (EffectError::Ble) while a pairing session
     // is current must not leave the SM stranded on the pairing screen with
     // no radio: exit back to the Settings BLE PAIRING row.
@@ -3154,6 +3940,35 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
         if matches!(failure.error, EffectError::Ble(_)) {
             batches.push(render_batch(state));
         }
+    }
+    if state.pending_sync_apply_op == Some(failure.operation_id) {
+        state.pending_sync_apply_op = None;
+        state.sync = SyncState::Idle;
+        state.pending_sync_data = None;
+        state.pending_sync_metadata = None;
+        state.pending_sync_rtc_op = None;
+        state.pending_sync_metadata_op = None;
+    }
+    if state.pending_sync_rtc_op == Some(failure.operation_id)
+        || state.pending_sync_metadata_op == Some(failure.operation_id)
+    {
+        state.pending_sync_rtc_op = None;
+        state.pending_sync_metadata_op = None;
+        state.pending_sync_metadata = None;
+        state.pending_sync_data = None;
+        state.sync = SyncState::Idle;
+    }
+    if state.pending_urgent_poll == Some(failure.operation_id) {
+        state.pending_urgent_poll = None;
+    }
+    if matches!(
+        state.sync,
+        SyncState::Applying { request_id } if request_id == failure.operation_id
+    ) {
+        state.sync = SyncState::Idle;
+        state.pending_sync_metadata = None;
+        state.pending_sync_rtc_op = None;
+        state.pending_sync_metadata_op = None;
     }
     let error_message = match &failure.error {
         EffectError::Persist(msg)
@@ -3202,17 +4017,52 @@ fn transition_command(
     }
 
     match request {
-        ControlRequest::SetRtc { .. } => {
-            // The firmware transport performs the RTC write directly on the
-            // main loop after validating the host timestamp. Keep a
-            // defensive reply for callers that bypass that path.
-            vec![reply_batch(
+        ControlRequest::SetRtc { epoch_secs } => {
+            // Route the host-provided Unix timestamp through the state
+            // machine instead of performing a direct RTC write on the
+            // firmware main loop. The shift to local time (epoch + stored
+            // UTC offset) is computed here; the hardware write is a
+            // confirmable `WriteRtcTime` effect executed by the effect
+            // task. The reply waits for `RtcTimeWritten`, which also
+            // triggers alarm re-derivation (P1-5 fix). Clearing the RTC
+            // alignment marker (so NTP does not later undo the host-set
+            // time) runs as a fire-and-forget persist in a separate op.
+            const MIN_EPOCH: u64 = 946_684_800; // 2000-01-01
+            const MAX_EPOCH: u64 = 4_102_444_800; // 2100-01-01
+            if !(MIN_EPOCH..=MAX_EPOCH).contains(&epoch_secs) {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "RTC timestamp must be between 2000-01-01 and 2100-01-01".into(),
+                    },
+                )];
+            }
+            let timezone_offset = state.config.timezone_offset_minutes as i32;
+            let target_time = DateTime::from_unix(epoch_secs).shifted_minutes(timezone_offset);
+            let clear_op = state.next_operation_id();
+            let time_op = state.next_operation_id();
+            set_pending_reply(
                 state,
                 channel,
-                Reply::Error {
-                    message: "RTC set command is handled by the firmware transport".into(),
-                },
-            )]
+                time_op,
+                ControlRequest::SetRtc { epoch_secs },
+                vec![time_op],
+            );
+            vec![
+                batch(
+                    state,
+                    clear_op,
+                    FailurePolicy::Continue,
+                    vec![Effect::ClearRtcAlignEpoch],
+                ),
+                batch(
+                    state,
+                    time_op,
+                    FailurePolicy::AbortBatch,
+                    vec![Effect::WriteRtcTime(target_time)],
+                ),
+            ]
         }
         ControlRequest::SyncNow => {
             // Single network operation at a time (SyncState arbitration): if
@@ -3246,7 +4096,7 @@ fn transition_command(
             // Wi-Fi verification + save runs on the network executor (it
             // owns the Wi-Fi driver); the reply is deferred like SyncNow.
             // The command takes the requesting transport's pending slot and
-            // emits StartSetWifi; Event::SetWifiCompleted resolves it. The
+            // emits StartSetWifi; Event::SetWifiVerified starts persistence. The
             // status-visible wifi facts are applied only on success (the
             // executor verified + persisted the credentials), so a failed
             // verification never leaves facts claiming credentials that are
@@ -3530,10 +4380,10 @@ fn repoint_sync_to_apply(state: &mut AppState, channel: Channel, apply_op: Opera
 /// applies the status-visible facts and builds the reply: on success the
 /// facts reflect the verified-and-persisted credentials; on failure they
 /// are left as NVS holds them.
-fn take_set_wifi_pending(state: &mut AppState, channel: Channel) -> Option<(Channel, WifiCreds)> {
+fn pending_set_wifi_creds(state: &AppState, channel: Channel) -> Option<WifiCreds> {
     let slot = match channel {
-        Channel::Usb => &mut state.pending_usb_reply,
-        Channel::Ble => &mut state.pending_ble_reply,
+        Channel::Usb => &state.pending_usb_reply,
+        Channel::Ble => &state.pending_ble_reply,
     };
     let pending = slot.as_ref()?;
     let ControlRequest::SetWifi { ssid, password } = &pending.request else {
@@ -3543,8 +4393,28 @@ fn take_set_wifi_pending(state: &mut AppState, channel: Channel) -> Option<(Chan
         ssid: ssid.clone(),
         password: password.clone(),
     };
-    *slot = None;
-    Some((channel, creds))
+    Some(creds)
+}
+
+fn pending_reply_mut(state: &mut AppState, channel: Channel) -> Option<&mut PendingReply> {
+    match channel {
+        Channel::Usb => state.pending_usb_reply.as_mut(),
+        Channel::Ble => state.pending_ble_reply.as_mut(),
+    }
+}
+
+fn pending_reply_ref(state: &AppState, channel: Channel) -> Option<&PendingReply> {
+    match channel {
+        Channel::Usb => state.pending_usb_reply.as_ref(),
+        Channel::Ble => state.pending_ble_reply.as_ref(),
+    }
+}
+
+fn take_pending_reply(state: &mut AppState, channel: Channel) -> Option<PendingReply> {
+    match channel {
+        Channel::Usb => state.pending_usb_reply.take(),
+        Channel::Ble => state.pending_ble_reply.take(),
+    }
 }
 
 /// Resolves `channel`'s pending-reply slot after one of its awaited
@@ -4390,7 +5260,31 @@ mod tests {
                 password: "pw".into(),
             }),
         );
-        let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
+        let done = update(
+            &mut state,
+            Event::SetWifiVerified(Ok(WifiCreds {
+                ssid: "net".into(),
+                password: "pw".into(),
+            })),
+        );
+        assert_eq!(state.config.wifi_ssid, None);
+        let persist_op = done
+            .iter()
+            .find_map(|b| match b.effects.first() {
+                Some(Effect::PersistWifiCredentials(_)) => Some(b.operation_id),
+                _ => None,
+            })
+            .expect("verification must admit a credential persistence effect");
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::WifiCredentials),
+            }),
+        );
         assert_eq!(state.config.wifi_ssid.as_deref(), Some("net"));
         assert!(
             done.iter()
@@ -4424,7 +5318,7 @@ mod tests {
                 effect_id: EffectId(0),
                 operation_id: time_op,
                 render_generation: None,
-                output: EffectOutput::RtcTimeWritten,
+                output: EffectOutput::RtcTimeWritten(dt(12, 0)),
             }),
         );
         let batches = update(
@@ -4467,7 +5361,30 @@ mod tests {
                 .any(|e| matches!(e, Effect::StartSetWifi(_)))
         });
         assert!(batches_has_effect);
-        let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
+        let verified = update(
+            &mut state,
+            Event::SetWifiVerified(Ok(WifiCreds {
+                ssid: "home-wifi".into(),
+                password: "sekrit".into(),
+            })),
+        );
+        let persist_op = verified
+            .iter()
+            .find_map(|b| match b.effects.first() {
+                Some(Effect::PersistWifiCredentials(_)) => Some(b.operation_id),
+                _ => None,
+            })
+            .expect("verification must produce persistence");
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::WifiCredentials),
+            }),
+        );
         assert!(done.iter().any(|b| {
             b.effects.iter().any(|e| {
                 matches!(
@@ -4499,7 +5416,7 @@ mod tests {
         );
         let done = update(
             &mut state,
-            Event::SetWifiCompleted(Err("authentication failed".into())),
+            Event::SetWifiVerified(Err("authentication failed".into())),
         );
         let error_seen = done.iter().any(|b| {
             b.effects.iter().any(|e| match e {
@@ -4521,7 +5438,13 @@ mod tests {
     #[test]
     fn set_wifi_completion_without_pending_request_is_harmless() {
         let mut state = AppState::default();
-        let done = update(&mut state, Event::SetWifiCompleted(Ok(())));
+        let done = update(
+            &mut state,
+            Event::SetWifiVerified(Ok(WifiCreds {
+                ssid: "test".into(),
+                password: "pass".into(),
+            })),
+        );
         assert!(!done
             .iter()
             .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
@@ -4728,7 +5651,7 @@ mod tests {
                 effect_id: EffectId(0),
                 operation_id: rtc_op,
                 render_generation: None,
-                output: EffectOutput::RtcTimeWritten,
+                output: EffectOutput::RtcTimeWritten(dt(18, 0)),
             }),
         );
         assert!(
@@ -4800,7 +5723,7 @@ mod tests {
                 effect_id: EffectId(0),
                 operation_id: rtc_op,
                 render_generation: None,
-                output: EffectOutput::RtcTimeWritten,
+                output: EffectOutput::RtcTimeWritten(dt(18, 0)),
             }),
         );
         assert!(
@@ -4810,6 +5733,13 @@ mod tests {
                     .any(|e| matches!(e, Effect::ProgramRtcAlarm(_)))
             }),
             "RtcTimeWritten must reprogram the hardware alarm after a clock shift"
+        );
+        // The clock fact must reflect the time that was actually written,
+        // not the stale pre-write value (used above for alarm re-derivation).
+        assert_eq!(
+            state.clock.now,
+            Some(dt(18, 0)),
+            "RtcTimeWritten must update the clock fact to the written time"
         );
     }
 
@@ -4857,6 +5787,81 @@ mod tests {
         assert_eq!(
             state.config.timezone_offset_minutes, 0,
             "offset must not change on a failed SetTimezone"
+        );
+    }
+
+    #[test]
+    fn set_rtc_routes_through_state_machine_and_clears_alignment() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.timezone_offset_minutes = 120; // UTC+2
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetRtc {
+                epoch_secs: 946_684_800 + 10 * 3600, // 2000-01-01 10:00 UTC
+            }),
+        );
+        assert!(
+            state.pending_usb_reply.is_some(),
+            "SetRtc must take a USB slot"
+        );
+        // Must emit both the alignment-clear (fire-and-forget persist) and
+        // the confirmable WriteRtcTime effect.
+        let has_clear = batches.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearRtcAlignEpoch))
+        });
+        let write_rtc = batches.iter().find(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::WriteRtcTime(_)))
+        });
+        assert!(has_clear, "SetRtc must clear the RTC alignment marker");
+        let rtc_batch = write_rtc.expect("SetRtc must emit a WriteRtcTime effect");
+        assert!(
+            matches!(
+                rtc_batch.effects.iter().find(|e| matches!(e, Effect::WriteRtcTime(_))),
+                Some(Effect::WriteRtcTime(dt)) if dt.hour == 12 && dt.minute == 0
+            ),
+            "WriteRtcTime must carry local time (epoch UTC 10:00 + 120 min offset -> 12:00)"
+        );
+        let rtc_op = rtc_batch.operation_id;
+        // RTC write confirms: clock fact must update to the written time,
+        // alarm must re-derive from the new time, and the reply must fire.
+        let confirmed = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                output: EffectOutput::RtcTimeWritten(dt(12, 0)),
+            }),
+        );
+        assert_eq!(
+            state.clock.now,
+            Some(dt(12, 0)),
+            "clock must reflect written time"
+        );
+        let has_reply = confirmed.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Ok
+                    }
+                )
+            })
+        });
+        assert!(
+            has_reply,
+            "RtcTimeWritten must fire the pending SetRtc reply"
+        );
+        assert!(
+            state.pending_usb_reply.is_none(),
+            "slot released on confirm"
         );
     }
 
@@ -4937,6 +5942,128 @@ mod tests {
     }
 
     #[test]
+    fn tick_owns_full_sync_boundary_and_starts_single_flight() {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let boot_now = dt(10, 0);
+        let _ = update(
+            &mut state,
+            Event::SyncSchedulerConfigured(SyncSchedulerConfig {
+                now_unix: boot_now.to_unix(),
+                interval_minutes: 1,
+                last_sync_epoch: Some(boot_now.to_unix()),
+            }),
+        );
+        let batches = update(&mut state, Event::Tick(dt(10, 1)));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        assert!(batches
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))));
+    }
+
+    #[test]
+    fn urgent_poll_completion_returns_to_app_before_starting_sync() {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let boot_now = dt(10, 0);
+        let _ = update(
+            &mut state,
+            Event::SyncSchedulerConfigured(SyncSchedulerConfig {
+                now_unix: boot_now.to_unix(),
+                interval_minutes: 60,
+                last_sync_epoch: Some(boot_now.to_unix()),
+            }),
+        );
+        let poll = update(&mut state, Event::Tick(dt(10, 1)));
+        assert!(poll
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::PollUrgent))));
+        assert_eq!(state.sync, SyncState::Idle);
+        let sync = update(&mut state, Event::UrgentPollCompleted { available: true });
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+        assert!(sync
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))));
+    }
+
+    #[test]
+    fn urgent_poll_failure_restores_boundary_for_retry() {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let boot_now = dt(10, 0);
+        let _ = update(
+            &mut state,
+            Event::SyncSchedulerConfigured(SyncSchedulerConfig {
+                now_unix: boot_now.to_unix(),
+                interval_minutes: 60,
+                last_sync_epoch: Some(boot_now.to_unix()),
+            }),
+        );
+        let tick = DateTime {
+            second: 31,
+            ..boot_now
+        };
+        let poll = update(&mut state, Event::Tick(tick));
+        let op = poll
+            .iter()
+            .find(|b| b.effects.iter().any(|e| matches!(e, Effect::PollUrgent)))
+            .unwrap()
+            .operation_id;
+        let _ = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Sync("poll failed".into()),
+            }),
+        );
+        assert!(update(&mut state, Event::Tick(tick))
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::PollUrgent))));
+    }
+
+    #[test]
+    fn full_sync_start_failure_restores_boundary_for_retry() {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let boot_now = dt(10, 0);
+        let _ = update(
+            &mut state,
+            Event::SyncSchedulerConfigured(SyncSchedulerConfig {
+                now_unix: boot_now.to_unix(),
+                interval_minutes: 1,
+                last_sync_epoch: Some(boot_now.to_unix()),
+            }),
+        );
+        let tick = dt(10, 1);
+        let start = update(&mut state, Event::Tick(tick));
+        let op = start
+            .iter()
+            .find(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_))))
+            .unwrap()
+            .operation_id;
+        let _ = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: op,
+                render_generation: None,
+                error: EffectError::Sync("start failed".into()),
+            }),
+        );
+        assert!(update(&mut state, Event::Tick(tick))
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))));
+    }
+
+    #[test]
     fn sync_now_while_running_replies_busy_on_either_transport() {
         let mut state = AppState::default();
         state.clock.now = Some(dt(10, 0));
@@ -4966,16 +6093,16 @@ mod tests {
         state.clock.now = Some(dt(10, 0));
         let _ = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
         assert!(matches!(state.sync, SyncState::Running { .. }));
-        // SyncCompleted(Ok) adopts the merged data and emits an apply batch
-        // - no reply yet (persist must confirm before Ok).
+        // SyncCompleted(Ok) stages the merged data and emits an apply batch;
+        // visible lists remain unchanged until the local apply confirms.
         let applied = update(
             &mut state,
             Event::SyncCompleted(SyncResult::Ok {
                 data: synced_data(vec![alarm(1, 9, 0), alarm(2, 10, 30)]),
             }),
         );
-        assert_eq!(state.alarms.alarms, vec![alarm(1, 9, 0), alarm(2, 10, 30)]);
-        assert_eq!(state.sync, SyncState::Idle);
+        assert!(state.alarms.alarms.is_empty());
+        assert!(matches!(state.sync, SyncState::Applying { .. }));
         assert!(state.pending_ble_reply.is_some(), "slot awaits the apply");
         assert!(!applied
             .iter()
@@ -4989,8 +6116,9 @@ mod tests {
                     .then_some(b.operation_id)
             })
             .expect("SyncCompleted(Ok) must emit an apply");
-        // Apply confirms -> final Ok on BLE, slot released.
-        let done = update(
+        // Apply confirms -> data is adopted and rendered, then the new alarm
+        // plan must be confirmed before the sync can commit.
+        let rtc_batches = update(
             &mut state,
             Event::EffectCompleted(EffectCompletion {
                 batch_id: EffectBatchId(0),
@@ -4998,6 +6126,30 @@ mod tests {
                 operation_id: apply_op,
                 render_generation: None,
                 output: EffectOutput::Persisted(PersistTarget::SyncApply),
+            }),
+        );
+        assert_eq!(state.alarms.alarms, vec![alarm(1, 9, 0), alarm(2, 10, 30)]);
+        assert!(rtc_batches
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Render(_)))));
+        assert!(state.sync_scheduler.is_never_synced());
+        let rtc_op = rtc_batches
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm))
+                    .then_some(b.operation_id)
+            })
+            .expect("sync apply must confirm the RTC plan");
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
             }),
         );
         assert!(done.iter().any(|b| {
@@ -5013,12 +6165,154 @@ mod tests {
         }));
         assert!(state.pending_ble_reply.is_none());
         assert!(state.pending_usb_reply.is_none());
+        assert!(!state.sync_scheduler.is_never_synced());
+    }
+
+    #[test]
+    fn sync_metadata_failure_does_not_mark_scheduler_complete() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let applied = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::OkWithMetadata {
+                data: synced_data(vec![alarm(1, 11, 0)]),
+                last_sync_epoch: 123,
+                ntp_epoch: None,
+            }),
+        );
+        let apply_op = applied
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ApplySyncedData(_)))
+                    .then_some(b.operation_id)
+            })
+            .unwrap();
+        let rtc_batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: apply_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::SyncApply),
+            }),
+        );
+        let rtc_op = rtc_batches
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm))
+                    .then_some(b.operation_id)
+            })
+            .unwrap();
+        let metadata_batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: rtc_op,
+                render_generation: None,
+                output: EffectOutput::RtcProgrammed,
+            }),
+        );
+        let metadata_op = metadata_batches
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistSyncMetadata(_)))
+                    .then_some(b.operation_id)
+            })
+            .unwrap();
+        let failed = update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: metadata_op,
+                render_generation: None,
+                error: EffectError::Persist("metadata failed".into()),
+            }),
+        );
+        assert!(state.sync_scheduler.is_never_synced());
+        assert!(failed.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Usb,
+                        reply: Reply::Error { message }
+                    } if message.contains("metadata failed")
+                )
+            })
+        }));
+        assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn sync_apply_pipeline_blocks_second_sync_and_sleep() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let applied = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                data: synced_data(vec![alarm(1, 11, 0)]),
+            }),
+        );
+        assert!(matches!(state.sync, SyncState::Applying { .. }));
+        let busy = update(&mut state, Event::BleCommand(ControlRequest::SyncNow));
+        assert!(busy.iter().any(|b| {
+            b.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Reply {
+                        channel: Channel::Ble,
+                        reply: Reply::Busy
+                    }
+                )
+            })
+        }));
+
+        state.requested_sleep = Some(SleepKind::Deep);
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        let _ = update(&mut state, Event::PowerPoll(poll(0)));
+        let sleep = update(&mut state, Event::PowerPoll(poll(2_000)));
+        assert!(!sleep.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::PrepareSleep { .. }))
+        }));
+        assert_eq!(state.requested_sleep, Some(SleepKind::Deep));
+        assert!(state.pending_sync_data.is_some());
+        assert!(applied.iter().any(|b| {
+            b.effects
+                .iter()
+                .any(|e| matches!(e, Effect::ApplySyncedData(_)))
+        }));
     }
 
     #[test]
     fn sync_completed_apply_failure_replies_error_and_releases_slot() {
         let mut state = AppState::default();
         state.clock.now = Some(dt(10, 0));
+        state.alarms.alarms = vec![alarm(9, 8, 0)];
+        let original_alarms = state.alarms.alarms.clone();
         let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
         let applied = update(
             &mut state,
@@ -5058,6 +6352,8 @@ mod tests {
             state.pending_usb_reply.is_none(),
             "slot released on apply failure"
         );
+        assert_eq!(state.alarms.alarms, original_alarms);
+        assert!(state.pending_sync_data.is_none());
     }
 
     #[test]
@@ -5122,8 +6418,31 @@ mod tests {
                 data: synced_data(vec![alarm(1, 9, 0), alarm(2, 10, 30)]),
             }),
         );
+        assert_eq!(state.alarms.alarms, vec![alarm(1, 9, 0)]);
+        assert!(!batches
+            .iter()
+            .any(|b| { b.effects.iter().any(|e| matches!(e, Effect::Render(_))) }));
+        let apply_op = batches
+            .iter()
+            .find_map(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ApplySyncedData(_)))
+                    .then_some(b.operation_id)
+            })
+            .expect("sync adopt must emit apply");
+        let after_apply = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: apply_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::SyncApply),
+            }),
+        );
         assert_eq!(state.alarms.alarms, vec![alarm(1, 9, 0), alarm(2, 10, 30)]);
-        let render_requests: Vec<_> = batches
+        let render_requests: Vec<_> = after_apply
             .iter()
             .flat_map(|b| &b.effects)
             .filter_map(|e| match e {
@@ -5131,7 +6450,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(render_requests.len(), 1, "sync adopt emits one render");
+        assert_eq!(
+            render_requests.len(),
+            1,
+            "confirmed sync adopt emits one render"
+        );
         let vm = &render_requests[0].view_model;
         assert_eq!(vm.view, RenderView::AlarmList { selected: 0 });
         // The fingerprint must differ from the pre-sync single-alarm list.
@@ -5795,12 +7118,15 @@ mod tests {
     }
 
     #[test]
-    fn settings_sleep_row_emits_deep_sleep_effect() {
+    fn settings_sleep_row_requests_tokenized_sleep() {
         let mut state = AppState::default();
         let _ = update(
             &mut state,
             Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
         );
+        // Boot's RTC disable is an effect; settle that mechanical fact before
+        // asking the state machine to admit sleep.
+        state.pending_rtc = None;
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
@@ -5827,16 +7153,427 @@ mod tests {
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
         assert_eq!(state.screen, Screen::Settings { selected: 3 });
-        let batches = update(
+        let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        // Sleep is an SM effect now (deep sleep with the maintenance wake);
-        // no legacy wedge for the Sleep row.
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        let _ = update(&mut state, Event::PowerPoll(poll(0)));
+        let batches = update(&mut state, Event::PowerPoll(poll(2_000)));
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::EnterDeepSleep(WakeupPlan { .. }))));
+            .any(|e| matches!(e, Effect::PrepareSleep { .. })));
+        assert!(state.sleep.prepared_token().is_some());
+    }
+
+    #[test]
+    fn power_poll_drives_manual_sleep_prepare_commit_and_enter() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            ..AppState::default()
+        };
+        let poll = |now_ticks, wake_plan_confirmed| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        let _ = update(&mut state, Event::PowerPoll(poll(0, false)));
+        let prepared = update(&mut state, Event::PowerPoll(poll(2_000, false)));
+        let token = state.sleep.prepared_token().expect("sleep token");
+        assert!(prepared
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::PrepareSleep { .. })));
+        let committed = update(
+            &mut state,
+            Event::SleepPrepared {
+                token,
+                inputs: SleepInputs {
+                    wake_plan_confirmed: true,
+                    page_allows_sleep: true,
+                    event_queue_empty: true,
+                    input_latch_clear: true,
+                    rtc_plan_confirmed: true,
+                    ..SleepInputs::default()
+                },
+            },
+        );
+        assert!(committed
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::CommitSleep(_))));
+        let entered = update(&mut state, Event::SleepCommitted(token));
+        assert!(entered
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::EnterDeepSleep(_))));
+        let duplicate = update(&mut state, Event::SleepCommitted(token));
+        assert!(!duplicate
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::EnterDeepSleep(_))));
+    }
+
+    #[test]
+    fn deep_sleep_prepare_fact_requires_wake_plan_confirmation() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            ..AppState::default()
+        };
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: false,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(&mut state, Event::PowerPoll(poll(0)));
+        update(&mut state, Event::PowerPoll(poll(2_000)));
+        let token = state.sleep.prepared_token().expect("prepared token");
+        let batches = update(
+            &mut state,
+            Event::SleepPrepared {
+                token,
+                inputs: SleepInputs {
+                    page_allows_sleep: true,
+                    event_queue_empty: true,
+                    input_latch_clear: true,
+                    rtc_plan_confirmed: true,
+                    wake_plan_confirmed: false,
+                    ..SleepInputs::default()
+                },
+            },
+        );
+        assert!(batches.is_empty());
+        assert!(state.sleep.prepared_token().is_none());
+        assert!(state.pending_sleep_operation.is_none());
+    }
+
+    #[test]
+    fn stale_sleep_failure_does_not_cancel_new_prepared_token() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            ..AppState::default()
+        };
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(&mut state, Event::PowerPoll(poll(0)));
+        let first_batches = update(&mut state, Event::PowerPoll(poll(2_000)));
+        let first_token = state.sleep.prepared_token().expect("first token");
+        let first_batch = first_batches.first().expect("prepare batch");
+        let first_operation = first_batch.operation_id;
+
+        update(&mut state, Event::SleepCancelled(first_token));
+        state.requested_sleep = Some(SleepKind::Deep);
+        update(&mut state, Event::PowerPoll(poll(4_000)));
+        let second_token = state.sleep.prepared_token().expect("second token");
+        assert_ne!(first_token, second_token);
+        let second_operation = state.pending_sleep_operation.expect("second operation");
+        assert_ne!(first_operation, second_operation);
+
+        update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: first_batch.id,
+                effect_id: EffectId(1),
+                operation_id: first_operation,
+                render_generation: None,
+                error: EffectError::Sleep("stale prepare failure".into()),
+            }),
+        );
+        assert_eq!(state.sleep.prepared_token(), Some(second_token));
+        assert_eq!(state.pending_sleep_operation, Some(second_operation));
+    }
+
+    #[test]
+    fn activity_power_poll_invalidates_committed_sleep() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            ..AppState::default()
+        };
+        let poll = |now_ticks, activity_observed| PowerPoll {
+            now_ticks,
+            activity_observed,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(&mut state, Event::PowerPoll(poll(0, false)));
+        update(&mut state, Event::PowerPoll(poll(2_000, false)));
+        let token = state.sleep.prepared_token().expect("prepared token");
+        update(
+            &mut state,
+            Event::SleepPrepared {
+                token,
+                inputs: SleepInputs {
+                    wake_plan_confirmed: true,
+                    page_allows_sleep: true,
+                    event_queue_empty: true,
+                    input_latch_clear: true,
+                    rtc_plan_confirmed: true,
+                    ..SleepInputs::default()
+                },
+            },
+        );
+        update(&mut state, Event::SleepCommitted(token));
+        assert_eq!(state.sleep.committed_kind(), Some(SleepKind::Deep));
+
+        update(&mut state, Event::PowerPoll(poll(3_000, true)));
+        assert_eq!(state.sleep.committed_kind(), None);
+        assert!(state.pending_sleep_operation.is_none());
+    }
+
+    #[test]
+    fn urgent_poll_blocks_deep_sleep_admission() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            pending_urgent_poll: Some(OperationId(77)),
+            ..AppState::default()
+        };
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(&mut state, Event::PowerPoll(poll(0)));
+        let batches = update(&mut state, Event::PowerPoll(poll(2_000)));
+        assert!(!batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|effect| { matches!(effect, Effect::PrepareSleep { .. }) }));
+        assert_eq!(state.requested_sleep, Some(SleepKind::Deep));
+        assert!(state.sleep.prepared_token().is_none());
+    }
+
+    #[test]
+    fn light_sleep_completion_closes_enter_operation() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Light),
+            ..AppState::default()
+        };
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(&mut state, Event::PowerPoll(poll(0)));
+        update(&mut state, Event::PowerPoll(poll(2_000)));
+        let token = state.sleep.prepared_token().expect("prepared token");
+        update(
+            &mut state,
+            Event::SleepPrepared {
+                token,
+                inputs: SleepInputs {
+                    page_allows_sleep: true,
+                    event_queue_empty: true,
+                    input_latch_clear: true,
+                    rtc_plan_confirmed: true,
+                    ..SleepInputs::default()
+                },
+            },
+        );
+        let entered = update(&mut state, Event::SleepCommitted(token));
+        let enter_batch = entered
+            .iter()
+            .find(|batch| {
+                batch
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::EnterLightSleep(_)))
+            })
+            .expect("enter-light batch");
+        let operation_id = enter_batch.operation_id;
+        assert_eq!(state.pending_sleep_operation, Some(operation_id));
+
+        update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: enter_batch.id,
+                effect_id: EffectId(1),
+                operation_id,
+                render_generation: None,
+                output: EffectOutput::LightSleepEntered,
+            }),
+        );
+        assert_eq!(state.sleep.committed_kind(), Some(SleepKind::Light));
+        assert!(state.pending_sleep_operation.is_none());
+
+        update(&mut state, Event::Tick(dt(8, 1)));
+        assert!(state.sleep.committed_kind().is_none());
+    }
+
+    #[test]
+    fn light_sleep_failure_cancels_matching_token_for_retry() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Light),
+            ..AppState::default()
+        };
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(&mut state, Event::PowerPoll(poll(0)));
+        let prepare = update(&mut state, Event::PowerPoll(poll(2_000)));
+        let prepare_batch = prepare.first().expect("prepare batch");
+        let operation_id = prepare_batch.operation_id;
+        update(
+            &mut state,
+            Event::EffectFailed(EffectFailure {
+                batch_id: prepare_batch.id,
+                effect_id: EffectId(1),
+                operation_id,
+                render_generation: None,
+                error: EffectError::Sleep("light wake setup failed".into()),
+            }),
+        );
+        assert!(state.sleep.prepared_token().is_none());
+        state.requested_sleep = Some(SleepKind::Light);
+        let retry = update(&mut state, Event::PowerPoll(poll(4_000)));
+        assert!(retry.iter().flat_map(|batch| &batch.effects).any(|effect| {
+            matches!(effect, Effect::PrepareSleep { token, .. } if token.kind == SleepKind::Light)
+        }));
+    }
+
+    #[test]
+    fn new_input_cancels_sleep_token_before_commit() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            ..AppState::default()
+        };
+        let poll = PowerPoll {
+            now_ticks: 2_000,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: false,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(
+            &mut state,
+            Event::PowerPoll(PowerPoll {
+                now_ticks: 0,
+                ..poll
+            }),
+        );
+        update(&mut state, Event::PowerPoll(poll));
+        let token = state.sleep.prepared_token().unwrap();
+        update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(!state.sleep.is_committed(token));
+        assert!(update(
+            &mut state,
+            Event::SleepPrepared {
+                token,
+                inputs: SleepInputs {
+                    wake_plan_confirmed: true,
+                    rtc_plan_confirmed: true,
+                    page_allows_sleep: true,
+                    event_queue_empty: true,
+                    input_latch_clear: true,
+                    ..SleepInputs::default()
+                },
+            },
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn sleep_request_survives_release_tick_and_activity_poll_until_prepare() {
+        let mut state = AppState {
+            requested_sleep: Some(SleepKind::Deep),
+            ..AppState::default()
+        };
+        let poll = |now_ticks, activity_observed| PowerPoll {
+            now_ticks,
+            activity_observed,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        update(
+            &mut state,
+            Event::Button(ButtonEvent::Released(ButtonId::Enter)),
+        );
+        update(&mut state, Event::Tick(dt(8, 1)));
+        update(&mut state, Event::PowerPoll(poll(0, true)));
+        assert_eq!(state.requested_sleep, Some(SleepKind::Deep));
+        let batches = update(&mut state, Event::PowerPoll(poll(2_000, false)));
+        assert!(batches
+            .iter()
+            .flat_map(|batch| &batch.effects)
+            .any(|effect| matches!(effect, Effect::PrepareSleep { .. })));
     }
 
     #[test]
@@ -5854,6 +7591,7 @@ mod tests {
             &mut state,
             Event::Boot(boot_snapshot(list, Some(dt(8, 1)), false, true)),
         );
+        state.pending_rtc = None;
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
@@ -5873,17 +7611,28 @@ mod tests {
                 Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
             );
         }
-        let batches = update(
+        let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        assert!(batches.iter().flat_map(|b| &b.effects).any(|e| matches!(
-            e,
-            Effect::EnterDeepSleep(WakeupPlan {
-                maintenance: Some(_),
-                ..
-            })
-        )));
+        let poll = |now_ticks| PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        };
+        let _ = update(&mut state, Event::PowerPoll(poll(0)));
+        let batches = update(&mut state, Event::PowerPoll(poll(2_000)));
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::PrepareSleep { .. })));
     }
 
     #[test]
@@ -8521,6 +10270,8 @@ mod tests {
             Event::ReminderDue(ReminderPayload {
                 kind: ReminderKind::Urgent,
                 lines: vec!["URGENT: server down".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
             }),
         );
         assert!(matches!(
@@ -8553,6 +10304,50 @@ mod tests {
     }
 
     #[test]
+    fn reminder_persistence_releases_tone_and_render_after_worker_completion() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let batches = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Urgent,
+                lines: vec!["urgent".into()],
+                urgent_read_ids: vec![7, 9],
+                todo_date: None,
+            }),
+        );
+        assert_eq!(batches.len(), 1);
+        assert!(matches!(batches[0].effects[0], Effect::PersistReminder(_)));
+        let operation_id = batches[0].operation_id;
+        assert!(!batches.iter().any(|batch| batch
+            .effects
+            .iter()
+            .any(|effect| { matches!(effect, Effect::StartReminderTone(_)) })));
+
+        let completed = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: batches[0].id,
+                effect_id: EffectId(0),
+                operation_id,
+                render_generation: batches[0].render_generation,
+                output: EffectOutput::ReminderPersisted,
+            }),
+        );
+        assert!(completed
+            .iter()
+            .any(|batch| batch.effects.iter().any(|effect| {
+                matches!(effect, Effect::StartReminderTone(ReminderKind::Urgent))
+            })));
+        assert!(completed
+            .iter()
+            .any(|batch| batch.render_generation.is_some()));
+    }
+
+    #[test]
     fn reminder_any_button_dismisses_restores_and_stops_tone() {
         let mut state = AppState::default();
         let _ = update(
@@ -8565,6 +10360,8 @@ mod tests {
             Event::ReminderDue(ReminderPayload {
                 kind: ReminderKind::Todo,
                 lines: vec!["todo due".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
             }),
         );
         assert!(matches!(state.screen, Screen::Reminder(_)));
@@ -8598,6 +10395,8 @@ mod tests {
             Event::ReminderDue(ReminderPayload {
                 kind: ReminderKind::Todo,
                 lines: vec!["due".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
             }),
         );
         assert!(matches!(state.screen, Screen::Reminder(_)));
@@ -8629,6 +10428,8 @@ mod tests {
             Event::ReminderDue(ReminderPayload {
                 kind: ReminderKind::Urgent,
                 lines: vec!["urgent".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
             }),
         );
         assert!(matches!(state.screen, Screen::Reminder(_)));
@@ -8664,6 +10465,8 @@ mod tests {
             Event::ReminderDue(ReminderPayload {
                 kind: ReminderKind::Todo,
                 lines: vec!["due".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
             }),
         );
         assert!(matches!(state.screen, Screen::Reminder(_)));
@@ -8720,6 +10523,8 @@ mod tests {
             Event::ReminderDue(ReminderPayload {
                 kind: ReminderKind::Todo,
                 lines: vec!["due".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
             }),
         );
         assert!(matches!(state.screen, Screen::Reminder(_)));
@@ -9635,4 +11440,14 @@ mod tests {
 pub struct ReminderPayload {
     pub kind: ReminderKind,
     pub lines: Vec<String>,
+    /// Inbox sequence numbers to mark read as part of presenting this fact.
+    pub urgent_read_ids: Vec<u64>,
+    /// Date key to record for a due-todo reminder, if applicable.
+    pub todo_date: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReminderPersistence {
+    pub urgent_read_ids: Vec<u64>,
+    pub todo_date: Option<String>,
 }

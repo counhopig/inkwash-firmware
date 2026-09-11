@@ -11,8 +11,40 @@
 //! records calls and scripts failures.
 
 use crate::app::{
-    Effect, EffectBatchId, EffectError, EffectId, EffectOutput, OperationId, RenderGeneration,
+    Effect, EffectBatch, EffectBatchId, EffectCompletion, EffectError, EffectFailure, EffectId,
+    EffectOutput, OperationId, RenderGeneration,
 };
+
+/// Whether a whole batch can run in the independent effect worker.
+/// Main-thread resources are batch barriers: the caller keeps the entire
+/// batch together so effect order and `AbortBatch` remain unchanged.
+pub fn batch_is_worker_safe(batch: &EffectBatch) -> bool {
+    batch.effects.iter().all(|effect| {
+        matches!(
+            effect,
+            Effect::PersistAlarms(_)
+                | Effect::PersistTodos(_)
+                | Effect::PersistInbox(_)
+                | Effect::PersistConfig(_)
+                | Effect::PersistWifiCredentials(_)
+                | Effect::PersistTimezone(_)
+                | Effect::ApplySyncedData(_)
+                | Effect::PersistSyncMetadata(_)
+                | Effect::ClearSyncEtag
+                | Effect::ClearRtcAlignEpoch
+                | Effect::MarkInboxRead { .. }
+                | Effect::PersistReminder(_)
+                | Effect::CollectReminderFacts(_)
+                | Effect::SetSyncInterval { .. }
+                | Effect::PersistAlarmToggle { .. }
+                | Effect::PersistTodoEdit { .. }
+                | Effect::ProgramRtcAlarm(_)
+                | Effect::WriteRtcTime(_)
+                | Effect::DisableRtcAlarm
+                | Effect::AcknowledgeRtcAlarm
+        )
+    })
+}
 
 /// Per-category failure classification, mirroring the state machine's
 /// `EffectError` variants. The executor reports which category an
@@ -70,6 +102,72 @@ pub trait EffectExecutor {
     fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)>;
 }
 
+/// Owned result of executing one effect batch. The executor never applies the
+/// resulting events itself; the Runtime enqueues them after every effect in
+/// the current batch has run, so an A-completion-derived batch cannot interrupt
+/// the current batch's remaining effects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchNotice {
+    Completed(EffectCompletion),
+    Failed(EffectFailure),
+    Async(AsyncKick),
+}
+
+/// Execute one batch in array order without owning or touching Runtime.
+/// Synchronous completion/failure notices are returned as owned events for the
+/// application loop to enqueue. `AbortBatch` stops only effects after the
+/// first failure; it never rolls back effects already executed.
+pub fn execute_batch<E: EffectExecutor>(batch: EffectBatch, executor: &mut E) -> Vec<BatchNotice> {
+    let mut notices = Vec::new();
+    for (idx, effect) in batch.effects.iter().cloned().enumerate() {
+        let effect_id = EffectId(idx as u64 + 1);
+        match executor.run(&effect) {
+            Ok(EffectOutcome::Completed(output)) => {
+                notices.push(BatchNotice::Completed(EffectCompletion {
+                    batch_id: batch.id,
+                    effect_id,
+                    operation_id: batch.operation_id,
+                    render_generation: batch.render_generation,
+                    output,
+                }));
+            }
+            Ok(EffectOutcome::AsyncWithId(request_id)) => {
+                notices.push(BatchNotice::Async(AsyncKick {
+                    batch_id: batch.id,
+                    effect_id,
+                    operation_id: batch.operation_id,
+                    render_generation: batch.render_generation,
+                    effect,
+                    request_id: Some(request_id),
+                }));
+            }
+            Ok(EffectOutcome::Async) => {
+                notices.push(BatchNotice::Async(AsyncKick {
+                    batch_id: batch.id,
+                    effect_id,
+                    operation_id: batch.operation_id,
+                    render_generation: batch.render_generation,
+                    effect,
+                    request_id: None,
+                }));
+            }
+            Err((category, msg)) => {
+                notices.push(BatchNotice::Failed(EffectFailure {
+                    batch_id: batch.id,
+                    effect_id,
+                    operation_id: batch.operation_id,
+                    render_generation: batch.render_generation,
+                    error: err_for_category(category, &msg),
+                }));
+                if batch.failure_policy == crate::app::FailurePolicy::AbortBatch {
+                    break;
+                }
+            }
+        }
+    }
+    notices
+}
+
 /// Maps a per-category failure into the state machine's `EffectError`.
 pub fn err_for_category(category: EffectCategory, msg: &str) -> EffectError {
     match category {
@@ -81,5 +179,74 @@ pub fn err_for_category(category: EffectCategory, msg: &str) -> EffectError {
         EffectCategory::Tone => EffectError::Tone(msg.to_string()),
         EffectCategory::Sleep => EffectError::Sleep(msg.to_string()),
         EffectCategory::Ble => EffectError::Ble(msg.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{EffectBatchId, FailurePolicy, OperationId};
+
+    struct Recorder {
+        order: Vec<&'static str>,
+    }
+
+    impl EffectExecutor for Recorder {
+        fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
+            self.order.push(match effect {
+                Effect::StartTone => "A",
+                Effect::StopTone => "B",
+                _ => "other",
+            });
+            Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
+        }
+    }
+
+    #[test]
+    fn execute_batch_runs_all_effects_before_returning_completion_notices() {
+        let mut recorder = Recorder { order: Vec::new() };
+        let notices = execute_batch(
+            EffectBatch {
+                id: EffectBatchId(1),
+                operation_id: OperationId(1),
+                render_generation: None,
+                effects: vec![Effect::StartTone, Effect::StopTone],
+                failure_policy: FailurePolicy::Continue,
+            },
+            &mut recorder,
+        );
+        assert_eq!(recorder.order, vec!["A", "B"]);
+        assert_eq!(notices.len(), 2);
+        assert!(matches!(notices[0], BatchNotice::Completed(_)));
+        assert!(matches!(notices[1], BatchNotice::Completed(_)));
+    }
+
+    #[test]
+    fn worker_route_keeps_main_thread_effects_as_whole_batch() {
+        let worker_batch = EffectBatch {
+            id: EffectBatchId(2),
+            operation_id: OperationId(1),
+            render_generation: None,
+            effects: vec![
+                Effect::PersistTimezone(480),
+                Effect::ProgramRtcAlarm(crate::alarm_regs::AlarmRegs {
+                    minute: 0,
+                    hour: 0,
+                    day: None,
+                    weekday: None,
+                }),
+            ],
+            failure_policy: FailurePolicy::AbortBatch,
+        };
+        assert!(batch_is_worker_safe(&worker_batch));
+
+        let main_batch = EffectBatch {
+            id: EffectBatchId(3),
+            operation_id: OperationId(2),
+            render_generation: None,
+            effects: vec![Effect::PersistTimezone(480), Effect::StopTone],
+            failure_policy: FailurePolicy::AbortBatch,
+        };
+        assert!(!batch_is_worker_safe(&main_batch));
     }
 }

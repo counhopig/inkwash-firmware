@@ -128,12 +128,6 @@ impl InboxStore {
         self.write_blob(KEY_PENDING, &remaining)
     }
 
-    /// Count of locally-unread items (for the home badge). `Alert` items that
-    /// have been notified also count as unread until the user opens them.
-    pub fn unread_count(&self) -> Result<usize> {
-        Ok(self.load()?.iter().filter(|it| !it.read).count())
-    }
-
     /// The `seq`s of unread high-priority `alert` items, in store order. These
     /// drive the urgent full-screen reminder + tone.
     pub fn unread_urgent(&self) -> Result<Vec<u64>> {

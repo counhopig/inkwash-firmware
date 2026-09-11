@@ -17,7 +17,6 @@
 //! machine's StartTone effect fails cleanly (audio is a "degraded run, not a
 //! blocker" category), so an alarm still rings visually and dismisses.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -44,15 +43,14 @@ const BEEP_COUNT: u8 = 3;
 
 /// What the audio task should play.
 pub use inkwash_logic::audio_command::AudioCommand;
-use inkwash_logic::audio_command::{AudioMode, AudioReducer};
+use inkwash_logic::audio_command::{AudioMailbox, AudioMode, AudioReducer};
 
 /// Handle kept by the main loop: the command sender.
 pub struct AudioTask {
-    /// A tiny mutex-protected mailbox keeps submissions non-blocking. The
-    /// old bounded `sync_channel::send` could stall the app loop when the
-    /// codec was busy; commands are never dropped, including Stop and alarm
-    /// starts.
-    mailbox: Arc<Mutex<VecDeque<AudioCommand>>>,
+    /// A fixed-capacity mutex-protected mailbox keeps submissions non-blocking.
+    /// Critical Stop/alarm commands coalesce when full; reminder commands
+    /// return backpressure to the effect runner instead of being dropped.
+    mailbox: Arc<Mutex<AudioMailbox>>,
 }
 
 /// Result of a spawned audio task.
@@ -74,7 +72,7 @@ impl AudioTask {
         // executor StartTone did this set_mute(false)).
         codec.set_mute(false)?;
 
-        let mailbox = Arc::new(Mutex::new(VecDeque::new()));
+        let mailbox = Arc::new(Mutex::new(AudioMailbox::new()));
         let task_mailbox = mailbox.clone();
         thread::Builder::new()
             .stack_size(8 * 1024)
@@ -105,15 +103,18 @@ impl AudioTask {
     }
 
     fn enqueue(&self, command: AudioCommand) -> Result<()> {
-        self.mailbox
+        let mut mailbox = self
+            .mailbox
             .lock()
-            .map_err(|_| anyhow!("audio mailbox poisoned"))?
-            .push_back(command);
+            .map_err(|_| anyhow!("audio mailbox poisoned"))?;
+        mailbox.enqueue(command).map_err(|rejected| {
+            anyhow!("audio mailbox full; rejected reminder command {rejected:?}")
+        })?;
         Ok(())
     }
 }
 
-fn run(mut codec: Es8311, mailbox: Arc<Mutex<VecDeque<AudioCommand>>>) {
+fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>) {
     log::info!("Audio task running");
     let watchdog_subscribed = match watchdog::subscribe() {
         Ok(()) => true,
@@ -174,11 +175,7 @@ fn run(mut codec: Es8311, mailbox: Arc<Mutex<VecDeque<AudioCommand>>>) {
 
 /// Drain commands during a tone gap. Every command is reduced explicitly;
 /// in particular a StartAlarmTone is never mistaken for Stop.
-fn wait_gap(
-    mailbox: &Arc<Mutex<VecDeque<AudioCommand>>>,
-    reducer: &mut AudioReducer,
-    duration: Duration,
-) {
+fn wait_gap(mailbox: &Arc<Mutex<AudioMailbox>>, reducer: &mut AudioReducer, duration: Duration) {
     let until = EspSystemTime {}.now() + duration;
     while (EspSystemTime {}).now() < until {
         drain_commands(mailbox, reducer);
@@ -186,9 +183,9 @@ fn wait_gap(
     }
 }
 
-fn drain_commands(mailbox: &Arc<Mutex<VecDeque<AudioCommand>>>, reducer: &mut AudioReducer) {
+fn drain_commands(mailbox: &Arc<Mutex<AudioMailbox>>, reducer: &mut AudioReducer) {
     let commands = match mailbox.lock() {
-        Ok(mut queue) => queue.drain(..).collect::<Vec<_>>(),
+        Ok(mut queue) => queue.drain().collect::<Vec<_>>(),
         Err(_) => return,
     };
     for command in commands {

@@ -15,7 +15,8 @@
 //! without fighting the borrow checker.
 
 use anyhow::Result;
-use std::sync::mpsc::TryRecvError;
+use std::collections::VecDeque;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
@@ -27,50 +28,236 @@ use crate::storage::{PersistedCounters, WifiCreds};
 use crate::sync;
 use crate::sync_task::{PendingWifiOp, SyncTask};
 use crate::todos::TodoStore;
-use crate::usb_console::UsbConsole;
+use crate::usb_console::{QueuedReply, ReplyQueueError, UsbConsole, UsbReplyWriter};
 
-/// Wall-clock sync cursors shared by Home and every blocking UI loop.
-/// Keeping them here prevents each screen from inventing its own timer and
-/// ensures a successful first sync disables the fresh-device fast path.
-pub struct SyncScheduler {
-    last_urgent_boundary: u64,
-    last_full_boundary: u64,
-    never_synced: bool,
-    /// True once a successful full sync has fetched the server state in
-    /// response to an urgent poll. The server keeps answering `urgent:
-    /// true` until the message is read on-device, so after a full sync
-    /// that fetched the urgent message, the device checks its local
-    /// unread_urgent set: if non-empty, the same message was already
-    /// fetched — skip further syncs. If empty, a *new* urgent message has
-    /// arrived since the last sync — clear the flag and sync again.
-    ///
-    /// This fixes P1-4: the old `urgent_synced` boolean was not bound to
-    /// any inbox version, so a newly-arrived high-priority message was
-    /// silently skipped until the next scheduled full sync interval.
-    urgent_synced: bool,
+/// Platform fact retained between the successful PrepareSleep effect and the
+/// final commit check. The operation IDs distinguish a stale prepare/commit
+/// kick from the current token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedWakePlan {
+    pub token: inkwash_logic::power_state::SleepToken,
+    pub prepare_operation_id: inkwash_logic::app::OperationId,
+    pub commit_operation_id: Option<inkwash_logic::app::OperationId>,
 }
 
-impl SyncScheduler {
-    pub fn new(now: Option<&DateTime>, counters: &PersistedCounters) -> Self {
-        let unix = now.map(|dt| dt.to_unix()).unwrap_or(0);
-        let interval = counters.sync_interval_minutes().unwrap_or(60) as u64;
+pub struct PendingRenderCompletion {
+    pub kick: crate::app_runner::AsyncKick,
+    pub output: inkwash_logic::app::EffectOutput,
+    pub failure: Option<inkwash_logic::app::EffectError>,
+}
+
+/// Fixed producer-owned latches used when the runtime input queue is full.
+/// Each source keeps its own ordering and admission bound; mergeable facts
+/// retain only their newest value. The latches are deliberately separate from
+/// the runtime FIFO so a busy application queue cannot consume a source fact.
+pub struct PendingDispatchSources {
+    pub tick: Option<inkwash_logic::app::Event>,
+    pub power_poll: Option<inkwash_logic::app::Event>,
+    pub rtc_alarm_snapshot: Option<inkwash_logic::app::Event>,
+    pub buttons: VecDeque<inkwash_logic::app::Event>,
+    pub usb_command: Option<inkwash_logic::app::Event>,
+    pub ble_command: Option<inkwash_logic::app::Event>,
+    pub lifecycle: VecDeque<inkwash_logic::app::Event>,
+    pub worker: VecDeque<inkwash_logic::app::Event>,
+    pub sleep: VecDeque<inkwash_logic::app::Event>,
+    pub boot: Option<inkwash_logic::app::Event>,
+    pub scheduler: Option<inkwash_logic::app::Event>,
+}
+
+const BUTTON_PENDING_CAPACITY: usize = 3;
+const LIFECYCLE_PENDING_CAPACITY: usize = 4;
+const WORKER_PENDING_CAPACITY: usize = 8;
+const SLEEP_PENDING_CAPACITY: usize = 2;
+
+impl Default for PendingDispatchSources {
+    fn default() -> Self {
         Self {
-            last_urgent_boundary: inkwash_logic::scheduler::boundary_index(unix, 30),
-            last_full_boundary: inkwash_logic::scheduler::boundary_index(unix, interval * 60),
-            never_synced: counters.last_sync_epoch().unwrap_or(None).is_none(),
-            urgent_synced: false,
+            tick: None,
+            power_poll: None,
+            rtc_alarm_snapshot: None,
+            buttons: VecDeque::with_capacity(BUTTON_PENDING_CAPACITY),
+            usb_command: None,
+            ble_command: None,
+            lifecycle: VecDeque::with_capacity(LIFECYCLE_PENDING_CAPACITY),
+            worker: VecDeque::with_capacity(WORKER_PENDING_CAPACITY),
+            sleep: VecDeque::with_capacity(SLEEP_PENDING_CAPACITY),
+            boot: None,
+            scheduler: None,
+        }
+    }
+}
+
+impl PendingDispatchSources {
+    /// Retain a source event without allocating beyond its fixed source
+    /// bound. Returns the event to its producer when that source's owner must
+    /// retry it before producing another one.
+    #[allow(clippy::result_large_err)]
+    pub fn retain(
+        &mut self,
+        event: inkwash_logic::app::Event,
+    ) -> Result<(), inkwash_logic::app::Event> {
+        use inkwash_logic::app::Event;
+        match event {
+            Event::Tick(_) => {
+                self.tick = Some(event);
+                Ok(())
+            }
+            Event::PowerPoll(_) => {
+                self.power_poll = Some(event);
+                Ok(())
+            }
+            Event::RtcAlarmSnapshotReady(_) => {
+                self.rtc_alarm_snapshot = Some(event);
+                Ok(())
+            }
+            Event::Button(_) => {
+                if self.buttons.len() >= BUTTON_PENDING_CAPACITY {
+                    return Err(event);
+                }
+                self.buttons.push_back(event);
+                Ok(())
+            }
+            Event::UsbCommand(_) => {
+                if self.usb_command.is_some() {
+                    return Err(event);
+                }
+                self.usb_command = Some(event);
+                Ok(())
+            }
+            Event::BleCommand(_) => {
+                if self.ble_command.is_some() {
+                    return Err(event);
+                }
+                self.ble_command = Some(event);
+                Ok(())
+            }
+            Event::BlePairingStarted
+            | Event::BlePairingSucceeded(_)
+            | Event::BlePairingFailed(_)
+            | Event::BleDisconnected => {
+                if self.lifecycle.len() >= LIFECYCLE_PENDING_CAPACITY {
+                    return Err(event);
+                }
+                self.lifecycle.push_back(event);
+                Ok(())
+            }
+            Event::SyncCompleted(_)
+            | Event::SetWifiVerified(_)
+            | Event::UrgentPollCompleted { .. }
+            | Event::UrgentPollFailed
+            | Event::ReminderFacts(_)
+            | Event::ReminderDue(_)
+            | Event::WifiConfigApplied(_)
+            | Event::EffectCompleted(_)
+            | Event::EffectFailed(_) => {
+                if self.worker.len() >= WORKER_PENDING_CAPACITY {
+                    return Err(event);
+                }
+                self.worker.push_back(event);
+                Ok(())
+            }
+            Event::SleepPrepared { .. } | Event::SleepCommitted(_) | Event::SleepCancelled(_) => {
+                if self.sleep.len() >= SLEEP_PENDING_CAPACITY {
+                    return Err(event);
+                }
+                self.sleep.push_back(event);
+                Ok(())
+            }
+            Event::Boot(_) => {
+                if self.boot.is_some() {
+                    return Err(event);
+                }
+                self.boot = Some(event);
+                Ok(())
+            }
+            Event::SyncBoundaryDue | Event::SyncSchedulerConfigured(_) => {
+                if self.scheduler.is_some() {
+                    return Err(event);
+                }
+                self.scheduler = Some(event);
+                Ok(())
+            }
         }
     }
 
-    /// Returns true if the device already fetched the current urgent message
-    /// and a further urgent-triggered full sync would be redundant. Checks
-    /// the local unread_urgent set: if non-empty, the last full sync already
-    /// fetched the message — the server is just re-reporting `urgent: true`
-    /// until the user reads it.
-    fn already_synced_urgent(&self, inbox_store: &crate::inbox::InboxStore) -> bool {
-        self.urgent_synced
-            && matches!(inbox_store.unread_urgent(), Ok(items) if !items.is_empty())
+    pub fn take_next(&mut self) -> Option<inkwash_logic::app::Event> {
+        self.tick
+            .take()
+            .or_else(|| self.power_poll.take())
+            .or_else(|| self.rtc_alarm_snapshot.take())
+            .or_else(|| self.buttons.pop_front())
+            .or_else(|| self.usb_command.take())
+            .or_else(|| self.ble_command.take())
+            .or_else(|| self.lifecycle.pop_front())
+            .or_else(|| self.worker.pop_front())
+            .or_else(|| self.sleep.pop_front())
+            .or_else(|| self.boot.take())
+            .or_else(|| self.scheduler.take())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.tick.is_none()
+            && self.power_poll.is_none()
+            && self.rtc_alarm_snapshot.is_none()
+            && self.buttons.is_empty()
+            && self.usb_command.is_none()
+            && self.ble_command.is_none()
+            && self.lifecycle.is_empty()
+            && self.worker.is_empty()
+            && self.sleep.is_empty()
+            && self.boot.is_none()
+            && self.scheduler.is_none()
+    }
+}
+
+/// Fixed ownership capacity for every USB reply, including immediate Busy and
+/// cached replies. A reply remains in this queue until the writer acknowledges
+/// it or the bounded retry policy terminates it.
+pub const USB_REPLY_PENDING_CAPACITY: usize = 32;
+/// Fixed ownership capacity for every BLE reply. The queue covers both
+/// deliveries waiting for the worker and replies already tracked by it.
+pub const BLE_REPLY_PENDING_CAPACITY: usize = 32;
+const USB_REPLY_MAX_RETRIES: u8 = 3;
+
+/// Main-loop ownership of a USB reply until the writer task acknowledges the
+/// frame. The rendered frame is retained so a short write or a full writer
+/// queue can be retried without re-running the command.
+pub struct PendingUsbReply {
+    pub session_id: u64,
+    pub id: Option<String>,
+    pub command: Command,
+    pub reply: Reply,
+    pub queued: QueuedReply,
+    pub accepted: bool,
+    pub retry_count: u8,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingBleDelivery {
+    pub session_id: u64,
+    pub generation: u64,
+    pub conn_handle: u16,
+    pub id: Option<String>,
+    pub command: Command,
+    pub reply: Reply,
+}
+
+/// One BLE reply accepted by the worker and awaiting its NimBLE notify-tx
+/// completion, keyed by the transport session it was sent on. Field order:
+/// `(session_id, generation, conn_handle, reply_id, delivery_id, command, reply)`.
+pub type PendingBleReply = (u64, u64, u16, u64, Option<String>, Command, Reply);
+
+/// BLE SetWifi keeps its logical transport key across the radio handoff. The
+/// physical connection may disappear before verification/persistence finishes;
+/// the eventual terminal reply then either uses a reconnected transport or is
+/// explicitly terminated and released.
+#[derive(Clone)]
+pub struct PendingBleHandoff {
+    pub session_id: u64,
+    pub generation: u64,
+    pub conn_handle: u16,
+    pub id: Option<String>,
+    pub command: Command,
 }
 
 /// All of the firmware's shared, long-lived state, created once in `main()`
@@ -89,13 +276,13 @@ pub struct DeviceContext<'a> {
     pub todo_store: &'a TodoStore,
     pub inbox_store: &'a InboxStore,
     pub usb_console: &'a mut UsbConsole,
+    pub usb_reply_writer: UsbReplyWriter,
     pub ble_control: &'a mut BleControl,
     /// Handle to the audio task (the sole owner of the ES8311 codec). `None`
     /// when the codec failed to initialise at boot (audio is a degraded-run
     /// category, never a boot blocker). Every tone - alarm ring, reminder -
     /// goes through this handle; nobody touches the codec directly.
     pub audio_task: Option<&'a crate::audio_task::AudioTask>,
-    pub sync_scheduler: SyncScheduler,
     /// One long-running Wi-Fi operation at a time (the sync task
     /// serializes them anyway); `None` when idle. The receipt is polled by
     /// [`DeviceContext::poll_wifi_ops`].
@@ -104,26 +291,43 @@ pub struct DeviceContext<'a> {
     /// through every completion so a stale worker result cannot resume Wi-Fi
     /// for a newer pairing session.
     pub ble_session_id: Option<u64>,
+    /// Monotonic generation of the current GATT connection. This is distinct
+    /// from the pairing screen session: a reconnect must invalidate replies
+    /// from the previous client even when pairing remains open.
+    pub ble_connection_generation: Option<u64>,
+    /// Handle of the single accepted GATT connection. Replies are routed to
+    /// this handle so a rejected/reconnected client cannot receive an old
+    /// session's notification.
+    pub ble_connection_handle: Option<u16>,
     pub ble_wifi_suspended: bool,
     pub ble_set_wifi_after_resume: Option<WifiCreds>,
     pub ble_start_failure: Option<(u64, String)>,
     pub ble_start_cancelled: bool,
-    /// The last id-tagged command `control::dispatch` actually executed
-    /// (USB or BLE, whichever came last), and the reply it produced.
-    /// Resent duplicates of that exact `(id, Command)` replay the cached
-    /// reply instead of re-executing - see `control::dispatch`'s doc
-    /// comment for why this exists and why the key includes `Command`,
-    /// not just `id`.
-    pub last_command: Option<(String, Command, Reply)>,
-    /// When a state-machine-routed SyncNow started a network sync, this
-    /// remembers the transport + correlation id AND the original command so
-    /// the final reply (Ok/Error) can be cached in `last_command` for dedup.
-    /// `None` when no SM-routed sync is awaiting its receipt. Cleared when
-    /// the receipt arrives (or the sync is superseded).
-    pub sm_sync_reply_target: Option<(Channel, String, Command)>,
-    /// Same as `sm_sync_reply_target` for a state-machine-routed SetWifi.
-    pub sm_wifi_reply_target: Option<(Channel, String, Command)>,
-    /// [[`DeviceContext::poll_alarm_snapshot`]] dispatches to AppRunner so
+    /// BLE replies accepted by the worker but awaiting the NimBLE
+    /// notify-tx completion callback. The tuple retains the original command
+    /// so the command-session cache is completed only after actual delivery.
+    pub pending_ble_replies: Vec<PendingBleReply>,
+    /// BLE reply requests that could not yet reserve a worker reply slot.
+    /// These own the rendered reply metadata until the current connection
+    /// can accept them or the connection/session becomes stale.
+    pub pending_ble_deliveries: VecDeque<PendingBleDelivery>,
+    /// One producer-owned BLE reply retained when the fixed queue is full.
+    /// A second overflow is explicitly rejected after this bounded latch.
+    pub pending_ble_reply_latch: Option<PendingBleDelivery>,
+    pub pending_ble_handoff: Option<PendingBleHandoff>,
+    pub pending_ble_set_wifi_ack: Option<u64>,
+    /// BLE pairing success is retained until the state-machine event is
+    /// admitted; the notify completion itself has already been consumed.
+    pub pending_ble_pairing_success: Option<(u64, inkwash_logic::app::BlePairingResult)>,
+    /// Per-transport cache of the last id-tagged command that actually
+    /// executed on USB or BLE, and the reply it produced. A resend with the
+    /// same id + command on the same transport replays the cached reply
+    /// instead of re-executing - see `dispatch_migrated_command`'s doc
+    /// comment. Kept per-transport so a USB command's id never collides
+    /// with a BLE command's id.
+    pub command_sessions: inkwash_logic::command_sessions::CommandSessions,
+    pub usb_session_id: u64,
+    /// [`DeviceContext::poll_alarm_snapshot`] dispatches to AppRunner so
     /// the bounded alert loops (reminder overlays, which briefly own the
     /// main thread) can still ring an alarm through the same state machine.
     /// Clone the `Rc` out, then call `dispatch` with `self` as the driver
@@ -135,8 +339,22 @@ pub struct DeviceContext<'a> {
     /// it.
     pub pending_renders:
         std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
+    /// Render kicks that arrived while the fixed registry was full. They
+    /// retain ownership until a later turn admits them.
+    pub pending_render_retries: VecDeque<crate::app_runner::AsyncKick>,
+    /// One terminal EPD completion retained until its state-machine event is
+    /// admitted. The EPD source has already emitted the fact, so clearing the
+    /// registry before this handoff would otherwise strand the render op.
+    pub pending_render_completion: Option<PendingRenderCompletion>,
+    /// Sleep platform handshakes are held until the next complete polling
+    /// turn so prepare/commit never recursively bypass input collection.
+    pub pending_sleep_kick: Option<crate::app_runner::AsyncKick>,
+    /// Wake-source configuration succeeded for this exact sleep token. This
+    /// is populated only after PrepareSleep returns an async kick and is
+    /// consumed by the collector's final prepare/commit facts.
+    pub prepared_wake_plan: Option<PreparedWakePlan>,
     /// Disabled after a core boot fact failure. Shared by the main loop
-    /// *and* every blocking page so no entry can dispatch to a default
+    /// and every collection path so no entry can dispatch to a default
     /// AppState after a corrupt boot. Set by `main` from its own
     /// `app_runner_enabled`; `poll_alarm_snapshot` checks it before
     /// dispatching.
@@ -146,6 +364,32 @@ pub struct DeviceContext<'a> {
     /// holds the state so `poll_alarm_snapshot` runs the exact same
     /// `AlarmPoll` logic the harness drives.
     pub alarm_poll: inkwash_logic::alarm_flow::AlarmPoll,
+    /// Non-blocking RTC collection requests. The main loop submits a status
+    /// read, then a consistent snapshot only after the status reply arrives.
+    pub pending_alarm_status: Option<Receiver<anyhow::Result<crate::rtc_executor::AlarmStatus>>>,
+    pub pending_alarm_snapshot:
+        Option<Receiver<anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot>>>,
+    pub pending_clock_read: Option<Receiver<anyhow::Result<DateTime>>>,
+    pub effect_task: &'a crate::effect_task::EffectTask,
+    pub pending_effect_batch: Option<inkwash_logic::app::EffectBatch>,
+    pub worker_batch_in_flight: bool,
+    /// Bounded producer-owned events retained while the runtime queue or the
+    /// worker continuation is busy. Events are admitted in FIFO order on the
+    /// next service turn, so collection never waits for NVS/RTC work.
+    pub pending_app_events: VecDeque<inkwash_logic::app::Event>,
+    /// Event owned across an effect-worker service failure. This slot is
+    /// filled before touching the worker, so a disconnected worker cannot
+    /// consume a caller's event without a retry owner.
+    pub pending_dispatch_event: Option<inkwash_logic::app::Event>,
+    /// Source-owned latches retained while the runtime FIFO is full.
+    pub pending_dispatch_sources: PendingDispatchSources,
+    /// One bounded continuation for notices produced by a main-thread batch
+    /// when Runtime's high-priority queue is temporarily full.
+    pub pending_effect_notices: Option<Vec<inkwash_logic::runner::BatchNotice>>,
+    /// USB replies retained until the bounded writer acknowledges them.
+    pub pending_usb_replies: VecDeque<PendingUsbReply>,
+    /// One producer-owned USB reply retained when the fixed queue is full.
+    pub pending_usb_reply_latch: Option<PendingUsbReply>,
 }
 
 /// Dispatches one migrated command into the shared state-machine runner.
@@ -166,101 +410,287 @@ pub(crate) fn dispatch_migrated_command(
     pre_event: Option<inkwash_logic::app::Event>,
     request: Command,
     id: Option<&str>,
-) -> Option<Reply> {
+    session_id: u64,
+) -> anyhow::Result<Option<Reply>> {
     let channel = match &event {
         inkwash_logic::app::Event::UsbCommand(_) => Channel::Usb,
         inkwash_logic::app::Event::BleCommand(_) => Channel::Ble,
-        _ => return None,
+        _ => return Ok(None),
     };
     // Dedup: a resent duplicate of the exact (id, Command) replays the
     // cached reply rather than running the command again.
     if let Some(id) = id {
-        if let Some((last_id, last_cmd, last_reply)) = &ctx.last_command {
-            if last_id == id && *last_cmd == request {
-                return Some(last_reply.clone());
-            }
+        if let Some(reply) = ctx
+            .command_sessions
+            .lookup(channel, session_id, id, &request)
+        {
+            return Ok(Some(reply));
         }
     }
-    let last_clock = runner.borrow().last_clock();
-    let mut reply_for_channel = None;
+    // Reserve the exact transport correlation before admitting the command.
+    // The unified dispatcher may reduce the command immediately, or retain it
+    // behind a worker batch; either way the Reply effect is delivered by the
+    // main-thread reducer after the actual transport write.
+    let request_id = id.map(str::to_owned);
+    if ctx
+        .command_sessions
+        .reserve_pending(channel, session_id, request_id.clone(), request.clone())
+        .is_err()
     {
-        let mut executor = crate::app_runner::EffectRunner::new(ctx, last_clock);
-        let mut runtime = runner.borrow_mut();
-        if let Some(pre) = pre_event {
-            runtime.push(pre);
-        }
-        runtime.push(event);
-        if let Err(err) = runtime.pump(&mut executor) {
-            log::warn!("Command dispatch through state machine failed: {err}");
-        }
-        for (reply_channel, reply) in executor.take_replies() {
-            if reply_channel == channel && reply_for_channel.is_none() {
-                reply_for_channel = Some(reply);
-            }
-        }
+        // The transport already owns another deferred command. Return Busy
+        // through the caller's normal bounded transport delivery path; the
+        // existing pending correlation remains untouched.
+        return Ok(Some(Reply::Busy));
     }
-    for kick in runner.borrow_mut().take_kicks() {
-        match &kick.effect {
-            inkwash_logic::app::Effect::StartSync(_) => {
-                if let Some(id) = id {
-                    ctx.sm_sync_reply_target = Some((channel, id.to_string(), request.clone()));
-                }
-            }
-            inkwash_logic::app::Effect::StartSetWifi(_) => {
-                if let Some(id) = id {
-                    ctx.sm_wifi_reply_target = Some((channel, id.to_string(), request.clone()));
-                }
-            }
-            _ => {}
-        }
-        let mut reg = ctx.pending_renders.borrow_mut();
-        if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-            reg.register(kick);
-        } else {
-            log::warn!(
-                "AppRunner async kick {:?} (op {:?}) not wired; dropped",
-                kick.effect,
-                kick.operation_id
-            );
-        }
+    if let Some(pre) = pre_event {
+        crate::dispatch_or_retain(runner, pre, ctx)?;
     }
-    // Update the dedup cache with the real result (like control::dispatch).
-    if let (Some(id), Some(reply)) = (id, &reply_for_channel) {
-        ctx.last_command = Some((id.to_string(), request, reply.clone()));
-    }
-    reply_for_channel
+    crate::dispatch_or_retain(runner, event, ctx)?;
+    // Replies are delivered by `deliver_effect_replies`; returning `None`
+    // prevents the transport caller from writing a second copy.
+    Ok(None)
 }
 
 impl DeviceContext<'_> {
-    /// Dispatches one non-command event (reminder facts, etc.) into the
-    /// shared state-machine runner and routes any render kicks into the
-    /// shared EPD registry, so the SM's render effects reach the panel the
-    /// same way every other dispatch does. Non-blocking: the pump only runs
-    /// the pure update + synchronous effects.
-    pub fn dispatch_event(&mut self, event: inkwash_logic::app::Event) -> anyhow::Result<()> {
-        let runner = self.app_runner.clone();
-        let last_clock = runner.borrow().last_clock();
+    /// Enqueue a USB reply and retain its exact correlation and rendered frame
+    /// until the writer reports completion. A full/disconnected writer is
+    /// represented by `accepted = false`; the owned frame remains retryable.
+    pub fn queue_usb_reply(
+        &mut self,
+        session_id: u64,
+        id: Option<&str>,
+        command: &Command,
+        reply: &Reply,
+    ) -> Result<(), String> {
+        if self.pending_usb_replies.iter().any(|pending| {
+            pending.session_id == session_id
+                && pending.id.as_deref() == id
+                && pending.command == *command
+                && pending.reply == *reply
+        }) || self
+            .pending_usb_reply_latch
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.session_id == session_id
+                    && pending.id.as_deref() == id
+                    && pending.command == *command
+                    && pending.reply == *reply
+            })
         {
-            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
-            let mut runtime = runner.borrow_mut();
-            runtime.push(event);
-            runtime
-                .pump(&mut executor)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            return Ok(());
         }
-        for kick in runner.borrow_mut().take_kicks() {
-            let mut reg = self.pending_renders.borrow_mut();
-            if kick.is_render() {
-                reg.register(kick);
-            } else {
+        if self.pending_usb_replies.len() >= USB_REPLY_PENDING_CAPACITY {
+            if self.pending_usb_reply_latch.is_some() {
+                return Err(format!(
+                    "USB reply mailbox and producer latch full (capacity {})",
+                    USB_REPLY_PENDING_CAPACITY
+                ));
+            }
+            let queued = self.usb_reply_writer.prepare(reply, id);
+            self.pending_usb_reply_latch = Some(PendingUsbReply {
+                session_id,
+                id: id.map(str::to_owned),
+                command: command.clone(),
+                reply: reply.clone(),
+                queued,
+                accepted: false,
+                retry_count: 0,
+            });
+            return Ok(());
+        }
+        let queued = self.usb_reply_writer.prepare(reply, id);
+        let accepted = match self.usb_reply_writer.enqueue_owned(queued.clone()) {
+            Ok(_) => true,
+            Err(ReplyQueueError::Full(_)) => false,
+            Err(ReplyQueueError::Disconnected(_)) => false,
+        };
+        self.pending_usb_replies.push_back(PendingUsbReply {
+            session_id,
+            id: id.map(str::to_owned),
+            command: command.clone(),
+            reply: reply.clone(),
+            queued,
+            accepted,
+            retry_count: 0,
+        });
+        Ok(())
+    }
+
+    /// Consume writer acknowledgements and retry rejected owned frames. Cache
+    /// ownership is released only after a successful acknowledgement and is
+    /// guarded by the original transport session.
+    pub fn service_usb_reply_writer(&mut self) {
+        while let Ok(Some(ack)) = self.usb_reply_writer.try_completion() {
+            let Some(index) = self
+                .pending_usb_replies
+                .iter()
+                .position(|pending| pending.queued.sequence == ack.sequence)
+            else {
+                if self
+                    .pending_usb_reply_latch
+                    .as_ref()
+                    .is_some_and(|pending| pending.queued.sequence == ack.sequence)
+                {
+                    let mut pending = self
+                        .pending_usb_reply_latch
+                        .take()
+                        .expect("USB producer latch");
+                    if ack.result.is_err() {
+                        pending.accepted = false;
+                        pending.retry_count = pending.retry_count.saturating_add(1);
+                        if pending.retry_count <= USB_REPLY_MAX_RETRIES {
+                            self.pending_usb_reply_latch = Some(pending);
+                        } else {
+                            self.cancel_usb_reply(&pending);
+                        }
+                    } else {
+                        self.complete_usb_reply(pending);
+                    }
+                }
+                log::debug!("ignoring stale USB reply completion {}", ack.sequence);
+                continue;
+            };
+            if ack.result.is_err() {
+                let mut pending = self.pending_usb_replies.remove(index).expect("reply index");
+                pending.accepted = false;
+                pending.retry_count = pending.retry_count.saturating_add(1);
                 log::warn!(
-                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
-                    kick.effect,
-                    kick.operation_id
+                    "USB reply write failed for session {}: {:?}",
+                    pending.session_id,
+                    ack.result
                 );
+                if pending.retry_count <= USB_REPLY_MAX_RETRIES {
+                    self.pending_usb_replies.insert(index, pending);
+                } else {
+                    self.cancel_usb_reply(&pending);
+                }
+            } else {
+                let pending = self.pending_usb_replies.remove(index).expect("reply index");
+                self.complete_usb_reply(pending);
             }
         }
-        Ok(())
+
+        if let Some(pending) = self.pending_usb_reply_latch.as_mut() {
+            if !pending.accepted && pending.session_id == self.usb_session_id {
+                match self.usb_reply_writer.retry(pending.queued.clone()) {
+                    Ok(()) => pending.accepted = true,
+                    Err(ReplyQueueError::Full(_)) => {}
+                    Err(ReplyQueueError::Disconnected(_)) => {
+                        pending.retry_count = pending.retry_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+        if self
+            .pending_usb_reply_latch
+            .as_ref()
+            .is_some_and(|pending| pending.retry_count > USB_REPLY_MAX_RETRIES)
+        {
+            let pending = self
+                .pending_usb_reply_latch
+                .take()
+                .expect("USB producer latch");
+            self.cancel_usb_reply(&pending);
+        }
+
+        let mut terminated_index = None;
+        for index in 0..self.pending_usb_replies.len() {
+            let Some(pending) = self.pending_usb_replies.get_mut(index) else {
+                break;
+            };
+            if pending.accepted || pending.session_id != self.usb_session_id {
+                continue;
+            }
+            let queued = pending.queued.clone();
+            match self.usb_reply_writer.retry(queued) {
+                Ok(()) => pending.accepted = true,
+                Err(ReplyQueueError::Full(_)) => break,
+                Err(ReplyQueueError::Disconnected(_)) => {
+                    pending.retry_count = pending.retry_count.saturating_add(1);
+                    if pending.retry_count > USB_REPLY_MAX_RETRIES {
+                        terminated_index = Some(index);
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(index) = terminated_index {
+            let failed = self.pending_usb_replies.remove(index).expect("reply index");
+            self.cancel_usb_reply(&failed);
+        }
+    }
+
+    fn complete_usb_reply(&mut self, pending: PendingUsbReply) {
+        if let Some(id) = pending.id {
+            self.command_sessions.complete_terminal(
+                Channel::Usb,
+                pending.session_id,
+                id,
+                pending.command,
+                pending.reply,
+            );
+        } else {
+            self.command_sessions.complete_untagged_terminal(
+                Channel::Usb,
+                pending.session_id,
+                pending.command,
+                pending.reply,
+            );
+        }
+    }
+
+    fn cancel_usb_reply(&mut self, pending: &PendingUsbReply) {
+        self.command_sessions.cancel_pending(
+            Channel::Usb,
+            pending.session_id,
+            pending.id.as_deref(),
+            &pending.command,
+        );
+        log::error!(
+            "USB reply delivery terminated after {} retries for session {}",
+            pending.retry_count,
+            pending.session_id
+        );
+    }
+
+    /// A disconnected USB session owns no future reply delivery. Remove only
+    /// old-session records; exact session matching prevents this from
+    /// cancelling a request in a newly opened session with a reused ID.
+    pub fn drop_stale_usb_replies(&mut self) {
+        let current = self.usb_session_id;
+        let mut index = 0;
+        while index < self.pending_usb_replies.len() {
+            if self.pending_usb_replies[index].session_id == current {
+                index += 1;
+                continue;
+            }
+            let pending = self.pending_usb_replies.remove(index).expect("reply index");
+            self.command_sessions.cancel_pending(
+                Channel::Usb,
+                pending.session_id,
+                pending.id.as_deref(),
+                &pending.command,
+            );
+        }
+        if self
+            .pending_usb_reply_latch
+            .as_ref()
+            .is_some_and(|pending| pending.session_id != current)
+        {
+            let pending = self
+                .pending_usb_reply_latch
+                .take()
+                .expect("USB producer latch");
+            self.cancel_usb_reply(&pending);
+        }
+    }
+
+    /// Dispatches one non-command event (reminder facts, etc.) into the
+    /// shared state-machine runner. The unified dispatcher owns admission,
+    /// effect execution, completion feedback, and kick routing.
+    pub fn dispatch_event(&mut self, event: inkwash_logic::app::Event) -> anyhow::Result<()> {
+        let runner = self.app_runner.clone();
+        crate::dispatch_or_retain(&runner, event, self)
     }
 
     /// Services one queued USB command from any UI loop. Returns
@@ -270,56 +700,83 @@ impl DeviceContext<'_> {
     /// command frame was received - used by the main loop's idle/deep-sleep
     /// tracking, where idle counts "no USB frames" (not just
     /// state-changing ones) as idle.
-    pub fn poll_usb_control(&mut self, _now: Option<&DateTime>) -> (bool, bool) {
+    pub fn poll_usb_control(&mut self, _now: Option<&DateTime>) -> anyhow::Result<(bool, bool)> {
         let Some((id, cmd)) = self.usb_console.poll_command() else {
-            return (false, false);
+            return Ok((false, false));
         };
         let changes_visible_state = !matches!(cmd, Command::GetStatus);
-        if let Command::SetRtc { epoch_secs } = cmd.clone() {
-            let reply = if self.pending_wifi_op.is_some() || self.ble_wifi_suspended {
-                Reply::Busy
-            } else {
-                self.set_rtc_from_epoch(epoch_secs)
-            };
-            if !matches!(reply, Reply::Busy) {
-                if let Some(id_value) = id.as_deref() {
-                    self.last_command = Some((id_value.to_string(), cmd, reply.clone()));
-                }
-            }
-            crate::usb_console::write_reply(&reply, id.as_deref());
-            let changed = matches!(reply, Reply::Ok);
-            return (changes_visible_state && changed, true);
-        }
         if matches!(cmd, Command::SyncNow) && self.pending_wifi_op.is_some() {
-            crate::usb_console::write_reply(&Reply::Busy, id.as_deref());
-            return (false, true);
+            let reply = Reply::Busy;
+            if let Err(err) = self.queue_usb_reply(self.usb_session_id, id.as_deref(), &cmd, &reply)
+            {
+                log::error!("USB Busy reply could not be retained: {err}");
+                self.command_sessions.cancel_pending(
+                    Channel::Usb,
+                    self.usb_session_id,
+                    id.as_deref(),
+                    &cmd,
+                );
+            }
+            return Ok((false, true));
         }
-        // Migrated commands run through the state machine (Stage 3): the
+        // Migrated commands run through the state machine (Phase 5): the
         // runner's effects (persist/RTC) execute and its Reply effect is
         // written back to USB with the frame's correlation id.
-        // A time-sensitive migrated command (SetTimezone shifts the RTC
-        // by the offset delta from the current clock) needs a fresh
-        // time fact: push a Tick from the latest RTC read first so the
-        // state machine's clock is current when it computes the shift.
+        // SetRtc carries an absolute value and needs no pre-read. For
+        // SetTimezone, use the latest completed clock fact already held by
+        // the state machine; command collection never waits on I2C.
         let pre_event = if matches!(cmd, Command::SetTimezone { .. }) {
-            self.rtc
-                .read_time()
-                .ok()
+            self.app_runner
+                .borrow()
+                .last_clock()
                 .map(inkwash_logic::app::Event::Tick)
         } else {
             None
         };
+        let is_time_write = matches!(cmd, Command::SetRtc { .. } | Command::SetTimezone { .. });
+        let request_for_cache = cmd.clone();
+        let usb_session_id = self.usb_session_id;
         let event = inkwash_logic::app::Event::UsbCommand(cmd.clone());
         let runner = self.app_runner.clone();
-        let reply = dispatch_migrated_command(self, &runner, event, pre_event, cmd, id.as_deref());
+        let reply = dispatch_migrated_command(
+            self,
+            &runner,
+            event,
+            pre_event,
+            cmd,
+            id.as_deref(),
+            usb_session_id,
+        )?;
         if let Some(reply) = &reply {
-            crate::usb_console::write_reply(reply, id.as_deref());
+            if let Err(err) = self.queue_usb_reply(
+                self.usb_session_id,
+                id.as_deref(),
+                &request_for_cache,
+                reply,
+            ) {
+                log::error!("USB reply could not be retained: {err}");
+                self.command_sessions.cancel_pending(
+                    Channel::Usb,
+                    self.usb_session_id,
+                    id.as_deref(),
+                    &request_for_cache,
+                );
+            }
+        }
+        if is_time_write && matches!(reply, Some(Reply::Ok)) {
+            // Any in-flight alarm snapshot was read before the new clock was
+            // committed. Drop that stale completion and restart AF sampling;
+            // the state machine's RtcTimeWritten fact is authoritative.
+            self.pending_alarm_status = None;
+            self.pending_alarm_snapshot = None;
+            self.pending_clock_read = None;
+            self.alarm_poll.observe_alarm_flag(false);
         }
         let changed = matches!(reply, Some(Reply::Ok));
-        (changes_visible_state && changed, true)
+        Ok((changes_visible_state && changed, true))
     }
 
-    /// Polls the RTC alarm AF edge from a blocking page and dispatches a
+    /// Polls the RTC alarm AF edge from a collection path and dispatches a
     /// consistent snapshot to AppRunner via `rtc_alarm_callback`. The
     /// snapshot is only consumed after all three facts (time, AF, AIE)
     /// read consistently; a read failure keeps the edge retryable so the
@@ -331,73 +788,88 @@ impl DeviceContext<'_> {
     /// thread - `main`'s AF fast path does not run then. It must NOT ACK
     /// or rearm the RTC itself; that stays with the state machine via the
     /// callback.
-    /// Polls the RTC alarm AF edge from a blocking page and dispatches a
+    /// Polls the RTC alarm AF edge from a collection path and dispatches a
     /// consistent snapshot to AppRunner via the shared `app_runner`
     /// handle. The snapshot is only consumed after all three facts
     /// (time, AF, AIE) read consistently; a read failure keeps the edge
     /// retryable so the next poll retries. Returns `true` when AppRunner
     /// decided to start ringing (the caller should return to the main
-    /// loop which drives the blocking ring screen).
+    /// loop which drives the ring state machine).
     ///
     /// This is the only alarm entry available while a page owns the main
     /// thread - `main`'s AF fast path does not run then. It must NOT ACK
     /// or rearm the RTC itself; that stays with the state machine via the
     /// dispatch.
-    pub fn poll_alarm_snapshot(&mut self) -> bool {
-        // A corrupt boot (core_failed) disables AppRunner for every entry
-        // - the main loop's AF fast path and any blocking page. Without
-        // this guard a default AppState would interpret a real AF as
-        // residue and ACK it off.
+    pub fn poll_alarm_snapshot(&mut self) -> anyhow::Result<bool> {
+        // Safe mode exits before this runtime context is created. Keep the
+        // guard as a defensive check so a platform collection path cannot
+        // dispatch an alarm into an uninitialised application state.
         if !self.app_runner_enabled {
-            return false;
+            return Ok(false);
         }
-        // Run the *same* `AlarmPoll` orchestration the host harness
-        // drives (inkwash-logic::alarm_flow): AF edge -> consistent
-        // snapshot -> dispatch -> exit flag. The driver reads the real
-        // RTC; the dispatcher forwards through the shared runner. The
-        // poll state is moved out of `self` so driver + dispatcher can
-        // both borrow `self` while the poll runs, then put back.
-        let mut poll = std::mem::take(&mut self.alarm_poll);
-        let runner = self.app_runner.clone();
-        let pending_renders = self.pending_renders.clone();
-        let mut host = CtxAlarmHost {
-            ctx: self,
-            runner,
-            pending_renders,
-        };
-        let firing = poll.poll(&mut host);
-        if let Some(err) = poll.take_error() {
-            log::warn!("Blocking page RTC alarm snapshot read failed; stays retryable: {err}");
+        // Collection is a two-step non-blocking exchange. GPIO5/AF polling
+        // never waits for I2C: status and the consistent snapshot each stay
+        // in a receiver until the executor completes them.
+        if let Some(reply) = self.pending_alarm_snapshot.take() {
+            match reply.try_recv() {
+                Ok(Ok(snapshot)) => {
+                    self.alarm_poll.mark_snapshot_dispatched();
+                    self.dispatch_event(inkwash_logic::app::Event::RtcAlarmSnapshotReady(
+                        snapshot,
+                    ))?;
+                    return Ok(matches!(
+                        self.app_runner.borrow().state().screen,
+                        inkwash_logic::app::Screen::AlarmRinging
+                    ));
+                }
+                Ok(Err(err)) => {
+                    log::warn!("RTC alarm snapshot read failed; stays retryable: {err:#}");
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_alarm_snapshot = Some(reply);
+                    return Ok(false);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    log::warn!("RTC alarm snapshot executor disconnected");
+                }
+            }
         }
-        self.alarm_poll = poll;
+
+        if let Some(reply) = self.pending_alarm_status.take() {
+            match reply.try_recv() {
+                Ok(Ok(status)) => {
+                    if self.alarm_poll.observe_alarm_flag(status.alarm_flag) {
+                        match self.rtc.request_snapshot() {
+                            Ok(snapshot) => self.pending_alarm_snapshot = Some(snapshot),
+                            Err(err) => log::warn!("RTC snapshot request failed: {err:#}"),
+                        }
+                    }
+                }
+                Ok(Err(err)) => log::warn!("RTC alarm status read failed: {err:#}"),
+                Err(TryRecvError::Empty) => {
+                    self.pending_alarm_status = Some(reply);
+                    return Ok(false);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    log::warn!("RTC alarm status executor disconnected");
+                }
+            }
+        }
+
+        if self.pending_alarm_status.is_none() && self.pending_alarm_snapshot.is_none() {
+            match self.rtc.request_alarm_status() {
+                Ok(status) => self.pending_alarm_status = Some(status),
+                Err(err) => log::warn!("RTC alarm status request failed: {err:#}"),
+            }
+        }
+        let firing = false;
         // Firing is now a pure state-machine affair: the SM entered
         // Screen::AlarmRinging, the executor started the alarm tone through
         // the audio task (non-blocking) and rendered the ring frame; ENTER
         // and the ring-deadline Tick dismiss through the SM's shared
         // `dismiss_ringing`. Nothing blocks here - the unified loop keeps
         // serving Button/Tick/USB/BLE/EPD events while the alarm rings.
-        firing
-    }
-
-    /// Services scheduled sync and due-todo reminders. AppRunner owns
-    /// the alarm business (boot/home/RTC alarm) so alarm handling lives
-    /// outside this path - any AF-driven ringing flows through
-    /// `Event::RtcAlarmSnapshotReady` and the state machine. This
-    /// function only schedules network + reminder work, mirroring what
-    /// it did before AppRunner existed; the legacy alarm branch is
-    /// gone so the two paths cannot race for the same AF.
-    pub fn poll_runtime(&mut self, now: &DateTime) {
-        // Stage 5/6: reminders are now a state-machine overlay - the fact
-        // layer dispatches ReminderDue (Screen::Reminder + its render), so
-        // nothing visible happens here. This only advances the sync
-        // scheduler (boundary dispatch) and raises reminder facts; the
-        // SM's own render effects are the only refreshes.
-        self.poll_reminders(now);
-        self.poll_scheduled_sync(now);
-    }
-
-    fn poll_reminders(&mut self, now: &DateTime) {
-        crate::reminders::poll(self, now);
+        Ok(firing)
     }
 
     /// Runs an urgent/full sync when its wall-clock boundary advances. The
@@ -406,74 +878,6 @@ impl DeviceContext<'_> {
     /// completion side effects - redraw, RTC re-arm - are applied by
     /// [`DeviceContext::poll_wifi_ops`]). Failed attempts are retried at
     /// the next boundary.
-    pub fn poll_scheduled_sync(&mut self, now: &DateTime) -> bool {
-        let server_configured = self
-            .counters
-            .device_config()
-            .map(|cfg| cfg.is_some())
-            .unwrap_or(false);
-        let wifi_configured = self
-            .counters
-            .wifi_creds()
-            .map(|creds| creds.is_some())
-            .unwrap_or(false);
-        if !server_configured || !wifi_configured {
-            return false;
-        }
-
-        let interval = self.counters.sync_interval_minutes().unwrap_or(60) as u64;
-        let unix = now.to_unix();
-        let urgent_due = inkwash_logic::scheduler::boundary_advanced(
-            unix,
-            30,
-            self.sync_scheduler.last_urgent_boundary,
-        );
-        let full_due = inkwash_logic::scheduler::boundary_advanced(
-            unix,
-            interval * 60,
-            self.sync_scheduler.last_full_boundary,
-        );
-        if !urgent_due && !full_due {
-            return false;
-        }
-
-        // One op at a time; cursors were advanced when the previous one
-        // dispatched, so the next boundary still fires on time.
-        if self.pending_wifi_op.is_some()
-            || self.ble_wifi_suspended
-            || self.ble_session_id.is_some()
-        {
-            return false;
-        }
-
-        if full_due || (self.sync_scheduler.never_synced && urgent_due) {
-            self.sync_scheduler.last_full_boundary =
-                inkwash_logic::scheduler::boundary_index(unix, interval * 60);
-            self.sync_scheduler.last_urgent_boundary =
-                inkwash_logic::scheduler::boundary_index(unix, 30);
-            log::info!("Aligned sync due (interval {interval} min); dispatching");
-            // The state machine owns the start decision (single-flight
-            // arbitration); the event only reports that the boundary fired.
-            // The executor's StartSync effect performs the real dispatch.
-            let runner = self.app_runner.clone();
-            self.dispatch_sync_boundary(&runner);
-            return false;
-        }
-
-        if urgent_due {
-            self.sync_scheduler.last_urgent_boundary =
-                inkwash_logic::scheduler::boundary_index(unix, 30);
-            log::info!("Urgent poll boundary; dispatching");
-            match self.sync.poll_urgent() {
-                Ok(reply) => {
-                    self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
-                }
-                Err(err) => log::warn!("Failed to dispatch urgent poll: {err}"),
-            }
-        }
-        false
-    }
-
     /// Dispatches a full sync to the sync task and records the pending
     /// receipt. Returns `Ok(true)` when dispatched, `Ok(false)` when
     /// another Wi-Fi operation is already in flight (the caller replies
@@ -487,102 +891,66 @@ impl DeviceContext<'_> {
         Ok(true)
     }
 
-    /// Sets the PCF8563 from a host-provided Unix timestamp. This stays on
-    /// the firmware main loop because the RTC executor is the sole I2C owner;
-    /// the host timestamp path is useful when NTP UDP is unavailable.
-    pub fn set_rtc_from_epoch(&mut self, epoch_secs: u64) -> Reply {
-        const MIN_EPOCH: u64 = 946_684_800; // 2000-01-01
-        const MAX_EPOCH: u64 = 4_102_444_800; // 2100-01-01
-        if !(MIN_EPOCH..MAX_EPOCH).contains(&epoch_secs) {
-            return Reply::Error {
-                message: "RTC timestamp must be between 2000-01-01 and 2100-01-01".into(),
-            };
+    pub fn start_urgent_poll(&mut self) -> Result<()> {
+        if self.pending_wifi_op.is_some() || self.ble_wifi_suspended {
+            anyhow::bail!("another Wi-Fi operation is already in progress");
         }
-        let timezone_offset = self.counters.timezone_offset_minutes().unwrap_or(0);
-        let local_time = DateTime::from_unix(epoch_secs).shifted_minutes(timezone_offset as i32);
-        match self.rtc.write_time(&local_time) {
-            Ok(()) => {
-                if let Err(err) = self.counters.clear_rtc_align_epoch() {
-                    log::warn!("Failed to clear RTC alignment marker after host set: {err}");
-                }
-                log::info!(
-                    "Host RTC sync applied: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    local_time.year,
-                    local_time.month,
-                    local_time.day,
-                    local_time.hour,
-                    local_time.minute,
-                    local_time.second
-                );
-                if let Err(err) = self.dispatch_event(inkwash_logic::app::Event::Tick(local_time)) {
-                    log::warn!("Failed to refresh clock fact after host RTC sync: {err}");
-                }
-                // The wall clock moved — the PCF8563 hardware alarm slot may
-                // now point at the wrong instant. Re-derive it from the new
-                // RTC time so a host-set timestamp never leaves the hardware
-                // alarm lagging (P1-5 fix).
-                match self.alarm_store.load().and_then(|list| {
-                    crate::alarms::program_hardware_alarm_via(self.rtc, &list, &local_time)
-                }) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        log::warn!("Failed to re-arm hardware alarm after host RTC sync: {err}")
-                    }
-                }
-                Reply::Ok
-            }
-            Err(err) => Reply::Error {
-                message: format!("failed to write RTC: {err}"),
-            },
-        }
+        let reply = self.sync.poll_urgent()?;
+        self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
+        Ok(())
     }
 
-    /// Dispatches a Wi-Fi verification + save to the sync task.
+    /// Dispatches Wi-Fi credential verification to the sync task.
     pub fn start_set_wifi(&mut self, creds: WifiCreds) -> Result<bool> {
-        if self.pending_wifi_op.is_some() || self.ble_wifi_suspended {
+        if self.pending_wifi_op.is_some() {
             return Ok(false);
+        }
+        if self.ble_wifi_suspended {
+            if self.ble_set_wifi_after_resume.is_some() {
+                return Ok(false);
+            }
+            self.ble_set_wifi_after_resume = Some(creds);
+            if let Err(err) = self.stop_ble_pairing() {
+                self.ble_set_wifi_after_resume = None;
+                return Err(err);
+            }
+            return Ok(true);
         }
         let reply = self.sync.set_wifi(creds)?;
         self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
         Ok(true)
     }
 
-    /// Accepts a BLE-sent SetWifi while the BLE pairing screen owns the
-    /// radio. The BLE transport gets its ack before StopBlePairing is queued;
-    /// once BLE is torn down and Wi-Fi is restored, the saved credentials are
-    /// verified by the sync task in the background.
-    pub fn begin_ble_set_wifi_handoff(&mut self, creds: WifiCreds) -> bool {
-        if self.ble_session_id.is_none()
-            || !self.ble_wifi_suspended
-            || self.pending_wifi_op.is_some()
-            || self.ble_set_wifi_after_resume.is_some()
-        {
-            return false;
+    /// Cancels a BLE SetWifi handoff after its transport reply can no longer
+    /// be delivered. The radio must still be stopped so the normal Wi-Fi
+    /// resume receipt restores ownership consistently.
+    pub fn abort_ble_set_wifi_handoff(&mut self) -> Result<()> {
+        self.ble_set_wifi_after_resume = None;
+        if self.ble_session_id.is_some() {
+            if let Err(err) = self.stop_ble_pairing() {
+                self.ble_wifi_suspended = false;
+                self.ble_session_id = None;
+                self.ble_start_cancelled = false;
+                return Err(err);
+            }
         }
-        log::info!(
-            "BLE SetWifi accepted for '{}'; stopping BLE before Wi-Fi verification",
-            creds.ssid
-        );
-        self.ble_set_wifi_after_resume = Some(creds);
-        true
+        Ok(())
     }
 
-    fn start_ble_set_wifi_after_resume(&mut self, creds: WifiCreds) {
-        let ssid = creds.ssid.clone();
-        let has_password = !creds.password.is_empty();
+    fn start_ble_set_wifi_after_resume(&mut self, creds: WifiCreds) -> anyhow::Result<()> {
         match self.sync.set_wifi(creds) {
             Ok(reply) => {
-                log::info!("BLE SetWifi handoff: verifying saved credentials for '{ssid}'");
-                self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi {
-                    reply,
-                    ssid,
-                    has_password,
-                });
+                log::info!("BLE SetWifi handoff: verifying credentials");
+                self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi { reply });
             }
             Err(err) => {
                 log::error!("BLE SetWifi handoff: failed to queue Wi-Fi verification: {err:#}");
+                self.feed_set_wifi_verified(Err(format!(
+                    "Wi-Fi verification could not start: {err:#}"
+                )))?;
             }
         }
+        Ok(())
     }
 
     /// Begins BLE radio arbitration without waiting on the sync task.  The
@@ -620,7 +988,13 @@ impl DeviceContext<'_> {
             Ok(reply) => {
                 self.pending_wifi_op = Some(PendingWifiOp::ResumeAfterBle { reply });
             }
-            Err(err) => log::error!("Failed to queue Wi-Fi resume after BLE: {err:#}"),
+            Err(err) => {
+                self.ble_set_wifi_after_resume = None;
+                self.ble_wifi_suspended = false;
+                self.ble_session_id = None;
+                self.ble_start_cancelled = false;
+                log::error!("Failed to queue Wi-Fi resume after BLE: {err:#}");
+            }
         }
     }
 
@@ -658,13 +1032,13 @@ impl DeviceContext<'_> {
     }
 
     /// Polls the pending Wi-Fi operation's receipt (non-blocking). Called
-    /// every main-loop iteration and by blocking screens via
+    /// every main-loop iteration and by collection paths via
     /// [`DeviceContext::poll_background`]; applies completion side effects
     /// (RTC re-arm, NTP alignment, deferred transport replies) and returns
     /// the completed operation's event for the caller.
-    pub fn poll_wifi_ops(&mut self) {
+    pub fn poll_wifi_ops(&mut self) -> anyhow::Result<()> {
         let Some(op) = self.pending_wifi_op.take() else {
-            return;
+            return Ok(());
         };
         match op {
             PendingWifiOp::Sync { reply } => match reply.try_recv() {
@@ -672,91 +1046,70 @@ impl DeviceContext<'_> {
                     // Every completed sync - scheduled or on-demand - is
                     // fed through the state machine, which owns the merged
                     // data apply (Effect::ApplySyncedData) and the transport
-                    // reply (only when a SyncNow slot awaits, tracked in
-                    // `sm_sync_reply_target`). The RTC/NVS-maintenance
-                    // side effects stay on the main loop here.
-                    let ok = result.outcome.is_ok();
-                    self.feed_sync_completed(&result);
-                    self.apply_sync_side_effects(&result);
+                    // reply when a SyncNow slot awaits. The RTC/NVS-
+                    // maintenance side effects stay on the main loop here.
+                    self.feed_sync_completed(&result)?;
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
                 }
-                Err(_) => {}
+                Err(_) => {
+                    self.feed_sync_completed(&sync::SyncResult {
+                        outcome: Err(anyhow::anyhow!("sync task disconnected")),
+                        ntp_epoch: None,
+                    })?;
+                }
             },
             PendingWifiOp::SetWifi { reply } => match reply.try_recv() {
                 Ok(result) => {
                     // Every SetWifi is state-machine-routed (its reply is
                     // delivered through the machine when a slot awaits).
-                    self.feed_set_wifi_completed(result.map_err(|e| e.to_string()));
+                    self.feed_set_wifi_verified(result.map_err(|e| e.to_string()))?;
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
                 }
-                Err(_) => {}
+                Err(_) => {
+                    self.feed_set_wifi_verified(Err(
+                        "Wi-Fi verification task disconnected".to_string()
+                    ))?;
+                }
             },
-            PendingWifiOp::PostBleSetWifi {
-                reply,
-                ssid,
-                has_password,
-            } => match reply.try_recv() {
-                Ok(Ok(())) => {
-                    log::info!("BLE SetWifi handoff: Wi-Fi credentials verified and saved");
-                    if let Err(err) =
-                        self.dispatch_event(inkwash_logic::app::Event::WifiConfigApplied(
-                            inkwash_logic::app::WifiConfigApplied { ssid, has_password },
-                        ))
-                    {
-                        log::warn!("Wi-Fi config fact dispatch failed after BLE handoff: {err}");
-                    }
+            PendingWifiOp::PostBleSetWifi { reply } => match reply.try_recv() {
+                Ok(Ok(verified)) => {
+                    log::info!("BLE SetWifi handoff: Wi-Fi credentials verified");
+                    self.feed_set_wifi_verified(Ok(verified))?;
                 }
                 Ok(Err(err)) => {
                     log::warn!("BLE SetWifi handoff: Wi-Fi verification failed: {err}");
+                    self.feed_set_wifi_verified(Err(err.to_string()))?;
                 }
                 Err(TryRecvError::Empty) => {
-                    self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi {
-                        reply,
-                        ssid,
-                        has_password,
-                    });
+                    self.pending_wifi_op = Some(PendingWifiOp::PostBleSetWifi { reply });
                 }
-                Err(_) => log::warn!("BLE SetWifi handoff: Wi-Fi verification task disconnected"),
+                Err(_) => {
+                    log::warn!("BLE SetWifi handoff: Wi-Fi verification task disconnected");
+                    self.feed_set_wifi_verified(Err(
+                        "Wi-Fi verification task disconnected".to_string()
+                    ))?;
+                }
             },
             PendingWifiOp::UrgentPoll { reply } => match reply.try_recv() {
-                Ok(Ok(true)) => {
-                    // The server keeps answering `urgent: true` until the
-                    // message is read on-device. After a full sync that
-                    // fetched the message, the local unread_urgent set is
-                    // non-empty — so this is the same message already
-                    // fetched; skip the redundant full sync. If the local set
-                    // is empty, a *new* urgent message arrived since the last
-                    // sync, so fall through and sync again. (P1-4 fix:
-                    // replaces the old `urgent_synced` boolean which was not
-                    // bound to any inbox version.)
-                    if self.sync_scheduler.already_synced_urgent(&self.inbox_store) {
-                        log::info!("Urgent flag already fetched and unread locally; skipping full sync");
-                    } else {
-                        log::info!("Urgent message available; dispatching full sync");
-                        match self.rtc.read_time() {
-                            Ok(now) => {
-                                if let Err(err) = self.start_sync(now) {
-                                    log::warn!("Failed to dispatch sync after urgent poll: {err}");
-                                }
-                            }
-                            Err(err) => log::warn!("RTC read failed after urgent poll: {err}"),
-                        }
-                    }
-                }
-                Ok(Ok(false)) => {
-                    self.sync_scheduler.urgent_synced = false;
+                Ok(Ok(available)) => {
+                    self.dispatch_event(inkwash_logic::app::Event::UrgentPollCompleted {
+                        available,
+                    })?;
                 }
                 Ok(Err(err)) => {
                     log::warn!("Urgent poll failed: {err}");
+                    self.dispatch_event(inkwash_logic::app::Event::UrgentPollFailed)?;
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
                 }
-                Err(_) => {}
+                Err(_) => {
+                    self.dispatch_event(inkwash_logic::app::Event::UrgentPollFailed)?;
+                }
             },
             PendingWifiOp::SuspendForBle {
                 reply,
@@ -805,102 +1158,43 @@ impl DeviceContext<'_> {
                     self.ble_wifi_suspended = false;
                     self.ble_session_id = None;
                     if let Some(creds) = post_ble_set_wifi {
-                        self.start_ble_set_wifi_after_resume(creds);
+                        self.start_ble_set_wifi_after_resume(creds)?;
                     }
                 }
                 Ok(Err(err)) => {
                     self.ble_set_wifi_after_resume = None;
+                    self.ble_wifi_suspended = false;
+                    self.ble_session_id = None;
+                    self.ble_start_cancelled = false;
                     log::error!("Wi-Fi resume after BLE failed: {err:#}");
+                    self.feed_set_wifi_verified(Err(format!(
+                        "Wi-Fi resume after BLE failed: {err:#}"
+                    )))?;
                 }
                 Err(TryRecvError::Empty) => {
                     self.pending_wifi_op = Some(PendingWifiOp::ResumeAfterBle { reply });
                 }
-                Err(_) => log::error!("Wi-Fi resume task disconnected after BLE"),
+                Err(_) => {
+                    self.ble_set_wifi_after_resume = None;
+                    self.ble_wifi_suspended = false;
+                    self.ble_session_id = None;
+                    self.ble_start_cancelled = false;
+                    log::error!("Wi-Fi resume task disconnected after BLE");
+                    self.feed_set_wifi_verified(Err(
+                        "Wi-Fi resume task disconnected after BLE".to_string()
+                    ))?;
+                }
             },
         }
-    }
-
-    /// The RTC/NVS-maintenance half of a completed sync: re-point the
-    /// PCF8563 alarm slot at the newly-synced alarm list (the executor's
-    /// `ApplySyncedData` already wrote the list to NVS), apply the daily
-    /// NTP alignment, and clear the fresh-device/urgent-gate flags. The
-    /// merged data apply + transport reply are owned by the state machine;
-    /// this only does what the machine cannot (I2C RTC work on the main
-    /// thread).
-    fn apply_sync_side_effects(&mut self, result: &sync::SyncResult) {
-        let ok = result.outcome.is_ok();
-        if ok {
-            // The merged alarm list is in NVS (applied by the machine);
-            // re-point the PCF8563's single alarm slot at the new nearest
-            // alarm.
-            match self.rtc.read_time() {
-                Ok(now) => {
-                    // Record when this sync ran (main-thread NVS write; the
-                    // network task never writes NVS). The auto-sync checker
-                    // uses this to know how long since the last sync.
-                    if let Err(err) = self.counters.set_last_sync_epoch(now.to_unix()) {
-                        log::warn!("Failed to record last-sync time: {err}");
-                    }
-                    match self.alarm_store.load().and_then(|list| {
-                        crate::alarms::program_hardware_alarm_via(self.rtc, &list, &now)
-                    }) {
-                        Ok(()) => {}
-                        Err(err) => {
-                            log::warn!("Failed to re-arm hardware alarm after sync: {err}")
-                        }
-                    }
-                }
-                Err(err) => log::warn!("RTC read failed after sync (alarm not re-armed): {err}"),
-            }
-            // Daily NTP alignment: the sync task captured the NTP time
-            // while Wi-Fi was up; apply it here (the task never touches
-            // the I2C bus).
-            if let Some(epoch) = result.ntp_epoch {
-                let tz = self.counters.timezone_offset_minutes().unwrap_or(0);
-                let dt = DateTime::from_unix(epoch).shifted_minutes(tz as i32);
-                match self.rtc.write_time(&dt) {
-                    Ok(()) => {
-                        log::info!("NTP alignment applied to RTC");
-                        if let Err(err) = self.counters.set_rtc_align_epoch(epoch) {
-                            log::warn!("Failed to record RTC alignment time: {err}");
-                        }
-                        // NTP just shifted the wall clock — re-point the PCF8563
-                        // hardware alarm at the new instant. The alarm above
-                        // was computed from the pre-NTP RTC read, so without
-                        // this re-arm the slot lags the true time. (P1-6 fix.)
-                        match self.alarm_store.load().and_then(|list| {
-                            crate::alarms::program_hardware_alarm_via(self.rtc, &list, &dt)
-                        }) {
-                            Ok(()) => {}
-                            Err(err) => {
-                                log::warn!("Failed to re-arm hardware alarm after NTP alignment: {err}")
-                            }
-                        }
-                    }
-                    Err(err) => log::warn!("Failed to write NTP time to RTC: {err}"),
-                }
-            }
-            self.sync_scheduler.never_synced = false;
-            // A successful full sync fetched the current server state; if the
-            // urgent flag is set, check whether we already have the message
-            // locally — the server keeps answering `urgent: true` until the
-            // device marks it read. If the local unread_urgent set is
-            // non-empty, we already have it; if empty, a new urgent message
-            // has arrived since this sync (detected on the next poll).
-            // Fixes P1-4: the old behavior set the flag unconditionally,
-            // silently skipping newly-arrived urgent messages.
-            self.sync_scheduler.urgent_synced = true;
-            log::info!("Full sync completed");
-        }
+        Ok(())
     }
 
     /// Feeds a completed sync receipt into the state machine as
     /// `Event::SyncCompleted`. The machine applies the merged data
     /// (`Effect::ApplySyncedData`) for every sync - scheduled and
-    /// on-demand - and emits a `Reply` only when a SyncNow slot awaits
-    /// (tracked in `sm_sync_reply_target`); when present, that reply is
-    /// written to the stored transport + correlation id exactly once.
-    fn feed_sync_completed(&mut self, result: &sync::SyncResult) {
+    /// on-demand - and lets the unified dispatcher resolve any pending
+    /// transport reply.
+    fn feed_sync_completed(&mut self, result: &sync::SyncResult) -> anyhow::Result<()> {
         let sm_result = match &result.outcome {
             Ok(sync::SyncOutcome::Applied {
                 alarms,
@@ -911,246 +1205,49 @@ impl DeviceContext<'_> {
                 etag,
                 uploaded_alarm_ids,
                 uploaded_todo_ids,
-            }) => inkwash_logic::app::SyncResult::Ok {
-                data: inkwash_logic::app::SyncedData {
-                    alarms: alarms.clone(),
-                    todos: todos.clone(),
-                    inbox: inbox.clone(),
-                    inbox_read_acked: inbox_read_acked.clone(),
-                    inbox_truncated: *inbox_truncated,
-                    etag: etag.clone(),
-                    uploaded_alarm_ids: uploaded_alarm_ids.clone(),
-                    uploaded_todo_ids: uploaded_todo_ids.clone(),
-                },
-            },
+            }) => {
+                let last_sync_epoch = self
+                    .app_runner
+                    .borrow()
+                    .last_clock()
+                    .map(|now| now.to_unix())
+                    .unwrap_or(0);
+                inkwash_logic::app::SyncResult::OkWithMetadata {
+                    data: inkwash_logic::app::SyncedData {
+                        alarms: alarms.clone(),
+                        todos: todos.clone(),
+                        inbox: inbox.clone(),
+                        inbox_read_acked: inbox_read_acked.clone(),
+                        inbox_truncated: *inbox_truncated,
+                        etag: etag.clone(),
+                        uploaded_alarm_ids: uploaded_alarm_ids.clone(),
+                        uploaded_todo_ids: uploaded_todo_ids.clone(),
+                    },
+                    last_sync_epoch,
+                    ntp_epoch: result.ntp_epoch,
+                }
+            }
             Err(err) => inkwash_logic::app::SyncResult::Failed(err.to_string()),
         };
-        let target = self.sm_sync_reply_target.take();
         let runner = self.app_runner.clone();
-        let result = self.dispatch_sync_completed(&runner, sm_result);
-        if let (Some(reply), Some((channel, id, cmd))) = (result, target) {
-            write_reply_to_channel(self, channel, &reply, Some(&id));
-            // Cache the final result for async-command dedup: a resent
-            // SyncNow with the same correlation id replays this reply
-            // instead of re-dispatching. (P1-7 fix.)
-            self.last_command = Some((id, cmd, reply));
-        }
+        crate::dispatch_or_retain(
+            &runner,
+            inkwash_logic::app::Event::SyncCompleted(sm_result),
+            self,
+        )
     }
 
-    /// Feeds a completed SetWifi result into the state machine as
-    /// the transport that requested the SetWifi (stored in
-    /// `sm_wifi_reply_target`) and caches it for async-command dedup.
-    fn feed_set_wifi_completed(&mut self, result: Result<(), String>) {
-        let Some((channel, id, cmd)) = self.sm_wifi_reply_target.take() else {
-            return;
-        };
+    /// Feeds a completed SetWifi result through the unified application
+    /// dispatcher. The state machine and dispatcher own reply correlation.
+    fn feed_set_wifi_verified(
+        &mut self,
+        result: Result<crate::storage::WifiCreds, String>,
+    ) -> anyhow::Result<()> {
         let runner = self.app_runner.clone();
-        let reply = self.dispatch_set_wifi_completed(&runner, result);
-        if let Some(reply) = &reply {
-            write_reply_to_channel(self, channel, reply, Some(&id));
-            // Cache the final result for async-command dedup: a resent
-            // SetWifi with the same correlation id replays this reply
-            // instead of re-dispatching. (P1-7 fix.)
-            self.last_command = Some((id, cmd, reply.clone()));
-        }
-    }
-
-    /// Pushes one `SetWifiCompleted` into the runner, pumps, and returns
-    /// the reply the state machine recorded for the wifi operation.
-    fn dispatch_set_wifi_completed(
-        &mut self,
-        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
-        result: Result<(), String>,
-    ) -> Option<Reply> {
-        let last_clock = runner.borrow().last_clock();
-        let mut reply_for_channel = None;
-        {
-            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
-            let mut runtime = runner.borrow_mut();
-            runtime.push(inkwash_logic::app::Event::SetWifiCompleted(result));
-            if let Err(err) = runtime.pump(&mut executor) {
-                log::warn!("SetWifiCompleted dispatch through state machine failed: {err}");
-            }
-            for (reply_channel, reply) in executor.take_replies() {
-                if (reply_channel == Channel::Usb || reply_channel == Channel::Ble)
-                    && reply_for_channel.is_none()
-                {
-                    reply_for_channel = Some(reply);
-                }
-            }
-        }
-        for kick in runner.borrow_mut().take_kicks() {
-            let mut reg = self.pending_renders.borrow_mut();
-            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                reg.register(kick);
-            } else if matches!(
-                kick.effect,
-                inkwash_logic::app::Effect::StartBlePairing(_)
-                    | inkwash_logic::app::Effect::StopBlePairing
-            ) {
-                // BLE worker results are delivered through its dedicated
-                // result channel and correlated by session id, not by an
-                // AppRunner async kick.
-            } else {
-                log::warn!(
-                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
-                    kick.effect,
-                    kick.operation_id
-                );
-            }
-        }
-        reply_for_channel
-    }
-
-    /// Pushes one `SyncBoundaryDue` into the runner and pumps. The state
-    /// machine decides whether a scheduled sync may start (single-flight +
-    /// configured); if it emits StartSync, the executor performs the real
-    /// dispatch inside the pump. No reply is expected (scheduled syncs have
-    /// no transport slot).
-    fn dispatch_sync_boundary(
-        &mut self,
-        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
-    ) {
-        let last_clock = runner.borrow().last_clock();
-        {
-            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
-            let mut runtime = runner.borrow_mut();
-            runtime.push(inkwash_logic::app::Event::SyncBoundaryDue);
-            if let Err(err) = runtime.pump(&mut executor) {
-                log::warn!("SyncBoundaryDue dispatch through state machine failed: {err}");
-            }
-        }
-        for kick in runner.borrow_mut().take_kicks() {
-            let mut reg = self.pending_renders.borrow_mut();
-            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                reg.register(kick);
-            } else {
-                log::warn!(
-                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
-                    kick.effect,
-                    kick.operation_id
-                );
-            }
-        }
-    }
-
-    /// Pushes one `SyncCompleted` into the runner, pumps, and returns the
-    /// reply the state machine recorded for the sync (the Ok/Error for the
-    /// pending SyncNow slot). The caller writes it to the stored target.
-    fn dispatch_sync_completed(
-        &mut self,
-        runner: &std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
-        result: inkwash_logic::app::SyncResult,
-    ) -> Option<Reply> {
-        let last_clock = runner.borrow().last_clock();
-        let mut reply_for_channel = None;
-        {
-            let mut executor = crate::app_runner::EffectRunner::new(self, last_clock);
-            let mut runtime = runner.borrow_mut();
-            runtime.push(inkwash_logic::app::Event::SyncCompleted(result));
-            if let Err(err) = runtime.pump(&mut executor) {
-                log::warn!("SyncCompleted dispatch through state machine failed: {err}");
-            }
-            for (reply_channel, reply) in executor.take_replies() {
-                if (reply_channel == Channel::Usb || reply_channel == Channel::Ble)
-                    && reply_for_channel.is_none()
-                {
-                    reply_for_channel = Some(reply);
-                }
-            }
-        }
-        for kick in runner.borrow_mut().take_kicks() {
-            let mut reg = self.pending_renders.borrow_mut();
-            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                reg.register(kick);
-            } else {
-                log::warn!(
-                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
-                    kick.effect,
-                    kick.operation_id
-                );
-            }
-        }
-        reply_for_channel
-    }
-}
-
-/// Writes one control reply to the given transport, echoing the
-/// correlation id. Mirrors the legacy `deliver_deferred_reply` write but
-/// takes an explicit channel (used by the state-machine-routed paths).
-fn write_reply_to_channel(
-    ctx: &DeviceContext<'_>,
-    channel: Channel,
-    reply: &Reply,
-    id: Option<&str>,
-) {
-    match channel {
-        Channel::Usb => crate::usb_console::write_reply(reply, id),
-        Channel::Ble => {
-            ctx.ble_control.write_reply(reply, id);
-        }
-    }
-}
-
-/// Single `AlarmHost` adapter over the RTC executor + shared runner.
-/// Borrows `&mut DeviceContext` once so `AlarmPoll::poll` runs the exact
-/// orchestration the host harness drives; RTC facts come from the executor
-/// client (the sole owner), never from a direct `board.rtc` access.
-struct CtxAlarmHost<'a, 'ctx> {
-    ctx: &'a mut DeviceContext<'ctx>,
-    runner: std::rc::Rc<std::cell::RefCell<crate::app_runner::AppRunner>>,
-    pending_renders: std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
-}
-
-impl inkwash_logic::alarm_flow::AlarmHost for CtxAlarmHost<'_, '_> {
-    fn alarm_flag(&mut self) -> Result<bool, String> {
-        self.ctx
-            .rtc
-            .alarm_status()
-            .map(|status| status.alarm_flag)
-            .map_err(|e| format!("{e:#}"))
-    }
-    fn read_snapshot(&mut self) -> Result<inkwash_logic::app::RtcAlarmSnapshot, String> {
-        // The executor returns a consistent (time, AF, AIE) snapshot and
-        // honors its own duplicate latch while AF stays asserted.
-        self.ctx.rtc.snapshot().map_err(|e| format!("{e:#}"))
-    }
-    fn snapshot_ready(&mut self, snapshot: inkwash_logic::app::RtcAlarmSnapshot) -> bool {
-        let last_clock = self.runner.borrow().last_clock();
-        let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
-        let mut runtime = self.runner.borrow_mut();
-        runtime.push(inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot));
-        let ok = runtime.pump(&mut executor);
-        drop(runtime);
-        ok.is_ok()
-            && matches!(
-                self.runner.borrow().state().screen,
-                inkwash_logic::app::Screen::AlarmRinging
-            )
-    }
-    fn dismiss(&mut self) {
-        let last_clock = self.runner.borrow().last_clock();
-        let mut executor = crate::app_runner::EffectRunner::new(self.ctx, last_clock);
-        let mut runtime = self.runner.borrow_mut();
-        runtime.push(inkwash_logic::app::Event::Button(
-            inkwash_logic::button_event::ButtonEvent::Pressed(
-                inkwash_logic::button_event::ButtonId::Enter,
-            ),
-        ));
-        let _ = runtime.pump(&mut executor);
-    }
-    fn drain_kicks(&mut self) {
-        for kick in self.runner.borrow_mut().take_kicks() {
-            let mut reg = self.pending_renders.borrow_mut();
-            if matches!(kick.effect, inkwash_logic::app::Effect::Render(_)) {
-                reg.register(kick);
-            } else {
-                log::warn!(
-                    "AppRunner async kick {:?} (op {:?}) not wired; dropped",
-                    kick.effect,
-                    kick.operation_id
-                );
-            }
-        }
+        crate::dispatch_or_retain(
+            &runner,
+            inkwash_logic::app::Event::SetWifiVerified(result),
+            self,
+        )
     }
 }

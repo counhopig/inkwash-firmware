@@ -18,14 +18,15 @@
 //! pending).
 //!
 //! Completion: the task reports every refresh back to the
-//! app through a completion channel - success, failure, and partial->full
+//! app through a bounded completion mailbox - success, failure, and partial->full
 //! recovery are all observable, so the app state machine can treat a frame
 //! as displayed only once its completion arrives.
 
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::collections::VecDeque;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use anyhow::{bail, Result};
 use esp_idf_svc::sys::zectrix_epd::{
@@ -35,6 +36,68 @@ use esp_idf_svc::sys::zectrix_epd::{
 };
 
 use crate::canvas::{self, Rect};
+
+/// Terminal EPD outcomes are critical: every submitted request must receive
+/// exactly one result. The mailbox is bounded, and producers reserve a slot
+/// before replacing a pending render so supersede completion cannot be lost.
+const COMPLETION_CAPACITY: usize = 16;
+
+struct CompletionState {
+    queue: VecDeque<EpdCompletion>,
+    reserved: usize,
+}
+
+struct CompletionMailbox {
+    state: Mutex<CompletionState>,
+    available: Condvar,
+}
+
+impl CompletionMailbox {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CompletionState {
+                queue: VecDeque::with_capacity(COMPLETION_CAPACITY),
+                reserved: 0,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn reserve(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.queue.len() + state.reserved >= COMPLETION_CAPACITY {
+            return false;
+        }
+        state.reserved += 1;
+        true
+    }
+
+    fn complete_reserved(&self, completion: EpdCompletion) {
+        let mut state = self.state.lock();
+        debug_assert!(state.reserved > 0);
+        state.reserved = state.reserved.saturating_sub(1);
+        state.queue.push_back(completion);
+        self.available.notify_one();
+    }
+
+    fn send(&self, completion: EpdCompletion) {
+        let mut state = self.state.lock();
+        while state.queue.len() + state.reserved >= COMPLETION_CAPACITY {
+            self.available.wait(&mut state);
+        }
+        state.queue.push_back(completion);
+        self.available.notify_one();
+    }
+
+    fn try_recv(&self) -> Option<EpdCompletion> {
+        let mut state = self.state.lock();
+        let completion = state.queue.pop_front();
+        if completion.is_some() {
+            self.available.notify_one();
+        }
+        completion
+    }
+}
 
 /// What to refresh: the whole panel, or one rect of the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +147,9 @@ struct RefreshSlot {
     /// queued. A full queue is not a lost wakeup - the task re-checks the
     /// slot on every loop iteration.
     notify_tx: SyncSender<()>,
-    /// Sends completions. The slot uses this to emit a `superseded`
-    /// completion for a request that a newer submission replaced, so no
-    /// submitted request_id is ever left without a terminal outcome.
-    completions_tx: Sender<EpdCompletion>,
+    /// Bounded terminal outcomes. Supersede slots are reserved before
+    /// replacing a pending request, so no critical completion is dropped.
+    completions: Arc<CompletionMailbox>,
 }
 
 impl RefreshSlot {
@@ -95,8 +157,9 @@ impl RefreshSlot {
     /// partials union their rects (the newest frame wins), and a pending
     /// full is superseded by the newer frame's full refresh (it covers
     /// everything anyway).
-    fn submit_partial(&self, rect: Rect, frame: Box<[u8]>, request_id: u64) {
+    fn submit_partial(&self, rect: Rect, frame: Box<[u8]>, request_id: u64) -> Result<()> {
         let mut pending = self.pending.lock();
+        let mut superseded = None;
         match pending.as_mut() {
             Some(cmd) => match &mut cmd.kind {
                 RefreshKind::Full => {
@@ -106,12 +169,21 @@ impl RefreshSlot {
                     // eventual completion carries the *new* id - the old
                     // id already got its terminal outcome, and the new id
                     // must not be left without one.
-                    self.complete_superseded(cmd.request_id, RefreshKind::Full);
+                    if !self.completions.reserve() {
+                        bail!("EPD completion mailbox full; retry partial refresh");
+                    }
+                    superseded =
+                        Some(self.superseded_completion(cmd.request_id, RefreshKind::Full));
                     cmd.request_id = request_id;
                     cmd.frame = frame;
                 }
                 RefreshKind::Partial(prev) => {
-                    self.complete_superseded(cmd.request_id, RefreshKind::Partial(*prev));
+                    if !self.completions.reserve() {
+                        bail!("EPD completion mailbox full; retry partial refresh");
+                    }
+                    superseded = Some(
+                        self.superseded_completion(cmd.request_id, RefreshKind::Partial(*prev)),
+                    );
                     cmd.request_id = request_id;
                     *prev = union_rect(*prev, rect);
                     cmd.frame = frame;
@@ -126,21 +198,36 @@ impl RefreshSlot {
             }
         }
         let _ = self.notify_tx.try_send(());
+        drop(pending);
+        if let Some(completion) = superseded {
+            self.completions.complete_reserved(completion);
+        }
+        Ok(())
     }
 
     /// Submits a full refresh; replaces any pending command (a full of
     /// the newest frame supersedes a pending partial).
-    fn submit_full(&self, frame: Box<[u8]>, request_id: u64) {
+    fn submit_full(&self, frame: Box<[u8]>, request_id: u64) -> Result<()> {
         let mut pending = self.pending.lock();
-        if let Some(cmd) = pending.as_ref() {
-            self.complete_superseded(cmd.request_id, cmd.kind);
-        }
+        let superseded = if let Some(cmd) = pending.as_ref() {
+            if !self.completions.reserve() {
+                bail!("EPD completion mailbox full; retry full refresh");
+            }
+            Some(self.superseded_completion(cmd.request_id, cmd.kind))
+        } else {
+            None
+        };
         *pending = Some(RenderCommand {
             kind: RefreshKind::Full,
             frame,
             request_id,
         });
         let _ = self.notify_tx.try_send(());
+        drop(pending);
+        if let Some(completion) = superseded {
+            self.completions.complete_reserved(completion);
+        }
+        Ok(())
     }
 
     /// Emits a `superseded` completion for a request id that a newer
@@ -149,51 +236,51 @@ impl RefreshSlot {
     /// submitted request_id must receive exactly one terminal outcome
     /// (ok / failed / superseded), otherwise the caller's in-flight
     /// registry leaks.
-    fn complete_superseded(&self, request_id: u64, kind: RefreshKind) {
-        let _ = self.completions_tx.send(EpdCompletion {
+    fn superseded_completion(&self, request_id: u64, kind: RefreshKind) -> EpdCompletion {
+        EpdCompletion {
             kind,
             request_id,
             ok: true,
             recovered: false,
             superseded: true,
-        });
+        }
     }
 }
 
 /// App-side handle: the request slot plus the completion receiver.
+#[derive(Clone)]
 pub struct EpdHandle {
     slot: Arc<RefreshSlot>,
-    completions: Receiver<EpdCompletion>,
+    completions: Arc<CompletionMailbox>,
     /// Monotonic request-id source so each submitted render carries a
-    /// unique id that its completion echoes back. `Cell` because the app
-    /// side is single-threaded and no atomic CAS is available for u64 on
-    /// this target.
-    next_id: std::cell::Cell<u64>,
+    /// unique id that its completion echoes back. `AtomicU64` so the
+    /// handle can be shared across the main loop and the effect task
+    /// without `Rc`/thread-local constraints.
+    next_id: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl EpdHandle {
-    /// Queues a partial refresh of `rect`, merging into any pending
-    /// request (latest-wins). Returns the request id the completion will
-    /// echo back.
-    pub fn request_partial(&self, rect: Rect, frame: Box<[u8]>) -> u64 {
-        let id = self.next_id.get();
-        self.next_id.set(id + 1);
-        self.slot.submit_partial(rect, frame, id);
-        id
+    pub fn request_partial(&self, rect: Rect, frame: Box<[u8]>) -> Result<u64> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
+        self.slot.submit_partial(rect, frame, id)?;
+        Ok(id)
     }
 
     /// Queues a full refresh of the newest frame, replacing any pending
     /// request. Returns the request id the completion will echo back.
-    pub fn request_full(&self, frame: Box<[u8]>) -> u64 {
-        let id = self.next_id.get();
-        self.next_id.set(id + 1);
-        self.slot.submit_full(frame, id);
-        id
+    pub fn request_full(&self, frame: Box<[u8]>) -> Result<u64> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
+        self.slot.submit_full(frame, id)?;
+        Ok(id)
     }
 
     /// Non-blocking drain of completed refreshes.
     pub fn poll_completion(&self) -> Option<EpdCompletion> {
-        self.completions.try_recv().ok()
+        self.completions.try_recv()
     }
 }
 
@@ -218,21 +305,22 @@ pub fn spawn() -> Result<EpdHandle> {
     // later refresh (clock minute changes, deep-sleep wake region) was lost,
     // which froze the on-screen clock.
     let (notify_tx, notify_rx) = sync_channel(1);
-    let (completions_tx, completions_rx) = channel();
+    let completions = Arc::new(CompletionMailbox::new());
     let slot = Arc::new(RefreshSlot {
         pending: Mutex::new(None),
         notify_tx,
-        completions_tx: completions_tx.clone(),
+        completions: Arc::clone(&completions),
     });
     let task_slot = Arc::clone(&slot);
+    let task_completions = Arc::clone(&completions);
     std::thread::Builder::new()
         .name("epd".to_string())
         .stack_size(EPD_TASK_STACK)
-        .spawn(move || run(driver, task_slot, notify_rx, completions_tx))?;
+        .spawn(move || run(driver, task_slot, notify_rx, task_completions))?;
     Ok(EpdHandle {
         slot,
-        completions: completions_rx,
-        next_id: std::cell::Cell::new(1),
+        completions,
+        next_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
     })
 }
 
@@ -259,7 +347,7 @@ fn run(
     driver: EpdDriver,
     slot: Arc<RefreshSlot>,
     notify_rx: Receiver<()>,
-    completions: Sender<EpdCompletion>,
+    completions: Arc<CompletionMailbox>,
 ) {
     // Scratch buffer for the pixels handed to the FFI, reused across
     // refreshes so a request never allocates.
@@ -270,7 +358,9 @@ fn run(
         // refresh are not lost even when the wakeup queue was full.
         while let Some(cmd) = slot.pending.lock().take() {
             let completion = execute(driver.0, &cmd, &mut scratch);
-            let _ = completions.send(completion);
+            // Completion is terminal and therefore applies backpressure to
+            // this worker until the main loop drains the bounded mailbox.
+            completions.send(completion);
         }
         if notify_rx.recv().is_err() {
             break; // client is gone
@@ -373,4 +463,33 @@ fn check_epd(operation: &str, result: i32) -> Result<()> {
         bail!("{operation} failed with ESP-IDF error 0x{result:04x}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completion(request_id: u64) -> EpdCompletion {
+        EpdCompletion {
+            kind: RefreshKind::Full,
+            request_id,
+            ok: true,
+            recovered: false,
+            superseded: false,
+        }
+    }
+
+    #[test]
+    fn completion_mailbox_is_bounded_and_reservation_is_lossless() {
+        let mailbox = CompletionMailbox::new();
+        for request_id in 0..COMPLETION_CAPACITY as u64 {
+            assert!(mailbox.reserve());
+            mailbox.complete_reserved(completion(request_id));
+        }
+        assert!(!mailbox.reserve());
+        assert_eq!(mailbox.try_recv().unwrap().request_id, 0);
+        assert!(mailbox.reserve());
+        mailbox.complete_reserved(completion(99));
+        assert_eq!(mailbox.try_recv().unwrap().request_id, 1);
+    }
 }

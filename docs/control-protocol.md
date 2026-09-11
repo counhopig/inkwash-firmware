@@ -144,14 +144,24 @@ replies arrive close together. Set `id` and match on it rather than assuming
 replies arrive in the order requests were sent.
 
 **Resending is safe and cheap when `id` is set.** If a client resends the
-same command (same `id`, same body) because it hasn't seen a reply yet - USB
-boot reset, a slow operation, a lost byte - the device recognizes the exact
-`(id, command)` pair it already executed and replays the cached reply
-instead of re-running the command. Without a matching `id` on both the
-original and the resend, the device has no way to tell a resend apart from
-a genuinely new, identically-shaped command, and will execute it again -
-this matters for anything with a real side effect (`set_wifi`, `sync_now`),
-not just for saving battery.
+same command (same `id`, same body) because it hasn't seen a reply yet, the
+device recognizes the exact `(id, command)` pair within the current USB or
+BLE connection session and replays the terminal reply instead of re-running
+the command. A deferred command keeps its correlation key until the terminal
+frame is accepted by its transport. For USB, acceptance means the framed
+bytes were written and flushed. For BLE, acceptance means the NimBLE
+notify-tx callback reports `SuccessNotify` for the same connection
+generation. A notify-tx status failure is retried while that connection
+remains valid. An immediate `notify_with` error, a timeout, or a disconnect
+terminates that transport delivery and clears the pending command; the client
+may resend an id-tagged command in the same connection. `busy` is never cached and
+never replaces an existing deferred command. Reconnecting starts a new
+transport session, so an id reused by a new client is not matched to an old
+reply. Without a matching `id` on both the original and the resend, the
+device has no way to tell a resend apart from a genuinely new,
+identically-shaped command, and will execute it again - this matters for
+anything with a real side effect (`set_wifi`, `sync_now`), not just for
+saving battery.
 
 ### Replies
 
@@ -306,10 +316,22 @@ notifications are already message-delimited at the link layer).
 
 - BLE is **not** active by default; it costs ~150KB RAM.
 - User enters "BLE PAIRING" menu item from Home to start advertising.
-- GATT service is available to any BLE client that connects.
+- GATT service accepts one connected client at a time; a second connection is
+  rejected so command writes, notify-tx callbacks, and retries stay bound to
+  one connection handle.
 - On screen exit (HOLD), advertising stops and the GATT service is torn down.
 - The same `control::dispatch` logic handles both USB and BLE commands,
   so the command/reply contract is identical between transports.
+
+The firmware tags each BLE command and reply internally with the pairing
+session, connection generation, connection handle, and a private reply id.
+The private reply id is used for retry bookkeeping even when the command has
+no wire-level `id`; it is never added to the JSON payload. BLE notification
+completion means NimBLE reported `SuccessNotify`. This is a protocol-stack
+transmit result, not an application-level acknowledgement from the client.
+Inbound command and reply queues are bounded: a full command queue rejects the
+write, while a reply already accepted by the worker remains owned by its
+bounded retry buffer until delivery, termination, or disconnect.
 
 ### Limitations (same as USB)
 

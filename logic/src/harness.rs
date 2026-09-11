@@ -114,9 +114,11 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistTodos(_) => "PersistTodos",
         Effect::PersistInbox(_) => "PersistInbox",
         Effect::PersistConfig(_) => "PersistConfig",
+        Effect::PersistWifiCredentials(_) => "PersistWifiCredentials",
         Effect::PersistSyncMetadata(_) => "PersistSyncMetadata",
         Effect::ApplySyncedData(_) => "ApplySyncedData",
         Effect::ClearSyncEtag => "ClearSyncEtag",
+        Effect::ClearRtcAlignEpoch => "ClearRtcAlignEpoch",
         Effect::PersistTimezone(_) => "PersistTimezone",
         Effect::WriteRtcTime(_) => "WriteRtcTime",
         Effect::ProgramRtcAlarm(_) => "ProgramRtcAlarm",
@@ -128,15 +130,21 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::Reply { .. } => "Reply",
         Effect::Render(_) => "Render",
         Effect::StartSync(_) => "StartSync",
+        Effect::PollUrgent => "PollUrgent",
         Effect::StartSetWifi(_) => "StartSetWifi",
         Effect::StartBlePairing(_) => "StartBlePairing",
         Effect::PersistAlarmToggle { .. } => "PersistAlarmToggle",
         Effect::PersistTodoEdit { .. } => "PersistTodoEdit",
         Effect::MarkInboxRead { .. } => "MarkInboxRead",
+        Effect::PersistReminder(_) => "PersistReminder",
+        Effect::CollectReminderFacts(_) => "CollectReminderFacts",
         Effect::SetSyncInterval { .. } => "SetSyncInterval",
         Effect::StopBlePairing => "StopBlePairing",
         Effect::EnterLightSleep(_) => "EnterLightSleep",
+        Effect::DisableLightSleep => "DisableLightSleep",
         Effect::EnterDeepSleep(_) => "EnterDeepSleep",
+        Effect::PrepareSleep { .. } => "PrepareSleep",
+        Effect::CommitSleep(_) => "CommitSleep",
     }
 }
 
@@ -147,10 +155,13 @@ impl EffectExecutor for FakeExecutor {
             | Effect::PersistTodos(_)
             | Effect::PersistInbox(_)
             | Effect::PersistConfig(_)
+            | Effect::PersistWifiCredentials(_)
             | Effect::PersistSyncMetadata(_)
             | Effect::ApplySyncedData(_)
+            | Effect::ClearRtcAlignEpoch
             | Effect::ClearSyncEtag
             | Effect::PersistTimezone(_) => EffectCategory::Persist,
+            Effect::CollectReminderFacts(_) => EffectCategory::Persist,
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm | Effect::WriteRtcTime(_) => {
                 EffectCategory::Rtc
             }
@@ -160,15 +171,19 @@ impl EffectExecutor for FakeExecutor {
             }
             Effect::Reply { .. } => EffectCategory::Ack,
             Effect::Render(_) => EffectCategory::Render,
-            Effect::StartSync(_) | Effect::StartSetWifi(_) => EffectCategory::Sync,
-            Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Ble,
-            Effect::MarkInboxRead { .. } | Effect::SetSyncInterval { .. } => {
-                EffectCategory::Persist
+            Effect::StartSync(_) | Effect::PollUrgent | Effect::StartSetWifi(_) => {
+                EffectCategory::Sync
             }
+            Effect::StartBlePairing(_) | Effect::StopBlePairing => EffectCategory::Ble,
+            Effect::MarkInboxRead { .. }
+            | Effect::PersistReminder(_)
+            | Effect::SetSyncInterval { .. } => EffectCategory::Persist,
             Effect::PersistAlarmToggle { .. } | Effect::PersistTodoEdit { .. } => {
                 EffectCategory::Persist
             }
             Effect::EnterLightSleep(_) | Effect::EnterDeepSleep(_) => EffectCategory::Sleep,
+            Effect::DisableLightSleep => EffectCategory::Sleep,
+            Effect::PrepareSleep { .. } | Effect::CommitSleep(_) => EffectCategory::Sleep,
         };
         self.record(effect, cat);
         if self.failures.take(cat) {
@@ -187,22 +202,34 @@ impl EffectExecutor for FakeExecutor {
             Effect::PersistConfig(_) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                 crate::app::PersistTarget::Config,
             ))),
+            Effect::PersistWifiCredentials(_) => Ok(EffectOutcome::Completed(
+                EffectOutput::Persisted(crate::app::PersistTarget::WifiCredentials),
+            )),
             Effect::PersistSyncMetadata(_) => Ok(EffectOutcome::Completed(
                 EffectOutput::Persisted(crate::app::PersistTarget::SyncMetadata),
             )),
             Effect::ClearSyncEtag => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                 crate::app::PersistTarget::SyncMetadata,
             ))),
+            Effect::ClearRtcAlignEpoch => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::ApplySyncedData(_) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                 crate::app::PersistTarget::SyncApply,
             ))),
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm => {
                 Ok(EffectOutcome::Completed(EffectOutput::RtcProgrammed))
             }
-            Effect::WriteRtcTime(_) => Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten)),
+            Effect::WriteRtcTime(dt) => {
+                Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten(*dt)))
+            }
             Effect::PersistTimezone(_) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                 crate::app::PersistTarget::Timezone,
             ))),
+            Effect::PersistReminder(_) => {
+                Ok(EffectOutcome::Completed(EffectOutput::ReminderPersisted))
+            }
+            Effect::CollectReminderFacts(_) => {
+                Ok(EffectOutcome::Completed(EffectOutput::ReminderFacts(None)))
+            }
             Effect::AcknowledgeRtcAlarm => Ok(EffectOutcome::Completed(EffectOutput::AckDone)),
             Effect::StartTone | Effect::StartReminderTone(_) | Effect::StopTone => {
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
@@ -219,6 +246,7 @@ impl EffectExecutor for FakeExecutor {
                 Ok(EffectOutcome::AsyncWithId(id))
             }
             Effect::StartSync(_)
+            | Effect::PollUrgent
             | Effect::StartSetWifi(_)
             | Effect::StartBlePairing(_)
             | Effect::StopBlePairing => Ok(EffectOutcome::Async),
@@ -235,7 +263,11 @@ impl EffectExecutor for FakeExecutor {
             Effect::EnterLightSleep(_) => {
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }
+            Effect::DisableLightSleep => {
+                Ok(EffectOutcome::Completed(EffectOutput::LightSleepDisabled))
+            }
             Effect::EnterDeepSleep(_) => Ok(EffectOutcome::Async),
+            Effect::PrepareSleep { .. } | Effect::CommitSleep(_) => Ok(EffectOutcome::Async),
         }
     }
 }
@@ -334,8 +366,12 @@ impl Harness {
     /// (high-priority tier first, merged ticks last), then register any
     /// newly-issued render kicks.
     pub fn dispatch(&mut self, event: Event) -> Result<(), String> {
-        self.runtime.push(event);
-        self.runtime.pump(&mut self.executor)?;
+        self.runtime
+            .try_push(event)
+            .map_err(|_| "application event queue saturated".to_string())?;
+        self.runtime
+            .pump(&mut self.executor)
+            .map_err(|error| error.to_string())?;
         self.drain_kicks();
         Ok(())
     }
@@ -344,7 +380,9 @@ impl Harness {
     pub fn drain_kicks(&mut self) {
         for kick in self.runtime.take_kicks() {
             if kick.is_render() {
-                self.pending_renders.register(kick);
+                self.pending_renders
+                    .register(kick)
+                    .expect("host render registry capacity");
             }
         }
     }
@@ -430,18 +468,24 @@ impl Harness {
                 };
                 match failure {
                     Some(error) => {
-                        self.runtime
-                            .push(Event::EffectFailed(crate::app::EffectFailure {
-                                batch_id: kick.batch_id,
-                                effect_id: kick.effect_id,
-                                operation_id: kick.operation_id,
-                                render_generation: kick.render_generation,
-                                error,
-                            }));
+                        let _ =
+                            self.runtime
+                                .try_push(Event::EffectFailed(crate::app::EffectFailure {
+                                    batch_id: kick.batch_id,
+                                    effect_id: kick.effect_id,
+                                    operation_id: kick.operation_id,
+                                    render_generation: kick.render_generation,
+                                    error,
+                                }));
                     }
-                    None => self.runtime.push(Event::EffectCompleted(completion)),
+                    None => self
+                        .runtime
+                        .try_push(Event::EffectCompleted(completion))
+                        .map_err(|_| "application event queue saturated".to_string())?,
                 }
-                self.runtime.pump(&mut self.executor)?;
+                self.runtime
+                    .pump(&mut self.executor)
+                    .map_err(|error| error.to_string())?;
                 self.drain_kicks();
                 Ok(true)
             }
@@ -953,13 +997,13 @@ mod tests {
         let mut reg = RenderRegistry::new();
         let pending_kicks = h.pending_renders.drain_all();
         let first = pending_kicks[0].clone();
-        reg.register(first);
+        reg.register(first).unwrap();
         let replacement = {
             let mut k = pending_kicks[0].clone();
             k.request_id = Some(rid + 1);
             k
         };
-        reg.supersede_then_register(rid, replacement);
+        reg.supersede_then_register(rid, replacement).unwrap();
         assert_eq!(reg.len(), 1);
         assert_eq!(
             reg.feed(rid, true, false),
@@ -988,7 +1032,7 @@ mod tests {
             }),
             request_id: Some(5),
         };
-        reg.register(k);
+        reg.register(k).unwrap();
         assert!(matches!(
             reg.feed(5, false, false),
             FeedOutcome::Matched(_, RenderTerminal::Failed)

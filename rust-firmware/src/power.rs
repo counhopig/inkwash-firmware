@@ -68,31 +68,13 @@ pub fn log_wakeup_cause() -> bool {
 /// background content resync, then enters deep sleep. GPIO17 is held high
 /// via the RTC slow IO block so the main power latch survives the sleep.
 /// The function does not return.
-pub fn enter_deep_sleep_with_wakeups(resync_interval: Option<std::time::Duration>) -> ! {
-    // A boot normally ran `configure_light_sleep`, which armed the keys
-    // for digital GPIO wakeup; deep sleep must not inherit that (an armed
-    // digital wakeup on GPIO0 would double-trigger with the ext1 wake and
-    // garble `wake_cause` disambiguation).
-    disable_light_sleep_gpio_wakeup();
-    // ext1 = multi-GPIO, any-selected-pin-low wakes the chip. GPIO0, GPIO5,
-    // and GPIO18 are all RTC-capable on ESP32-S3 (GPIOs 0-21); GPIO39 (UP)
-    // is not and can never wake deep sleep.
-    let mask: u64 = (1u64 << GPIO_NUM_0) | (1u64 << GPIO_NUM_5) | (1u64 << GPIO_NUM_18);
-    let ret = unsafe {
-        esp_sleep_enable_ext1_wakeup(mask, esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_LOW)
-    };
-    if ret != 0 {
-        log::error!(
-            "esp_sleep_enable_ext1_wakeup(GPIO0|GPIO5, low) failed: 0x{:x}",
-            ret
-        );
-    }
-    if let Some(interval) = resync_interval {
-        let ret = unsafe { esp_sleep_enable_timer_wakeup(interval.as_micros() as u64) };
-        if ret != 0 {
-            log::error!("esp_sleep_enable_timer_wakeup failed: 0x{:x}", ret);
-        }
-    }
+pub fn enter_deep_sleep_with_wakeups(resync_interval: Option<std::time::Duration>) -> Result<()> {
+    // The prepare phase already arms the wake pins when the state machine
+    // admits deep sleep. Keep this call idempotent for the final entry and
+    // make sure a stale light-sleep GPIO source cannot win wake-cause
+    // priority. A failure is returned to the effect layer so it becomes an
+    // explicit Sleep failure and cancels the matching token.
+    prepare_deep_sleep_wakeups(resync_interval)?;
     // Keep GPIO switches off so the held output (GPIO17) is not yanked back
     // to its sleep default while we are asleep.
     unsafe { esp_sleep_enable_gpio_switch(false) };
@@ -100,6 +82,27 @@ pub fn enter_deep_sleep_with_wakeups(resync_interval: Option<std::time::Duration
     unsafe { gpio_hold_en(GPIO_NUM_17) };
     log::info!("Entering deep sleep; wake on ENTER/RTC alarm/DOWN (GPIO0/5/18 low)");
     unsafe { esp_deep_sleep_start() };
+}
+
+/// Arms the deep-sleep wake sources without entering sleep. This is the
+/// hardware half of the tokenized prepare handshake; the state machine still
+/// performs the final business and input-latch checks before commit.
+pub fn prepare_deep_sleep_wakeups(resync_interval: Option<std::time::Duration>) -> Result<()> {
+    disable_light_sleep_gpio_wakeup();
+    let mask: u64 = (1u64 << GPIO_NUM_0) | (1u64 << GPIO_NUM_5) | (1u64 << GPIO_NUM_18);
+    let ret = unsafe {
+        esp_sleep_enable_ext1_wakeup(mask, esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_LOW)
+    };
+    if ret != 0 {
+        bail!("esp_sleep_enable_ext1_wakeup(GPIO0|GPIO5|GPIO18, low) failed: 0x{ret:x}");
+    }
+    if let Some(interval) = resync_interval {
+        let ret = unsafe { esp_sleep_enable_timer_wakeup(interval.as_micros() as u64) };
+        if ret != 0 {
+            bail!("esp_sleep_enable_timer_wakeup failed: 0x{ret:x}");
+        }
+    }
+    Ok(())
 }
 
 /// Performs a controlled software power-cycle using only a short timer
@@ -171,10 +174,21 @@ pub fn wake_cause() -> WakeCause {
 /// disconnected is a precondition for actually sleeping; the config below
 /// only arms the capability - sleep happens solely when idle).
 pub fn configure_light_sleep() -> Result<()> {
+    prepare_light_sleep_wakeups()?;
+    set_light_sleep_enabled(true)?;
+    log::info!("Light sleep armed: keys GPIO0/18/39 wake");
+    Ok(())
+}
+
+pub fn disable_light_sleep() -> Result<()> {
+    set_light_sleep_enabled(false)
+}
+
+fn set_light_sleep_enabled(enabled: bool) -> Result<()> {
     let config = esp_pm_config_t {
         max_freq_mhz: esp_idf_svc::sys::CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ as i32,
         min_freq_mhz: esp_idf_svc::sys::CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ as i32,
-        light_sleep_enable: true,
+        light_sleep_enable: enabled,
     };
     let ret = unsafe { esp_pm_configure(&config as *const esp_pm_config_t as *const c_void) };
     if ret != 0 {
@@ -188,6 +202,13 @@ pub fn configure_light_sleep() -> Result<()> {
     // loop; alarms are caught by the main loop's alarm_flag poll instead.
     // Deep sleep re-arms GPIO5 via ext1, where the RTC-IO path handles
     // its own pull.
+    Ok(())
+}
+
+/// Arms the digital key wake sources without enabling automatic light sleep.
+/// This is used during the cancellable prepare handshake; the PM mode is
+/// enabled only after the token has passed its final commit check.
+pub fn prepare_light_sleep_wakeups() -> Result<()> {
     for gpio in WAKE_PINS {
         let ret = unsafe { gpio_wakeup_enable(gpio, gpio_int_type_t_GPIO_INTR_LOW_LEVEL) };
         if ret != 0 {
@@ -199,7 +220,6 @@ pub fn configure_light_sleep() -> Result<()> {
         bail!("esp_sleep_enable_gpio_wakeup failed: 0x{ret:x}");
     }
 
-    log::info!("Light sleep armed: keys GPIO0/18/39 wake");
     Ok(())
 }
 

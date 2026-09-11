@@ -32,7 +32,9 @@
 //! read instead of hammering the bus, and the latch is dropped once an
 //! ACK/disable clears the flag.
 
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{
+    channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
+};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -47,6 +49,11 @@ use crate::rtc::{DateTime, Pcf8563, PCF8563_ADDR};
 /// 8 KiB leaves comfortable headroom over the 4 KiB default for anyhow
 /// formatting and log calls without overrunning internal RAM.
 const RTC_TASK_STACK: usize = 8 * 1024;
+/// A small bounded command queue preserves the non-blocking collection path;
+/// callers receive an explicit saturation error when the executor is
+/// temporarily full. One-shot reply channels remain unbounded because each
+/// has one producer and one pending receiver.
+const RTC_COMMAND_CAPACITY: usize = 8;
 /// Idle drain timeout: the task feeds the watchdog on this cadence while
 /// no command is pending.
 const IDLE_DRAIN: Duration = Duration::from_secs(1);
@@ -94,7 +101,7 @@ pub struct AlarmStatus {
 /// intact while the actual bus work happens on the executor task.
 #[derive(Clone)]
 pub struct RtcExecutor {
-    tx: Sender<RtcCommand>,
+    tx: SyncSender<RtcCommand>,
 }
 
 impl RtcExecutor {
@@ -103,7 +110,7 @@ impl RtcExecutor {
     /// bring-up loudly (matching the pre-executor `Note4Board::take`
     /// behaviour) instead of silently degrading mid-boot.
     pub fn spawn(bus: SharedI2c) -> Result<Self> {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(RTC_COMMAND_CAPACITY);
         let (probe_tx, probe_rx) = channel();
         std::thread::Builder::new()
             .name("rtc".to_string())
@@ -117,13 +124,20 @@ impl RtcExecutor {
 
     pub fn read_time(&self) -> Result<DateTime> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::ReadTime { reply: reply_tx })?;
+        self.try_send(RtcCommand::ReadTime { reply: reply_tx })?;
         reply_rx.recv()?
+    }
+
+    /// Submit a time read without waiting for the I2C transaction.
+    pub fn request_read_time(&self) -> Result<Receiver<Result<DateTime>>> {
+        let (reply_tx, reply_rx) = channel();
+        self.try_send(RtcCommand::ReadTime { reply: reply_tx })?;
+        Ok(reply_rx)
     }
 
     pub fn write_time(&self, dt: &DateTime) -> Result<()> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::WriteTime {
+        self.try_send(RtcCommand::WriteTime {
             dt: *dt,
             reply: reply_tx,
         })?;
@@ -132,39 +146,62 @@ impl RtcExecutor {
 
     pub fn alarm_status(&self) -> Result<AlarmStatus> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::AlarmStatus { reply: reply_tx })?;
+        self.try_send(RtcCommand::AlarmStatus { reply: reply_tx })?;
         reply_rx.recv()?
+    }
+
+    /// Submit an alarm-status read without waiting for the I2C transaction.
+    pub fn request_alarm_status(&self) -> Result<Receiver<Result<AlarmStatus>>> {
+        let (reply_tx, reply_rx) = channel();
+        self.try_send(RtcCommand::AlarmStatus { reply: reply_tx })?;
+        Ok(reply_rx)
     }
 
     /// Requests a consistent alarm snapshot. Blocks for the executor's
     /// read (sub-ms I2C), matching the old synchronous snapshot reads on
     /// the collection path; the duplicate latch keeps an asserted AF from
     /// turning every poll into a fresh bus transaction.
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> Result<RtcAlarmSnapshot> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::Snapshot { reply: reply_tx })?;
+        self.try_send(RtcCommand::Snapshot { reply: reply_tx })?;
         reply_rx.recv()?
+    }
+
+    /// Submit a consistent alarm snapshot without waiting for I2C. The
+    /// caller polls the returned receiver from its event collector.
+    pub fn request_snapshot(&self) -> Result<Receiver<Result<RtcAlarmSnapshot>>> {
+        let (reply_tx, reply_rx) = channel();
+        self.try_send(RtcCommand::Snapshot { reply: reply_tx })?;
+        Ok(reply_rx)
     }
 
     pub fn acknowledge(&self) -> Result<()> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::Acknowledge { reply: reply_tx })?;
+        self.try_send(RtcCommand::Acknowledge { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn disable(&self) -> Result<()> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::Disable { reply: reply_tx })?;
+        self.try_send(RtcCommand::Disable { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn program(&self, regs: &AlarmRegs) -> Result<()> {
         let (reply_tx, reply_rx) = channel();
-        self.tx.send(RtcCommand::Program {
+        self.try_send(RtcCommand::Program {
             regs: *regs,
             reply: reply_tx,
         })?;
         reply_rx.recv()?
+    }
+
+    fn try_send(&self, command: RtcCommand) -> Result<()> {
+        self.tx.try_send(command).map_err(|err| match err {
+            TrySendError::Full(_) => anyhow::anyhow!("RTC command queue is full"),
+            TrySendError::Disconnected(_) => anyhow::anyhow!("RTC executor disconnected"),
+        })
     }
 }
 

@@ -18,7 +18,7 @@
 use crate::control;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 
 /// Prefix that marks an incoming line as a command, not a log message.
@@ -29,6 +29,14 @@ const COMMAND_PREFIX: &str = ">>IW ";
 /// responses from ordinary log output.
 const REPLY_PREFIX: &str = "<<IW ";
 const MAX_COMMAND_LINE_BYTES: usize = 512;
+/// The reader channel and this staging queue are both bounded. Once both are
+/// full, the reader thread blocks on `SyncSender::send`, preserving command
+/// ownership instead of silently dropping a parsed request.
+const PENDING_COMMAND_CAPACITY: usize = 8;
+/// Bounded main-loop -> writer-task queue and writer-task -> main-loop ACK
+/// queue. The ACK carries the original sequence so a failed frame can be
+/// retried without re-running the command.
+pub const REPLY_WRITER_CAPACITY: usize = 8;
 
 /// Reader state. The receiver thread owns stdin; the main loop only drains its
 /// channel and never waits on ESP-IDF's VFS buffering.
@@ -45,13 +53,13 @@ pub struct UsbConsole {
 
 impl UsbConsole {
     pub fn start() -> Self {
-        let (tx, rx) = mpsc::sync_channel(8);
+        let (tx, rx) = mpsc::sync_channel(PENDING_COMMAND_CAPACITY);
         thread::Builder::new()
             .name("usb-console-rx".into())
             .spawn(move || read_commands(tx))
             .expect("USB console receiver thread must start");
         Self {
-            pending: VecDeque::new(),
+            pending: VecDeque::with_capacity(PENDING_COMMAND_CAPACITY),
             rx,
         }
     }
@@ -62,10 +70,17 @@ impl UsbConsole {
     /// there are no queued commands, or if a line was queued but failed to
     /// parse (in which case a warning is logged).
     pub fn poll_command(&mut self) -> Option<(Option<String>, control::Command)> {
-        while let Ok(cmd) = self.rx.try_recv() {
-            self.pending.push_back(cmd);
-        }
+        self.stage_pending();
         self.pending.pop_front()
+    }
+
+    fn stage_pending(&mut self) {
+        while self.pending.len() < PENDING_COMMAND_CAPACITY {
+            match self.rx.try_recv() {
+                Ok(cmd) => self.pending.push_back(cmd),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -125,11 +140,194 @@ fn read_commands(tx: SyncSender<(Option<String>, control::Command)>) {
     }
 }
 
-/// Write a reply back to the PC tool, framed with the `<<IW ` prefix, echoing
-/// back the triggering command's correlation `id` if it had one. This should
-/// be called from the main loop after dispatching a command.
-pub fn write_reply(reply: &control::Reply, id: Option<&str>) {
-    let json = control::render_reply(reply, id);
-    println!("{REPLY_PREFIX}{json}");
-    let _ = io::stdout().flush();
+/// An owned reply frame waiting for the writer task. The frame remains with
+/// the caller when the bounded queue is full or disconnected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedReply {
+    pub sequence: u64,
+    pub frame: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyWriteAck {
+    pub sequence: u64,
+    pub result: Result<(), String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyQueueError {
+    Full(QueuedReply),
+    Disconnected(QueuedReply),
+}
+
+/// Main-loop handle for the bounded USB reply writer. Enqueueing is
+/// non-blocking; the caller owns a rejected frame and retries it after polling
+/// [`UsbReplyWriter::try_completion`].
+pub struct UsbReplyWriter {
+    tx: SyncSender<QueuedReply>,
+    completion_rx: Receiver<ReplyWriteAck>,
+    next_sequence: u64,
+}
+
+impl UsbReplyWriter {
+    pub fn start() -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(REPLY_WRITER_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::sync_channel(REPLY_WRITER_CAPACITY);
+        thread::Builder::new()
+            .name("usb-console-writer".into())
+            .spawn(move || run_reply_writer(rx, completion_tx))?;
+        Ok(Self {
+            tx,
+            completion_rx,
+            next_sequence: 1,
+        })
+    }
+
+    /// Render a reply into an owned frame without touching the bounded queue.
+    /// The caller can retain this value when the queue is full and retry it
+    /// later without re-serializing or re-running the command.
+    pub fn prepare(&mut self, reply: &control::Reply, id: Option<&str>) -> QueuedReply {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
+        QueuedReply {
+            sequence,
+            frame: render_reply_frame(reply, id),
+        }
+    }
+
+    pub fn enqueue_owned(&self, queued: QueuedReply) -> Result<u64, ReplyQueueError> {
+        self.try_enqueue(queued)
+    }
+
+    pub fn retry(&self, queued: QueuedReply) -> Result<(), ReplyQueueError> {
+        self.try_enqueue(queued).map(|_| ())
+    }
+
+    pub fn try_completion(&self) -> Result<Option<ReplyWriteAck>, mpsc::RecvError> {
+        match self.completion_rx.try_recv() {
+            Ok(ack) => Ok(Some(ack)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(mpsc::RecvError),
+        }
+    }
+
+    fn try_enqueue(&self, queued: QueuedReply) -> Result<u64, ReplyQueueError> {
+        let sequence = queued.sequence;
+        match self.tx.try_send(queued) {
+            Ok(()) => Ok(sequence),
+            Err(TrySendError::Full(queued)) => Err(ReplyQueueError::Full(queued)),
+            Err(TrySendError::Disconnected(queued)) => Err(ReplyQueueError::Disconnected(queued)),
+        }
+    }
+}
+
+fn run_reply_writer(rx: Receiver<QueuedReply>, completion_tx: SyncSender<ReplyWriteAck>) {
+    while let Ok(queued) = rx.recv() {
+        let result = write_frame(&queued.frame).map_err(|err| err.to_string());
+        if completion_tx
+            .send(ReplyWriteAck {
+                sequence: queued.sequence,
+                result,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn render_reply_frame(reply: &control::Reply, id: Option<&str>) -> String {
+    format!("{REPLY_PREFIX}{}\n", control::render_reply(reply, id))
+}
+
+fn write_frame(frame: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(frame.as_bytes())?;
+    stdout.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_staging_is_bounded_without_dropping_channel_commands() {
+        let (tx, rx) = mpsc::sync_channel(PENDING_COMMAND_CAPACITY);
+        let mut console = UsbConsole {
+            rx,
+            pending: VecDeque::with_capacity(PENDING_COMMAND_CAPACITY),
+        };
+        for _ in 0..PENDING_COMMAND_CAPACITY {
+            console
+                .pending
+                .push_back((None, control::Command::GetStatus));
+            tx.send((None, control::Command::GetStatus)).unwrap();
+        }
+
+        console.stage_pending();
+        assert_eq!(console.pending.len(), PENDING_COMMAND_CAPACITY);
+        assert_eq!(console.rx.try_iter().count(), PENDING_COMMAND_CAPACITY);
+
+        assert!(console.poll_command().is_some());
+        assert_eq!(console.pending.len(), PENDING_COMMAND_CAPACITY - 1);
+        console.stage_pending();
+        assert_eq!(console.pending.len(), PENDING_COMMAND_CAPACITY);
+        assert_eq!(console.rx.try_iter().count(), PENDING_COMMAND_CAPACITY - 1);
+    }
+
+    #[test]
+    fn reply_writer_returns_owned_frame_when_full() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (_completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let mut writer = UsbReplyWriter {
+            tx,
+            completion_rx,
+            next_sequence: 1,
+        };
+        rx.try_iter();
+        writer
+            .tx
+            .try_send(QueuedReply {
+                sequence: 77,
+                frame: "occupied".into(),
+            })
+            .unwrap();
+
+        let queued = writer.prepare(&control::Reply::Busy, Some("retry"));
+        let error = writer.enqueue_owned(queued).unwrap_err();
+        let ReplyQueueError::Full(queued) = error else {
+            panic!("expected bounded writer backpressure");
+        };
+        assert_eq!(queued.sequence, 1);
+        assert!(queued.frame.contains("retry"));
+    }
+
+    #[test]
+    fn owned_reply_retries_with_the_same_sequence_after_backpressure() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (_completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let mut writer = UsbReplyWriter {
+            tx,
+            completion_rx,
+            next_sequence: 1,
+        };
+        writer
+            .tx
+            .try_send(QueuedReply {
+                sequence: 99,
+                frame: "occupied".into(),
+            })
+            .unwrap();
+
+        let queued = writer.prepare(&control::Reply::Busy, Some("owned"));
+        let returned = match writer.enqueue_owned(queued) {
+            Err(ReplyQueueError::Full(queued)) => queued,
+            other => panic!("expected owned full reply, got {other:?}"),
+        };
+        assert_eq!(returned.sequence, 1);
+        assert!(returned.frame.contains("owned"));
+        assert_eq!(rx.try_recv().unwrap().sequence, 99);
+        assert_eq!(writer.retry(returned).unwrap(), ());
+        assert_eq!(rx.try_recv().unwrap().sequence, 1);
+    }
 }

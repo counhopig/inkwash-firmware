@@ -311,6 +311,14 @@ impl WifiManager {
         log::info!("Fresh Wi-Fi driver resumed after BLE");
         Ok(())
     }
+
+    /// Return ownership to the normal sync path after a failed BLE resume.
+    /// The failed driver instance is already absent (or stopped); the next
+    /// ordinary connect call will construct a fresh one lazily.
+    pub fn abort_ble_resume(&mut self) {
+        self.started = false;
+        self.suspended_was_started = false;
+    }
 }
 
 /// Legacy fallback that restarts the device for a fresh Wi-Fi session.

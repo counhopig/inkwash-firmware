@@ -1,11 +1,9 @@
 //! HTTPS sync client for pulling alarms and todos from the inkwash-server
 //! (contract: `docs/sync-api.md`).
 //!
-//! `fetch_and_apply` handles conditional requests via `If-None-Match`/ETag,
-//! parses the sync response, writes the fetched data into the local NVS
-//! stores, and re-arms the RTC hardware alarm to whichever is now nearest -
-//! this is the only place outside `screens.rs`'s on-device edit paths that
-//! mutates `alarms::AlarmStore`/`todos::TodoStore`.
+//! The sync client handles conditional requests via `If-None-Match`/ETag and
+//! returns validated merged data. The application state machine admits the
+//! corresponding persistence and RTC effects after the network fact arrives.
 
 use anyhow::{anyhow, Result};
 use embedded_svc::http::client::Client as HttpClient;
@@ -26,7 +24,7 @@ use crate::wifi;
 /// `SyncResponse` and `validate_sync_response` (the sync merge rules) live
 /// in `inkwash-logic` so they can be unit-tested on the host. This crate
 /// is the single source of truth; everything below just wires the result
-/// into HTTP + NVS.
+/// into the HTTP transport and validated result.
 use inkwash_logic::sync_validate::{validate_sync_response, SyncResponse};
 
 /// Response bodies from a compliant server are small (alarms/todos are
@@ -148,7 +146,8 @@ fn read_body_fully(response: &mut impl embedded_svc::io::Read, buf: &mut [u8]) -
     }
     // Buffer is full — check whether the server still has more data.
     if offset == buf.len() {
-        let probe = response.read(&mut [0u8; 1])
+        let probe = response
+            .read(&mut [0u8; 1])
             .map_err(|e| anyhow!("HTTP response read failed during overflow probe: {e:?}"))?;
         if probe > 0 {
             return Err(anyhow!(

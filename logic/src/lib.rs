@@ -25,6 +25,7 @@ pub mod audio_command;
 pub mod ble_memory;
 pub mod ble_radio;
 pub mod button_event;
+pub mod command_sessions;
 pub mod datetime;
 pub mod device_config;
 pub mod epd_registry;
@@ -32,6 +33,7 @@ pub mod event_queue;
 pub mod harness;
 pub mod inbox_item;
 pub mod list_window;
+pub mod power_state;
 pub mod protocol;
 pub mod reminder_dedup;
 pub mod render_plan;
@@ -78,12 +80,138 @@ mod ble_memory_contract {
             .find("if session.is_some()")
             .expect("worker must guard duplicate Start commands");
         let start_init = BLE_SOURCE
-            .find("match BleSession::start()")
+            .find("match BleSession::start(session_id)")
             .expect("worker must initialize after duplicate Start guard");
         assert!(start_guard < start_init);
         assert!(BLE_SOURCE.contains("active_session_id"));
         assert!(BLE_SOURCE.contains("rejecting Start session"));
         assert!(BLE_SOURCE.contains("ignoring stale Stop session"));
+    }
+
+    #[test]
+    fn ble_lifecycle_callbacks_retain_full_channel_observations() {
+        assert!(BLE_SOURCE.contains("struct LifecycleSender"));
+        assert!(BLE_SOURCE.contains("fn send_lifecycle"));
+        assert!(BLE_SOURCE.contains("struct LifecycleMailbox"));
+        assert!(BLE_SOURCE.contains("queue: VecDeque<SequencedLifecycle>"));
+        assert!(BLE_SOURCE.contains("Condvar"));
+        assert!(BLE_SOURCE.contains("while mailbox.queue.len() >= CHANNEL_CAPACITY"));
+        assert!(!BLE_SOURCE.contains("latest: Option<SequencedLifecycle>"));
+        assert!(BLE_SOURCE.contains("poll_lifecycle(&self.lifecycle_mailbox"));
+        assert!(BLE_SOURCE.contains(
+            "send_lifecycle(\n                &lc_tx,\n                BleLifecycle::Connected"
+        ));
+        assert!(BLE_SOURCE.contains(
+            "send_lifecycle(\n                &lc_tx,\n                BleLifecycle::Disconnected"
+        ));
+        assert!(!BLE_SOURCE.contains("let _ = lc_tx.try_send(BleLifecycle"));
+    }
+
+    #[test]
+    fn ble_notify_completion_is_attempt_bound_and_stale_safe() {
+        assert!(BLE_SOURCE.contains("struct NotifyAttempt"));
+        assert!(BLE_SOURCE.contains("attempt: NotifyAttempt"));
+        assert!(BLE_SOURCE.contains("attempt_id: u64"));
+        assert!(BLE_SOURCE.contains("const BLE_REPLY_MAX_RETRIES: u8 = 3"));
+        assert!(BLE_SOURCE.contains("ReplyTerminated"));
+        assert!(BLE_SOURCE.contains("retired_handles: [u64; 1024]"));
+        assert!(BLE_SOURCE.contains("fn release_generation"));
+        assert!(BLE_SOURCE.contains("self.is_retired(attempt.conn_handle)"));
+        assert!(BLE_SOURCE.contains("self.retire_handle(conn_handle)"));
+        assert!(BLE_SOURCE.contains("late callback can\n    /// never consume"));
+        assert!(BLE_SOURCE.contains("pending.push_back(event)"));
+        assert!(!BLE_SOURCE.contains("pending: StdArc<StdMutex<Option<NotifyTxEvent>>>"));
+        assert!(BLE_SOURCE.contains("inflight.attempt_id != event.attempt.attempt_id"));
+        assert!(BLE_SOURCE.contains("BLE stale notify-tx callback ignored"));
+        assert!(BLE_SOURCE.contains("ReplyTerminated"));
+        assert!(BLE_SOURCE.contains("pending_command: Option<BleCommand>"));
+    }
+
+    #[test]
+    fn ble_main_lifecycle_precedes_results_and_filters_stale_events() {
+        const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
+        const CTX_SOURCE: &str = include_str!("../../rust-firmware/src/ctx.rs");
+        let lifecycle_poll = MAIN_SOURCE
+            .find("let mut ble_changed = poll_ble_lifecycle")
+            .expect("main must reduce lifecycle before worker results");
+        let result_poll = MAIN_SOURCE
+            .find("while let Some(result) = ctx.ble_control.poll_result()")
+            .expect("main must poll worker results");
+        assert!(lifecycle_poll < result_poll);
+        assert!(MAIN_SOURCE.contains("Ignoring stale BLE connect session"));
+        assert!(MAIN_SOURCE.contains("Ignoring stale BLE disconnect session"));
+        assert!(MAIN_SOURCE.contains("abort_ble_set_wifi_handoff"));
+        assert!(MAIN_SOURCE.contains("if let Err(err) = ctx.abort_ble_set_wifi_handoff()"));
+        assert!(MAIN_SOURCE.contains("pending_render_completion.is_some()"));
+        assert!(MAIN_SOURCE.contains("pending_app_events.is_empty()"));
+        assert!(MAIN_SOURCE.contains("ctx.pending_sleep_kick = Some(kick)"));
+        assert!(MAIN_SOURCE.contains("replayed_notices"));
+        assert!(CTX_SOURCE.contains("queue_usb_reply"));
+        assert!(CTX_SOURCE.contains("let reply = Reply::Busy"));
+        assert!(CTX_SOURCE.contains("self.ble_wifi_suspended = false"));
+        assert!(CTX_SOURCE.contains("self.ble_session_id = None"));
+    }
+
+    #[test]
+    fn dispatch_saturation_uses_source_latches_instead_of_a_central_overflow() {
+        const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
+        const CTX_SOURCE: &str = include_str!("../../rust-firmware/src/ctx.rs");
+        assert!(CTX_SOURCE.contains("pub struct PendingDispatchSources"));
+        assert!(CTX_SOURCE.contains("BUTTON_PENDING_CAPACITY"));
+        assert!(CTX_SOURCE.contains("WORKER_PENDING_CAPACITY"));
+        assert!(MAIN_SOURCE.contains("pending_dispatch_sources.take_next()"));
+        assert!(MAIN_SOURCE.contains("pub(crate) struct DispatchSaturated"));
+        assert!(MAIN_SOURCE.contains("pub event: inkwash_logic::app::Event"));
+        assert!(MAIN_SOURCE.contains("dispatch_or_retain"));
+        assert!(!MAIN_SOURCE.contains("pending_dispatch_return"));
+        assert!(!MAIN_SOURCE.contains("source dispatch latch saturated; retaining current event"));
+        assert!(!MAIN_SOURCE.contains("pending_dispatch_overflow"));
+        assert!(!MAIN_SOURCE.contains("application dispatch mailbox is saturated"));
+    }
+
+    #[test]
+    fn dispatch_over_capacity_returns_the_event_to_the_producer() {
+        const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
+        const CTX_SOURCE: &str = include_str!("../../rust-firmware/src/ctx.rs");
+        assert!(CTX_SOURCE.contains("if self.buttons.len() >= BUTTON_PENDING_CAPACITY"));
+        assert!(CTX_SOURCE.contains("if self.lifecycle.len() >= LIFECYCLE_PENDING_CAPACITY"));
+        assert!(CTX_SOURCE.contains("if self.worker.len() >= WORKER_PENDING_CAPACITY"));
+        assert!(CTX_SOURCE.contains("if self.sleep.len() >= SLEEP_PENDING_CAPACITY"));
+        assert!(MAIN_SOURCE.contains("return Err(DispatchSaturated { event })"));
+        assert!(MAIN_SOURCE
+            .contains("Err(event) => Err(anyhow::Error::new(DispatchSaturated { event }))"));
+        assert!(MAIN_SOURCE.contains("dispatch_or_retain(runner, event, ctx)"));
+    }
+
+    #[test]
+    fn transport_reply_paths_retain_owned_frames_and_bound_failures() {
+        const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
+        const CTX_SOURCE: &str = include_str!("../../rust-firmware/src/ctx.rs");
+        const SESSIONS_SOURCE: &str = include_str!("../src/command_sessions.rs");
+        assert!(CTX_SOURCE.contains("pending.reply == *reply"));
+        assert!(CTX_SOURCE.contains("pub const USB_REPLY_PENDING_CAPACITY: usize = 32"));
+        assert!(CTX_SOURCE.contains("const USB_REPLY_MAX_RETRIES: u8 = 3"));
+        assert!(CTX_SOURCE.contains("fn cancel_usb_reply"));
+        assert!(CTX_SOURCE.contains("retry_count = pending.retry_count.saturating_add(1)"));
+        assert!(MAIN_SOURCE.contains("fn queue_ble_delivery"));
+        assert!(MAIN_SOURCE.contains("BLE_REPLY_PENDING_CAPACITY"));
+        assert!(MAIN_SOURCE.contains("Reserve an owned delivery record before enqueueing"));
+        assert!(MAIN_SOURCE.contains("BleReplyError::QueueFull"));
+        assert!(MAIN_SOURCE.contains("deliver_ble_reply("));
+        assert!(MAIN_SOURCE.contains("ctx.command_sessions.cancel_pending"));
+        assert!(CTX_SOURCE.contains("pub const BLE_REPLY_PENDING_CAPACITY: usize = 32"));
+        assert!(MAIN_SOURCE.contains("BLE reply mailbox and producer latch full"));
+        assert!(MAIN_SOURCE.contains("pending_ble_reply_latch"));
+        assert!(CTX_SOURCE.contains("pending_usb_reply_latch"));
+        assert!(MAIN_SOURCE.contains("terminate_ble_set_wifi_delivery"));
+        assert!(!MAIN_SOURCE.contains("pending_ble_overflow_retry"));
+        assert!(!CTX_SOURCE.contains("pending_usb_terminal_retry"));
+        assert!(MAIN_SOURCE.contains("pending_ble_handoff"));
+        assert!(MAIN_SOURCE.contains("begin_preserving_pending"));
+        assert!(MAIN_SOURCE.contains("pending_ble_reply_latch"));
+        assert!(CTX_SOURCE.contains("pending_usb_reply_latch"));
+        assert!(MAIN_SOURCE.contains("BLE SetWifi terminal reply terminated after radio handoff"));
+        assert!(SESSIONS_SOURCE.contains("Busy/Pending is a transport response"));
     }
 
     #[test]

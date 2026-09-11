@@ -64,10 +64,6 @@ impl TodoStore {
         self.dirty().ids()
     }
 
-    /// Drops the dirty set after a successful sync.
-    pub fn clear_dirty(&self) -> Result<()> {
-        self.dirty().clear()
-    }
     /// Clears only the IDs that were uploaded in this sync, preserving any
     /// dirty flags set during the round-trip (P1-3 race fix).
     pub fn clear_dirty_ids(&self, ids: &[u8]) -> Result<()> {

@@ -62,6 +62,21 @@ impl AlarmPoll {
         Self::default()
     }
 
+    /// Records an asynchronously collected AF fact and reports whether a
+    /// snapshot request should be started for this edge.
+    pub fn observe_alarm_flag(&mut self, af: bool) -> bool {
+        if !af {
+            self.edge_consumed = false;
+            return false;
+        }
+        !self.edge_consumed
+    }
+
+    /// Marks an asynchronously delivered snapshot as consumed.
+    pub fn mark_snapshot_dispatched(&mut self) {
+        self.edge_consumed = true;
+    }
+
     /// The firmware's `poll_alarm_snapshot`: on a fresh AF edge, read a
     /// consistent snapshot and dispatch; on success set the exit flag
     /// when ringing. Returns true when the state machine entered
@@ -159,5 +174,20 @@ impl AlarmPoll {
     /// Nested pages that must unwind set this; `main` consumes it once.
     pub fn mark_exit(&mut self) {
         self.alarm_exit = true;
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::AlarmPoll;
+
+    #[test]
+    fn async_alarm_edge_is_coalesced_until_clear() {
+        let mut poll = AlarmPoll::new();
+        assert!(poll.observe_alarm_flag(true));
+        poll.mark_snapshot_dispatched();
+        assert!(!poll.observe_alarm_flag(true));
+        assert!(!poll.observe_alarm_flag(false));
+        assert!(poll.observe_alarm_flag(true));
     }
 }

@@ -23,8 +23,26 @@ pub use inkwash_logic::runtime::Runtime as AppRunner;
 
 use crate::alarms::AlarmStore;
 use crate::ctx::DeviceContext;
+use crate::inbox::InboxItem;
 use crate::rtc::DateTime;
-use crate::todos::TodoStore;
+use crate::todos::{Todo, TodoStore};
+
+struct RenderFacts {
+    alarms: Vec<crate::alarms::StoredAlarm>,
+    todos: Vec<Todo>,
+    inbox: Vec<InboxItem>,
+    wifi_configured: bool,
+}
+
+fn render_facts(ctx: &DeviceContext<'_>) -> RenderFacts {
+    let state = ctx.app_runner.borrow();
+    RenderFacts {
+        alarms: state.state().alarms.alarms.clone(),
+        todos: state.state().todos.todos.clone(),
+        inbox: state.state().inbox.items.clone(),
+        wifi_configured: state.state().config.wifi_configured(),
+    }
+}
 
 /// Executes one `Effect` against the existing drivers, reporting the
 /// outcome back to the `inkwash_logic::runtime::Runtime` consumer.
@@ -32,8 +50,8 @@ pub struct EffectRunner<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     last_clock: Option<DateTime>,
     /// Control replies the state machine emitted during this pump, in
-    /// order, tagged with their target channel. The caller (main loop /
-    /// blocking page) drains them after the pump and writes each to its
+    /// order, tagged with their target channel. The caller drains them after
+    /// the pump and writes each to its
     /// transport with the correlation id of the frame that triggered it.
     replies: Vec<(
         inkwash_logic::protocol::Channel,
@@ -94,6 +112,13 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 ))),
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
             },
+            Effect::PersistWifiCredentials(creds) => match self.ctx.counters.save_wifi_creds(creds)
+            {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
+                    inkwash_logic::app::PersistTarget::WifiCredentials,
+                ))),
+                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+            },
             Effect::PersistTimezone(offset_minutes) => match self
                 .ctx
                 .counters
@@ -119,8 +144,12 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     // sync snapshot, not the entire dirty set — any local
                     // edits made during the network round-trip must survive
                     // to be re-uploaded on the next sync (P1-3 race fix).
-                    self.ctx.alarm_store.clear_dirty_ids(&data.uploaded_alarm_ids)?;
-                    self.ctx.todo_store.clear_dirty_ids(&data.uploaded_todo_ids)?;
+                    self.ctx
+                        .alarm_store
+                        .clear_dirty_ids(&data.uploaded_alarm_ids)?;
+                    self.ctx
+                        .todo_store
+                        .clear_dirty_ids(&data.uploaded_todo_ids)?;
                     if let Some(etag) = data.etag.as_deref() {
                         self.ctx.counters.save_sync_etag(etag)?;
                     }
@@ -134,7 +163,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
             }
             Effect::WriteRtcTime(dt) => match self.ctx.rtc.write_time(dt) {
-                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten)),
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RtcTimeWritten(*dt))),
                 Err(err) => Err((EffectCategory::Rtc, format!("{err:#}"))),
             },
             Effect::PersistSyncMetadata(meta) => {
@@ -161,6 +190,10 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                     inkwash_logic::app::PersistTarget::SyncMetadata,
                 ))),
+                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+            },
+            Effect::ClearRtcAlignEpoch => match self.ctx.counters.clear_rtc_align_epoch() {
+                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
             },
             Effect::ProgramRtcAlarm(regs) => match self.ctx.rtc.program(regs) {
@@ -247,6 +280,25 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
                 }
             }
+            Effect::PersistReminder(persistence) => {
+                let result = (|| -> anyhow::Result<()> {
+                    for seq in &persistence.urgent_read_ids {
+                        self.ctx.inbox_store.mark_read(*seq)?;
+                    }
+                    if let Some(date) = persistence.todo_date.as_deref() {
+                        self.ctx.counters.set_todo_reminded_date(date)?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::ReminderPersisted)),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
+                }
+            }
+            Effect::CollectReminderFacts(_) => Err((
+                EffectCategory::Persist,
+                "reminder fact collection requires the effect worker".into(),
+            )),
             Effect::SetSyncInterval { minutes } => {
                 // Fire-and-forget persistence of the SYNC INTERVAL picker
                 // choice: the executor writes the NVS counters the sync
@@ -319,7 +371,8 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                         Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
                     }
                     inkwash_logic::render_plan::RenderPlan::Partial { region, .. } => {
-                        draw_sm_surface(self.ctx, self.last_clock, req.view.clone());
+                        let facts = render_facts(self.ctx);
+                        draw_sm_surface(self.ctx, self.last_clock, req.view.clone(), &facts);
                         let rect = partial_region_rect(region);
                         match self.ctx.board.display.refresh_partial(rect) {
                             Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
@@ -327,7 +380,8 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                         }
                     }
                     inkwash_logic::render_plan::RenderPlan::Full { .. } => {
-                        draw_sm_surface(self.ctx, self.last_clock, req.view.clone());
+                        let facts = render_facts(self.ctx);
+                        draw_sm_surface(self.ctx, self.last_clock, req.view.clone(), &facts);
                         match self.ctx.board.display.refresh_full() {
                             Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
                             Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
@@ -352,6 +406,10 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
                 }
             }
+            Effect::PollUrgent => match self.ctx.start_urgent_poll() {
+                Ok(()) => Ok(EffectOutcome::Async),
+                Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
+            },
             Effect::StartSetWifi(creds) => {
                 // Wi-Fi verification + save runs on the sync task (it owns
                 // the Wi-Fi driver). `Ok(true)` = dispatched (receipt
@@ -409,8 +467,48 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
                 Ok(EffectOutcome::Completed(EffectOutput::LightSleepEntered))
             }
+            Effect::DisableLightSleep => crate::power::disable_light_sleep()
+                .map(|()| EffectOutcome::Completed(EffectOutput::LightSleepDisabled))
+                .map_err(|err| (EffectCategory::Sleep, format!("{err:#}"))),
             Effect::EnterDeepSleep(plan) => {
-                crate::power::enter_deep_sleep_with_wakeups(plan.maintenance);
+                match crate::power::enter_deep_sleep_with_wakeups(plan.maintenance) {
+                    Ok(()) => Ok(EffectOutcome::Async),
+                    Err(err) => Err((EffectCategory::Sleep, format!("{err:#}"))),
+                }
+            }
+            Effect::PrepareSleep {
+                token,
+                maintenance,
+                light_wake_after_ms: _,
+            } => {
+                // The platform half of prepare is synchronous: wake-source
+                // configuration either succeeds or reports a Sleep failure.
+                // The main event collector feeds the resulting token fact
+                // back after this effect, where the state machine performs
+                // the final business gates.
+                match token.kind {
+                    inkwash_logic::power_state::SleepKind::Light => {
+                        crate::power::prepare_light_sleep_wakeups()
+                    }
+                    inkwash_logic::power_state::SleepKind::Deep => {
+                        crate::power::prepare_deep_sleep_wakeups(*maintenance)
+                    }
+                }
+                .map(|()| EffectOutcome::Async)
+                .map_err(|err| {
+                    (
+                        EffectCategory::Sleep,
+                        format!("sleep prepare failed: {err:#}"),
+                    )
+                })
+            }
+            Effect::CommitSleep(_) => {
+                // Commit is a platform handshake marker. The main loop must
+                // re-sample input latch, queue, USB and completion facts
+                // immediately before feeding SleepCommitted; this effect is
+                // deliberately kept asynchronous so it cannot be placed in
+                // an AbortBatch.
+                Ok(EffectOutcome::Async)
             }
         }
     }
@@ -450,7 +548,9 @@ pub(crate) fn apply_render_cache_terminal(
     reg.note_kick_terminal(kick, true, generation_is_current);
 }
 
-fn partial_region_rect(region: inkwash_logic::render_plan::PartialRegion) -> crate::canvas::Rect {
+pub(crate) fn partial_region_rect(
+    region: inkwash_logic::render_plan::PartialRegion,
+) -> crate::canvas::Rect {
     match region {
         inkwash_logic::render_plan::PartialRegion::Clock => crate::canvas::Rect {
             x: 16,
@@ -486,18 +586,19 @@ fn partial_region_rect(region: inkwash_logic::render_plan::PartialRegion) -> cra
 /// Shared with main's legacy dirty-path redraws so the canvas always matches
 /// the SM's current screen (a dirty full redraw while the drawer is open
 /// must keep the overlay).
-pub(crate) fn draw_sm_surface(
+fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
     view: RenderView,
+    facts: &RenderFacts,
 ) {
     match view {
-        RenderView::Home => draw_home_surface(ctx, clock),
+        RenderView::Home => draw_home_surface(ctx, clock, facts),
         RenderView::Navigation {
             selected,
             underlying,
         } => {
-            draw_sm_surface(ctx, clock, *underlying);
+            draw_sm_surface(ctx, clock, *underlying, facts);
             let mut canvas = ctx.board.display.canvas_mut();
             crate::screens::draw_navigation_bar(&mut canvas, selected);
         }
@@ -510,25 +611,25 @@ pub(crate) fn draw_sm_surface(
             crate::screens::draw_sync_interval(&mut canvas, selected);
         }
         RenderView::AlarmList { selected } => {
-            crate::screens::draw_alarm_list(ctx.board, ctx.alarm_store, selected);
+            crate::screens::draw_alarm_list(ctx.board, &facts.alarms, selected);
         }
         RenderView::TodoList { selected } => {
-            crate::screens::draw_todo_list(ctx.board, ctx.todo_store, selected, clock.as_ref());
+            crate::screens::draw_todo_list(ctx.board, &facts.todos, selected, clock.as_ref());
         }
         RenderView::Inbox { selected } => {
-            crate::screens::draw_inbox_list(ctx.board, ctx.inbox_store, selected);
+            crate::screens::draw_inbox_list(ctx.board, &facts.inbox, selected);
         }
         RenderView::InboxItem { index } => {
-            crate::screens::draw_inbox_item_detail(ctx, index, clock.as_ref());
+            crate::screens::draw_inbox_item_detail(ctx.board, &facts.inbox, index);
         }
         RenderView::Calendar { selected_day, .. } => {
             // The grid always renders the current clock month (matching the
             // SM, which keeps its year/month synced to the clock on every
             // tick); only the day cursor comes from the view.
-            crate::screens::draw_calendar_grid(ctx, clock.as_ref(), selected_day);
+            crate::screens::draw_calendar_grid(ctx, clock.as_ref(), selected_day, &facts.todos);
         }
         RenderView::WeekView { year, month, day } => {
-            crate::screens::draw_week_view(ctx, year, month, day, clock.as_ref());
+            crate::screens::draw_week_view(ctx, &facts.todos, year, month, day, clock.as_ref());
         }
         RenderView::NumberPick { stage, value } => {
             crate::screens::draw_number_pick(ctx.board, stage, value);
@@ -545,18 +646,13 @@ pub(crate) fn draw_sm_surface(
     }
 }
 
-/// Draws the idle Home canvas (clock + cards).
-fn draw_home_surface(ctx: &mut DeviceContext<'_>, clock: Option<DateTime>) {
+fn draw_home_surface(ctx: &mut DeviceContext<'_>, clock: Option<DateTime>, facts: &RenderFacts) {
     let next_alarm = clock
         .as_ref()
-        .and_then(|dt| crate::screens::next_alarm_label(ctx.alarm_store, dt));
-    let todo_summary = crate::screens::todo_summary(ctx.todo_store, clock.as_ref());
-    let unread_inbox = ctx.inbox_store.unread_count().unwrap_or(0);
-    let wifi_configured = ctx
-        .counters
-        .wifi_creds()
-        .map(|creds| creds.is_some())
-        .unwrap_or(false);
+        .and_then(|dt| crate::screens::next_alarm_label_from(&facts.alarms, dt));
+    let todo_summary = crate::screens::todo_summary_from(&facts.todos, clock.as_ref());
+    let unread_inbox = facts.inbox.iter().filter(|item| !item.read).count();
+    let wifi_configured = facts.wifi_configured;
     let battery_percent = ctx.board.battery_percent();
     let charge = ctx.board.charge_snapshot();
     ctx.board.display.render_home(

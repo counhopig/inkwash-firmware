@@ -11,6 +11,8 @@
 //! the caller decides whether an explicit full refresh is needed, while
 //! partial requests stay partial.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
@@ -25,8 +27,16 @@ pub use crate::canvas::Rect;
 
 /// Main-thread handle to the EPD subsystem: a lockable view of the frame
 /// buffer plus the request slot into [`crate::epd_task`].
+/// Main-thread handle to the EPD subsystem: an `Arc`-shared lockable
+/// view of the frame buffer plus the request slot into [`crate::epd_task`].
+/// `Clone` so the effect task can own its own handle; the canvas is behind
+/// `Arc<Mutex<>>` so both threads draw and submit from the same buffer.
+/// The EPD task itself never reads the canvas (it receives an immutable
+/// frame snapshot via `RenderCommand`), so the only contention is between
+/// the main loop and the effect task when drawing.
+#[derive(Clone)]
 pub struct EpdClient {
-    canvas: Mutex<Canvas>,
+    canvas: Arc<Mutex<Canvas>>,
     handle: EpdHandle,
 }
 
@@ -34,7 +44,7 @@ impl EpdClient {
     /// Initializes the EPD driver (hardware faults propagate) and spawns
     /// the refresh task.
     pub fn new() -> Result<Self> {
-        let canvas = Mutex::new(Canvas::new());
+        let canvas = Arc::new(Mutex::new(Canvas::new()));
         let handle = epd_task::spawn()?;
         Ok(Self { canvas, handle })
     }
@@ -44,7 +54,7 @@ impl EpdClient {
     /// The returned guard is the frame buffer; the refresh request issued
     /// after drawing snapshots it, so what was just drawn is what the
     /// panel shows.
-    pub fn canvas_mut(&mut self) -> MutexGuard<'_, Canvas> {
+    pub fn canvas_mut(&self) -> MutexGuard<'_, Canvas> {
         self.canvas.lock()
     }
 
@@ -56,7 +66,7 @@ impl EpdClient {
     /// on a PC; this only hands it the canvas.
     #[allow(clippy::too_many_arguments)]
     pub fn render_home(
-        &mut self,
+        &self,
         clock: Option<&DateTime>,
         next_alarm_time: Option<&str>,
         next_alarm_date: Option<&str>,
@@ -86,9 +96,9 @@ impl EpdClient {
 
     /// Queues a full-screen refresh of the current canvas contents; the
     /// frame is snapshotted now, so the panel shows exactly this frame.
-    pub fn refresh_full(&mut self) -> Result<u64> {
+    pub fn refresh_full(&self) -> Result<u64> {
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
-        Ok(self.handle.request_full(frame))
+        self.handle.request_full(frame)
     }
 
     /// Always refreshes only `rect`, never promotes to a full refresh.
@@ -99,14 +109,14 @@ impl EpdClient {
     /// The scheduler merges consecutive partials into one pending request;
     /// `refresh_full` is reserved for deliberate full refreshes such as boot,
     /// page transitions, overlays, and recovery.
-    pub fn refresh_partial(&mut self, rect: Rect) -> Result<u64> {
+    pub fn refresh_partial(&self, rect: Rect) -> Result<u64> {
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
-        Ok(self.handle.request_partial(rect, frame))
+        self.handle.request_partial(rect, frame)
     }
 
     /// Non-blocking drain of completed refreshes: the app
     /// state machine observes each refresh's success/failure/recovery here.
-    pub fn poll_completion(&mut self) -> Option<EpdCompletion> {
+    pub fn poll_completion(&self) -> Option<EpdCompletion> {
         self.handle.poll_completion()
     }
 }
