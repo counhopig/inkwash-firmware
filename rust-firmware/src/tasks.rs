@@ -1,11 +1,21 @@
-//! Shared thread-spawn helper that keeps a worker's stack in internal RAM.
+//! Shared thread-spawn helper: an explicit stack size, forced into internal RAM.
 //!
 //! Several workers run code that must not touch PSRAM: NimBLE controller init
 //! and NVS/flash writes both execute with the flash cache disabled, and a
-//! stack that lives in external SPI RAM is unreachable in that window. The
-//! build allows pthread stacks in PSRAM
-//! (`CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y`), so the allocation caps
-//! have to be requested explicitly per spawn.
+//! stack that lives in external SPI RAM is unreachable in that window.
+//!
+//! The explicit `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` caps below match what
+//! ESP-IDF's pthread default already uses (`components/pthread/pthread.c`,
+//! `esp_pthread_get_default_config`), and on the pinned IDF v5.5.5 FreeRTOS
+//! stacks are forced to internal memory regardless. So these caps are
+//! belt-and-braces rather than a fix: they keep the requirement visible at each
+//! spawn and would still hold if that default ever changed.
+//!
+//! (Historical note: this comment previously cited
+//! `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y` as the reason. That option is
+//! gone from IDF v5.5.5; IDF 5.2.3 defined it with default `n` and scoped it to
+//! `xTaskCreateStatic`, not to pthread stacks. The mitigation was never load-
+//! bearing, but the requirement it expresses still is.)
 
 use anyhow::{anyhow, Result};
 

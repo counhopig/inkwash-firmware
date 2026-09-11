@@ -10,7 +10,7 @@ Firmware for ZECTRIX NOTE4 b/w (ESP32-S3-WROOM-1 N16R8, 4.2" 400×300 SSD2683 EP
 inkwash-firmware/
 ├── docs/            # dev guide (must read) + protocol contracts
 ├── logic/           # inkwash-logic: host-testable pure logic (the only automated test suite, CI-tested)
-├── rust-firmware/   # inkwash-note4: 33 flat src modules + C++ EPD FFI
+├── rust-firmware/   # inkwash-note4: 36 flat src modules + C++ EPD FFI
 ├── scripts/         # Build/flash/provisioning (.sh Linux, .ps1 Windows twin)
 ├── tools/           # inkwash-preview renderer + CJK font generator
 ├── vendor/          # vendored esp-idf-hal 0.46.2 + sdmmc patch (third-party, read-only)
@@ -38,19 +38,19 @@ Highest-signal symbols only; per-module role map lives in `rust-firmware/AGENTS.
 
 | Symbol | Location | Role |
 |--------|----------|------|
-| `main()` | `rust-firmware/src/main.rs:114` | Sole device entry; boot + `dispatch_app_runner` at ~:1135 |
-| `AppRunner` + `EffectRunner` | `logic/src/app.rs` | Firmware-driven host-testable state machine; `update()` MUST NOT do IO (`app.rs:17-19`) |
+| `main()` | `rust-firmware/src/main.rs:91` | Sole device entry; boot + `dispatch_app_runner` (`main.rs:1748`) |
+| `AppRunner` + `EffectRunner` | `logic/src/app.rs` (`update` at `:1293`) / `rust-firmware/src/app_runner.rs:49` | Firmware-driven host-testable state machine; `update()` MUST NOT do IO (contract comment `app.rs:17-19`) |
 | `Note4Board::take()` | `rust-firmware/src/board.rs` | Central hardware assembly (RTC/EPD/buttons/LED/audio/NFC/ADC) |
 | `WifiManager` | `rust-firmware/src/wifi.rs` | One-per-process Wi-Fi singleton; crash-history anchor |
-| `DeviceContext` | `rust-firmware/src/ctx.rs:679` LOC | Shared wall-clock schedulers (`SyncScheduler` + `AlarmScheduler`) for Home/blocking UI loops |
-| `control::dispatch` | `rust-firmware/src/control.rs` | Shared USB/BLE command dispatch, main-loop only |
-| EPD task | `rust-firmware/src/epd_task.rs` | Owns refresh + recovery; `submit_*` channel must stay wired (`epd_task.rs:215-219`) |
+| `DeviceContext` | `rust-firmware/src/ctx.rs:265` (1260 LOC) | Shared wall-clock schedulers (`SyncScheduler` + `AlarmScheduler`) for Home/blocking UI loops |
+| `control` command path | `rust-firmware/src/control.rs` | Wire protocol re-export + parse/render; dispatch lives in the main loop and `ctx.poll_usb_control` |
+| EPD task | `rust-firmware/src/epd_task.rs` | Owns refresh + recovery; notify channel must stay wired (`epd_task.rs:307-311`) |
 | Sync task | `rust-firmware/src/sync_task.rs` | Never touches I2C (`sync_task.rs:9-12`) |
 | Logic test harness | `logic/src/harness.rs` | `FakeExecutor`/`FakeHostAdapter`/`ScriptedFailures` drive the same `AppRunner` the firmware drives |
 
 ## CONVENTIONS
 - Docs mixed-language: dev guide + contracts English; `device-verification-*.md` Chinese. Commits conventional English lowercase (`feat:`/`fix:`/`docs:`/`chore:`/`build:`).
-- `rust-firmware` has no tests; `logic/` owns the entire test suite (121 `#[test]` markers across 10 modules, host). Pre-commit = `cargo +esp fmt --check` + clippy (zero warnings) + release build + on-device verification.
+- `rust-firmware` has no tests; `logic/` owns the entire test suite (383 `#[test]` markers across 29 source files, host). Pre-commit = `cargo +esp fmt --check` + clippy (zero warnings) + release build + on-device verification. Note CI enforces only the `logic` crate — the firmware crate has no automated gate.
 - Toolchain pinned `esp` channel; formatting MUST use `cargo +esp fmt`. SDK = ESP-IDF v5.5.5.
 - Size-first: release `opt-level="s"`, dev `"z"`; `build-std=["std","panic_abort"]`.
 - `sdkconfig.defaults` is the only IDF config committed; real `sdkconfig*` are gitignored `target/` artifacts.

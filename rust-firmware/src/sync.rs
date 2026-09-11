@@ -337,11 +337,21 @@ pub fn fetch_and_apply(
 }
 
 /// Result of a full sync, plus the RTC-relevant side effects the main loop
-/// must apply itself: the sync task runs on its own thread and never
-/// touches the I2C bus (the shared-`Pcf8563`
-/// route was rejected because `SharedI2c` is `Rc<RefCell<...>>`, which is
-/// not `Send`; converting it to `Arc<Mutex<...>>` would ripple through the
-/// audio/NFC drivers for no functional gain over the receipt).
+/// must apply itself.
+///
+/// The sync task never touches the RTC: `rtc_executor.rs` is the single owner
+/// of the `Pcf8563` driver and serializes every register operation on its own
+/// task, so a second writer would break that single-owner invariant *and*
+/// race the executor's duplicate-snapshot latch, which assumes it is the only
+/// code clearing AF. The receipt handoff keeps RTC programming on the path
+/// that already arbitrates it.
+///
+/// (Earlier this was justified by `SharedI2c` being `Rc<RefCell<...>>` and
+/// therefore not `Send`. That is no longer true — `board.rs` now defines it as
+/// `Arc<Mutex<I2cDriver<'static>>>`, which is `Send` — so the sharing this
+/// comment described as impossible is technically possible. It is still not
+/// wanted, for the ownership reason above; the constraint is architectural,
+/// not a type-system limitation.)
 pub struct SyncResult {
     pub outcome: Result<SyncOutcome>,
     /// NTP epoch seconds for the daily RTC alignment, when the alignment
