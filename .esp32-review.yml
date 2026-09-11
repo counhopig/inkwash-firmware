@@ -1,0 +1,38 @@
+# Architecture-review rules for inkwash-firmware.
+#
+# Layers, lowest to highest: the reviewer's built-in defaults, this file, then
+# prohibitions mined from AGENTS.md/CLAUDE.md. Copy `rules/default.yml` from the
+# plugin checkout to widen or narrow the checks.
+#
+# The `allow` lists below are the point of this file: they record sites that the
+# project has deliberately decided are correct. An exception written here is
+# visible and reviewable; the same exception buried in prose is not, and rots
+# the moment the code moves above it.
+
+forbid:
+  # The two sanctioned Peripherals::steal() sites. Both rebuild a peripheral
+  # handle outside the central board assembly on purpose:
+  #   board.rs:416 - battery ADC channel, rebuilt per read
+  #   wifi.rs:94   - the lazy one-per-process EspWifi modem
+  # Recorded with their real line numbers; if either moves, the reviewer will
+  # report the new site rather than silently keeping the exemption.
+  - id: forbid.peripherals-steal
+    severity: high
+    pattern: Peripherals::steal\s*\(
+    message: >-
+      Peripherals::steal() bypasses the central board assembly and can alias a
+      live driver. Only the two documented sites are allowed; a new one needs a
+      rationale, not just a line in this list.
+    allow:
+      - rust-firmware/src/board.rs:416
+      - rust-firmware/src/wifi.rs:94
+
+# The review reads `rust-firmware/sdkconfig.defaults` for CONFIG_* values, so a
+# comment that cites a configuration option is checked against what the build
+# actually applies. Two known tensions are recorded here rather than suppressed,
+# because both need a decision from the project rather than a rule:
+#   - tasks.rs:7 claims CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y; it is unset
+#     (IDF default n). Either set it in sdkconfig.defaults or fix the comment.
+#   - usb_console.rs:57,176 spawn workers with no .stack_size(), so they inherit
+#     the 4096-byte default; the reader parses JSON on that stack.
+# These are reported as findings on purpose. Remove this comment once decided.
