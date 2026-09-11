@@ -427,6 +427,26 @@ impl EffectTask {
         *pending = Some(notice);
     }
 
+    /// True while a received batch result is still latched here because the
+    /// runtime queue had no room for its notices.
+    ///
+    /// The main loop reads this to tell the two states of
+    /// `DeviceContext::worker_batch_in_flight` apart:
+    ///
+    /// - the worker still owns the batch (its result has not arrived) - the
+    ///   state machine must not be advanced any further, because the batch's
+    ///   completion has not been observed yet;
+    /// - the batch is *done* and only its notice is undelivered - reduction
+    ///   must keep running, because draining the runtime queue is the only
+    ///   thing that can free the room that notice is waiting for.
+    ///
+    /// Conflating the two is what let a full queue deadlock the effect path:
+    /// the retained notice held the worker slot, and holding the slot stopped
+    /// the reduction that would have freed a queue slot for the notice.
+    pub fn has_retained_notice(&self) -> bool {
+        self.pending_notice.lock().is_some()
+    }
+
     pub fn try_next_notice(&self) -> Result<Option<BatchResult>, EffectTaskError> {
         if let Some(notice) = self.pending_notice.lock().take() {
             return Ok(Some(notice));

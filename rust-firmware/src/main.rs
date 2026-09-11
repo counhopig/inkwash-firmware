@@ -65,6 +65,14 @@ const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 /// 10 s boundary-detection granularity is fine for the :00/:30-aligned
 /// scheduler.
 const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long the sleep handshake waits for the outstanding PCF8563
+/// alarm-status read to finish before it samples the mechanical sleep facts
+/// (`DeviceContext::settle_sleep_reads`). The executor owns the bus and
+/// answers a register read in well under a millisecond of I2C time, so this
+/// only has to absorb queueing; exceeding it means the executor is stalled, in
+/// which case the read stays latched and the commit is refused rather than
+/// truncating the bus.
+const RTC_READ_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
 const SAFE_MODE_REPLY_CAPACITY: usize = usb_console::REPLY_WRITER_CAPACITY;
 
 /// Epoch seconds captured at firmware build time. Used as the fallback RTC
@@ -517,11 +525,14 @@ fn main() -> Result<()> {
     // (`board.rtc_int`) runs the alarm path immediately after an ext1 wake.
     //
     // Cron-style wall-clock alignment: sync decisions fire when the
-    // boundary index *advances*, not when a boot-relative timer elapses -
-    // so "every 30s" means at :00/:30 of each minute and "every 1h" means
-    // at the top of the hour. Initialized to the boot-time boundary so the
-    // first aligned boundary after boot fires (and a never-synced device
-    // syncs on its first urgent-poll boundary).
+    // boundary index the clock falls into *changes*, not when a boot-relative
+    // timer elapses - so "every 30s" means at :00/:30 of each minute and
+    // "every 1h" means at the top of the hour. Initialized to the boot-time
+    // boundary so the first aligned boundary after boot fires (and a
+    // never-synced device syncs on its first urgent-poll boundary). A clock
+    // that moves backwards (host SetTime, NTP alignment, or the PCF8563 `VL`
+    // reseed) also counts as a change, so the cadence re-aligns instead of
+    // stalling until the clock re-passes a stale cursor.
     let mut idle = false;
     let mut light_sleep_enabled = false;
     let power_ticks_origin = Instant::now();
@@ -1188,6 +1199,14 @@ fn main() -> Result<()> {
         // receipts. Prepare success is represented by the retained kick;
         // commit gets a fresh mechanical snapshot and can still cancel.
         if let Some(kick) = ctx.pending_sleep_kick.take() {
+            // The alarm-status poll is armed again at the top of every
+            // iteration (the <= 1 s alarm cadence while light-sleeping), so
+            // without this bounded settle the mechanical facts below would
+            // always report an RTC read in flight and deep sleep could never
+            // be committed. See `DeviceContext::settle_sleep_reads`; an
+            // unsettleable read (or an asserted alarm flag) leaves the read
+            // latched, which keeps the commit refused.
+            ctx.settle_sleep_reads(RTC_READ_SETTLE_TIMEOUT);
             let event = match &kick.effect {
                 inkwash_logic::app::Effect::PrepareSleep { token, .. } => {
                     let wake_plan_confirmed =
@@ -1261,6 +1280,15 @@ fn main() -> Result<()> {
                     || ctx.worker_batch_in_flight
                     || ctx.pending_effect_notices.is_some(),
                 usb_connected: usb_host_connected,
+                // The in-flight RTC reads are deliberately NOT part of
+                // `event_queue_empty`: the alarm-status read is re-armed by
+                // `poll_alarm_snapshot` every iteration by design (the <= 1 s
+                // alarm cadence while light-sleeping), so counting it here
+                // made this fact permanently false and deep sleep unreachable.
+                // They are re-derivable observations, not pending work; the
+                // I2C hazard they do carry is handled by `settle_sleep_reads`
+                // plus `SleepInputs.operation_in_flight` in
+                // `collect_sleep_inputs`.
                 event_queue_empty: !app_runner.borrow().has_work()
                     && ctx.pending_effect_batch.is_none()
                     && ctx.pending_effect_batches.is_empty()
@@ -1273,9 +1301,6 @@ fn main() -> Result<()> {
                     && ctx.pending_ble_replies.is_empty()
                     && ctx.pending_ble_deliveries.is_empty()
                     && ctx.pending_ble_handoff.is_none()
-                    && ctx.pending_alarm_status.is_none()
-                    && ctx.pending_alarm_snapshot.is_none()
-                    && ctx.pending_clock_read.is_none()
                     && ctx.pending_sleep_kick.is_none()
                     && ctx.pending_app_events.is_empty()
                     && ctx.pending_dispatch_event.is_none()
@@ -1931,6 +1956,16 @@ fn service_effect_task(
                 remaining.extend(notices_iter);
                 ctx.effect_task
                     .retain_notice(crate::effect_task::BatchResult { notices: remaining });
+                // The batch is finished; only its notice is undelivered. Keep
+                // `worker_batch_in_flight` set (no new batch may start before
+                // this one's completion has been admitted) but let
+                // `reduce_effect_batches` keep running: the runtime queue is
+                // full, and reducing queued events is the only thing that can
+                // free the slot this notice needs. See
+                // `EffectTask::has_retained_notice` for the full invariant.
+                log::warn!(
+                    "effect notice retained: runtime queue full; reducing queued events to make room"
+                );
                 return Ok(());
             }
         }
@@ -1974,8 +2009,21 @@ fn reduce_effect_batches(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     ctx: &mut DeviceContext<'_>,
 ) -> anyhow::Result<()> {
+    // A batch that is still *running* pauses the chain: reducing further
+    // events would advance the state machine past an effect whose completion
+    // it has not observed yet. A batch whose result has already arrived (held
+    // in the effect task because the runtime queue was full) must not: that
+    // notice needs a free queue slot, and reducing queued events is the only
+    // thing that can produce one. The inner loop below stays gated on
+    // `worker_batch_in_flight`, so no new batch is submitted while the notice
+    // waits for its slot. The flag cannot change inside this loop - only
+    // `service_effect_task` admits notices, and it is not re-entered here.
+    let notice_retained = ctx.effect_task.has_retained_notice();
     loop {
-        if ctx.pending_effect_batch.is_some() || ctx.worker_batch_in_flight {
+        if ctx.pending_effect_batch.is_some() {
+            break;
+        }
+        if ctx.worker_batch_in_flight && !notice_retained {
             break;
         }
         let batches = match runner.borrow_mut().reduce_next() {
@@ -2486,13 +2534,19 @@ fn collect_sleep_inputs(
         rtc_plan_confirmed: state.rtc_alarm_plan_confirmed(),
         wake_plan_confirmed,
         usb_connected: power::usb_host_connected(),
+        // An in-flight RTC read is a re-derivable observation, not queued
+        // work, so it is excluded here: the alarm-status read is armed at
+        // every iteration by design, and counting it would mean "the queue is
+        // never empty". The deep-sleep I2C hazard it does carry is covered by
+        // `operation_in_flight` above, which the caller makes honest by
+        // settling the read (`DeviceContext::settle_sleep_reads`) before this
+        // snapshot is taken.
         event_queue_empty: !runner.has_work()
             && !worker_in_flight
             && !pending_usb_reply
             && !pending_usb_reply_latch
             && !pending_render_retry
             && !pending_ble_reply
-            && !rtc_read_in_flight
             && ctx.pending_sleep_kick.is_none()
             && ctx.pending_app_events.is_empty()
             && ctx.pending_dispatch_event.is_none()

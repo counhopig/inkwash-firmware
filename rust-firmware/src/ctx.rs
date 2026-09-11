@@ -16,7 +16,8 @@
 
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::Duration;
 
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
@@ -877,6 +878,52 @@ impl DeviceContext<'_> {
         // `dismiss_ringing`. Nothing blocks here - the unified loop keeps
         // serving Button/Tick/USB/BLE/EPD events while the alarm rings.
         Ok(firing)
+    }
+
+    /// Bounded, blocking settle of the outstanding alarm-status read, called
+    /// by the main loop immediately before it samples the mechanical sleep
+    /// facts (`main::collect_sleep_inputs`).
+    ///
+    /// `poll_alarm_snapshot` deliberately keeps a status read armed at (almost)
+    /// every iteration: that is the documented <= 1 s alarm-detection cadence
+    /// while the device light-sleeps, because the PCF8563 `RTC_INT` line is not
+    /// a light-sleep wake source on this board (`power::WAKE_PINS`). The sleep
+    /// gates, however, must not treat that always-armed observation as an
+    /// operation in flight, and deep sleep must not power the digital domain
+    /// down in the middle of the I2C transaction it represents. Waiting here
+    /// resolves both: the read completes before the gates are sampled, and a
+    /// read that cannot be settled (executor stalled) keeps its latch, so the
+    /// gates keep refusing the commit instead of truncating the bus.
+    ///
+    /// An asserted alarm flag is *not* discarded: it is fed back into the
+    /// shared [`inkwash_logic::alarm_flow::AlarmPoll`] exactly as the poll path
+    /// does, which arms the snapshot read the alarm path consumes. The read
+    /// therefore stays in flight and the sleep stays refused until the alarm has
+    /// been handled - a device that is ringing an alarm must not sleep through
+    /// it.
+    pub fn settle_sleep_reads(&mut self, timeout: Duration) {
+        let Some(reply) = self.pending_alarm_status.take() else {
+            return;
+        };
+        match reply.recv_timeout(timeout) {
+            Ok(Ok(status)) => {
+                if self.alarm_poll.observe_alarm_flag(status.alarm_flag) {
+                    match self.rtc.request_snapshot() {
+                        Ok(snapshot) => self.pending_alarm_snapshot = Some(snapshot),
+                        Err(err) => log::warn!("RTC snapshot request failed: {err:#}"),
+                    }
+                }
+            }
+            Ok(Err(err)) => log::warn!("RTC alarm status read failed: {err:#}"),
+            Err(RecvTimeoutError::Timeout) => {
+                // The executor has not finished the transaction: keep the
+                // latch so the admission gates still report a read in flight.
+                self.pending_alarm_status = Some(reply);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                log::warn!("RTC alarm status executor disconnected");
+            }
+        }
     }
 
     /// Runs an urgent/full sync when its wall-clock boundary advances. The

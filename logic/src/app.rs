@@ -6063,6 +6063,54 @@ mod tests {
             .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))));
     }
 
+    /// A host `SetTime` / a corrected RTC write can move the wall clock
+    /// *backwards*. The sync scheduler must re-align to the new boundary
+    /// (paying one extra sync) rather than stalling until the clock walks
+    /// forward past the stale cursor again.
+    #[test]
+    fn backward_clock_move_re_arms_the_full_sync_boundary() {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        let boot_now = dt(10, 0);
+        let _ = update(
+            &mut state,
+            Event::SyncSchedulerConfigured(SyncSchedulerConfig {
+                now_unix: boot_now.to_unix(),
+                interval_minutes: 60,
+                last_sync_epoch: Some(boot_now.to_unix()),
+            }),
+        );
+        // A full sync at 11:00 advances the hourly cursor. Delivery outcome is
+        // irrelevant here - even a failed sync keeps the boundary advanced so
+        // the retry lands on the next boundary.
+        assert!(update(&mut state, Event::Tick(dt(11, 0)))
+            .iter()
+            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))));
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Failed("test".into())),
+        );
+        assert_eq!(state.sync, SyncState::Idle);
+
+        // The clock is then set back to 09:59. The cursor still points at the
+        // 11:00 hour, so the next tick re-aligns with one full sync.
+        assert!(
+            update(&mut state, Event::Tick(dt(9, 59)))
+                .iter()
+                .any(|b| b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))),
+            "a backward clock move must re-arm auto-sync, not stall it"
+        );
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Failed("test".into())),
+        );
+        // Re-aligned: the rest of the 09:00 hour is quiet again.
+        assert!(update(&mut state, Event::Tick(dt(9, 59)))
+            .iter()
+            .all(|b| !b.effects.iter().any(|e| matches!(e, Effect::StartSync(_)))));
+    }
+
     #[test]
     fn sync_now_while_running_replies_busy_on_either_transport() {
         let mut state = AppState::default();

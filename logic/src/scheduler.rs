@@ -1,8 +1,8 @@
 //! Wall-clock boundary-alignment math shared by `rust-firmware/src/ctx.rs`'s
 //! sync-scheduler and `main.rs`'s status/clock poll counters. "Cron-style"
-//! alignment means a boundary is due when its index *advances* relative to
-//! the last one observed, not when a boot-relative timer elapses - so
-//! "every 30s" fires at :00/:30 of each minute and "every 1h" fires at the
+//! alignment means a boundary is due when the index the clock falls into is
+//! no longer the last one observed, not when a boot-relative timer elapses -
+//! so "every 30s" fires at :00/:30 of each minute and "every 1h" fires at the
 //! top of the hour, regardless of what wall-clock time the device happened
 use crate::app::InboxState;
 use crate::inbox_item::{InboxKind, Priority};
@@ -14,12 +14,22 @@ pub fn boundary_index(unix: u64, period_secs: u64) -> u64 {
     unix / period_secs
 }
 
-/// Whether the boundary `unix` falls into has advanced past `last_seen` (the
+/// Whether the boundary `unix` falls into differs from `last_seen` (the
 /// index recorded the last time this boundary fired). A caller should
 /// record the new `boundary_index(unix, period_secs)` after acting on
 /// `true`, mirroring `ctx.rs::poll_scheduled_sync`.
-pub fn boundary_advanced(unix: u64, period_secs: u64, last_seen: u64) -> bool {
-    boundary_index(unix, period_secs) > last_seen
+///
+/// The comparison is deliberately `!=` rather than `>`: a wall clock that
+/// moves *backwards* (host `SetTime`, NTP alignment, or the PCF8563 `VL`
+/// reseed from build time) leaves the cursor pointing at a boundary the clock
+/// has left. Under a monotone comparison the cadence would then stall until
+/// the clock walked forward past that stale index again - for the full-sync
+/// period that is up to a whole interval (hours), or longer after a reseed
+/// that moves the clock back days, and auto-sync would silently stop. With
+/// `!=` the next sample re-aligns the cursor, exactly as it does after a
+/// forward jump.
+pub fn boundary_changed(unix: u64, period_secs: u64, last_seen: u64) -> bool {
+    boundary_index(unix, period_secs) != last_seen
 }
 
 /// Wall-clock sync cursors + urgent-message tracking, moved out of
@@ -76,10 +86,11 @@ impl SyncScheduler {
             .any(|it| !it.read && it.priority == Priority::High && it.kind == InboxKind::Alert)
     }
 
-    /// Whether a full sync is due (boundary index advanced since last fire).
+    /// Whether a full sync is due (the boundary index is no longer the one
+    /// this cursor recorded).
     pub fn full_due(&self, unix: u64, sync_interval_minutes: u16) -> bool {
         let period = sync_interval_minutes.max(1) as u64 * 60;
-        boundary_advanced(unix, period, self.last_full_boundary)
+        boundary_changed(unix, period, self.last_full_boundary)
     }
 
     pub fn interval_minutes(&self) -> u16 {
@@ -92,9 +103,9 @@ impl SyncScheduler {
         self.last_full_boundary = boundary_index(unix, interval as u64 * 60);
     }
 
-    /// Whether an urgent poll is due (30s boundary advanced).
+    /// Whether an urgent poll is due (the 30s boundary index changed).
     pub fn urgent_due(&self, unix: u64) -> bool {
-        boundary_advanced(unix, 30, self.last_urgent_boundary)
+        boundary_changed(unix, 30, self.last_urgent_boundary)
     }
 
     /// Record that the full-sync boundary fired at `unix`.
@@ -181,16 +192,22 @@ mod tests {
     }
 
     #[test]
-    fn boundary_advanced_is_false_within_the_same_period() {
+    fn boundary_changed_is_false_within_the_same_period() {
         let last_seen = boundary_index(100, 30);
-        assert!(!boundary_advanced(101, 30, last_seen));
-        assert!(!boundary_advanced(119, 30, last_seen));
+        assert!(!boundary_changed(101, 30, last_seen));
+        assert!(!boundary_changed(119, 30, last_seen));
     }
 
     #[test]
-    fn boundary_advanced_is_true_once_the_index_changes() {
+    fn boundary_changed_is_true_once_the_index_changes() {
         let last_seen = boundary_index(100, 30);
-        assert!(boundary_advanced(130, 30, last_seen));
+        assert!(boundary_changed(130, 30, last_seen));
+    }
+
+    #[test]
+    fn boundary_changed_is_true_when_the_clock_moves_backwards() {
+        let last_seen = boundary_index(300, 30);
+        assert!(boundary_changed(270, 30, last_seen));
     }
 
     #[test]
@@ -201,8 +218,8 @@ mod tests {
 
     #[test]
     fn a_never_seen_boundary_index_of_zero_is_not_special_cased() {
-        assert!(boundary_advanced(3600, 3600, 0));
-        assert!(!boundary_advanced(0, 3600, 0));
+        assert!(boundary_changed(3600, 3600, 0));
+        assert!(!boundary_changed(0, 3600, 0));
     }
 
     #[test]
@@ -289,12 +306,21 @@ mod tests {
         let mut s = SyncScheduler::new(0, 60, None);
         s.advance_full_boundary(3600, 60);
         s.advance_urgent_boundary(30);
-        assert!(!s.full_due(3599, 60));
-        assert!(!s.urgent_due(29));
+        assert!(!s.full_due(7199, 60), "same hour as the advance → not due");
+        assert!(
+            !s.urgent_due(59),
+            "same 30s window as the advance → not due"
+        );
         s.rollback_full_boundary();
         s.rollback_urgent_boundary();
-        assert!(s.full_due(3600, 60));
-        assert!(s.urgent_due(30));
+        assert!(
+            s.full_due(7199, 60),
+            "the rolled-back hour is due for a retry again"
+        );
+        assert!(
+            s.urgent_due(59),
+            "the rolled-back 30s window is due for a retry again"
+        );
     }
 
     #[test]
@@ -305,10 +331,46 @@ mod tests {
     }
 
     #[test]
-    fn clock_rollback_does_not_make_a_boundary_due() {
-        let s = SyncScheduler::new(300, 60, Some(300));
-        assert!(!s.urgent_due(270));
-        assert!(!s.full_due(270, 60));
+    fn clock_rollback_re_aligns_the_urgent_cursor_instead_of_stalling() {
+        let mut s = SyncScheduler::new(300, 60, Some(300));
+        // The wall clock moved backwards by 30 s (host SetTime / a corrected
+        // RTC). The cursor still points at the boundary the clock no longer
+        // occupies, so exactly one poll fires and re-aligns it.
+        assert!(s.urgent_due(270));
+        assert!(
+            !s.full_due(270, 60),
+            "a rollback inside the same hour is not a full-sync boundary"
+        );
+        s.advance_urgent_boundary(270);
+        assert!(
+            !s.urgent_due(275),
+            "same 30s window after the re-align → not due"
+        );
+        assert!(s.urgent_due(300), "the next real boundary → due again");
+    }
+
+    #[test]
+    fn clock_rollback_re_arms_a_full_sync_after_a_long_backward_jump() {
+        // A `VL` reseed from build time (or any large correction) moves the
+        // clock back *days*. Before the `!=` comparison the hourly cursor sat
+        // days ahead of the clock, so no full sync fired until the clock
+        // walked forward past it again - auto-sync silently stopped for as
+        // long as the jump was wide.
+        let mut s = SyncScheduler::new(7 * 24 * 3600, 60, Some(600));
+        let rolled_back = 6 * 24 * 3600;
+        assert!(
+            s.full_due(rolled_back, 60),
+            "the first sample after the jump re-aligns and syncs"
+        );
+        s.advance_full_boundary(rolled_back, 60);
+        assert!(
+            !s.full_due(rolled_back + 3599, 60),
+            "re-aligned hour → not due"
+        );
+        assert!(
+            s.full_due(rolled_back + 3600, 60),
+            "the next aligned hour → due"
+        );
     }
 
     #[test]
