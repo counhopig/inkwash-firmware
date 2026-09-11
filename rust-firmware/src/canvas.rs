@@ -1,5 +1,3 @@
-//! 1bpp frame buffer and drawing primitives, independent of the EPD driver.
-
 use crate::font8x16;
 use crate::font_cjk;
 
@@ -56,7 +54,6 @@ impl Canvas {
         }
     }
 
-    /// Draws a crisp rectangular outline without filling its interior.
     pub fn stroke_rect(
         &mut self,
         x: usize,
@@ -75,19 +72,10 @@ impl Canvas {
         self.fill_rect(x + width.saturating_sub(t), y, t, height, true);
     }
 
-    /// Draws text with the proportional-width 8x16 font (`font8x16.rs`) -
-    /// more legible than the fixed 5x7 grid `draw_text` uses, at the cost
-    /// of a bigger glyph. Returns the pixel width drawn, so callers that
-    /// need to right-align or center text don't have to duplicate the
-    /// advance-width math.
     pub fn draw_text_prop(&mut self, x: usize, y: usize, scale: usize, text: &str) -> usize {
         self.draw_text_prop_ink(x, y, scale, text, true)
     }
 
-    /// Draws text with the tiny 5x7 font (`font5x7.rs`) at scale 1. Used for
-    /// dense columnar layouts (week view) where 16px type is too tall.
-    /// CJK characters render with the 12x12 GB2312 font instead, advancing
-    /// a fixed cell width.
     pub fn draw_text_small(&mut self, x: usize, y: usize, text: &str) -> usize {
         let mut cursor = x;
         for character in text.chars() {
@@ -121,8 +109,6 @@ impl Canvas {
         cursor - x
     }
 
-    /// Pixel width `text` would occupy if drawn with
-    /// [`Canvas::draw_text_small`], without drawing anything.
     pub fn text_small_width(text: &str) -> usize {
         text.chars()
             .map(|c| {
@@ -135,9 +121,6 @@ impl Canvas {
             .sum()
     }
 
-    /// Pixel width `text` would occupy if drawn with [`Canvas::draw_text_prop`]
-    /// at `scale`, without drawing anything - for right-aligning/centering
-    /// before the content is known to fit.
     pub fn text_prop_width(text: &str, scale: usize) -> usize {
         text.chars()
             .map(|c| {
@@ -160,8 +143,6 @@ impl Canvas {
     ) -> usize {
         let mut cursor = x;
         for character in text.chars() {
-            // CJK characters use the fixed 16x16 GB2312 cell: a solid
-            // block, 16 rows of 16 bits (2 bytes per row, MSB first).
             if let Some(glyph) = font_cjk::glyph16(character) {
                 for (row, bytes) in glyph.chunks_exact(2).enumerate() {
                     let (hi, lo) = (bytes[0], bytes[1]);
@@ -205,10 +186,6 @@ impl Canvas {
     }
 }
 
-/// Packs the pixels inside `rect` from a full-frame snapshot `frame`
-/// (e.g. a `RenderCommand` snapshot captured at request time) into `out`
-/// (a reusable scratch buffer), replacing its contents with the
-/// row-padded 1bpp format the EPD partial-refresh API expects.
 pub fn pack_rect_from_frame(frame: &[u8], rect: Rect, out: &mut Vec<u8>) {
     let row_bytes = (rect.width as usize).div_ceil(8);
     out.clear();

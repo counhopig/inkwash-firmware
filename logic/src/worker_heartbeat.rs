@@ -1,13 +1,3 @@
-//! Pure scheduling policy for watchdog-backed worker loops.
-//!
-//! A worker that is subscribed to the task watchdog must feed after completed
-//! work as well as during an idle timeout.  A continuous command stream can
-//! otherwise keep a `recv_timeout` call from reaching its timeout branch.
-
-/// Whether a subscribed worker should feed after completing one command.
-///
-/// Keeping this decision hardware-independent makes the continuous-command
-/// contract host-testable while the firmware module performs the actual feed.
 pub fn should_feed_after_command(watchdog_subscribed: bool) -> bool {
     watchdog_subscribed
 }

@@ -1,10 +1,3 @@
-//! BLE GATT control channel for on-demand pairing (Phase 5).
-//!
-//! NimBLE owns thread-affine global state and its initialization can block for
-//! several seconds. `BleControl` is therefore only a main-loop handle. A
-//! dedicated worker owns the `BleSession` and serializes start, replies, and
-//! stop commands; callback facts are forwarded through bounded channels.
-
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -22,16 +15,9 @@ use crate::control;
 
 const CHANNEL_CAPACITY: usize = 16;
 const BLE_REPLY_MAX_RETRIES: u8 = 3;
-/// BLE setup is driven from this worker, but the pthread stack itself lives
-/// in internal RAM because the ESP32-S3 controller initialization runs with
-/// the cache disabled and cannot safely touch a PSRAM stack. 16 KiB gives the
-/// NimBLE host/controller initialization path headroom over the configured
-/// 5120-byte NimBLE host stack; Wi-Fi is fully deinitialized before this
-/// worker starts BLE, so the internal heap remains sufficient for the
-/// controller.
+
 const BLE_TASK_STACK: usize = 16 * 1024;
-/// Match the ESP32-S3 controller's allocation capabilities. NimBLE host
-/// buffers are separate; controller startup uses internal DMA-capable RAM.
+
 const BLE_INTERNAL_CAPS: u32 =
     esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA;
 
@@ -117,12 +103,7 @@ struct NotifyAttempt {
 
 struct NotifyAttemptMailbox {
     armed: Option<NotifyAttempt>,
-    /// NimBLE notify callbacks carry no opaque attempt id or connection epoch.
-    /// Once a callback may have escaped (timeout, immediate notify failure, or
-    /// disconnect), retire that numeric handle for this NimBLE session. A new
-    /// connection generation may use another handle, but handle reuse is
-    /// rejected until the whole session is restarted, so a late callback can
-    /// never consume a new generation's inflight reply.
+
     retired_handles: [u64; 1024],
 }
 
@@ -195,10 +176,7 @@ fn send_notify_tx(sender: &NotifyTxSender, event: NotifyTxEvent) {
         log::error!("BLE notify-tx callback mailbox poisoned; awaiting timeout");
         return;
     };
-    // Once one callback has spilled into the fallback FIFO, keep subsequent
-    // callbacks there too. This preserves callback order across the channel
-    // and fallback boundary, so an older attempt cannot be observed after a
-    // newer in-flight attempt.
+
     if !pending.is_empty() {
         if pending.len() < CHANNEL_CAPACITY {
             pending.push_back(event);
@@ -210,9 +188,6 @@ fn send_notify_tx(sender: &NotifyTxSender, event: NotifyTxEvent) {
     match sender.tx.try_send(event) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(event)) | Err(mpsc::TrySendError::Disconnected(event)) => {
-            // The callback cannot block. Preserve events in a bounded FIFO;
-            // never overwrite an earlier callback. If even this mailbox is
-            // full, the worker's in-flight timeout produces a terminal result.
             if pending.len() < CHANNEL_CAPACITY {
                 pending.push_back(event);
             } else {
@@ -287,8 +262,6 @@ fn poll_lifecycle(mailbox: &StdArc<(StdMutex<LifecycleMailbox>, Condvar)>) -> Op
     let mut mailbox = lock.lock().ok()?;
     let event = mailbox.pop();
     if event.is_some() {
-        // The worker callback waits for a slot rather than overwriting a
-        // required connect/disconnect fact.
         available.notify_one();
     }
     event
@@ -321,8 +294,6 @@ struct PendingReply {
     retry_count: u8,
 }
 
-/// Worker-thread ownership that is held back until the radio is actually
-/// needed. Every field is `Send`; `ensure_worker` moves them into the thread.
 struct WorkerLaunch {
     command_rx: mpsc::Receiver<WorkerCommand>,
     tx: mpsc::SyncSender<BleCommand>,
@@ -330,14 +301,12 @@ struct WorkerLaunch {
     result_tx: mpsc::SyncSender<BleTaskResult>,
 }
 
-/// Main-loop handle for the BLE worker. No NimBLE handle crosses this type's
-/// thread boundary; the worker owns the session for its whole lifetime.
 pub struct BleControl {
     command_tx: mpsc::SyncSender<WorkerCommand>,
     rx: mpsc::Receiver<BleCommand>,
     lifecycle_mailbox: StdArc<(StdMutex<LifecycleMailbox>, Condvar)>,
     result_rx: mpsc::Receiver<BleTaskResult>,
-    /// `Some` until the worker thread has been created on demand.
+
     worker_launch: Option<WorkerLaunch>,
     pending_replies: Vec<PendingReply>,
     pending_stop: Option<u64>,
@@ -345,9 +314,6 @@ pub struct BleControl {
 }
 
 impl BleControl {
-    /// Starts the worker thread. NimBLE is not initialized until the state
-    /// machine submits `StartBlePairing`, so boot and the main loop remain
-    /// responsive while the radio is being brought up.
     pub fn spawn() -> Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -355,12 +321,7 @@ impl BleControl {
             StdArc::new((StdMutex::new(LifecycleMailbox::default()), Condvar::new()));
         let lifecycle_mailbox_for_worker = StdArc::clone(&lifecycle_mailbox);
         let (result_tx, result_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        // The worker thread is NOT created here. Bleeding 16 KiB of internal
-        // RAM plus a permanently parked pthread from boot, for a radio that is
-        // unused until the user opens the pairing screen, is waste on a device
-        // whose scarcest resource is internal RAM. The channel ends still
-        // exist, so no command can be lost; the OS thread is created by
-        // `ensure_worker` on the first `Start`.
+
         Ok(Self {
             command_tx,
             rx,
@@ -380,9 +341,6 @@ impl BleControl {
         })
     }
 
-    /// Creates the worker thread the first time it is needed. The worker is
-    /// never torn down once spawned (it parks between sessions), so the launch
-    /// material is consumed exactly once.
     fn ensure_worker(&mut self) -> Result<()> {
         let Some(launch) = self.worker_launch.take() else {
             return Ok(());
@@ -398,8 +356,6 @@ impl BleControl {
         })
     }
 
-    /// Queue radio initialization without blocking the main loop. The worker
-    /// thread is created here on first use, not at boot.
     pub fn start(&mut self, name: &str, session_id: u64) -> Result<()> {
         self.ensure_worker()?;
         self.command_tx
@@ -410,8 +366,6 @@ impl BleControl {
             .map_err(|err| anyhow!("BLE worker start queue unavailable: {err}"))
     }
 
-    /// Queue radio teardown without blocking the main loop. The worker's
-    /// command order guarantees Stop runs before a later Start.
     pub fn stop(&mut self, session_id: u64) -> Result<()> {
         match self.command_tx.try_send(WorkerCommand::Stop { session_id }) {
             Ok(()) => Ok(()),
@@ -491,7 +445,6 @@ impl BleControl {
             .retain(|reply| reply.session_id != session_id || reply.generation != generation);
     }
 
-    /// Forward a reply to the worker-owned notify characteristic.
     pub fn write_reply(
         &mut self,
         reply: &control::Reply,
@@ -515,9 +468,7 @@ impl BleControl {
             queued: false,
             retry_count: 0,
         };
-        // Reserve the bounded ownership record before touching the worker
-        // queue. A full queue therefore leaves an owned retry record instead
-        // of making enqueue and tracking a two-step lossy operation.
+
         self.pending_replies.push(pending);
         match self.command_tx.try_send(WorkerCommand::Reply {
             session_id,
@@ -532,11 +483,7 @@ impl BleControl {
                     .expect("reply reservation")
                     .queued = true;
             }
-            Err(mpsc::TrySendError::Full(_)) => {
-                // Accepted into the bounded retry buffer. The caller must
-                // treat this as accepted so command-session ownership is not
-                // cancelled while the worker drains its command queue.
-            }
+            Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.pending_replies.pop();
                 return Err(BleReplyError::Disconnected);
@@ -579,8 +526,6 @@ impl BleControl {
 
 impl Drop for BleControl {
     fn drop(&mut self) {
-        // Best-effort wakeup; dropping the last sender also makes the worker
-        // leave its receive loop and drop any session it still owns.
         let _ = self
             .command_tx
             .try_send(WorkerCommand::Stop { session_id: 0 });
@@ -602,9 +547,7 @@ fn run(
                 session_id,
             }) => {
                 log::info!("BLE worker: Start session {session_id}");
-                // Never tear down an active session to service a duplicate or
-                // corrupted Start. Stop must be received first; dropping the
-                // NimBLE session here could run deinit on a live controller.
+
                 if session.is_some() {
                     log::warn!(
                         "BLE worker: rejecting Start session {session_id}; active session {:?}",
@@ -842,18 +785,12 @@ fn run(
     session.take();
 }
 
-/// ESP-IDF reports this value in bytes (not the FreeRTOS word units used by
-/// the upstream API). Keeping the measurement in the worker log makes a
-/// device trace sufficient to distinguish a controller allocation failure
-/// from a worker-stack exhaustion before the next BLE regression.
 fn log_stack_high_watermark(stage: &str) {
     let free_bytes =
         unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark2(std::ptr::null_mut()) };
     log::info!("BLE worker stack: {stage}, high-water free={free_bytes} bytes");
 }
 
-/// The NimBLE-owning half of the BLE implementation. It never crosses the
-/// worker boundary, including its callback channels and notify handle.
 struct BleSession {
     rx: mpsc::Receiver<BleCommand>,
     _tx: mpsc::SyncSender<BleCommand>,
@@ -898,11 +835,6 @@ impl BleSession {
         result
     }
 
-    /// Stop advertising while the NimBLE host is still alive. The crate's
-    /// `deinit_full()` resets its global advertising object *after* stopping
-    /// the host; if advertising is still active that reset calls
-    /// `ble_gap_adv_stop()` after `nimble_port_deinit()`, which is a
-    /// use-after-deinit on ESP-IDF and panics in `ble_gap_adv_active()`.
     fn shutdown_nimble() {
         let advertising = BLEDevice::take().get_advertising();
         if advertising.lock().is_advertising() {

@@ -1,58 +1,3 @@
-//! Independent effect execution task: moves synchronous `EffectRunner::run`
-//! off the main loop so slow NVS writes, RTC I2C, and other blocking
-//! operations no longer stall button / RTC / USB / BLE fact collection.
-//!
-//! ## Architecture
-//!
-//! The main loop reduces events to `EffectBatch`es via `Runtime::reduce_next`
-//! (pure, fast, no I/O) and submits them through `EffectTask::submit_batch`.
-//! A dedicated FreeRTOS task executes each batch in array order, honouring
-//! `FailurePolicy::AbortBatch` / `Continue`, and returns `BatchNotice`s
-//! (completion / failure) through a channel. The main loop reads notices via
-//! `EffectTask::drain_notices` and feeds them back via `Runtime::submit_notice`.
-//!
-//! ## Driver ownership
-//!
-//! `DeviceContext` is `!Send` (it borrows `&mut Note4Board` with raw
-//! `PinDriver` pointers), so it cannot cross the thread boundary. Instead,
-//! the task owns a separate set of `Send`-safe driver handles:
-//!
-//! - **NVS stores**: `AlarmStore` / `TodoStore` / `InboxStore` / `PersistedCounters`
-//!   wrap `EspDefaultNvs` handles. ESP-IDF's NVS API serialises access internally
-//!   (per-namespace mutex); the stores are `unsafe impl Send` (see below).
-//! - **RTC**: `RtcExecutor` is a channel sender to the RTC executor task (I2C
-//!   serialised on the RTC task).
-//! - **Sync**: `SyncTask` is a channel sender to the Wi-Fi sync task.
-//! - **BLE**: `BleControl` uses channel senders internally.
-//! - **Audio**: `AudioTask` owns a fixed-capacity `AudioMailbox`.
-//! - **Display**: `EpdClient` is `Clone` (`Arc<Mutex<Canvas>>` + channel-based `EpdHandle`).
-//!
-//! ## RTC I2C safety
-//!
-//! All RTC operations go through `RtcExecutor`'s channel — the RTC executor task
-//! owns the I2C bus. The effect task's RTC calls block on the reply channel but
-//! never touch I2C directly, so there is no race with the main loop's clock polls.
-//!
-//! ## Battery / charging snapshot
-//!
-//! `Note4Board::battery_percent()` and `charge_snapshot()` use GPIO/ADC which
-//! are `!Send`. The main loop snapshots these values each iteration and stores
-//! them in `SharedTaskState`, which the task reads when drawing the Home
-//! surface.
-//!
-//! ## Render coordination
-//!
-//! `RenderRegistry` is `Arc<std::sync::Mutex<RenderRegistry>>` (shared between
-//! the main loop and the task). The task plans renders and kicks the EPD; the
-//! main loop's EPD-completion handler updates the cache via the same registry.
-//!
-//! ## Constraints
-//!
-//! - Each batch executes serially within the task (no intra-batch concurrency).
-//! - Async effects (Render, StartSync, StartBlePairing, EnterDeepSleep,
-//!   PrepareSleep, CommitSleep) are only the last effect in their batch — the
-//!   state machine enforces this.
-
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -68,35 +13,12 @@ use crate::rtc_executor::RtcExecutor;
 use crate::storage::PersistedCounters;
 use crate::todos::TodoStore;
 
-// ---- channel capacities ----
-
-/// Bounded channel main loop → task. Capacity 1: the task drains each
-/// batch before blocking; the main loop never queues more than one ahead.
 const BATCH_CHANNEL_CAP: usize = 1;
 
-/// Capacity of the notice channel (task → main). Must hold enough for a
-/// single batch's worth of completions plus margin for the main loop's
-/// fact-collection poll cycle.
 const NOTICE_CHANNEL_CAP: usize = 8;
 
-/// Stack size for the effect task. Covers NVS serde + I2C blocking waits
-/// without overrunning the ESP32-S3's limited internal-RAM stack.
-///
-/// Sized from on-device `uxTaskGetStackHighWaterMark` readings: the deepest
-/// observed effect is `CollectReminderFacts`, which reaches `read_blob::<4096>`
-/// (a 4 KiB stack array) and left only 1032 of 8192 bytes free. That is too
-/// little headroom for a task that also runs `PersistInbox` against the same
-/// 4 KiB buffer, so the budget here is doubled and the stack is pinned to
-/// internal RAM (flash writes run with the cache disabled, where a PSRAM
-/// stack is not safe - the same rule the BLE worker follows).
 const EFFECT_TASK_STACK: usize = 16 * 1024;
 
-/// The completion envelope for exactly one worker batch.
-///
-/// Keeping the batch boundary explicit is important for `AbortBatch`: a
-/// failed batch may legitimately produce fewer notices than it has effects,
-/// but it must still release the one worker slot once its complete result has
-/// been delivered.
 #[derive(Debug)]
 pub struct BatchResult {
     pub notices: Vec<BatchNotice>,
@@ -108,9 +30,6 @@ pub enum EffectTaskError {
     Disconnected,
 }
 
-/// A self-contained, `Send` set of driver handles that the effect task
-/// owns. This duplicates the relevant fields of `DeviceContext` as owned /
-/// clonable handles so the task never borrows `&mut DeviceContext`.
 pub struct EffectDrivers {
     pub alarm_store: AlarmStore,
     pub todo_store: TodoStore,
@@ -119,9 +38,6 @@ pub struct EffectDrivers {
     pub rtc: RtcExecutor,
 }
 
-/// The effect task's executor: wraps `EffectDrivers` and implements
-/// `EffectExecutor` by dispatching each effect to the appropriate driver.
-/// This mirrors `EffectRunner` but operates on owned `Send` handles.
 pub struct TaskExecutor {
     pub drivers: EffectDrivers,
 }
@@ -130,7 +46,6 @@ impl EffectExecutor for TaskExecutor {
     fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
         let d = &mut self.drivers;
         match effect {
-            // ---- synchronous persistence effects ----
             Effect::PersistAlarms(list) => match AlarmStore::save(&d.alarm_store, list) {
                 Ok(()) => Ok(EffectOutcome::Completed(
                     inkwash_logic::app::EffectOutput::Persisted(
@@ -312,7 +227,7 @@ impl EffectExecutor for TaskExecutor {
                     )),
                 }
             }
-            // ---- RTC effects (channel-based, serialized on RTC task) ----
+
             Effect::ProgramRtcAlarm(regs) => match d.rtc.program(regs) {
                 Ok(()) => Ok(EffectOutcome::Completed(
                     inkwash_logic::app::EffectOutput::RtcProgrammed,
@@ -362,13 +277,11 @@ impl EffectExecutor for TaskExecutor {
     }
 }
 
-/// The task's main loop: receive batches, execute them, send notices back.
 fn run(
     mut executor: TaskExecutor,
     batch_rx: Receiver<EffectBatch>,
     notice_tx: SyncSender<BatchResult>,
 ) {
-    // `recv()` returning `Err` means every sender was dropped: task shutdown.
     while let Ok(batch) = batch_rx.recv() {
         let result = BatchResult {
             notices: execute_batch(batch, &mut executor),
@@ -379,7 +292,6 @@ fn run(
     }
 }
 
-/// Handle to the effect task, used by the main loop.
 pub struct EffectTask {
     batch_tx: SyncSender<EffectBatch>,
     notice_rx: Receiver<BatchResult>,
@@ -387,8 +299,6 @@ pub struct EffectTask {
 }
 
 impl EffectTask {
-    /// Spawns the effect task with the given driver handles. The drivers
-    /// (and their contained handles) are moved into the task thread.
     pub fn spawn(drivers: EffectDrivers) -> Result<Self> {
         let (batch_tx, batch_rx) = sync_channel::<EffectBatch>(BATCH_CHANNEL_CAP);
         let (notice_tx, notice_rx) = sync_channel::<BatchResult>(NOTICE_CHANNEL_CAP);
@@ -404,9 +314,6 @@ impl EffectTask {
         })
     }
 
-    /// Submit one effect batch to the task. Returns `Err` if the task has
-    /// exited (channel closed). The batch executes asynchronously; completion
-    /// notices arrive via [`drain_notices`].
     pub fn try_submit_batch(
         &self,
         batch: EffectBatch,
@@ -418,31 +325,12 @@ impl EffectTask {
         }
     }
 
-    /// Retain the one notice that the Runtime queue could not admit. The main
-    /// loop stops draining after this point, so the bounded worker channel
-    /// provides backpressure without dropping notices.
     pub fn retain_notice(&self, notice: BatchResult) {
         let mut pending = self.pending_notice.lock();
         debug_assert!(pending.is_none());
         *pending = Some(notice);
     }
 
-    /// True while a received batch result is still latched here because the
-    /// runtime queue had no room for its notices.
-    ///
-    /// The main loop reads this to tell the two states of
-    /// `DeviceContext::worker_batch_in_flight` apart:
-    ///
-    /// - the worker still owns the batch (its result has not arrived) - the
-    ///   state machine must not be advanced any further, because the batch's
-    ///   completion has not been observed yet;
-    /// - the batch is *done* and only its notice is undelivered - reduction
-    ///   must keep running, because draining the runtime queue is the only
-    ///   thing that can free the room that notice is waiting for.
-    ///
-    /// Conflating the two is what let a full queue deadlock the effect path:
-    /// the retained notice held the worker slot, and holding the slot stopped
-    /// the reduction that would have freed a queue slot for the notice.
     pub fn has_retained_notice(&self) -> bool {
         self.pending_notice.lock().is_some()
     }
@@ -465,7 +353,6 @@ mod tests {
     use inkwash_logic::app::{Effect, EffectBatch, FailurePolicy};
     use inkwash_logic::runner::{BatchNotice, EffectExecutor};
 
-    /// Minimal executor that records effects instead of executing them.
     struct RecordingExecutor {
         effects: Vec<Effect>,
     }
@@ -590,9 +477,6 @@ mod tests {
             notices: execute_batch(batch, &mut exec),
         };
 
-        // AbortBatch intentionally returns one failure for the two-effect
-        // batch. The envelope is the completion signal, so the caller can
-        // release the worker slot and continue with the next batch.
         assert_eq!(result.notices.len(), 1);
         assert!(matches!(result.notices[0], BatchNotice::Failed(_)));
     }

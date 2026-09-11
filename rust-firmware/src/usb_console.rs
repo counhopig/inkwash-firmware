@@ -1,68 +1,24 @@
-//! Non-blocking USB serial console command reader for the shared
-//! `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG` port.
-//!
-//! Commands and log output share the same USB serial port. To avoid colliding
-//! with `log::info!`/`log::warn!` output, commands are framed with a sentinel
-//! prefix `>>IW ` (note the trailing space). A dedicated receiver thread reads
-//! stdin, splits it into `\n`-terminated lines, and parses every line that
-//! starts with `>>IW ` into a `Command`. Parsed commands are sent to the main
-//! loop and drained one per `poll_command()` call, so command reception never
-//! waits behind Wi-Fi, EPD, or other main-loop work.
-//!
-//! Replies are written back to stdout with the `<<IW ` prefix to distinguish
-//! them as control output (not ordinary logs).
-//!
-//! The receiver uses a standard Rust thread and channel, avoiding dependence
-//! on platform-specific stdin readiness or fcntl/termios behavior.
-
 use crate::control;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 
-/// Prefix that marks an incoming line as a command, not a log message.
-/// Must exactly match what the PC tool sends.
 const COMMAND_PREFIX: &str = ">>IW ";
 
-/// Prefix for outgoing replies, so the PC tool can distinguish control
-/// responses from ordinary log output.
 const REPLY_PREFIX: &str = "<<IW ";
 const MAX_COMMAND_LINE_BYTES: usize = 512;
-/// Explicit stacks for the two console workers, kept in internal RAM by the
-/// pthread default caps.
-///
-/// Neither thread may inherit `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT` (4096):
-/// the reader runs `control::parse_command`, whose recursive deserialization is
-/// driven by the frame's nesting rather than its length (see
-/// `MAX_COMMAND_NESTING` for the measurements). The pre-parse nesting limit is
-/// the actual fix; these sizes are defence in depth, so a future change to the
-/// protocol cannot quietly reintroduce the hazard on an undersized stack.
-///
-/// The writer only serializes and writes, so it needs far less — but it gets an
-/// explicit size for the same reason: silence about the budget is what made the
-/// original hazard invisible to review.
+
 const READER_TASK_STACK_SIZE: usize = 12 * 1024;
 const WRITER_TASK_STACK_SIZE: usize = 8 * 1024;
-/// The reader channel and this staging queue are both bounded. Once both are
-/// full, the reader thread blocks on `SyncSender::send`, preserving command
-/// ownership instead of silently dropping a parsed request.
+
 const PENDING_COMMAND_CAPACITY: usize = 8;
-/// Bounded main-loop -> writer-task queue and writer-task -> main-loop ACK
-/// queue. The ACK carries the original sequence so a failed frame can be
-/// retried without re-running the command.
+
 pub const REPLY_WRITER_CAPACITY: usize = 8;
 
-/// Reader state. The receiver thread owns stdin; the main loop only drains its
-/// channel and never waits on ESP-IDF's VFS buffering.
 pub struct UsbConsole {
     rx: Receiver<(Option<String>, control::Command)>,
-    /// Commands already parsed out of a previous read but not yet returned
-    /// to the caller, paired with each one's optional client-supplied
-    /// correlation `id` (see `control::parse_command`). A single 128-byte
-    /// read can contain more than one complete `>>IW ...\n` line; every one
-    /// of them is parsed here so none are lost, and `poll_command()` hands
-    /// them out one at a time.
+
     pending: VecDeque<(Option<String>, control::Command)>,
 }
 
@@ -80,11 +36,6 @@ impl UsbConsole {
         }
     }
 
-    /// Non-blocking poll for the next command. Returns `Some((id, Command))`
-    /// if a complete command line was received and parsed successfully
-    /// (`id` is the client's correlation id, if it sent one), or `None` if
-    /// there are no queued commands, or if a line was queued but failed to
-    /// parse (in which case a warning is logged).
     pub fn poll_command(&mut self) -> Option<(Option<String>, control::Command)> {
         self.stage_pending();
         self.pending.pop_front()
@@ -156,8 +107,6 @@ fn read_commands(tx: SyncSender<(Option<String>, control::Command)>) {
     }
 }
 
-/// An owned reply frame waiting for the writer task. The frame remains with
-/// the caller when the bounded queue is full or disconnected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedReply {
     pub sequence: u64,
@@ -176,9 +125,6 @@ pub enum ReplyQueueError {
     Disconnected(QueuedReply),
 }
 
-/// Main-loop handle for the bounded USB reply writer. Enqueueing is
-/// non-blocking; the caller owns a rejected frame and retries it after polling
-/// [`UsbReplyWriter::try_completion`].
 pub struct UsbReplyWriter {
     tx: SyncSender<QueuedReply>,
     completion_rx: Receiver<ReplyWriteAck>,
@@ -200,9 +146,6 @@ impl UsbReplyWriter {
         })
     }
 
-    /// Render a reply into an owned frame without touching the bounded queue.
-    /// The caller can retain this value when the queue is full and retry it
-    /// later without re-serializing or re-running the command.
     pub fn prepare(&mut self, reply: &control::Reply, id: Option<&str>) -> QueuedReply {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1).max(1);

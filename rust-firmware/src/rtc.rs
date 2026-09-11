@@ -3,16 +3,11 @@ use esp_idf_svc::sys::TickType_t;
 
 use crate::board::SharedI2c;
 
-/// `DateTime` and `is_leap` are pure calendar/epoch math with no I2C or
-/// other hardware dependency, so they live in `inkwash-logic` where they can
-/// be unit-tested on the host - this crate is the single source of truth,
-/// re-exported here so every existing `crate::rtc::DateTime` /
-/// `crate::rtc::is_leap` call site keeps working unchanged.
 pub use inkwash_logic::alarm_regs::AlarmRegs;
 pub use inkwash_logic::datetime::{is_leap, DateTime};
 
 pub const PCF8563_ADDR: u8 = 0x51;
-const I2C_TIMEOUT_TICKS: TickType_t = 100; // 100 ms RTOS ticks
+const I2C_TIMEOUT_TICKS: TickType_t = 100;
 
 fn bcd_to_bin(b: u8) -> u8 {
     ((b >> 4) & 0x0F) * 10 + (b & 0x0F)
@@ -105,12 +100,6 @@ impl Pcf8563 {
         Ok(())
     }
 
-    /// Arms the single PCF8563 alarm slot for `alarm` and enables AIE (ctrl2
-    /// bit1) so the open-drain INT pin (GPIO5, `RTC_INT`) is driven low when
-    /// it fires - the signal `power::enter_deep_sleep_with_wakeups` uses as
-    /// an ext1 wake source. Only one alarm can be armed in hardware at a
-    /// time; callers with multiple stored alarms must always program
-    /// whichever one is chronologically nearest (see `alarms::next_due`).
     pub fn set_alarm(&mut self, alarm: &AlarmRegs) -> Result<()> {
         let payload = [
             bin_to_bcd(alarm.minute) & 0x7F,
@@ -125,24 +114,18 @@ impl Pcf8563 {
         Ok(())
     }
 
-    /// Reads AF (ctrl2 bit3) without touching AIE. The shared runtime poller
-    /// checks this while awake; deep-sleep boots use the GPIO wake cause.
     pub fn alarm_flag(&mut self) -> Result<bool> {
         let mut ctrl2 = [0u8; 1];
         self.read_regs(0x01, &mut ctrl2)?;
         Ok(ctrl2[0] & 0x08 != 0)
     }
-    /// Reads AIE (ctrl2 bit1) without touching AF. A set AF with the
-    /// interrupt disabled is residue, not a ringable trigger - the
-    /// state machine reads both at boot and on every RTC snapshot.
+
     pub fn alarm_interrupt_enabled(&mut self) -> Result<bool> {
         let mut ctrl2 = [0u8; 1];
         self.read_regs(0x01, &mut ctrl2)?;
         Ok(ctrl2[0] & 0x02 != 0)
     }
 
-    /// Clears AF (ctrl2 bit3) so the open-drain INT line releases; must be
-    /// called after every alarm wake or INT stays asserted low forever.
     pub fn ack_alarm(&mut self) -> Result<()> {
         let mut ctrl2 = [0u8; 1];
         self.read_regs(0x01, &mut ctrl2)?;

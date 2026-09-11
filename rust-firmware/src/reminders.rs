@@ -1,9 +1,3 @@
-//! Runtime reminder fact collection.
-//!
-//! Store reads happen on the effect worker. The application loop receives an
-//! owned `ReminderPayload` as an effect completion and never reads NVS while
-//! collecting input or rendering.
-
 use anyhow::Result;
 
 use crate::inbox::InboxStore;

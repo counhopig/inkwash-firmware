@@ -1,49 +1,23 @@
-//! Alarm ordering/recurrence math and ID allocation, moved verbatim out of
-//! `rust-firmware/src/alarms.rs` (which re-exports everything here so
-//! nothing else has to change). The NVS-backed `AlarmStore`, hardware ring
-//! screen, and PCF8563 programming stay in that file - only the pure
-//! date/schedule arithmetic and the `StoredAlarm`/`Repeat` data shapes live
-//! here.
-//!
-//! Day-number/calendar-date conversion itself is not reimplemented here -
-//! it's `datetime::days_since_epoch`/`datetime::date_from_days`, re-exported
-//! below so existing call sites are unaffected.
-
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::alarm_regs::AlarmRegs;
 use crate::datetime::{weekday_from_days, DateTime};
 
-// Re-exported so `rust-firmware/src/alarms.rs`'s existing
-// `alarms::{days_since_epoch, date_from_days}` call sites keep working
-// unchanged - `datetime` is the single canonical implementation now (see
-// its module doc comment).
 pub use crate::datetime::{date_from_days, days_since_epoch};
 
-/// Recurrence schedule, wire-compatible with the server's
-/// `models::Repeat`. Externally tagged by serde: `"Daily"`, `{"Weekly":
-/// {"days": [0, 2, 4]}}`, `{"Monthly": {"days": [1, 15]}}`, or `{"Once":
-/// {"year": 2026, "month": 8, "day": 19}}`. Weekdays are 0=Sunday ..
-/// 6=Saturday (matching the RTC's `DateTime.weekday` and JS
-/// `Date.getDay()`); month days are 1..=31.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Repeat {
-    /// Every day at the alarm's time.
     Daily,
-    /// Days of the week at the alarm's time. Never empty once created.
+
     Weekly { days: Vec<u8> },
-    /// Days of the month at the alarm's time. Never empty once created.
+
     Monthly { days: Vec<u8> },
-    /// Fires once on this calendar date, then the caller is expected to
-    /// drop it from the store (see `main.rs`'s ack-and-rearm flow).
+
     Once { year: u16, month: u8, day: u8 },
 }
 
 impl Repeat {
-    /// Stable discriminator string - the server uses this as its SQLite
-    /// `repeat_kind` column value, so it must not change without a
-    /// migration on that side.
     pub const fn kind(&self) -> &'static str {
         match self {
             Repeat::Daily => "daily",
@@ -53,8 +27,6 @@ impl Repeat {
         }
     }
 
-    /// Whether this schedule covers the given calendar date. `weekday`
-    /// is 0=Sunday..6=Saturday.
     pub fn fires_on(&self, year: u16, month: u8, day: u8, weekday: u8) -> bool {
         match self {
             Repeat::Daily => true,
@@ -79,9 +51,6 @@ pub struct StoredAlarm {
     pub label: String,
 }
 
-/// A calendar date: year, month, day and its computed weekday
-/// (0=Sunday..6=Saturday). Returned by `next_matching_day`; callers that
-/// need an occurrence's time-of-day pair it with their own hour/minute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalDate {
     pub year: u16,
@@ -90,20 +59,6 @@ pub struct CalDate {
     pub weekday: u8,
 }
 
-/// The next calendar date at or after `from` whose schedule matches
-/// `repeat`, found by scanning day-by-day (the shared implementation behind
-/// `next_occurrence_date` and `minutes_until`'s Weekly/Monthly branches -
-/// before this function existed each caller carried its own copy of this
-/// scan, and a duplicated date-math bug in one copy is exactly the class of
-/// error this refactor prevents.
-///
-/// The scan runs for `max_days` consecutive days starting at `from`
-/// (inclusive). `None` means no matching day within the window; non-empty
-/// schedules always match within ~62 days, so with the default `370` the
-/// fallback is unreachable in practice for a validated schedule. Whether a
-/// match on the very first day is acceptable is the caller's decision: a
-/// caller whose occurrence time for today has already passed should start
-/// `from` at tomorrow rather than post-filtering the result.
 pub fn next_matching_day(repeat: &Repeat, from: CalDate, max_days: u32) -> Option<CalDate> {
     let from_days = days_since_epoch(from.year, from.month, from.day);
     for offset in 0..max_days {
@@ -122,9 +77,6 @@ pub fn next_matching_day(repeat: &Repeat, from: CalDate, max_days: u32) -> Optio
     None
 }
 
-/// The next calendar date (year, month, day, weekday) that `repeat` covers,
-/// at or after `now`'s date. Non-empty schedules always match within ~62
-/// days, so the scan is bounded and the fallback is unreachable in practice.
 pub fn next_occurrence_date(
     repeat: &Repeat,
     hour: u8,
@@ -152,17 +104,10 @@ pub fn next_occurrence_date(
     }
 }
 
-/// Whole days from `now` until the given calendar date (0 = today,
-/// negative = already passed). Used by the Home screen for the
-/// "in N days" alarm countdown.
 pub fn days_until(year: u16, month: u8, day: u8, now: &DateTime) -> i64 {
     days_since_epoch(year, month, day) - days_since_epoch(now.year, now.month, now.day)
 }
 
-/// Minutes from `now` until `alarm` next fires, or `i64::MAX` if it's a
-/// `Once` alarm whose date has already passed (a live store shouldn't have
-/// these - `main.rs` drops fired one-shots - but `next_due` stays correct
-/// even if one lingers).
 fn minutes_until(alarm: &StoredAlarm, now: &DateTime) -> i64 {
     let now_minutes = now.hour as i64 * 60 + now.minute as i64;
     let alarm_minutes = alarm.hour as i64 * 60 + alarm.minute as i64;
@@ -204,28 +149,15 @@ fn minutes_until(alarm: &StoredAlarm, now: &DateTime) -> i64 {
     }
 }
 
-/// First unused wire-compatible id. Searching gaps avoids overflow at 255 and
-/// prevents the duplicate id that a wrapping `max + 1` would create.
 pub fn next_id(alarms: &[StoredAlarm]) -> Option<u8> {
     (u8::MIN..=u8::MAX).find(|candidate| !alarms.iter().any(|a| a.id == *candidate))
 }
 
-/// True for a `Once` alarm whose date has already passed relative to `now`
-/// - i.e. it fired (or was skipped over) and should be dropped from the
-///   store so it doesn't linger and confuse `next_due` forever. Daily alarms
-///   recur on their own and are never "expired".
 pub fn is_expired_once(alarm: &StoredAlarm, now: &DateTime) -> bool {
     matches!(alarm.repeat, Repeat::Once { .. })
         && matches!(minutes_until(alarm, now), i64::MAX | ..=0)
 }
 
-/// Picks the chronologically nearest enabled alarm relative to `now`.
-///
-/// An expired one-shot (`minutes_until == i64::MAX`, i.e. a `Once` alarm
-/// whose date has passed) is excluded: it must not be returned, or it would
-/// be re-armed into the PCF8563 and re-fire on the already-passed
-/// day-of-month. The caller drops expired one-shots after firing; this
-/// makes `next_due` correct even when a stale one lingers in the store.
 pub fn next_due<'a>(alarms: &'a [StoredAlarm], now: &DateTime) -> Option<&'a StoredAlarm> {
     alarms
         .iter()
@@ -233,11 +165,6 @@ pub fn next_due<'a>(alarms: &'a [StoredAlarm], now: &DateTime) -> Option<&'a Sto
         .min_by_key(|a| minutes_until(a, now))
 }
 
-/// Timer wake needed to make a future-month one-shot alarm fully offline.
-/// PCF8563 cannot compare month/year, so the device wakes one minute before
-/// the earliest target month and arms the RTC alarm when the date boundary
-/// is observed (the firmware's idle deep-sleep path and the Settings SLEEP
-/// action both plan this wake). Pure calculation over the alarm list + now.
 pub fn maintenance_wakeup_delay(alarms: &[StoredAlarm], now: &DateTime) -> Option<Duration> {
     let now_epoch = now.to_unix();
     alarms
@@ -260,33 +187,9 @@ pub fn maintenance_wakeup_delay(alarms: &[StoredAlarm], now: &DateTime) -> Optio
             _ => None,
         })
         .min()
-        .map(|target_month| {
-            // Wake before midnight so the ordinary date-boundary tick can do
-            // the actual RTC programming without racing a 00:00 alarm.
-            Duration::from_secs(target_month.saturating_sub(now_epoch + 60).max(1))
-        })
+        .map(|target_month| Duration::from_secs(target_month.saturating_sub(now_epoch + 60).max(1)))
 }
 
-/// Computes the PCF8563 compare fields for a single alarm as it should be
-/// armed *right now* (the hardware slot holds one alarm at a time, so a
-/// caller programs only `next_due`'s result). Repeat rules are translated to
-/// the register's day/weekday fields - the same mapping `alarms.rs`'s
-/// `program_hardware_alarm` uses, factored here so the host-testable state
-/// machine and the firmware share one recurrence implementation rather than
-/// a second, drift-prone copy.
-///
-/// Returns `None` when the slot must stay *closed* for this alarm because
-/// it cannot be safely armed at this instant:
-/// - a `Once` alarm whose target date is in a different calendar month
-///   (the PCF8563 has no month/year register, so arming its day-of-month
-///   would false-fire on the current month's/earlier month's matching
-///   day). The caller leaves the slot closed and a maintenance wake
-///   re-evaluates when the target month arrives.
-///
-/// For `Weekly` the armed day is the *next* covered weekday (each ring is
-/// re-programmed by the ack-and-rearm flow, so it can't keep firing on
-/// later weeks that don't contain a nearer alarm); for `Monthly` it is the
-/// target day-of-month.
 pub fn alarm_regs_for(alarm: &StoredAlarm, now: &DateTime) -> Option<AlarmRegs> {
     match &alarm.repeat {
         Repeat::Daily => Some(AlarmRegs {
@@ -374,7 +277,6 @@ mod tests {
 
     #[test]
     fn next_matching_day_weekly_skips_non_matching_weekdays() {
-        // 2026-08-31 is a Monday; the next Tuesday (weekday 2) is 2026-09-01.
         let from = CalDate {
             year: 2026,
             month: 8,
@@ -389,8 +291,6 @@ mod tests {
 
     #[test]
     fn next_matching_day_monthly_wraps_across_year_boundary() {
-        // Only the 5th; from December 10th the next hit is January 5th of
-        // next year.
         let from = CalDate {
             year: 2026,
             month: 12,
@@ -404,9 +304,6 @@ mod tests {
 
     #[test]
     fn next_matching_day_monthly_never_clamps_to_a_nonexistent_day() {
-        // Day 29 in a non-leap February doesn't exist; the scan must skip
-        // the whole month and land on the next real 29th (March), never a
-        // clamped 28th.
         let from = CalDate {
             year: 2026,
             month: 2,
@@ -463,7 +360,7 @@ mod tests {
             day: 22,
             weekday: 6,
         };
-        let repeat = Repeat::Weekly { days: vec![2] }; // next Tuesday: Aug 25
+        let repeat = Repeat::Weekly { days: vec![2] };
         assert_eq!(
             next_matching_day(&repeat, from, 3),
             None,
@@ -493,8 +390,8 @@ mod tests {
     fn repeat_fires_on_matches_each_variant() {
         assert!(Repeat::Daily.fires_on(2026, 8, 22, 6));
         let weekly = Repeat::Weekly { days: vec![0, 6] };
-        assert!(weekly.fires_on(2026, 8, 22, 6)); // Saturday
-        assert!(!weekly.fires_on(2026, 8, 24, 1)); // Monday
+        assert!(weekly.fires_on(2026, 8, 22, 6));
+        assert!(!weekly.fires_on(2026, 8, 24, 1));
         let monthly = Repeat::Monthly { days: vec![1, 15] };
         assert!(monthly.fires_on(2026, 8, 15, 0));
         assert!(!monthly.fires_on(2026, 8, 16, 0));
@@ -523,8 +420,6 @@ mod tests {
 
     #[test]
     fn next_occurrence_date_weekly_wraps_across_month_boundary() {
-        // 2026-08-31 is a Monday; asking for the next Tuesday (weekday 2)
-        // must cross into September.
         let now = dt(2026, 8, 31, 0, 0);
         let repeat = Repeat::Weekly { days: vec![2] };
         let (y, m, d, weekday) = next_occurrence_date(&repeat, 8, 0, &now);
@@ -534,8 +429,6 @@ mod tests {
 
     #[test]
     fn next_occurrence_date_monthly_wraps_across_year_boundary() {
-        // Only the 5th; from December 10th the next hit is January 5th of
-        // next year.
         let now = dt(2026, 12, 10, 0, 0);
         let repeat = Repeat::Monthly { days: vec![5] };
         let (y, m, d, _) = next_occurrence_date(&repeat, 8, 0, &now);
@@ -544,15 +437,11 @@ mod tests {
 
     #[test]
     fn next_occurrence_date_monthly_skips_feb_29_on_non_leap_years() {
-        // Day 29 only exists in February on a leap year; from 2026 (not
-        // leap) this must land on the leap year 2028, not silently clamp.
         let now = dt(2026, 2, 1, 0, 0);
         let repeat = Repeat::Monthly { days: vec![29] };
         let (y, m, d, _) = next_occurrence_date(&repeat, 0, 0, &now);
         assert_eq!((y, m, d), (2026, 3, 29));
-        // A year that *does* have a Feb 29 still fires on day 29 of every
-        // other month first, in date order - March 29 comes before the
-        // "day 29" that happens to be Feb 29 the following February.
+
         let now_leap = dt(2028, 3, 1, 0, 0);
         let (y2, m2, d2, _) = next_occurrence_date(&repeat, 0, 0, &now_leap);
         assert_eq!((y2, m2, d2), (2028, 3, 29));
@@ -618,9 +507,9 @@ mod tests {
     fn next_due_ignores_disabled_and_picks_soonest() {
         let now = dt(2026, 8, 22, 10, 0);
         let alarms = vec![
-            alarm(0, 23, 0, Repeat::Daily, true),  // 13h away
-            alarm(1, 10, 30, Repeat::Daily, true), // 30m away - soonest
-            alarm(2, 10, 5, Repeat::Daily, false), // sooner but disabled
+            alarm(0, 23, 0, Repeat::Daily, true),
+            alarm(1, 10, 30, Repeat::Daily, true),
+            alarm(2, 10, 5, Repeat::Daily, false),
         ];
         let due = next_due(&alarms, &now).expect("an enabled alarm exists");
         assert_eq!(due.id, 1);
@@ -635,8 +524,6 @@ mod tests {
 
     #[test]
     fn next_due_none_when_only_expired_once() {
-        // 2026-08-22 12:00; the once alarm's date already passed, so
-        // `minutes_until` is i64::MAX and it must be excluded.
         let now = dt(2026, 8, 22, 12, 0);
         let alarms = vec![alarm(
             0,
@@ -673,8 +560,6 @@ mod tests {
         assert_eq!(due.id, 1);
     }
 
-    // ---- repeat-aware RTC programming (shared `alarm_regs_for`) ---------
-
     #[test]
     fn alarm_regs_for_daily_leaves_day_and_weekday_unset() {
         let now = dt(2026, 8, 22, 10, 0);
@@ -693,12 +578,10 @@ mod tests {
 
     #[test]
     fn alarm_regs_for_weekly_arms_next_covered_weekday() {
-        // 2026-08-22 is a Saturday (weekday 6). A weekly alarm on
-        // Sunday(0)/Monday(1) must arm the next covered weekday after today.
         let now = dt(2026, 8, 22, 10, 0);
         let mon = alarm(0, 8, 0, Repeat::Weekly { days: vec![1] }, true);
         let regs = alarm_regs_for(&mon, &now).expect("weekly is armable");
-        // Next Monday after Sat 22 Aug 2026 is Mon 24 Aug (weekday 1).
+
         assert_eq!(
             regs,
             AlarmRegs {
@@ -754,8 +637,6 @@ mod tests {
 
     #[test]
     fn alarm_regs_for_once_outside_target_month_returns_none() {
-        // Now is August; target is September. The slot has no month/year
-        // register, so arming the day would false-fire in August.
         let now = dt(2026, 8, 22, 10, 0);
         let once = alarm(
             0,

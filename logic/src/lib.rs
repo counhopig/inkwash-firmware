@@ -1,22 +1,3 @@
-//! Pure, hardware-independent firmware business logic, split out of
-//! `rust-firmware` so it can be unit-tested on the host - plain
-//! `cargo test` from this directory - without the ESP-IDF/xtensa toolchain
-//! or any hardware attached.
-//!
-//! `rust-firmware` cross-compiles only for `xtensa-esp32s3-espidf` and links
-//! against `esp-idf-sys`, whose build script shells out to `idf.py` and the
-//! ESP-IDF SDK; that dependency can't be built for a host target at all, so
-//! before this split, no part of the firmware crate's logic could be tested
-//! anywhere but on the physical device. This crate has no ESP-IDF
-//! dependency (just `serde`), so it builds and tests on any host.
-//!
-//! `rust-firmware` depends on this crate by path and re-exports each type
-//! from its usual module (`rtc::DateTime`, `alarms::{Repeat, StoredAlarm}`,
-//! `sync::{validate_repeat, validate_date}`, ...) so nothing calling into
-//! them needs to change - this crate is the single source of truth for the
-//! logic itself; the firmware modules add the hardware-facing parts (NVS
-//! storage, I2C, display, buttons) around it.
-
 pub mod alarm_flow;
 pub mod alarm_regs;
 pub mod alarm_schedule;
@@ -48,9 +29,7 @@ pub mod worker_heartbeat;
 
 #[cfg(test)]
 mod ble_memory_contract {
-    // Keep the host-only guard next to the host-testable state-machine tests.
-    // The hardware crate cannot be built for the host, but these invariants
-    // must stay coupled to its ESP-IDF memory configuration.
+
     const BLE_SOURCE: &str = include_str!("../../rust-firmware/src/ble_control.rs");
     const EFFECT_SOURCE: &str = include_str!("../../rust-firmware/src/effect_task.rs");
     const TASKS_SOURCE: &str = include_str!("../../rust-firmware/src/tasks.rs");
@@ -65,8 +44,7 @@ mod ble_memory_contract {
     #[test]
     fn ble_worker_uses_internal_stack_and_checks_internal_heap_before_init() {
         assert!(BLE_SOURCE.contains("const BLE_TASK_STACK: usize = 16 * 1024"));
-        // The internal-RAM stack caps moved into the shared spawner when the
-        // effect task needed the same guarantee; assert them there.
+
         assert!(
             TASKS_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT"),
             "the shared spawner must pin worker stacks to internal RAM"
@@ -89,11 +67,6 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("log_stack_high_watermark(\"after BLE init\")"));
     }
 
-    /// The effect task runs the NVS/flash-write path that used to live on the
-    /// 32 KiB main task, so its stack must be internal RAM too: flash writes
-    /// execute with the cache disabled, where a PSRAM stack is unreachable.
-    /// It must also stay large enough for `read_blob::<4096>` plus the serde
-    /// frames around it (8 KiB measured only 1032 bytes of headroom on device).
     #[test]
     fn effect_worker_uses_an_internal_stack_with_blob_headroom() {
         assert!(
@@ -112,9 +85,6 @@ mod ble_memory_contract {
         assert!(!EFFECT_SOURCE.contains("MALLOC_CAP_SPIRAM"));
     }
 
-    /// The BLE worker must be created on first use rather than at boot: a
-    /// permanently parked 16 KiB internal-RAM thread is what boot-looped this
-    /// device, and the radio is unused until the pairing screen opens.
     #[test]
     fn ble_worker_thread_is_created_on_demand() {
         assert!(
@@ -179,7 +149,6 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("fn release_generation"));
         assert!(BLE_SOURCE.contains("self.is_retired(attempt.conn_handle)"));
         assert!(BLE_SOURCE.contains("self.retire_handle(conn_handle)"));
-        assert!(BLE_SOURCE.contains("late callback can\n    /// never consume"));
         assert!(BLE_SOURCE.contains("pending.push_back(event)"));
         assert!(!BLE_SOURCE.contains("pending: StdArc<StdMutex<Option<NotifyTxEvent>>>"));
         assert!(BLE_SOURCE.contains("inflight.attempt_id != event.attempt.attempt_id"));
@@ -248,7 +217,6 @@ mod ble_memory_contract {
     fn transport_reply_paths_retain_owned_frames_and_bound_failures() {
         const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
         const CTX_SOURCE: &str = include_str!("../../rust-firmware/src/ctx.rs");
-        const SESSIONS_SOURCE: &str = include_str!("../src/command_sessions.rs");
         assert!(CTX_SOURCE.contains("pending.reply == *reply"));
         assert!(CTX_SOURCE.contains("pub const USB_REPLY_PENDING_CAPACITY: usize = 32"));
         assert!(CTX_SOURCE.contains("const USB_REPLY_MAX_RETRIES: u8 = 3"));
@@ -256,7 +224,6 @@ mod ble_memory_contract {
         assert!(CTX_SOURCE.contains("retry_count = pending.retry_count.saturating_add(1)"));
         assert!(MAIN_SOURCE.contains("fn queue_ble_delivery"));
         assert!(MAIN_SOURCE.contains("BLE_REPLY_PENDING_CAPACITY"));
-        assert!(MAIN_SOURCE.contains("Reserve an owned delivery record before enqueueing"));
         assert!(MAIN_SOURCE.contains("BleReplyError::QueueFull"));
         assert!(MAIN_SOURCE.contains("deliver_ble_reply("));
         assert!(MAIN_SOURCE.contains("ctx.command_sessions.cancel_pending"));
@@ -272,7 +239,6 @@ mod ble_memory_contract {
         assert!(MAIN_SOURCE.contains("pending_ble_reply_latch"));
         assert!(CTX_SOURCE.contains("pending_usb_reply_latch"));
         assert!(MAIN_SOURCE.contains("BLE SetWifi terminal reply terminated after radio handoff"));
-        assert!(SESSIONS_SOURCE.contains("Busy/Pending is a transport response"));
     }
 
     #[test]

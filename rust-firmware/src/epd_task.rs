@@ -1,27 +1,3 @@
-//! Dedicated EPD refresh task.
-//!
-//! Owns the synchronous `zectrix_epd` FFI driver and serializes every
-//! panel refresh on one thread, so the main loop never blocks on a
-//! refresh.
-//!
-//! Request model: every refresh command carries an
-//! **immutable pixel snapshot** of the whole frame, copied under the
-//! canvas lock at request time. The task never touches the shared canvas,
-//! so a pending request always paints exactly the picture its requester
-//! drew - a later page/screen drawing over the canvas cannot corrupt a
-//! queued refresh (the defect of the old "copy at execution time" design,
-//! where a queued rect executed against whatever the canvas held by then).
-//! The request path is a single latest-wins slot instead of an unbounded
-//! queue: at most one command is pending, a `Full` request replaces any
-//! pending partial, and partials merge into the union of their rects with
-//! the newest frame. Memory is bounded (at most one 15 KB frame snapshot
-//! pending).
-//!
-//! Completion: the task reports every refresh back to the
-//! app through a bounded completion mailbox - success, failure, and partial->full
-//! recovery are all observable, so the app state machine can treat a frame
-//! as displayed only once its completion arrives.
-
 use std::collections::VecDeque;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -37,9 +13,6 @@ use esp_idf_svc::sys::zectrix_epd::{
 
 use crate::canvas::{self, Rect};
 
-/// Terminal EPD outcomes are critical: every submitted request must receive
-/// exactly one result. The mailbox is bounded, and producers reserve a slot
-/// before replacing a pending render so supersede completion cannot be lost.
 const COMPLETION_CAPACITY: usize = 16;
 
 struct CompletionState {
@@ -99,76 +72,46 @@ impl CompletionMailbox {
     }
 }
 
-/// What to refresh: the whole panel, or one rect of the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshKind {
     Full,
     Partial(Rect),
 }
 
-/// One refresh request: an immutable full-frame pixel snapshot plus the
-/// region to paint from it. The snapshot is captured at request time under
-/// the canvas lock, so the panel shows exactly the frame the requester
-/// drew regardless of what the canvas holds later.
 pub struct RenderCommand {
     pub kind: RefreshKind,
     pub frame: Box<[u8]>,
-    /// Request identifier the initiator supplied. Carried through to
-    /// `EpdCompletion` so the caller can correlate a completion to the
-    /// exact render even when the single pending slot is re-submitted.
+
     pub request_id: u64,
 }
 
-/// Completion report for one executed refresh.
 #[derive(Debug, Clone, Copy)]
 pub struct EpdCompletion {
     pub kind: RefreshKind,
     pub request_id: u64,
-    /// Whether the panel-level refresh succeeded. For a partial refresh
-    /// that failed and recovered via a full refresh from the same
-    /// snapshot, `ok` is true and `recovered` marks the recovery.
+
     pub ok: bool,
-    /// A partial refresh failed and was re-executed as a full refresh
-    /// from the same snapshot.
+
     pub recovered: bool,
-    /// True when this request was dropped because a newer request
-    /// superseded it in the single pending slot before it ran. Every
-    /// submitted request_id must eventually receive a completion
-    /// (ok/superseded), so a `superseded` completion lets the caller
-    /// clear its in-flight entry without waiting for a panel outcome.
+
     pub superseded: bool,
 }
 
-/// The single pending-request slot shared by the app thread (writer) and
-/// the EPD task (consumer).
 struct RefreshSlot {
     pending: Mutex<Option<RenderCommand>>,
-    /// Wakes the task; `sync_channel(1)` so at most one wakeup is ever
-    /// queued. A full queue is not a lost wakeup - the task re-checks the
-    /// slot on every loop iteration.
+
     notify_tx: SyncSender<()>,
-    /// Bounded terminal outcomes. Supersede slots are reserved before
-    /// replacing a pending request, so no critical completion is dropped.
+
     completions: Arc<CompletionMailbox>,
 }
 
 impl RefreshSlot {
-    /// Submits a partial refresh. Merges into any pending command:
-    /// partials union their rects (the newest frame wins), and a pending
-    /// full is superseded by the newer frame's full refresh (it covers
-    /// everything anyway).
     fn submit_partial(&self, rect: Rect, frame: Box<[u8]>, request_id: u64) -> Result<()> {
         let mut pending = self.pending.lock();
         let mut superseded = None;
         match pending.as_mut() {
             Some(cmd) => match &mut cmd.kind {
                 RefreshKind::Full => {
-                    // A newer full-frame partial supersedes the pending
-                    // full: complete the old request as superseded, then
-                    // adopt the new request id so the merged command's
-                    // eventual completion carries the *new* id - the old
-                    // id already got its terminal outcome, and the new id
-                    // must not be left without one.
                     if !self.completions.reserve() {
                         bail!("EPD completion mailbox full; retry partial refresh");
                     }
@@ -205,8 +148,6 @@ impl RefreshSlot {
         Ok(())
     }
 
-    /// Submits a full refresh; replaces any pending command (a full of
-    /// the newest frame supersedes a pending partial).
     fn submit_full(&self, frame: Box<[u8]>, request_id: u64) -> Result<()> {
         let mut pending = self.pending.lock();
         let superseded = if let Some(cmd) = pending.as_ref() {
@@ -230,12 +171,6 @@ impl RefreshSlot {
         Ok(())
     }
 
-    /// Emits a `superseded` completion for a request id that a newer
-    /// submission replaced in the single pending slot. Returns the
-    /// original request id so the merge path can record it. Every
-    /// submitted request_id must receive exactly one terminal outcome
-    /// (ok / failed / superseded), otherwise the caller's in-flight
-    /// registry leaks.
     fn superseded_completion(&self, request_id: u64, kind: RefreshKind) -> EpdCompletion {
         EpdCompletion {
             kind,
@@ -247,15 +182,11 @@ impl RefreshSlot {
     }
 }
 
-/// App-side handle: the request slot plus the completion receiver.
 #[derive(Clone)]
 pub struct EpdHandle {
     slot: Arc<RefreshSlot>,
     completions: Arc<CompletionMailbox>,
-    /// Monotonic request-id source so each submitted render carries a
-    /// unique id that its completion echoes back. `AtomicU64` so the
-    /// handle can be shared across the main loop and the effect task
-    /// without `Rc`/thread-local constraints.
+
     next_id: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -268,8 +199,6 @@ impl EpdHandle {
         Ok(id)
     }
 
-    /// Queues a full refresh of the newest frame, replacing any pending
-    /// request. Returns the request id the completion will echo back.
     pub fn request_full(&self, frame: Box<[u8]>) -> Result<u64> {
         let id = self
             .next_id
@@ -278,32 +207,16 @@ impl EpdHandle {
         Ok(id)
     }
 
-    /// Non-blocking drain of completed refreshes.
     pub fn poll_completion(&self) -> Option<EpdCompletion> {
         self.completions.try_recv()
     }
 }
 
-/// 12 KiB stack: the FFI driver (SPI + waveform) is the deepest caller on
-/// this thread; the default 4 KiB pthread stack would be tight, and 16 KiB
-/// plus the sync task's stack overran internal RAM (pthread stacks are
-/// forced to MALLOC_CAP_INTERNAL - the device reboot-looped at boot).
 const EPD_TASK_STACK: usize = 12 * 1024;
 
-/// Initializes the EPD driver and spawns the refresh task. An init fault
-/// propagates to the caller (board bring-up fails loudly) rather than
-/// silently killing a background task.
 pub fn spawn() -> Result<EpdHandle> {
     let driver = EpdDriver(init_driver()?);
-    // One notify channel: the sender wakes the task through `RefreshSlot`,
-    // the receiver is the run-loop's wake source. The previous code created
-    // two independent `sync_channel(1)`s - one whose sender was kept and one
-    // whose receiver was handed to `run` - so `submit_*` notified a channel
-    // with a dropped receiver (`try_send` always failed) and `run` blocked
-    // forever on a channel nobody sent to. The task executed at most the
-    // commands already pending at startup, then never drained again: every
-    // later refresh (clock minute changes, deep-sleep wake region) was lost,
-    // which froze the on-screen clock.
+
     let (notify_tx, notify_rx) = sync_channel(1);
     let completions = Arc::new(CompletionMailbox::new());
     let slot = Arc::new(RefreshSlot {
@@ -324,10 +237,6 @@ pub fn spawn() -> Result<EpdHandle> {
     })
 }
 
-/// FFI driver handle moved into the EPD task. Raw pointers are `!Send` on
-/// this toolchain; the handle is only ever passed back to the C driver
-/// (never dereferenced here), so marking it `Send` to cross the thread
-/// boundary is sound.
 struct EpdDriver(zectrix_epd_handle_t);
 
 unsafe impl Send for EpdDriver {}
@@ -349,24 +258,18 @@ fn run(
     notify_rx: Receiver<()>,
     completions: Arc<CompletionMailbox>,
 ) {
-    // Scratch buffer for the pixels handed to the FFI, reused across
-    // refreshes so a request never allocates.
     let mut scratch: Vec<u8> = Vec::with_capacity(canvas::WIDTH * canvas::HEIGHT / 8);
     loop {
-        // Drain every pending command before blocking again; the slot is
-        // re-checked after each one, so requests submitted during a
-        // refresh are not lost even when the wakeup queue was full.
         while let Some(cmd) = slot.pending.lock().take() {
             let completion = execute(driver.0, &cmd, &mut scratch);
-            // Completion is terminal and therefore applies backpressure to
-            // this worker until the main loop drains the bounded mailbox.
+
             completions.send(completion);
         }
         if notify_rx.recv().is_err() {
-            break; // client is gone
+            break;
         }
     }
-    // Channel closed: the client is gone. Release the driver.
+
     if !driver.0.is_null() {
         unsafe { zectrix_epd_del(driver.0) };
     }
@@ -399,10 +302,6 @@ fn execute(
                     superseded: false,
                 },
                 Err(err) => {
-                    // Recovery path, same as the old synchronous
-                    // `refresh_partial_best_effort`, but deterministic: the
-                    // full refresh reuses the *same* snapshot the failed
-                    // partial came from, not whatever the canvas holds now.
                     log::warn!("EPD partial refresh failed; trying full refresh: {err}");
                     let result = refresh_full(handle, &cmd.frame);
                     EpdCompletion {
@@ -442,7 +341,6 @@ fn refresh_partial(handle: zectrix_epd_handle_t, rect: Rect, pixels: &[u8]) -> R
     refresh.and(power_off)
 }
 
-/// Smallest rect containing both inputs, clamped to the frame.
 fn union_rect(a: Rect, b: Rect) -> Rect {
     let x = a.x.min(b.x);
     let y = a.y.min(b.y);

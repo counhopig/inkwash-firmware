@@ -1,35 +1,3 @@
-//! Single application event loop: the only consumer of `app::update` and
-//! the only owner of `AppState` (migration step 2 of
-//! `docs/firmware-architecture.md`).
-//!
-//! Replaces the interim `AppRunner` dispatch model, where every event
-//! source called `AppRunner::dispatch` directly and each call site drained
-//! async kicks by hand. The runtime owns:
-//!
-//! - the tiered input [`EventQueue`] (high-priority vs mergeable events,
-//!   Tick coalescing - see `event_queue`),
-//! - the private `AppState` (no accessor hands out `&mut`, so no second
-//!   entry can mutate business state),
-//! - the batch-execution engine: every `EffectBatch` produced by
-//!   `app::update` runs against a caller-provided [`EffectExecutor`]
-//!   (the firmware's real driver executor, or a host fake). Synchronous
-//!   effects report `EffectCompleted` / `EffectFailed` back through the
-//!   bounded event queue after the complete current batch has run; async
-//!   effects become [`AsyncKick`]s collected in one place and drained by
-//!   the service loop after each pump.
-//!
-//! The execution engine is deliberately executor-agnostic: the firmware
-//! passes a fresh executor borrowing `DeviceContext` per pump. A later
-//! phase may move the engine onto its own FreeRTOS task once the RTC
-//! driver context is fully consolidated; until then, RTC effects execute
-//! on the main loop to avoid racing the shared I2C bus during clock
-//! polls.
-//!
-//! `pump` is the unique `App::update` consumer: events are applied one at
-//! a time in queue order (high-priority tier first), and each event's
-//! batches finish before completion-derived events are popped. This keeps
-//! every effect in the current batch ahead of its derived state transition.
-
 #![allow(clippy::result_large_err)]
 
 use crate::app::{AppState, EffectBatch, EffectOutput, Event};
@@ -37,13 +5,10 @@ use crate::datetime::DateTime;
 use crate::event_queue::EventQueue;
 use crate::runner::{execute_batch, AsyncKick, BatchNotice, EffectExecutor};
 
-/// A bounded event queue refused one or more completion notices. The caller
-/// owns `unsubmitted` and must retry them after reducing queued input.
 #[derive(Debug)]
 pub struct PumpError {
     pub unsubmitted: Vec<BatchNotice>,
-    /// The producer-owned event, when `submit_and_pump` could not admit it
-    /// before the pump itself reported saturation.
+
     pub rejected_event: Option<Event>,
 }
 
@@ -59,17 +24,13 @@ impl std::fmt::Display for PumpError {
 
 impl std::error::Error for PumpError {}
 
-/// The application event loop. Owns the business state, the input queue,
-/// and the in-flight async kicks.
 #[derive(Debug)]
 pub struct Runtime {
     state: AppState,
     queue: EventQueue,
-    /// Most recent RTC read - threaded into `Effect::Render` so the home
-    /// screen does not need a fresh I2C transaction for each refresh.
+
     last_clock: Option<DateTime>,
-    /// Async kicks accumulated by the last `pump`; drained by the service
-    /// loop after every pump (never carried across iterations).
+
     kicks: Vec<AsyncKick>,
 }
 
@@ -83,37 +44,26 @@ impl Runtime {
         }
     }
 
-    /// Enqueue one event. The only way facts reach the state machine.
-    /// Enqueues a producer event with explicit backpressure.
     #[allow(clippy::result_large_err)]
     pub fn try_push(&mut self, event: Event) -> Result<(), Event> {
         self.queue.try_push(event)
     }
 
-    /// Enqueue the one event held as a worker continuation ahead of events
-    /// collected while that worker batch was running.
     #[allow(clippy::result_large_err)]
     pub fn try_push_continuation(&mut self, event: Event) -> Result<(), Event> {
         self.queue.try_push_front(event)
     }
 
-    /// Submit an event while retaining it across queue saturation. The
-    /// producer owns the returned event until it is accepted; pumping makes
-    /// room without dropping or overwriting a critical fact.
     #[allow(clippy::result_large_err)]
     pub fn submit(&mut self, event: Event) -> Result<(), Event> {
         self.try_push(event)
     }
 
-    /// Admit one producer-owned event without taking ownership on failure.
-    /// Callers that cannot block must retain the returned event and retry
-    /// after servicing the runtime.
     #[allow(clippy::result_large_err)]
     pub fn admit_event(&mut self, event: Event) -> Result<(), Event> {
         self.try_push(event)
     }
 
-    /// Test-only fixture helper. Firmware producers must use [`try_push`].
     #[cfg(test)]
     pub fn push(&mut self, event: Event) {
         self.try_push(event).expect("test runtime queue must fit");
@@ -127,39 +77,22 @@ impl Runtime {
         self.last_clock
     }
 
-    /// Read-only view of the business state. Mutation happens exclusively
-    /// inside `reduce_event` via `app::update`.
     pub fn state(&self) -> &AppState {
         &self.state
     }
 
-    /// True while events (or the collapsed latest tick) remain queued.
     pub fn has_work(&self) -> bool {
         !self.queue.is_empty()
     }
 
-    /// Drain the async kicks collected by the most recent `pump`. The
-    /// service loop calls this once per pump; kicks are renders (to be
-    /// matched against EPD completions by request id) or not-yet-wired
-    /// async effects the caller reports.
     pub fn take_kicks(&mut self) -> Vec<AsyncKick> {
         std::mem::take(&mut self.kicks)
     }
 
-    /// The unique `App::update` consumer loop: pop events in priority
-    /// order and drive each one's batches to completion. Returns when the
-    /// queue is empty. An executor that pushes events while running an
-    /// effect (e.g. a completion observed mid-execution) is safe: the new
-    /// events queue up and are processed after the current event's chain.
     pub fn pump<E: EffectExecutor>(&mut self, executor: &mut E) -> Result<(), PumpError> {
         self.pump_with_notices(executor)
     }
 
-    /// Lossless compatibility helper for synchronous firmware call sites.
-    /// When the input queue is full, it pumps existing input to make room and
-    /// retries the producer-owned event. Any unsubmitted completion notices
-    /// remain in `PumpError` for the caller; neither the event nor notices are
-    /// converted to a lossy string.
     pub fn submit_and_pump<E: EffectExecutor>(
         &mut self,
         event: Event,
@@ -180,10 +113,6 @@ impl Runtime {
         }
     }
 
-    /// Lossless bounded adapter for synchronous producers. Completion notices
-    /// are retained in a fixed continuation window while queued events are
-    /// consumed; once the window is full, ownership is returned in
-    /// `PumpError` instead of growing memory or dropping a notice.
     #[allow(clippy::result_large_err)]
     pub fn submit_and_pump_lossless<E: EffectExecutor>(
         &mut self,
@@ -259,9 +188,6 @@ impl Runtime {
         }
     }
 
-    /// Host convenience pump with ownership of notices that could not enter
-    /// the bounded queue. A real worker should use `reduce_next` and
-    /// `submit_notice` directly so it can retain and retry those notices.
     pub fn pump_with_notices<E: EffectExecutor>(
         &mut self,
         executor: &mut E,
@@ -277,14 +203,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// Reduce exactly one queued event and return owned batches. This method
-    /// performs no effect execution or I/O and is the boundary a real effect
-    /// worker can consume.
     pub fn reduce_next(&mut self) -> Option<Vec<EffectBatch>> {
         self.queue.pop().map(|event| self.reduce_event(event))
     }
 
-    /// Reduce an owned event through the single state transition entry point.
     pub fn reduce_event(&mut self, event: Event) -> Vec<EffectBatch> {
         if let Event::EffectCompleted(completion) = &event {
             if let EffectOutput::RtcTimeWritten(written_time) = completion.output {
@@ -294,8 +216,6 @@ impl Runtime {
         crate::app::update(&mut self.state, event)
     }
 
-    /// Feed an executor notice back through the bounded event path. A full
-    /// queue returns the notice to its producer for a later retry.
     #[allow(clippy::result_large_err)]
     pub fn submit_notice(&mut self, notice: BatchNotice) -> Result<(), BatchNotice> {
         self.try_submit_notice_direct(notice)
@@ -338,11 +258,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Feed multiple executor notices back through the bounded event path.
-    /// All notices are attempted in order; rejected ones (queue full) are
-    /// returned to the caller for a later retry. This is the multi-notice
-    /// counterpart to [`submit_notice`], used by the effect task's
-    /// completion receiver loop.
     pub fn submit_notices(&mut self, notices: Vec<BatchNotice>) -> Result<(), Vec<BatchNotice>> {
         let mut rejected = Vec::new();
         for notice in notices {
@@ -363,9 +278,7 @@ impl Default for Runtime {
         Self::new()
     }
 }
-/// Re-exported for the firmware's service loop: an `EffectOutput` produced
-/// by a completed synchronous effect, used when building completion events
-/// for externally-observed async outcomes.
+
 pub type SyncEffectOutput = EffectOutput;
 
 #[cfg(test)]
@@ -428,8 +341,7 @@ mod tests {
         rt.push(Event::Tick(dt(9, 0)));
         rt.push(Event::Tick(dt(9, 1)));
         rt.push(boot(vec![], Some(dt(8, 0)), false, true));
-        // The tick queued before boot still applies after it, but only the
-        // latest tick survives the merge.
+
         rt.pump(&mut crate::harness::FakeExecutor::default())
             .unwrap();
         assert_eq!(rt.state().clock.now, Some(dt(9, 1)));
@@ -438,7 +350,6 @@ mod tests {
 
     #[test]
     fn state_is_only_mutable_through_the_queue() {
-        // No `&mut AppState` accessor exists: callers can only push facts.
         let rt = Runtime::new();
         let _: &AppState = rt.state();
     }
@@ -569,9 +480,6 @@ mod tests {
 
     #[test]
     fn sync_completion_is_queued_after_the_current_batch() {
-        // Boot with a residue AF: the ACK completes synchronously; its
-        // chained RTC reprogram is queued only after the complete batch has
-        // finished, so the current batch cannot be interrupted by C.
         struct Recorder {
             order: Vec<&'static str>,
         }
@@ -599,8 +507,7 @@ mod tests {
             }
         }
         let mut rt = Runtime::new();
-        // Alarm at 8:30, residue AF at 9:00: snapshot -> residue ACK, then
-        // (after AckDone) the register is reprogrammed/disabled.
+
         rt.push(boot(vec![alarm(1, 8, 30)], Some(dt(9, 0)), true, true));
         let mut rec = Recorder { order: vec![] };
         rt.pump(&mut rec).unwrap();
@@ -645,10 +552,7 @@ mod tests {
                 }
             }
         }
-        // Drive an AbortBatch failure mid-lifecycle by failing the persist
-        // inside a Firing boot: the ACK batch (AbortBatch) succeeds, the
-        // persist batch (AbortBatch) fails, and the Continue-policy tone
-        // batch must still run, with the render kicking as usual.
+
         let mut exec = FailOnce {
             failed: false,
             ran_stop_tone: false,
@@ -672,9 +576,6 @@ mod tests {
 
     #[test]
     fn events_pushed_while_effects_run_are_not_lost() {
-        // "Effect task busy still receives buttons and RTC alarms": the
-        // executor pushes a button event and an alarm snapshot while
-        // executing the boot render; both must queue and be processed.
         struct MidRunPusher;
         impl EffectExecutor for MidRunPusher {
             fn run(&mut self, _effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
@@ -686,7 +587,7 @@ mod tests {
         let mut rt = Runtime::new();
         rt.push(boot(vec![alarm(1, 9, 0)], Some(dt(8, 0)), false, true));
         rt.pump(&mut MidRunPusher).unwrap();
-        // Now push while "busy" (a later pump) and confirm neither event
+
         rt.push(Event::Button(crate::button_event::ButtonEvent::Pressed(
             crate::button_event::ButtonId::Enter,
         )));
@@ -705,7 +606,7 @@ mod tests {
         rt.push(boot(vec![], Some(dt(9, 0)), false, true));
         rt.pump(&mut crate::harness::FakeExecutor::default())
             .unwrap();
-        // Boot renders once -> exactly one render kick with a request id.
+
         let kicks = rt.take_kicks();
         assert_eq!(kicks.len(), 1);
         assert!(kicks[0].request_id.is_some());
@@ -727,7 +628,6 @@ mod tests {
         crate::event_queue::priority(event)
     }
 
-    // ---- regression: failure feedback produces no spurious batches -------
     #[test]
     fn failure_event_on_unmatched_op_is_harmless() {
         let mut rt = Runtime::new();
@@ -748,14 +648,12 @@ mod tests {
 
     #[test]
     fn submit_notices_feeds_completion_and_kick() {
-        // The two-phase dispatch pattern: the effect task produces notices,
-        // the main loop calls submit_notices to feed them back.
         let mut rt = Runtime::new();
         rt.push(boot(vec![], Some(dt(9, 0)), false, true));
-        // Pump with the fake executor to get the initial boot render.
+
         rt.pump(&mut crate::harness::FakeExecutor::default())
             .unwrap();
-        // Simulate the effect task sending back two notices.
+
         let notices = vec![
             BatchNotice::Completed(crate::app::EffectCompletion {
                 batch_id: crate::app::EffectBatchId(0),
@@ -773,7 +671,7 @@ mod tests {
             }),
         ];
         rt.submit_notices(notices).unwrap();
-        // Both notices should have been queued as events (work is available).
+
         assert!(rt.has_work(), "notices queued as events");
     }
 
@@ -813,16 +711,12 @@ mod tests {
 
     #[test]
     fn submit_notices_returns_rejected_when_queue_full() {
-        // When the event queue is full, submit_notices returns the
-        // notices that could not be enqueued so the caller can retry.
         let mut rt = Runtime::new();
         rt.push(boot(vec![], Some(dt(9, 0)), false, true));
         rt.pump(&mut crate::harness::FakeExecutor::default())
             .unwrap();
         rt.take_kicks();
 
-        // Fill the queue with EffectFailed events (the only thing that
-        // goes through try_push in submit_notice's Completed path).
         let big_failure = || {
             BatchNotice::Failed(crate::app::EffectFailure {
                 batch_id: crate::app::EffectBatchId(0),
@@ -833,14 +727,11 @@ mod tests {
             })
         };
 
-        // Push enough to fill the bounded queue.
         let mut i = 0;
         loop {
             match rt.submit_notice(big_failure()) {
                 Ok(()) => i += 1,
                 Err(rejected) => {
-                    // Now we know the queue is full — submit_notices
-                    // should reject at least the first one.
                     let result = rt.submit_notices(vec![rejected, big_failure()]);
                     assert!(
                         result.is_err(),
@@ -854,7 +745,6 @@ mod tests {
                 }
             }
             if i > 1000 {
-                // Queue didn't fill — test doesn't apply to this config.
                 break;
             }
         }

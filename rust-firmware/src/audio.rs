@@ -1,13 +1,3 @@
-//! ES8311 codec bring-up: I2C control-register init + I2S TX playback,
-//! fixed to this board's exact wiring (16 kHz mono, MCLK = 256x = 4.096 MHz,
-//! I2C addr 0x18 - confirmed against the official ZECTRIX demo's
-//! `zectrix_board_config.h` and `PrepareAudio()`).
-//!
-//! The register/coefficient sequence is ported from the well-known ES8311
-//! driver in zRedShift/es8311-rs (MIT/Apache-2.0), specialized to our one
-//! fixed hardware configuration instead of the general multi-rate driver -
-//! this board never runs the codec at any other MCLK/sample-rate pair.
-
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -22,7 +12,7 @@ use parking_lot::Mutex;
 pub const ES8311_ADDR: u8 = 0x18;
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 const I2C_TIMEOUT_TICKS: TickType_t = 100;
-/// Generous timeout for queuing a short test-tone buffer into I2S DMA.
+
 const I2S_WRITE_TIMEOUT_TICKS: TickType_t = 5_000;
 
 mod reg {
@@ -47,9 +37,6 @@ mod reg {
     pub const DAC_37: u8 = 0x37;
 }
 
-/// PLL coefficients for MCLK=4.096MHz (256x) at 16kHz - the single
-/// combination `StdConfig::philips(SAMPLE_RATE_HZ, ..)` produces. Values
-/// are the upstream driver's lookup-table entry for (Freq4096KHz, Freq16KHz).
 mod coeff {
     pub const PRE_DIV: u8 = 0x01;
     pub const PRE_MULTI: u8 = 0x00;
@@ -63,8 +50,6 @@ mod coeff {
     pub const DAC_OSR: u8 = 0x10;
 }
 
-/// 16-bit resolution's SDP format code (`Resolution16` in the upstream
-/// driver: value 3, packed into bits 4:2 of the SDP register).
 const RESOLUTION_16BIT_SDP: u8 = 3 << 2;
 
 pub struct Es8311 {
@@ -107,18 +92,15 @@ impl Es8311 {
             .map_err(|e| anyhow!("ES8311 write reg 0x{reg:02x} failed: {e}"))
     }
 
-    /// Reset + clock + format + power-up sequence, ported from the upstream
-    /// driver's `init()` / `clock_config()` / `format_config()`.
     fn init(&mut self) -> Result<()> {
         self.write_reg(reg::RESET, 0x1F)?;
         thread::sleep(Duration::from_micros(20));
         self.write_reg(reg::RESET, 0x00)?;
         self.write_reg(reg::RESET, 0x80)?;
 
-        // External MCLK enabled (reg01 bit7), MCLK not inverted.
         self.write_reg(reg::CLK_MANAGER_01, 0x3F | (1 << 7))?;
         let reg06 = self.read_reg(reg::CLK_MANAGER_06)?;
-        self.write_reg(reg::CLK_MANAGER_06, reg06 & !(1 << 5))?; // sclk not inverted
+        self.write_reg(reg::CLK_MANAGER_06, reg06 & !(1 << 5))?;
 
         let reg02 = self.read_reg(reg::CLK_MANAGER_02)?;
         let reg02 = (reg02 & 0x07) | ((coeff::PRE_DIV - 1) << 5) | (coeff::PRE_MULTI << 3);
@@ -136,7 +118,6 @@ impl Es8311 {
         self.write_reg(reg::CLK_MANAGER_07, (reg07 & 0xC0) | coeff::LRCK_H)?;
         self.write_reg(reg::CLK_MANAGER_08, coeff::LRCK_L)?;
 
-        // 16-bit in/out over the I2S serial data ports.
         let reg00 = self.read_reg(reg::RESET)?;
         self.write_reg(reg::RESET, reg00 & 0xBF)?;
         self.write_reg(reg::SDP_IN_09, RESOLUTION_16BIT_SDP)?;
@@ -154,7 +135,6 @@ impl Es8311 {
         Ok(())
     }
 
-    /// Digital DAC volume, 0 (silent) to 255 (max digital gain).
     pub fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.write_reg(reg::DAC_32, volume)
     }
@@ -170,9 +150,6 @@ impl Es8311 {
         self.write_reg(reg::DAC_31, reg31)
     }
 
-    /// Streams a sine tone straight to the I2S TX channel in small
-    /// stack-buffered chunks, so a multi-second tone never needs a single
-    /// large heap allocation. Used as the alarm-ring tone in `alarms.rs`.
     pub fn play_sine_stereo(
         &mut self,
         freq_hz: f32,
@@ -184,7 +161,7 @@ impl Es8311 {
         self.i2s.tx_enable()?;
 
         const CHUNK_FRAMES: usize = 256;
-        let mut chunk = [0u8; CHUNK_FRAMES * 4]; // 4 bytes/frame: L+R x 16-bit
+        let mut chunk = [0u8; CHUNK_FRAMES * 4];
         let sample_rate = SAMPLE_RATE_HZ as f32;
         let total_frames = (sample_rate * duration_secs) as usize;
 
@@ -211,10 +188,6 @@ impl Es8311 {
         result
     }
 
-    /// `write_all` returns once the last chunk is accepted into the DMA
-    /// buffers, not once it's actually been clocked out - the DMA queue
-    /// here (6 x 240 frames ~= 120ms at 16kHz) is far smaller than a typical
-    /// tone, so disabling tx immediately would clip the tail.
     fn drain_and_disable(&mut self) {
         thread::sleep(Duration::from_millis(150));
         let _ = self.i2s.tx_disable();
@@ -222,7 +195,6 @@ impl Es8311 {
     }
 }
 
-/// Ready-made 16kHz/16-bit Philips I2S config matching [`SAMPLE_RATE_HZ`].
 pub fn i2s_std_config() -> StdConfig {
     StdConfig::philips(SAMPLE_RATE_HZ, DataBitWidth::Bits16)
 }

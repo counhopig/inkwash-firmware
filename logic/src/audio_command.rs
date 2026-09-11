@@ -1,16 +1,7 @@
-//! Pure audio-command arbitration shared by the firmware audio task.
-//!
-//! Alarm audio has priority over reminder audio.  Commands may arrive in a
-//! burst while the codec is playing a note, so the task reduces the whole
-//! pending sequence instead of treating the arrival of any command as an
-//! implicit stop.
-
 use std::collections::VecDeque;
 
-/// Maximum number of audio commands waiting behind the codec task.
 pub const AUDIO_MAILBOX_CAPACITY: usize = 8;
 
-/// A sound request from the application executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioCommand {
     StartAlarmTone,
@@ -19,9 +10,6 @@ pub enum AudioCommand {
     Stop,
 }
 
-/// Fixed-capacity audio command mailbox. Critical alarm starts and Stop use
-/// explicit coalescing when full; lower-priority reminder commands return to
-/// the caller so ownership is retained for backpressure/error handling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioMailbox {
     queue: VecDeque<AudioCommand>,
@@ -40,9 +28,6 @@ impl AudioMailbox {
         }
     }
 
-    /// Enqueue without dropping a command. The newest Stop supersedes all
-    /// queued starts; a new alarm start supersedes queued reminder/stop
-    /// intent. Lower-priority reminders apply backpressure when full.
     pub fn enqueue(&mut self, command: AudioCommand) -> Result<(), AudioCommand> {
         if self.queue.len() < AUDIO_MAILBOX_CAPACITY {
             self.queue.push_back(command);
@@ -68,7 +53,6 @@ impl AudioMailbox {
     }
 }
 
-/// The sound currently desired by the application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioMode {
     Idle,
@@ -77,7 +61,6 @@ pub enum AudioMode {
     TodoBeep { pip: u8 },
 }
 
-/// Deterministic reducer for queued audio commands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioReducer {
     mode: AudioMode,
@@ -100,9 +83,6 @@ impl AudioReducer {
         self.mode
     }
 
-    /// Apply one command.  A lower-priority reminder cannot replace an
-    /// alarm that is already ringing; Stop always wins at its position in
-    /// the queue and is idempotent.
     pub fn apply(&mut self, command: AudioCommand) {
         self.mode = match command {
             AudioCommand::StartAlarmTone => AudioMode::AlarmRing,
@@ -118,8 +98,6 @@ impl AudioReducer {
         };
     }
 
-    /// Advance a completed todo beep pip.  A command arriving between pips
-    /// is reduced separately by [`AudioReducer::apply`].
     pub fn advance_todo(&mut self) {
         if let AudioMode::TodoBeep { pip } = self.mode {
             self.mode = AudioMode::TodoBeep { pip: pip + 1 };

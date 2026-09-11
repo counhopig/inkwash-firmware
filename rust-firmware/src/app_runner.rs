@@ -1,18 +1,3 @@
-//! Firmware-side `EffectExecutor` for the host-testable `Runtime`.
-//!
-//! The application-state driving engine (event queue, single
-//! `App::update` consumer, batch execution, EffectId allocation,
-//! AbortBatch semantics, completion feedback, async-kick collection,
-//! render-completion routing) lives in `inkwash_logic::runtime` and is
-//! host-testable with a fake executor. This module provides the *real*
-//! executor: `EffectRunner` runs each `Effect` against `DeviceContext`'s
-//! drivers (RTC, NVS stores, audio, display, USB/BLE), plus the
-//! render/reply helpers it needs.
-//!
-//! `Runtime`, `AsyncKick`, `EffectOutcome`, `EffectCategory` and
-//! `err_for_category` come from `inkwash_logic`; this module re-exports
-//! the names the firmware call sites use.
-
 use anyhow::Result;
 
 use inkwash_logic::app::{Effect, EffectOutput, RenderView};
@@ -44,15 +29,10 @@ fn render_facts(ctx: &DeviceContext<'_>) -> RenderFacts {
     }
 }
 
-/// Executes one `Effect` against the existing drivers, reporting the
-/// outcome back to the `inkwash_logic::runtime::Runtime` consumer.
 pub struct EffectRunner<'a, 'ctx> {
     ctx: &'a mut DeviceContext<'ctx>,
     last_clock: Option<DateTime>,
-    /// Control replies the state machine emitted during this pump, in
-    /// order, tagged with their target channel. The caller drains them after
-    /// the pump and writes each to its
-    /// transport with the correlation id of the frame that triggered it.
+
     replies: Vec<(
         inkwash_logic::protocol::Channel,
         inkwash_logic::protocol::Reply,
@@ -68,8 +48,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
         }
     }
 
-    /// Drain the replies emitted by the state machine during the last
-    /// pump, in emission order.
     pub fn take_replies(
         &mut self,
     ) -> Vec<(
@@ -83,7 +61,6 @@ impl<'a, 'ctx> EffectRunner<'a, 'ctx> {
 impl EffectExecutor for EffectRunner<'_, '_> {
     fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
         match effect {
-            // ---- synchronous effects ---------------------------------------
             Effect::PersistAlarms(list) => match AlarmStore::save(self.ctx.alarm_store, list) {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                     inkwash_logic::app::PersistTarget::Alarms,
@@ -130,20 +107,12 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
             },
             Effect::ApplySyncedData(data) => {
-                // The one place a sync's merged server state is written:
-                // the network task only transports; the state machine owns
-                // the apply ordering, and this executor performs the NVS
-                // writes (alarm/todo/inbox replace + dirty-clear + inbox
-                // read acks + ETag) as a single confirmable op.
                 let result = (|| -> Result<()> {
                     self.ctx.alarm_store.save(&data.alarms)?;
                     self.ctx.todo_store.save(&data.todos)?;
                     self.ctx.inbox_store.save(&data.inbox)?;
                     self.ctx.inbox_store.ack_read(&data.inbox_read_acked)?;
-                    // Clear only the dirty IDs that were uploaded in this
-                    // sync snapshot, not the entire dirty set — any local
-                    // edits made during the network round-trip must survive
-                    // to be re-uploaded on the next sync (P1-3 race fix).
+
                     self.ctx
                         .alarm_store
                         .clear_dirty_ids(&data.uploaded_alarm_ids)?;
@@ -208,59 +177,37 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::AckDone)),
                 Err(err) => Err((EffectCategory::Ack, format!("{err:#}"))),
             },
-            Effect::StartTone => {
-                // The state machine emits StartTone when entering Firing.
-                // The audio task (the sole owner of the ES8311 codec) starts
-                // the repeating alarm ring; this effect only dispatches the
-                // command and acknowledges - the main loop never blocks on a
-                // tone. Audio unavailability degrades cleanly (the effect
-                // still completes; the ring stays visual + dismissable).
-                match self.ctx.audio_task {
-                    Some(task) => {
-                        if let Err(err) = task.start_alarm_tone() {
-                            Err((EffectCategory::Tone, format!("{err:#}")))
-                        } else {
-                            Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
-                        }
-                    }
-                    None => {
-                        // No codec at boot: report the failure so the SM can
-                        // record the degraded audio state, but the ring
-                        // lifecycle (visual + dismiss) must keep working.
-                        Err((
-                            EffectCategory::Tone,
-                            "audio codec unavailable at boot".into(),
-                        ))
+            Effect::StartTone => match self.ctx.audio_task {
+                Some(task) => {
+                    if let Err(err) = task.start_alarm_tone() {
+                        Err((EffectCategory::Tone, format!("{err:#}")))
+                    } else {
+                        Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
                     }
                 }
-            }
-            Effect::StartReminderTone(kind) => {
-                // Start the reminder's attention tone through the audio task
-                // (siren for urgent, bounded beep for todo). Non-blocking;
-                // audio unavailability degrades cleanly (the effect still
-                // completes; the overlay stays visible + dismissable).
-                match self.ctx.audio_task {
-                    Some(task) => {
-                        let result = match kind {
-                            inkwash_logic::app::ReminderKind::Urgent => task.start_siren(),
-                            inkwash_logic::app::ReminderKind::Todo => task.beep_todo(),
-                        };
-                        if let Err(err) = result {
-                            Err((EffectCategory::Tone, format!("{err:#}")))
-                        } else {
-                            Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
-                        }
+                None => Err((
+                    EffectCategory::Tone,
+                    "audio codec unavailable at boot".into(),
+                )),
+            },
+            Effect::StartReminderTone(kind) => match self.ctx.audio_task {
+                Some(task) => {
+                    let result = match kind {
+                        inkwash_logic::app::ReminderKind::Urgent => task.start_siren(),
+                        inkwash_logic::app::ReminderKind::Todo => task.beep_todo(),
+                    };
+                    if let Err(err) = result {
+                        Err((EffectCategory::Tone, format!("{err:#}")))
+                    } else {
+                        Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
                     }
-                    None => Err((
-                        EffectCategory::Tone,
-                        "audio codec unavailable at boot".into(),
-                    )),
                 }
-            }
+                None => Err((
+                    EffectCategory::Tone,
+                    "audio codec unavailable at boot".into(),
+                )),
+            },
             Effect::StopTone => {
-                // Ask the audio task to stop the ring. The effect completes
-                // immediately (the sound fades within a burst gap); the SM
-                // transitions to WaitingForRearm without waiting for audio.
                 if let Some(task) = self.ctx.audio_task {
                     if let Err(err) = task.stop() {
                         return Err((EffectCategory::Tone, format!("{err:#}")));
@@ -268,12 +215,8 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
                 Ok(EffectOutcome::Completed(EffectOutput::ToneDone))
             }
-            // ---- asynchronous / out-of-band effects -------------------------
+
             Effect::MarkInboxRead { seq } => {
-                // Fire-and-forget local persist of the read mark: the
-                // executor marks `seq` read + adds it to the pending-read
-                // set (two-way sync uploads later). The SM already set the
-                // item's read flag optimistically; nothing to track.
                 if let Err(err) = self.ctx.inbox_store.mark_read(*seq) {
                     Err((EffectCategory::Persist, format!("{err:#}")))
                 } else {
@@ -300,9 +243,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 "reminder fact collection requires the effect worker".into(),
             )),
             Effect::SetSyncInterval { minutes } => {
-                // Fire-and-forget persistence of the SYNC INTERVAL picker
-                // choice: the executor writes the NVS counters the sync
-                // scheduler reads for its cadence.
                 if let Err(err) = self.ctx.counters.set_sync_interval_minutes(*minutes) {
                     Err((EffectCategory::Persist, format!("{err:#}")))
                 } else {
@@ -310,11 +250,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
             }
             Effect::PersistAlarmToggle { alarms, toggled_id } => {
-                // The AlarmList screen's confirmable enabled-toggle: save the
-                // list and mark the row dirty (two-way sync contract). The
-                // completion feeds back as Persisted(Alarms), which releases
-                // the machine's one-at-a-time toggle gate and re-programs
-                // the RTC slot.
                 match (
                     AlarmStore::save(self.ctx.alarm_store, alarms),
                     self.ctx.alarm_store.mark_dirty(*toggled_id),
@@ -330,10 +265,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
             }
             Effect::PersistTodoEdit { todos, edited_id } => {
-                // The TodoList screen's confirmable done-toggle: save the
-                // list and mark the row dirty (two-way sync contract). The
-                // completion feeds back as Persisted(Todos), which releases
-                // the machine's one-at-a-time edit gate.
                 match (
                     TodoStore::save(self.ctx.todo_store, todos),
                     self.ctx.todo_store.mark_dirty(*edited_id),
@@ -349,21 +280,10 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
             }
             Effect::Reply { channel, reply } => {
-                // Record the reply for the caller to write after the pump:
-                // only the caller knows the correlation id of the frame that
-                // triggered it, and the reply must go to exactly one
-                // transport (USB and BLE have independent pending slots).
                 self.replies.push((*channel, reply.clone()));
                 Ok(EffectOutcome::Completed(EffectOutput::RenderDone))
             }
             Effect::Render(req) => {
-                // Stage 5: the refresh plan is derived by diffing the
-                // request's ViewModel against the renderer's cached
-                // last-shown ViewModel (plan_render in logic). Noop renders
-                // nothing to the panel and completes synchronously; Partial
-                // and Full draw the requested surface and submit an EPD
-                // refresh, returning async so the completion correlates by
-                // request id.
                 let renders = self.ctx.pending_renders.clone();
                 let plan = renders.borrow().plan_for(&req.view_model);
                 match plan {
@@ -390,12 +310,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 }
             }
             Effect::StartSync(req) => {
-                // The sync task owns Wi-Fi; this only dispatches the
-                // request. `Ok(true)` = dispatched (async, receipt later);
-                // `Ok(false)` = another Wi-Fi operation is already in
-                // flight, so this sync did NOT start - fail immediately so
-                // the state machine's single-flight lock is not left
-                // waiting on a receipt that will never be this sync's.
                 let result = self.ctx.start_sync(req.now);
                 match result {
                     Ok(true) => Ok(EffectOutcome::Async),
@@ -411,11 +325,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
             },
             Effect::StartSetWifi(creds) => {
-                // Wi-Fi verification + save runs on the sync task (it owns
-                // the Wi-Fi driver). `Ok(true)` = dispatched (receipt
-                // later); `Ok(false)` = another Wi-Fi operation is in
-                // flight, so fail immediately rather than leave the
-                // state machine's pending slot waiting forever.
                 let result = self.ctx.start_set_wifi(creds.clone());
                 match result {
                     Ok(true) => Ok(EffectOutcome::Async),
@@ -426,41 +335,34 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Sync, format!("{err:#}"))),
                 }
             }
-            Effect::StartBlePairing(req) => {
-                // NimBLE init/advertising can block for seconds; the worker
-                // owns all radio handles and reports Started/Failed facts to
-                // the main loop. Never call BLEDevice::init on this thread.
-                self.ctx
-                    .start_ble_pairing(req)
-                    .and_then(|started| {
-                        if started {
-                            Ok(EffectOutcome::Async)
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "Wi-Fi is busy or BLE radio is still stopping"
-                            ))
-                        }
-                    })
-                    .map_err(|err| {
-                        (
-                            EffectCategory::Ble,
-                            format!("BLE worker start failed: {err:#}"),
-                        )
-                    })
-            }
-            Effect::StopBlePairing => {
-                // Stop is serialized behind any in-flight Start on the same
-                // worker, so a fast exit/re-entry cannot race deinit/init.
-                self.ctx
-                    .stop_ble_pairing()
-                    .map(|()| EffectOutcome::Async)
-                    .map_err(|err| {
-                        (
-                            EffectCategory::Ble,
-                            format!("BLE worker stop failed: {err:#}"),
-                        )
-                    })
-            }
+            Effect::StartBlePairing(req) => self
+                .ctx
+                .start_ble_pairing(req)
+                .and_then(|started| {
+                    if started {
+                        Ok(EffectOutcome::Async)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "Wi-Fi is busy or BLE radio is still stopping"
+                        ))
+                    }
+                })
+                .map_err(|err| {
+                    (
+                        EffectCategory::Ble,
+                        format!("BLE worker start failed: {err:#}"),
+                    )
+                }),
+            Effect::StopBlePairing => self
+                .ctx
+                .stop_ble_pairing()
+                .map(|()| EffectOutcome::Async)
+                .map_err(|err| {
+                    (
+                        EffectCategory::Ble,
+                        format!("BLE worker stop failed: {err:#}"),
+                    )
+                }),
             Effect::EnterLightSleep(_plan) => {
                 if let Err(err) = crate::power::configure_light_sleep() {
                     return Err((EffectCategory::Sleep, format!("{err:#}")));
@@ -480,56 +382,26 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 token,
                 maintenance,
                 light_wake_after_ms: _,
-            } => {
-                // The platform half of prepare is synchronous: wake-source
-                // configuration either succeeds or reports a Sleep failure.
-                // The main event collector feeds the resulting token fact
-                // back after this effect, where the state machine performs
-                // the final business gates.
-                match token.kind {
-                    inkwash_logic::power_state::SleepKind::Light => {
-                        crate::power::prepare_light_sleep_wakeups()
-                    }
-                    inkwash_logic::power_state::SleepKind::Deep => {
-                        crate::power::prepare_deep_sleep_wakeups(*maintenance)
-                    }
+            } => match token.kind {
+                inkwash_logic::power_state::SleepKind::Light => {
+                    crate::power::prepare_light_sleep_wakeups()
                 }
-                .map(|()| EffectOutcome::Async)
-                .map_err(|err| {
-                    (
-                        EffectCategory::Sleep,
-                        format!("sleep prepare failed: {err:#}"),
-                    )
-                })
+                inkwash_logic::power_state::SleepKind::Deep => {
+                    crate::power::prepare_deep_sleep_wakeups(*maintenance)
+                }
             }
-            Effect::CommitSleep(_) => {
-                // Commit is a platform handshake marker. The main loop must
-                // re-sample input latch, queue, USB and completion facts
-                // immediately before feeding SleepCommitted; this effect is
-                // deliberately kept asynchronous so it cannot be placed in
-                // an AbortBatch.
-                Ok(EffectOutcome::Async)
-            }
+            .map(|()| EffectOutcome::Async)
+            .map_err(|err| {
+                (
+                    EffectCategory::Sleep,
+                    format!("sleep prepare failed: {err:#}"),
+                )
+            }),
+            Effect::CommitSleep(_) => Ok(EffectOutcome::Async),
         }
     }
 }
 
-/// Maps a Stage-5 `PartialRegion` to the panel rectangle that region
-/// occupies. The region already encodes the *kind* of local change (Home
-/// clock, drawer bar, list block, calendar grid, or a whole-surface repaint
-/// for read-only pages); the refresh is submitted for exactly that rect.
-/// Stage-5 renderer cache terminal update, called from the EPD-completion
-/// path after a render kick was matched and consumed.
-///
-/// Updates the renderer's private "last successfully shown" ViewModel cache
-/// exactly per firmware-architecture.md: only a success whose render
-/// generation is still current replaces `last_shown` (Full resets the
-/// partial counter, Partial increments it, Noop leaves it); a failure
-/// invalidates the cache so the next render is a recovery Full; a
-/// superseded completion never touches the cache (its pixels never reached
-/// the panel - the replacement request updates the cache on its own
-/// completion). `#[inline(never)]` keeps this out of the completion loop's
-/// inlined frame.
 #[inline(never)]
 pub(crate) fn apply_render_cache_terminal(
     registry: &std::rc::Rc<std::cell::RefCell<inkwash_logic::epd_registry::RenderRegistry>>,
@@ -580,12 +452,6 @@ pub(crate) fn partial_region_rect(
     }
 }
 
-/// Renders the visible surface named by `view` into the shared canvas.
-/// Navigation first redraws its saved source surface, then overlays the GO TO
-/// bar. This keeps the drawer attached to the page that opened it.
-/// Shared with main's legacy dirty-path redraws so the canvas always matches
-/// the SM's current screen (a dirty full redraw while the drawer is open
-/// must keep the overlay).
 fn draw_sm_surface(
     ctx: &mut DeviceContext<'_>,
     clock: Option<DateTime>,
@@ -623,9 +489,6 @@ fn draw_sm_surface(
             crate::screens::draw_inbox_item_detail(ctx.board, &facts.inbox, index);
         }
         RenderView::Calendar { selected_day, .. } => {
-            // The grid always renders the current clock month (matching the
-            // SM, which keeps its year/month synced to the clock on every
-            // tick); only the day cursor comes from the view.
             crate::screens::draw_calendar_grid(ctx, clock.as_ref(), selected_day, &facts.todos);
         }
         RenderView::WeekView { year, month, day } => {

@@ -1,10 +1,3 @@
-//! Pure sleep admission and cancellation state.
-//!
-//! This module deliberately owns no application data. `AppState` remains the
-//! sole business-state owner; it can embed one `SleepState` and derive an
-//! [`SleepInputs`] snapshot from its own fields before calling `prepare`.
-//! Monotonic time is supplied by the caller as an opaque tick value.
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SleepKind {
     Light,
@@ -29,8 +22,6 @@ pub enum SleepBlocker {
     NoPreparedSleep,
 }
 
-/// Facts collected by the application/event layer for one admission check.
-/// No field is inferred by this module and no clock is read here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SleepInputs {
     pub input_pending: bool,
@@ -38,8 +29,7 @@ pub struct SleepInputs {
     pub final_display_pending: bool,
     pub final_persist_pending: bool,
     pub network_in_flight: bool,
-    /// True only when an in-flight network operation is safe to resume after
-    /// light sleep. Deep sleep never permits an in-flight network operation.
+
     pub network_resumable: bool,
     pub protocol_reply_pending: bool,
     pub operation_in_flight: bool,
@@ -64,8 +54,6 @@ enum SleepPhase {
     Committed(SleepToken),
 }
 
-/// Tracks only admission-token lifecycle. The owning `AppState` supplies all
-/// business facts and must call [`SleepState::activity`] for every new event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SleepState {
     activity_version: u64,
@@ -82,8 +70,6 @@ impl SleepState {
         self.activity_version
     }
 
-    /// Invalidates every prepared or committed request. Call this before
-    /// processing newly collected input, completions, failures, or frames.
     pub fn activity(&mut self) {
         self.activity_version = self.activity_version.wrapping_add(1);
         self.phase = None;
@@ -121,8 +107,6 @@ impl SleepState {
         }
     }
 
-    /// Performs the first admission check and issues a token. A manual sleep
-    /// request must use this same method and therefore cannot bypass gates.
     pub fn prepare(
         &mut self,
         kind: SleepKind,
@@ -131,8 +115,7 @@ impl SleepState {
     ) -> Result<SleepToken, SleepBlocker> {
         let blocker = match kind {
             SleepKind::Light => light_blocker(inputs),
-            // The platform has not yet returned its wake-plan prepare ACK;
-            // that fact is required by `commit`, not by issuing the token.
+
             SleepKind::Deep => deep_blocker(inputs, false),
         };
         if let Some(blocker) = blocker {
@@ -150,8 +133,6 @@ impl SleepState {
         Ok(token)
     }
 
-    /// Final handshake immediately before the platform sleep call. It checks
-    /// both token freshness and the complete gate again.
     pub fn commit(
         &mut self,
         token: SleepToken,

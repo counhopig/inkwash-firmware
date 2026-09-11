@@ -1,20 +1,3 @@
-//! Host fake harness for the `runtime::Runtime` single-consumer loop.
-//!
-//! `Runtime` executes effect batches through a caller-provided
-//! `EffectExecutor`. The firmware provides the real executor
-//! (`rust-firmware::app_runner::EffectRunner`) that drives
-//! `DeviceContext`; this module provides a recording fake so the full
-//! alarm lifecycle - boot, ring, dismiss, rearm, retries, render
-//! completions - can be exercised on the host without ESP-IDF.
-//!
-//! The fake records every effect invocation (counted per effect and per
-//! category), executes synchronous effects immediately with the output
-//! the state machine expects, and can be scripted to fail a category the
-//! first N times (e.g. an RTC I2C glitch) to exercise the retry paths.
-//! Render effects return `AsyncWithId` with a caller-controlled request
-//! id, so the harness can drive EPD completions (including stale ones)
-//! through the render-registry feed.
-
 use std::collections::BTreeMap;
 
 use crate::alarm_flow::{AlarmHost, AlarmPoll};
@@ -23,8 +6,6 @@ use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
 use crate::runner::{EffectCategory, EffectExecutor, EffectOutcome};
 use crate::runtime::Runtime;
 
-/// Counts how many times each effect variant ran. Keyed by a stable
-/// string label so the harness can assert "ACK ran exactly once".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EffectLog {
     pub by_name: BTreeMap<String, usize>,
@@ -43,8 +24,6 @@ impl EffectLog {
     }
 }
 
-/// Scripted failure: fail the next `n` invocations in a category with a
-/// synthetic message, then succeed. Simulates an I2C/NVS transient.
 #[derive(Clone, Debug, Default)]
 pub struct ScriptedFailures {
     pub per_category: BTreeMap<EffectCategory, usize>,
@@ -55,8 +34,7 @@ impl ScriptedFailures {
         self.per_category.insert(cat, n);
         self
     }
-    /// Consume one failure budget for `cat`; true means the next call
-    /// should fail.
+
     fn take(&mut self, cat: EffectCategory) -> bool {
         match self.per_category.get_mut(&cat) {
             Some(n) if *n > 0 => {
@@ -68,18 +46,17 @@ impl ScriptedFailures {
     }
 }
 
-/// A recording fake `EffectExecutor`.
 #[derive(Debug)]
 pub struct FakeExecutor {
     pub log: EffectLog,
     pub failures: ScriptedFailures,
-    /// Next request id handed to `Effect::Render` (the EPD would echo it).
+
     pub next_request_id: u64,
-    /// Renders issued (request_id, generation) in order.
+
     pub renders: Vec<(u64, Option<crate::app::RenderGeneration>)>,
-    /// Render surfaces issued in the same order as `renders`.
+
     pub render_views: Vec<RenderView>,
-    /// When true, `Effect::Render` fails with `EffectError::Render`.
+
     pub fail_render: bool,
 }
 
@@ -107,7 +84,6 @@ impl FakeExecutor {
     }
 }
 
-/// Stable label for `Effect` variants (used for count assertions).
 pub fn effect_name(effect: &Effect) -> &'static str {
     match effect {
         Effect::PersistAlarms(_) => "PersistAlarms",
@@ -272,17 +248,13 @@ impl EffectExecutor for FakeExecutor {
     }
 }
 
-/// Fake `AlarmHost` driving the shared `AlarmPoll` orchestration: a
-/// scripted AF edge + snapshot, dispatching through the `Harness`'s
-/// runner. A host test runs the *same* `AlarmPoll` code the firmware's
-/// `DeviceContext::poll_alarm_snapshot` runs.
 #[derive(Debug, Default)]
 pub struct FakeAlarmHost {
     pub af: bool,
     pub snapshot: Option<crate::app::RtcAlarmSnapshot>,
     pub snapshot_error: bool,
     pub alarm_flag_error: bool,
-    /// Number of snapshot_ready dispatches the harness performed.
+
     pub dispatches: usize,
 }
 
@@ -293,7 +265,6 @@ impl FakeAlarmHost {
     }
 }
 
-/// Bridges `AlarmPoll` to the `Harness`'s runner + `FakeAlarmHost`.
 struct FakeHostAdapter<'a> {
     harness: &'a mut Harness,
     host: &'a mut FakeAlarmHost,
@@ -319,10 +290,7 @@ impl AlarmHost for FakeHostAdapter<'_> {
     }
     fn snapshot_ready(&mut self, snapshot: crate::app::RtcAlarmSnapshot) -> bool {
         self.host.dispatches += 1;
-        // New-ringing detection: this snapshot must transition the state
-        // machine INTO AlarmRinging. If it was already ringing (a stale
-        // / duplicate edge), the state machine ignores it and we must
-        // not report a fresh ring.
+
         let was_ringing = self.harness.ringing();
         let ok = self
             .harness
@@ -342,18 +310,13 @@ impl AlarmHost for FakeHostAdapter<'_> {
     }
 }
 
-/// Convenience driver combining `Runtime` + `FakeExecutor`, mirroring
-/// the firmware's single-consumer event loop: push events, pump, drain
-/// render kicks, and feed EPD completions (including stale ones) back.
 #[derive(Debug, Default)]
 pub struct Harness {
     pub runtime: Runtime,
     pub executor: FakeExecutor,
-    /// Shared render-request registry (the same type the firmware uses),
-    /// so EPD completion tests exercise `RenderRegistry::register/feed`.
+
     pub pending_renders: RenderRegistry,
-    /// Shared alarm-poll state; `poll_alarm` runs the same `AlarmPoll`
-    /// orchestration the firmware runs.
+
     pub alarm_poll: AlarmPoll,
 }
 
@@ -362,9 +325,6 @@ impl Harness {
         Self::default()
     }
 
-    /// Push one event into the queue and pump the runtime to quiescence
-    /// (high-priority tier first, merged ticks last), then register any
-    /// newly-issued render kicks.
     pub fn dispatch(&mut self, event: Event) -> Result<(), String> {
         self.runtime
             .try_push(event)
@@ -376,7 +336,6 @@ impl Harness {
         Ok(())
     }
 
-    /// Move newly-issued render kicks into the shared `RenderRegistry`.
     pub fn drain_kicks(&mut self) {
         for kick in self.runtime.take_kicks() {
             if kick.is_render() {
@@ -387,8 +346,6 @@ impl Harness {
         }
     }
 
-    /// Run the shared `AlarmPoll` orchestration through a fake host.
-    /// Returns true when the state machine entered `AlarmRinging`.
     pub fn poll_alarm(&mut self, host: &mut FakeAlarmHost) -> bool {
         let mut poll = std::mem::take(&mut self.alarm_poll);
         let mut adapter = FakeHostAdapter {
@@ -400,7 +357,6 @@ impl Harness {
         firing
     }
 
-    /// `main` consumes the sticky exit flag exactly once.
     pub fn take_alarm_exit(&mut self) -> bool {
         self.alarm_poll.take_alarm_exit()
     }
@@ -409,20 +365,13 @@ impl Harness {
         self.alarm_poll.alarm_exit()
     }
 
-    /// Drive one full alarm lifecycle through the shared `AlarmPoll`
-    /// orchestration the firmware runs: AF edge -> snapshot -> dispatch
-    /// -> ring -> dismiss -> drain kicks. After this the state machine is
-    /// back on Home in `WaitingForRearm` (both commits were
-    /// auto-completed by the fake), and the AF edge is consumed. Callers
-    /// then clear AF and advance the minute to rearm before the next
-    /// source.
     pub fn complete_alarm_lifecycle(&mut self, host: &mut FakeAlarmHost) {
         assert!(
             self.poll_alarm(host),
             "AlarmPoll must ring on a fresh AF edge"
         );
         assert!(self.ringing(), "state machine entered AlarmRinging");
-        // Dismiss: Firing -> WaitingForRearm.
+
         let mut poll = std::mem::take(&mut self.alarm_poll);
         let mut adapter = FakeHostAdapter {
             harness: self,
@@ -441,18 +390,10 @@ impl Harness {
         );
     }
 
-    /// Feed an EPD completion for `request_id` back into the runtime via
-    /// the shared `RenderRegistry::feed` (the same type the firmware
-    /// uses). Completed/Failed push an EffectCompleted/EffectFailed event
-    /// and pump; Superseded only terminates it; Ignored (stale/duplicate)
-    /// does nothing. Returns true when a matching kick reached a terminal.
     pub fn complete_render(&mut self, request_id: u64, ok: bool) -> Result<bool, String> {
         let outcome = self.pending_renders.feed(request_id, ok, false);
         match outcome {
-            FeedOutcome::Matched(_kick, RenderTerminal::Superseded) => {
-                // Superseded: only terminate (never fed as RenderDone).
-                Ok(true)
-            }
+            FeedOutcome::Matched(_kick, RenderTerminal::Superseded) => Ok(true),
             FeedOutcome::Matched(kick, terminal) => {
                 let failure = if terminal == RenderTerminal::Failed {
                     Some(EffectError::Render("epd failed".into()))
@@ -501,13 +442,11 @@ impl Harness {
         self.runtime.state()
     }
 
-    /// Convenience: is an alarm currently ringing?
     pub fn ringing(&self) -> bool {
         matches!(self.screen(), Screen::AlarmRinging)
     }
 }
 
-/// Test helpers for building snapshots on the host.
 pub mod helpers {
     use crate::app::{BootSnapshot, RtcAlarmSnapshot};
     use crate::datetime::DateTime;
@@ -579,8 +518,6 @@ mod tests {
     use crate::runner::EffectCategory;
     use helpers::{alarm, boot, dt, snapshot};
 
-    // ---- verification point 1: boot alarm rings then dismisses -----------
-
     #[test]
     fn boot_alarm_rings_and_dismisses() {
         let mut h = Harness::new();
@@ -592,7 +529,7 @@ mod tests {
         )))
         .unwrap();
         assert!(h.ringing(), "boot with AF+AIE+due alarm must ring");
-        // ACK, persist, tone, render all issued on ring.
+
         assert_eq!(h.executor.log.count("AcknowledgeRtcAlarm"), 1);
         assert_eq!(h.executor.log.count("PersistAlarms"), 1);
         assert_eq!(h.executor.log.count("StartTone"), 1);
@@ -603,9 +540,7 @@ mod tests {
         assert!(!h.ringing(), "dismiss leaves ringing screen");
         assert_eq!(h.screen(), &Screen::Home, "dismiss restores Home");
         assert_eq!(h.executor.log.count("StopTone"), 1);
-        // Dismiss submits exactly one render request. Whether that request
-        // is Full or Partial is the renderer's decision (ViewModel diff);
-        // the SM contract is a single render on the dismiss transition.
+
         assert_eq!(
             h.executor.log.count("Render"),
             2,
@@ -629,7 +564,7 @@ mod tests {
         .unwrap();
         let renders_after_boot = h.executor.log.count("Render");
         h.dispatch(Event::Tick(dt(9, 0))).unwrap();
-        // A minute change on Home keeps emitting a render request (boot + 1).
+
         assert_eq!(
             h.executor.log.count("Render"),
             renders_after_boot + 1,
@@ -642,7 +577,7 @@ mod tests {
         let mut h = Harness::new();
         h.dispatch(Event::Boot(boot(Some(dt(8, 0)), false, true, vec![])))
             .unwrap();
-        // Home -> Navigation -> Settings, then select BLE PAIRING.
+
         h.dispatch(Event::Button(Btn::LongPressed(ButtonId::Up)))
             .unwrap();
         h.dispatch(Event::Button(Btn::LongPressed(ButtonId::Down)))
@@ -657,9 +592,6 @@ mod tests {
             .unwrap();
         assert_eq!(h.executor.log.count("StartBlePairing"), 1);
 
-        // No worker completion is delivered yet, but the runtime continues
-        // to accept ordinary events. The entry key must be released before
-        // the explicit long ENTER can stop the pending session.
         h.dispatch(Event::Tick(dt(8, 1))).unwrap();
         h.dispatch(Event::Button(Btn::Released(ButtonId::Enter)))
             .unwrap();
@@ -673,12 +605,10 @@ mod tests {
         assert_eq!(h.executor.log.count("StartBlePairing"), 2);
     }
 
-    // ---- verification point 2: runtime alarm preempts everywhere ---------
-
     #[test]
     fn runtime_alarm_rings_from_home() {
         let mut h = Harness::new();
-        // Boot clean (no AF), alarm armed for 9:00.
+
         h.dispatch(Event::Boot(boot(
             Some(dt(8, 59)),
             false,
@@ -687,18 +617,16 @@ mod tests {
         )))
         .unwrap();
         assert!(!h.ringing());
-        // AF asserts at 9:00 -> rings.
+
         h.dispatch(Event::RtcAlarmSnapshotReady(snapshot(dt(9, 0), true, true)))
             .unwrap();
         assert!(h.ringing(), "runtime AF must ring");
     }
 
-    // ---- verification point 3: two consecutive alarms --------------------
-
     #[test]
     fn two_consecutive_alarms_each_ring_once() {
         let mut h = Harness::new();
-        // First alarm at 9:00.
+
         h.dispatch(Event::Boot(boot(
             Some(dt(9, 0)),
             true,
@@ -707,7 +635,7 @@ mod tests {
         )))
         .unwrap();
         assert!(h.ringing());
-        // Duplicate snapshot while firing is ignored (idempotent).
+
         h.dispatch(Event::RtcAlarmSnapshotReady(snapshot(dt(9, 0), true, true)))
             .unwrap();
         assert_eq!(
@@ -716,9 +644,6 @@ mod tests {
             "no double ACK"
         );
 
-        // Dismiss. The fake auto-completed ACK + persist during boot, so
-        // both commits are already Succeeded; only the minute advance is
-        // needed for rearm.
         h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
             .unwrap();
         assert!(matches!(
@@ -728,7 +653,6 @@ mod tests {
         h.dispatch(Event::Tick(dt(9, 1))).unwrap();
         assert_eq!(h.executor.log.count("ProgramRtcAlarm"), 1);
 
-        // Second alarm at next day's 9:00 (Daily): AF again.
         let now2 = DateTime {
             year: 2026,
             month: 9,
@@ -746,8 +670,6 @@ mod tests {
         assert_eq!(h.executor.log.count("PersistAlarms"), 2);
     }
 
-    // ---- verification point 4: transient RTC failures retry -------------
-
     #[test]
     fn rtc_ack_failure_retries_on_tick() {
         let mut h = Harness::new();
@@ -759,13 +681,12 @@ mod tests {
             vec![alarm(1, 9, 0)],
         )))
         .unwrap();
-        // The ACK failed once; the state machine must have scheduled a
-        // retry rather than leaving ACK stuck failed.
+
         assert!(
             h.ringing(),
             "still firing (commit failed but not abandoned)"
         );
-        // Cross-minute tick re-issues the failed ACK.
+
         h.dispatch(Event::Tick(dt(9, 1))).unwrap();
         let ack_count = h.executor.log.count("AcknowledgeRtcAlarm");
         assert!(
@@ -777,8 +698,7 @@ mod tests {
     #[test]
     fn rtc_program_failure_degrades_then_retries() {
         let mut h = Harness::new();
-        // Boot clean, then program the alarm at 9:00; make the first
-        // ProgramRtcAlarm fail.
+
         h.executor.failures.fail_next(EffectCategory::Rtc, 1);
         h.dispatch(Event::Boot(boot(
             Some(dt(8, 59)),
@@ -787,12 +707,12 @@ mod tests {
             vec![alarm(1, 9, 0)],
         )))
         .unwrap();
-        // Program failed -> Degraded, retry scheduled.
+
         assert!(matches!(
             h.state().alarm_runtime,
             AlarmRuntimeState::Degraded { .. }
         ));
-        // Next minute tick retries the program.
+
         h.dispatch(Event::Tick(dt(9, 0))).unwrap();
         let program_count = h.executor.log.count("ProgramRtcAlarm");
         assert!(
@@ -800,8 +720,6 @@ mod tests {
             "program retried after transient failure, got {program_count}"
         );
     }
-
-    // ---- verification point 5: dismiss restores the correct page --------
 
     #[test]
     fn dismiss_restores_home() {
@@ -819,8 +737,6 @@ mod tests {
         assert_eq!(h.screen(), &Screen::Home);
     }
 
-    // ---- verification point 7: render kick <-> EPD completion loop ------
-
     #[test]
     fn render_completion_closes_loop_and_ignores_stale() {
         let mut h = Harness::new();
@@ -831,31 +747,27 @@ mod tests {
             vec![alarm(1, 9, 0)],
         )))
         .unwrap();
-        // One render kick is pending with the fake's request id.
+
         assert_eq!(h.pending_renders.len(), 1);
         let rid = h
             .pending_renders
             .first_request_id()
             .expect("render kick has id");
 
-        // A stale/unknown completion (no matching kick) is ignored.
         assert!(!h.complete_render(rid + 999, true).unwrap());
 
-        // The matching completion closes the loop.
         assert!(h.complete_render(rid, true).unwrap());
         assert!(h.pending_renders.is_empty(), "kick consumed");
-        // And a duplicate completion for the same id is now stale.
+
         assert!(!h.complete_render(rid, true).unwrap());
     }
 
     #[test]
     fn stale_render_completion_is_ignored() {
         let mut h = Harness::new();
-        // No renders at all: any completion is stale.
+
         assert!(!h.complete_render(7, true).unwrap());
     }
-
-    // ---- verification point 8: side effects exactly once ----------------
 
     #[test]
     fn lifecycle_side_effects_each_once() {
@@ -869,11 +781,9 @@ mod tests {
         .unwrap();
         h.dispatch(Event::Button(Btn::Pressed(ButtonId::Enter)))
             .unwrap();
-        // Commits were auto-completed by the fake during boot; a minute
-        // tick performs the rearm.
+
         h.dispatch(Event::Tick(dt(9, 1))).unwrap();
-        // Each key side effect fired exactly once across the whole
-        // lifecycle.
+
         assert_eq!(h.executor.log.count("AcknowledgeRtcAlarm"), 1);
         assert_eq!(h.executor.log.count("PersistAlarms"), 1);
         assert_eq!(h.executor.log.count("StopTone"), 1);
@@ -883,9 +793,6 @@ mod tests {
             AlarmRuntimeState::Armed { alarm_id: 1 }
         ));
     }
-
-    // ---- shared AlarmPoll orchestration (firmware's poll_alarm_snapshot
-    // runs this exact code) -----------------------------------------------
 
     #[test]
     fn alarm_poll_shared_orchestration_rings_via_fake_host() {
@@ -902,10 +809,10 @@ mod tests {
         assert!(h.poll_alarm(&mut host), "shared AlarmPoll must ring");
         assert_eq!(host.dispatches, 1);
         assert!(h.alarm_exit(), "exit flag set after ring");
-        // A duplicate edge (still af=true) is not re-dispatched.
+
         assert!(!h.poll_alarm(&mut host), "edge consumed -> no re-ring");
         assert_eq!(host.dispatches, 1);
-        // main consumes the flag exactly once.
+
         assert!(h.take_alarm_exit());
         assert!(!h.take_alarm_exit(), "flag consumed once");
     }
@@ -925,15 +832,14 @@ mod tests {
             snapshot_error: true,
             ..FakeAlarmHost::default()
         };
-        // First read fails: edge not consumed, error recorded for the
-        // caller to log.
+
         assert!(!h.poll_alarm(&mut host));
         assert!(
             h.alarm_poll.take_error().is_some(),
             "read failure must surface an error for logging"
         );
         assert_eq!(h.alarm_poll.take_error(), None, "error consumed once");
-        // Retry with a good snapshot: rings.
+
         host.snapshot_error = false;
         host.snapshot = Some(snapshot(dt(9, 0), true, true));
         assert!(h.poll_alarm(&mut host));
@@ -953,11 +859,10 @@ mod tests {
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         assert!(h.poll_alarm(&mut host));
-        // AF clears (ack): the edge resets; polling with AF low is a
-        // no-op (not a fresh ring).
+
         host.af = false;
         assert!(!h.poll_alarm(&mut host));
-        // Dismiss back to Home; the state machine leaves Firing.
+
         let mut poll = std::mem::take(&mut h.alarm_poll);
         let mut adapter = FakeHostAdapter {
             harness: &mut h,
@@ -967,17 +872,12 @@ mod tests {
         h.alarm_poll = poll;
         assert_eq!(h.screen(), &Screen::Home);
         assert!(h.take_alarm_exit());
-        // The edge was consumed by the first ring; AF re-asserting after
-        // the clear is a *new* edge, so the dispatcher is called again
-        // (the state machine sees no due alarm at 9:01 -> residue ACK,
-        // not a ring - that is correct: re-ring needs a due minute).
+
         host.set(true, snapshot(dt(9, 1), true, true));
         let _ = h.poll_alarm(&mut host);
         assert_eq!(host.dispatches, 2, "new AF edge re-dispatches");
         assert!(!h.ringing(), "no due alarm at 9:01, residue only");
     }
-
-    // ---- shared EPD registry (superseded terminal rule) ------------------
 
     use crate::epd_registry::{FeedOutcome, RenderRegistry, RenderTerminal};
 
@@ -992,8 +892,7 @@ mod tests {
         )))
         .unwrap();
         let rid = h.pending_renders.first_request_id().unwrap();
-        // Simulate the EPD single-slot: a newer render supersedes the
-        // pending one. Both must end with exactly one terminal each.
+
         let mut reg = RenderRegistry::new();
         let pending_kicks = h.pending_renders.drain_all();
         let first = pending_kicks[0].clone();
@@ -1045,8 +944,6 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
-    // ---- page unwind: alarm_exit consumed exactly once by main ----------
-
     #[test]
     fn page_unwind_flag_consumed_once_by_main() {
         let mut h = Harness::new();
@@ -1060,15 +957,13 @@ mod tests {
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         assert!(h.poll_alarm(&mut host));
-        // A nested page sees the flag pending.
+
         assert!(h.alarm_exit());
-        // main consumes it once; a second consume is a no-op.
+
         assert!(h.take_alarm_exit());
         assert!(!h.take_alarm_exit());
         assert!(!h.alarm_exit());
     }
-
-    // ---- main/background routing: Home vs blocking consumption ------
 
     use crate::alarm_flow::AlarmSource;
 
@@ -1082,18 +977,13 @@ mod tests {
         .unwrap();
     }
 
-    /// Start a fresh AF edge for the next alarm at `minute`.
     fn fresh_edge(h: &mut Harness, host: &mut FakeAlarmHost, minute: u8) {
         host.af = false;
         assert!(!h.poll_alarm(host), "AF clear resets the edge");
         host.set(true, snapshot(dt(minute, 0), true, true));
     }
 
-    /// After `complete_alarm_lifecycle`, advance the minute so the Daily
-    /// alarm re-arms (WaitingForRearm -> Armed) and the next source can
-    /// start from a clean armed state.
     fn rearm_after_dismiss(h: &mut Harness) {
-        // Commits were auto-completed by the fake; advance the minute.
         h.dispatch(Event::Tick(dt(10, 0))).unwrap();
         assert!(matches!(
             h.state().alarm_runtime,
@@ -1101,16 +991,15 @@ mod tests {
         ));
     }
 
-    /// Home alarm: full lifecycle, then the root consumes the flag at once.
     fn home_alarm_lifecycle(h: &mut Harness) {
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_exit(), "AlarmPoll sets the flag on ring");
-        // Home is the root: consume immediately via the shared policy.
+
         assert!(h.alarm_poll.consume_for(AlarmSource::Home));
         assert!(!h.alarm_exit(), "Home alarm flag cleared at once");
-        // AF clear + rearm for the next source.
+
         fresh_edge(h, &mut host, 9);
         rearm_after_dismiss(h);
     }
@@ -1135,10 +1024,10 @@ mod tests {
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         h.complete_alarm_lifecycle(&mut host);
-        // Blocking source: flag stays for the caller chain.
+
         assert!(h.alarm_poll.consume_for(AlarmSource::BlockingPage));
         assert!(h.alarm_exit(), "blocking alarm keeps flag pending");
-        // main consumes when the stack unwinds.
+
         assert!(h.take_alarm_exit());
         assert!(!h.alarm_exit());
     }
@@ -1148,8 +1037,7 @@ mod tests {
         let mut h = Harness::new();
         boot_clean(&mut h);
         home_alarm_lifecycle(&mut h);
-        // Fresh edge for the blocking alarm after the Home lifecycle
-        // cleared AF and rearmed.
+
         let mut host = FakeAlarmHost::default();
         fresh_edge(&mut h, &mut host, 9);
         h.complete_alarm_lifecycle(&mut host);
@@ -1164,14 +1052,14 @@ mod tests {
     fn blocking_then_home_do_not_leak_flags() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        // Blocking alarm lifecycle.
+
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_exit());
         assert!(h.take_alarm_exit(), "main consumes after stack unwinds");
         assert!(!h.alarm_exit());
-        // Clean AF + rearm, then a Home alarm.
+
         fresh_edge(&mut h, &mut host, 9);
         rearm_after_dismiss(&mut h);
         home_alarm_lifecycle(&mut h);
@@ -1182,14 +1070,14 @@ mod tests {
     fn full_route_home_alarm_then_navigation_entry() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        // Home alarm fires, full ring/dismiss lifecycle, root consumes.
+
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_poll.consume_for(AlarmSource::Home));
         assert!(!h.alarm_exit(), "no sticky flag leaked");
         assert_eq!(h.screen(), &Screen::Home);
-        // Navigation/Settings entry check (alarm_exit_pending) is false.
+
         assert!(!h.alarm_exit(), "Navigation entry sees no pending alarm");
     }
 
@@ -1197,18 +1085,17 @@ mod tests {
     fn blocking_route_alarm_unwind_then_epd_completion() {
         let mut h = Harness::new();
         boot_clean(&mut h);
-        // Blocking page alarm: full lifecycle.
+
         let mut host = FakeAlarmHost::default();
         host.set(true, snapshot(dt(9, 0), true, true));
         h.complete_alarm_lifecycle(&mut host);
         assert!(h.alarm_exit(), "blocking alarm pending for page unwind");
-        // Page stack unwinds: consume via the shared policy.
+
         assert!(h.alarm_poll.consume_for(AlarmSource::BlockingPage));
         assert!(h.alarm_exit());
         assert!(h.take_alarm_exit());
         assert!(!h.alarm_exit());
-        // The dismiss produced render kicks; complete them through the
-        // shared RenderRegistry path (each request id gets one terminal).
+
         for rid in h.pending_renders.request_ids() {
             assert!(h.complete_render(rid, true).unwrap());
         }

@@ -1,17 +1,3 @@
-//! Dedicated sync task: owns the process's single
-//! `WifiManager` and executes every Wi-Fi operation off the main loop, so
-//! an HTTPS sync (up to ~10 s on a flaky link) never blocks buttons, USB,
-//! BLE, or the display. The main loop, menus, and control channels send
-//! commands over a channel and receive results over per-command reply
-//! channels.
-//!
-//! The task opens its own NVS store handles on the shared partition -
-//! `EspNvs` is `Send` but not `Sync`, so two threads must not share one
-//! store instance - and never touches the I2C bus: alarm reprogramming and
-//! NTP alignment are applied by the main loop from the sync receipt, and
-//! merged sync data is persisted by the state machine (the task never
-//! writes the alarm/todo/inbox stores itself).
-
 use std::sync::mpsc::{
     channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
 };
@@ -28,44 +14,34 @@ use crate::sync::{self, SyncResult};
 use crate::todos::TodoStore;
 use crate::wifi::WifiManager;
 
-/// 16 KiB stack: HTTPS control flow stays here, while its 16 KiB response
-/// buffer is explicitly allocated in PSRAM. This preserves internal RAM for
-/// mbedTLS/AES without returning to the old stack overflow caused by placing
-/// that response buffer on this stack.
 const SYNC_TASK_STACK: usize = 16 * 1024;
-/// The main loop owns one pending Wi-Fi operation, while BLE handoff can
-/// transiently add a stop/start command. Keep a small explicit queue so a
-/// caller receives an explicit saturation error instead of growing memory;
-/// the pending operation slot owns the retry decision.
+
 const SYNC_COMMAND_CAPACITY: usize = 4;
 
-/// Commands the main loop dispatches to the sync task.
 pub enum SyncCommand {
-    /// Full "Sync Now": connect, fetch/apply, disconnect. `now` is the
-    /// main loop's latest RTC read; the result goes to `reply`.
     SyncNow {
         now: DateTime,
         reply: Sender<SyncResult>,
     },
-    /// Verify credentials by connecting; persistence is a state-machine effect.
+
     SetWifi {
         creds: WifiCreds,
         reply: Sender<Result<WifiCreds>>,
     },
-    /// Lightweight urgent-message poll; `true` when the server has urgent
-    /// content (the scheduler then dispatches a full sync).
-    UrgentPoll { reply: Sender<Result<bool>> },
-    /// Stop Wi-Fi and release its run-time buffers before BLE controller init.
-    SuspendForBle { reply: Sender<Result<()>> },
-    /// Restore the shared Wi-Fi driver after BLE deinitialization.
-    ResumeAfterBle { reply: Sender<Result<()>> },
+
+    UrgentPoll {
+        reply: Sender<Result<bool>>,
+    },
+
+    SuspendForBle {
+        reply: Sender<Result<()>>,
+    },
+
+    ResumeAfterBle {
+        reply: Sender<Result<()>>,
+    },
 }
 
-/// A Wi-Fi operation dispatched to the sync task, awaiting its receipt.
-/// Owned by `DeviceContext::pending_wifi_op`; polled by
-/// `DeviceContext::poll_wifi_ops`. `cmd` is the exact command the client
-/// sent, kept so the dedup cache can be updated with the real reply once
-/// the operation completes.
 pub enum PendingWifiOp {
     Sync {
         reply: Receiver<SyncResult>,
@@ -89,16 +65,11 @@ pub enum PendingWifiOp {
     },
 }
 
-/// Client handle kept by the main loop: the command sender. The task owns
-/// the Wi-Fi driver, so the main loop never touches Wi-Fi directly.
 pub struct SyncTask {
     tx: SyncSender<SyncCommand>,
 }
 
 impl SyncTask {
-    /// Spawns the sync task, moving the process's one `WifiManager` and a
-    /// clone of the shared NVS partition into it. Call after boot-time
-    /// Wi-Fi work (the boot NTP resync) is done.
     pub fn spawn(partition: EspDefaultNvsPartition, wifi: WifiManager) -> Result<Self> {
         let (tx, rx) = sync_channel(SYNC_COMMAND_CAPACITY);
         std::thread::Builder::new()
@@ -153,9 +124,6 @@ impl SyncTask {
 }
 
 fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<SyncCommand>) {
-    // This task runs the HTTPS+TLS round-trips, so it must be TWDT-watched
-    // too: the feeds inside sync.rs only take effect for subscribed tasks,
-    // and an un-watched hang would leave a pending op stuck forever.
     let watchdog_subscribed = match crate::watchdog::subscribe() {
         Ok(()) => true,
         Err(err) => {
@@ -163,7 +131,7 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
             false
         }
     };
-    // Independent NVS handles on the shared partition (see module doc).
+
     let (counters, alarm_store, todo_store, inbox_store) = match open_stores(partition) {
         Ok(stores) => stores,
         Err(err) => {
@@ -231,9 +199,6 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
                 if result.is_ok() {
                     wifi_suspended = false;
                 } else {
-                    // The BLE hand-off is terminal even when reconstruction
-                    // fails: discard the failed driver state so the next
-                    // normal connect can build a fresh instance.
                     wifi.abort_ble_resume();
                     wifi_suspended = false;
                 }
@@ -254,8 +219,6 @@ fn open_stores(
 }
 
 fn verify_credentials(wifi: &mut WifiManager, creds: &WifiCreds) -> Result<WifiCreds> {
-    // Attempt to connect and verify the credentials. The state machine emits
-    // the separate persistence effect only after this fact succeeds.
     wifi.connect(creds)?;
     wifi.disconnect();
     Ok(creds.clone())

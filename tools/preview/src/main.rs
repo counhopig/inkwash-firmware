@@ -1,10 +1,10 @@
-//! PC preview of the on-device screens. Draws exactly the same pixels the
-//! firmware would (the render modules are `#[path]`-included in place from
-//! `rust-firmware/src/`) and writes PNGs, so home-screen layout can be
-//! iterated without flashing a device.
-//!
-//! Run: `cargo run --release` from `tools/preview/` (host toolchain). Writes
-//! `*.png` into the current directory.
+
+
+
+
+
+
+
 
 #[path = "../../../rust-firmware/src/canvas.rs"]
 mod canvas;
@@ -24,7 +24,7 @@ mod icons;
 #[path = "../../../rust-firmware/src/home.rs"]
 mod home;
 
-/// Minimal stand-ins for the firmware-only types `home.rs` depends on.
+
 mod board {
     pub struct ChargeSnapshot {
         pub power_present: bool,
@@ -54,7 +54,7 @@ use rtc::DateTime;
 
 fn save(path: &str, canvas: &Canvas) {
     let img = image::GrayImage::from_fn(WIDTH as u32, HEIGHT as u32, |x, y| {
-        // Frame bit 1 = white, 0 = black; map to 255 (white) / 0 (black).
+
         let byte = canvas.frame()[y as usize * (WIDTH / 8) + (x as usize / 8)];
         let white = byte & (1 << (7 - (x as usize & 7))) != 0;
         image::Luma([if white { 255 } else { 0 }])
@@ -68,7 +68,7 @@ fn dt() -> DateTime {
         year: 2026,
         month: 8,
         day: 20,
-        weekday: 4, // THU
+        weekday: 4,
         hour: 14,
         minute: 50,
         second: 0,
@@ -87,7 +87,7 @@ fn full_battery() -> board::ChargeSnapshot {
 }
 
 fn main() {
-    // Scene 1: home screen, everything populated (README's home.png).
+
     let mut c = Canvas::new();
     home::render(
         &mut c,
@@ -104,7 +104,7 @@ fn main() {
     );
     save("home.png", &c);
 
-    // Scene 2: no clock (RTC lost), no alarm, no wifi, low battery.
+
     let mut c = Canvas::new();
     home::render(
         &mut c,
@@ -127,7 +127,7 @@ fn main() {
     );
     save("home-empty.png", &c);
 
-    // Scene 3: charging + one-shot alarm in a few days.
+
     let mut c = Canvas::new();
     home::render(
         &mut c,
@@ -150,10 +150,10 @@ fn main() {
     );
     save("home-charging.png", &c);
 
-    // Sub-screen scenes: share the home screen's header (brand mark +
-    // wordmark + right-aligned title + rule) so every page matches the
-    // home visual language. The list row chrome mirrors `ui::draw_rows`
-    // (stroke + left accent bar on the selection).
+
+
+
+
     fn header(canvas: &mut Canvas, title: &str) {
         canvas.stroke_rect(16, 9, 14, 14, 2);
         canvas.fill_rect(21, 14, 4, 4, true);
@@ -163,7 +163,7 @@ fn main() {
         canvas.fill_rect(16, 29, 368, 1, true);
     }
 
-    // Settings list, selection on the second row.
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "SETTINGS");
@@ -179,7 +179,7 @@ fn main() {
     }
     save("page-list.png", &c);
 
-    // Number picker (mirrors `ui::pick_number` layout).
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "HOUR");
@@ -194,8 +194,8 @@ fn main() {
     c.draw_text_prop(box_x + 7 + (box_w - 7 - nw) / 2, 143, 5, label);
     save("page-number.png", &c);
 
-    // GO TO navigation drawer: overlaid on the home screen, with a thick
-    // vertical rule down its right edge (mirrors screens::draw_navigation_bar).
+
+
     let mut c = Canvas::new();
     home::render(
         &mut c,
@@ -225,8 +225,8 @@ fn main() {
     c.fill_rect(16 + 176 - 3, 34, 3, 266, true);
     save("goto.png", &c);
 
-    // Calendar month grid (README's calendar.png, mirrors
-    // screens::draw_month_grid). August 2026 starts on a Saturday.
+
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "CALENDAR");
@@ -240,7 +240,7 @@ fn main() {
         c.draw_text_prop(CAL_ORIGIN_X + i * CAL_COL, CAL_ORIGIN_Y, 1, l);
     }
     c.fill_rect(16, 99, 368, 1, true);
-    let mut col = 6usize; // 2026-08-01 = Saturday
+    let mut col = 6usize;
     let mut row = 1usize;
     for day in 1..=31 {
         let x = CAL_ORIGIN_X + col * CAL_COL;
@@ -261,9 +261,9 @@ fn main() {
     }
     save("calendar.png", &c);
 
-    // Week view (README's week-view.png, mirrors screens::week_view):
-    // compact day cards, an outlined/accented opened day, and bullet-led
-    // todo stacks separated by short inset rules.
+
+
+
     fn wrap_text_small(text: &str, max_width: usize) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         let mut current = String::new();
@@ -358,9 +358,9 @@ fn main() {
     const WV_BOTTOM: usize = 296;
     let wdays = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
     let dates = [16, 17, 18, 19, 20, 21, 22];
-    // A deliberately long todo on WED proves word-wrap keeps it inside the
-    // column; the rest stay short so the overflow is easy to spot if it
-    // ever regresses.
+
+
+
     let todos: [Vec<String>; 7] = [
         vec![],
         vec!["call mum".into()],
@@ -423,7 +423,7 @@ fn main() {
     }
     save("week-view.png", &c);
 
-    // Alarms list (README's alarms.png, mirrors screens::render_alarm_page).
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "ALARMS");
@@ -443,7 +443,7 @@ fn main() {
     }
     save("alarms.png", &c);
 
-    // Todos list (README's todos.png, mirrors screens::render_todo_page).
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "TODOS");
@@ -463,7 +463,7 @@ fn main() {
     }
     save("todos.png", &c);
 
-    // INBOX list page (mirrors screens::render_inbox_page + the home badge).
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "INBOX");
@@ -483,8 +483,8 @@ fn main() {
     }
     save("inbox.png", &c);
 
-    // CJK rendering check: mixed Chinese + ASCII text (mirrors the
-    // notification titles/bodies the pipeline sends).
+
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "通知");
@@ -502,7 +502,7 @@ fn main() {
     c.draw_text_prop(16, 268, 1, "ENTER = 关闭");
     save("cjk-detail.png", &c);
 
-    // URGENT full-screen reminder (mirrors main.rs remind_urgent_screen).
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "URGENT");
@@ -513,7 +513,7 @@ fn main() {
     c.draw_text_prop(16, 284, 1, "ENTER = DISMISS");
     save("urgent.png", &c);
 
-    // ALARM ring screen (mirrors main.rs ring_alarm_until_dismissed).
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "ALARM");
@@ -524,7 +524,7 @@ fn main() {
     c.draw_text_prop(200usize.saturating_sub(hint_w / 2), 184, 1, hint);
     save("alarm-ring.png", &c);
 
-    // INBOX item detail with wrapped body.
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "INBOX");
@@ -541,8 +541,8 @@ fn main() {
     }
     save("inbox-detail.png", &c);
 
-    // CJK long-title detail: wraps to two scale-1 lines instead of
-    // overflowing (mirrors open_inbox_item's title fitting).
+
+
     let mut c = Canvas::new();
     c.clear();
     header(&mut c, "通知");
