@@ -1257,11 +1257,13 @@ fn main() -> Result<()> {
                     || !ctx.pending_render_retries.is_empty()
                     || ctx.pending_render_completion.is_some(),
                 final_persist_pending: ctx.pending_effect_batch.is_some()
+                    || !ctx.pending_effect_batches.is_empty()
                     || ctx.worker_batch_in_flight
                     || ctx.pending_effect_notices.is_some(),
                 usb_connected: usb_host_connected,
                 event_queue_empty: !app_runner.borrow().has_work()
                     && ctx.pending_effect_batch.is_none()
+                    && ctx.pending_effect_batches.is_empty()
                     && !ctx.worker_batch_in_flight
                     && ctx.pending_effect_notices.is_none()
                     && ctx.pending_ble_pairing_success.is_none()
@@ -2439,6 +2441,7 @@ fn collect_sleep_inputs(
     let runner = ctx.app_runner.borrow();
     let state = runner.state();
     let worker_in_flight = ctx.pending_effect_batch.is_some()
+        || !ctx.pending_effect_batches.is_empty()
         || ctx.worker_batch_in_flight
         || ctx.pending_effect_notices.is_some();
     let pending_usb_reply = !ctx.pending_usb_replies.is_empty();
