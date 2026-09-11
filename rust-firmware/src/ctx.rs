@@ -372,6 +372,13 @@ pub struct DeviceContext<'a> {
     pub pending_clock_read: Option<Receiver<anyhow::Result<DateTime>>>,
     pub effect_task: &'a crate::effect_task::EffectTask,
     pub pending_effect_batch: Option<inkwash_logic::app::EffectBatch>,
+    /// Batches already reduced for an earlier event but not yet executed, in
+    /// order. One event can produce several batches (a Tick yields a reminder
+    /// fact batch *and* a render batch), and a worker-safe batch pauses the
+    /// chain because the effect task runs one batch at a time. The remaining
+    /// batches wait here instead of being dropped - losing them silently
+    /// skips the render that batch carried.
+    pub pending_effect_batches: VecDeque<inkwash_logic::app::EffectBatch>,
     pub worker_batch_in_flight: bool,
     /// Bounded producer-owned events retained while the runtime queue or the
     /// worker continuation is busy. Events are admitted in FIFO order on the

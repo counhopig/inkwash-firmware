@@ -465,6 +465,7 @@ fn main() -> Result<()> {
         pending_clock_read: None,
         effect_task: &effect_task,
         pending_effect_batch: None,
+        pending_effect_batches: std::collections::VecDeque::new(),
         worker_batch_in_flight: false,
         pending_app_events: std::collections::VecDeque::with_capacity(
             inkwash_logic::event_queue::HIGH_CAPACITY,
@@ -1979,16 +1980,27 @@ fn reduce_effect_batches(
             Some(batches) => batches,
             None => break,
         };
-        for batch in batches {
+        // Queue the whole event's batches: one event can yield several
+        // ordered batches, and a worker-safe one pauses the chain (the effect
+        // task runs a single batch at a time). Running the rest of them from
+        // a queue - instead of returning out of this loop - is what keeps a
+        // Tick's render batch from being dropped behind its reminder fact
+        // batch, which silently froze the on-screen clock.
+        ctx.pending_effect_batches.extend(batches);
+        while ctx.pending_effect_batch.is_none() && !ctx.worker_batch_in_flight {
+            let Some(batch) = ctx.pending_effect_batches.pop_front() else {
+                break;
+            };
             if inkwash_logic::runner::batch_is_worker_safe(&batch) {
                 match ctx.effect_task.try_submit_batch(batch) {
                     Ok(()) => {
                         ctx.worker_batch_in_flight = true;
-                        return Ok(());
+                        break;
                     }
                     Err((batch, crate::effect_task::EffectTaskError::QueueFull)) => {
-                        ctx.pending_effect_batch = Some(batch);
-                        return Ok(());
+                        // Retry the head batch before anything queued after it.
+                        ctx.pending_effect_batches.push_front(batch);
+                        break;
                     }
                     Err((_, crate::effect_task::EffectTaskError::Disconnected)) => {
                         anyhow::bail!("effect worker disconnected while submitting batch")
