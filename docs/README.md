@@ -15,7 +15,7 @@
 | [`architecture.md`](architecture.md) | 分层、主循环、Event→Effect 控制回路、渲染/传输/同步/电源各机制 | 想理解"这个固件怎么运转" |
 | [`concurrency-and-resources.md`](concurrency-and-resources.md) | 9 个线程/栈预算、共享资源矩阵、24 个仲裁标志、背压容量表 | 改并发、加功能、排查干扰 |
 | [`review-findings.md`](review-findings.md) | 缺陷与风险清单（P0–P2），逐项 file:line + 触发条件 + 修法 | 要动手修 bug |
-| [`hardware-assessment.md`](hardware-assessment.md) | 以嵌入式工程师视角的总评：RAM 经济性、实时性、失效模式、取舍 | 决策/评审 |
+| [`hardware-assessment.md`](hardware-assessment.md) | 以嵌入式工程师视角的**结构评价**：七维打分、RAM 账、失效模式、验证基建、四仓库结构、量产前置条件 | 决策/评审 |
 | [`verification.md`](verification.md) | 测试与 CI 的实际覆盖、哪些结论未经真机验证 | 想知道"哪些能信" |
 | [`control-protocol.md`](control-protocol.md) | USB/BLE 的 7 条命令线上协议（由代码复原） | 写上位机/桌面工具 |
 
@@ -28,10 +28,16 @@
 - ✅ **优点突出**：逻辑与硬件彻底解耦（主机可测）；并发权责干净；副作用有界可退还可重试。
 - ⚠️ **代价明确**：9 个线程吃满 128 KiB 内 RAM；24 个 `pending_*` 仲裁标志 + 660 行主循环；
   Rust 源码注释为零。
-- 🔴 **必须修**：`effect-task` 未订阅看门狗（持久化会静默停摆）；渲染层对 NVS 数据无边界校验；
-  `screens.rs:381` 的字节切片 panic 可由服务端数据触发。
+- 🔴 **必须修**（P0）：
+  1. 响铃期收到 `clear_alarms` → **闹钟界面永久无法退出、铃声不停，只能断电**；
+  2. `effect-task` 未订阅看门狗 → 持久化会静默停摆；
+  3. `screens.rs:381` 字节切片 panic，**服务端待办文本即可远程触发重启**；
+  4. BLE `retired_handles` 只置位不清位 → **断线重连后应答通道永久失效**
+     （⚠️ 根治需先解决 NimBLE 回调归属，**要单独立项**，不能直接清位）。
+- 🟡 **工程基建失灵**：仓库自己的测试套件在 Windows 检出下是红的（CRLF）；
+  `rust-firmware` 有 4 个测试**编译不过**、从未运行过。
 
-详见 `review-findings.md`。
+详见 `review-findings.md` 与 `verification.md`。
 
 ## 源码事实基线
 
@@ -44,8 +50,19 @@ rust-firmware/src 10514 行  ├─ main.rs 2166 / ble_control 1118 / ctx.rs 106
 版本         v0.6.0 (rust-firmware/Cargo.toml:3)
 目标         ESP32-S3-WROOM-1 N16R8，4.2" 400×300 SSD2683 EPD
 IDF          v5.5.5 (.cargo/config.toml:13)
-主机测试      386 passed (cargo test -p inkwash-logic)
+主机测试      386 个，实跑 385 passed / 1 failed（CRLF 检出必失败，见 verification.md §1）
+固件侧测试    3 个模块，其中 effect_task.rs 的 4 个编译不过
 ```
+
+> **文档修订**
+> - **首版**：由源码通读得出。
+> - **第二轮**：对全部 66 个模块逐行重读 + 可执行验证，新增 P0-3 / P0-4、P1-10~13、P2-7，
+>   并更正了 `verification.md` 的三处结论。
+> - **第三轮**：缺陷判定全部成立，但更正了四处**修复建议错误/覆盖遗漏**
+>   （P0-4 修法、P1-2 修法、P1-10 范围、P2-7d 已证伪）与两处表述过强，
+>   见 `review-findings.md` 的"第三轮更正"。
+>
+> 标注 ✅ 实测 的条目表示写过可运行的测试或让编译器复现过。
 
 ## 一条重要的取证提醒
 

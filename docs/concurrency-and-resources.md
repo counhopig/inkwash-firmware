@@ -120,7 +120,7 @@ esp_sys::esp_pthread_set_cfg(&default_cfg)   // ← 恢复
 | 级 | 容量 | 常量 | 满时行为 |
 |---|---|---|---|
 | 事件队列 High | 16 | `event_queue.rs:5` | `Err(event)` 退还 |
-| 事件队列 Mergeable | 4 | `event_queue.rs:7` | High 退还；**Mergeable 静默丢最旧**（`:115-118`） |
+| 事件队列 Mergeable | 4（名义） | `event_queue.rs:7` | `Tick` 就地合并，实际深度恒为 1；`:114-119` 的"丢最旧"分支**不可达**（见 `review-findings.md` P2-7a） |
 | dispatch 来源：按钮 | 3 | `ctx.rs:45` | 退还 |
 | dispatch 来源：生命周期 | 4 | `ctx.rs:46` | 退还 |
 | dispatch 来源：worker | 8 | `ctx.rs:47` | 退还 |

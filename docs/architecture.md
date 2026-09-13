@@ -87,10 +87,15 @@ service_usb_reply_writer()                  main.rs:404   USB 应答重发
 | `Effect` | 35 | `logic/src/app.rs:332-403` |
 | `RenderView` | 14 | `logic/src/app.rs:406-465` |
 | `Command` | 7 | `logic/src/protocol.rs:11-25` |
-| `Screen` | 13 | `logic/src/app.rs:31-75` |
+| `Screen` | 14 | `logic/src/app.rs:31-73`（首版误记为 13） |
 
 事件优先级硬编码为两档（`logic/src/event_queue.rs:16-45`）：`High`（16 深度 FIFO）与
 `Mergeable`（4 深度，`Tick` 就地合并）。这是"新按键立即响应、旧时钟 tick 可丢弃"的策略。
+
+> 实际上 **Mergeable 档只装得下 Tick 一种事件**——`priority()` 里只有 `Event::Tick`
+> 映射到 `Mergeable`，而 Tick 走的是 `retain` + `push_back` 分支，
+> 所以 `NORMAL_CAPACITY = 4` 和 `:114-119` 的"满了丢最旧"逻辑**在当前代码下不可达**，
+> 队列实际深度恒为 1。见 `review-findings.md` P2-7a。
 
 ### 4.2 转移
 
