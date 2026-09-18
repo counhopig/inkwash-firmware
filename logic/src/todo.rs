@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::alarm_schedule::Repeat;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Importance {
     Low,
@@ -21,7 +23,7 @@ impl Importance {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct TodoDue {
     #[serde(default)]
     pub year: u16,

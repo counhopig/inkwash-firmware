@@ -21,6 +21,7 @@ pub mod render_plan;
 pub mod rtc_latch;
 pub mod runner;
 pub mod runtime;
+pub mod sanitize;
 pub mod scheduler;
 pub mod sync_validate;
 pub mod todo;
@@ -285,5 +286,42 @@ mod ble_memory_contract {
             .find("BLEDevice::deinit_full()")
             .expect("cleanup must deinitialize NimBLE");
         assert!(stop < deinit, "advertising must stop before NimBLE deinit");
+    }
+
+    #[test]
+    fn effect_worker_subscribes_to_the_task_watchdog() {
+        assert!(
+            EFFECT_SOURCE.contains("crate::watchdog::subscribe()"),
+            "the only NVS writer must be watched: an unwatched hang latches \
+             worker_batch_in_flight forever and silently stops all persistence"
+        );
+        assert!(
+            EFFECT_SOURCE.contains("crate::watchdog::feed()"),
+            "subscribing without feeding turns the watchdog into a reboot loop"
+        );
+        assert!(
+            EFFECT_SOURCE.contains("batch_rx.recv_timeout("),
+            "the worker must wake periodically so it can feed while idle"
+        );
+    }
+
+    #[test]
+    fn firmware_keeps_no_unrunnable_test_modules() {
+        const EP_TASK: &str = include_str!("../../rust-firmware/src/epd_task.rs");
+        const USB: &str = include_str!("../../rust-firmware/src/usb_console.rs");
+        const CARGO: &str = include_str!("../../rust-firmware/Cargo.toml");
+
+        assert!(
+            CARGO.contains("harness = false"),
+            "the firmware bin disables the libtest harness; host tests must live in inkwash-logic"
+        );
+        assert!(
+            !EFFECT_SOURCE.contains("#[cfg(test)]"),
+            "with `harness = false` no `#[test]` body is ever run, and cargo does not \
+             even type-check those bodies (ordinary helpers in a cfg(test) module still \
+             are); a test module here can therefore only rot, so keep it in inkwash-logic"
+        );
+        assert!(!EP_TASK.contains("#[cfg(test)]"));
+        assert!(!USB.contains("#[cfg(test)]"));
     }
 }

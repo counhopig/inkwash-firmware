@@ -5,6 +5,11 @@ fn main() {
     if std::env::var("INKWASH_FORCE_SAFE_MODE").is_ok_and(|v| v == "1") {
         println!("cargo:rustc-env=INKWASH_FORCE_SAFE_MODE=1");
     }
+    println!("cargo:rerun-if-env-changed=INKWASH_P06_VALIDATE");
+    if std::env::var("INKWASH_P06_VALIDATE").is_ok_and(|v| v == "1") {
+        println!("cargo:rustc-env=INKWASH_P06_VALIDATE=1");
+    }
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

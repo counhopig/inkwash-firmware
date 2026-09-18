@@ -59,33 +59,7 @@ impl ViewModel {
     }
 
     pub fn from_state(state: &AppState) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-
-        let data_screen = match &state.screen {
-            crate::app::Screen::Navigation { screen_before, .. } => screen_before.as_ref(),
-            screen => screen,
-        };
-        match data_screen {
-            crate::app::Screen::AlarmList { .. } => {
-                for a in &state.alarms.alarms {
-                    (a.id, a.hour, a.minute, a.enabled).hash(&mut hasher);
-                }
-            }
-            crate::app::Screen::TodoList { .. } => {
-                for t in &state.todos.todos {
-                    (&t.text, t.done).hash(&mut hasher);
-                }
-            }
-            crate::app::Screen::Inbox { .. } | crate::app::Screen::InboxItem { .. } => {
-                for i in &state.inbox.items {
-                    (i.id, i.read, i.title.as_str()).hash(&mut hasher);
-                }
-            }
-            _ => {}
-        }
-        let data_fingerprint = hasher.finish();
+        let data_fingerprint = data_fingerprint(state);
         let clock_minute = state
             .clock
             .now
@@ -103,6 +77,52 @@ impl ViewModel {
             data_fingerprint,
         }
     }
+}
+
+fn data_fingerprint(state: &AppState) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+
+    for alarm in &state.alarms.alarms {
+        (
+            alarm.id,
+            alarm.hour,
+            alarm.minute,
+            alarm.enabled,
+            alarm.label.as_str(),
+            &alarm.repeat,
+        )
+            .hash(&mut hasher);
+    }
+
+    for todo in &state.todos.todos {
+        (
+            todo.text.as_str(),
+            todo.done,
+            todo.importance,
+            todo.due_date,
+            &todo.repeat,
+        )
+            .hash(&mut hasher);
+    }
+
+    for item in &state.inbox.items {
+        (
+            item.id,
+            item.kind,
+            item.priority,
+            item.title.as_str(),
+            item.body.as_str(),
+            item.when,
+            item.read,
+        )
+            .hash(&mut hasher);
+    }
+
+    state.config.wifi_configured().hash(&mut hasher);
+
+    hasher.finish()
 }
 
 pub fn plan_render(previous: Option<&ViewModel>, current: &ViewModel) -> RenderPlan {
@@ -145,7 +165,12 @@ pub fn plan_render(previous: Option<&ViewModel>, current: &ViewModel) -> RenderP
     }
 
     let region = match surface_kind(&current.view) {
-        SurfaceKind::Home if current.clock_minute != prev.clock_minute => PartialRegion::Clock,
+        SurfaceKind::Home
+            if current.clock_minute != prev.clock_minute
+                && current.data_fingerprint == prev.data_fingerprint =>
+        {
+            PartialRegion::Clock
+        }
         SurfaceKind::Home => return RenderPlan::Full { frame },
 
         SurfaceKind::NavBar => PartialRegion::NavBar,
@@ -319,6 +344,22 @@ mod tests {
                 frame: Frame(2),
                 region: PartialRegion::Clock
             }
+        );
+    }
+
+    #[test]
+    fn home_data_change_with_a_minute_tick_must_not_be_clock_only() {
+        let prev = home_vm(8 * 60);
+        let mut cur = prev.clone();
+        cur.generation = crate::app::RenderGeneration(2);
+        cur.clock_minute = Some(8 * 60 + 1);
+        cur.data_fingerprint = prev.data_fingerprint.wrapping_add(1);
+
+        assert_eq!(
+            plan_render(Some(&prev), &cur),
+            RenderPlan::Full { frame: Frame(2) },
+            "a Clock-only refresh would repaint the digits and then cache the new \
+             fingerprint, leaving the icons stale behind a Noop"
         );
     }
 
@@ -687,5 +728,144 @@ mod tests {
         state.alarms.alarms[0].enabled = false;
         let fp_off = ViewModel::from_state(&state).data_fingerprint;
         assert_ne!(fp_on, fp_off, "enabled flip must change the fingerprint");
+    }
+
+    fn state_with_inbox_item() -> crate::app::AppState {
+        let mut state = crate::app::AppState::default();
+        let snap = boot_snapshot(vec![alarm(1, 8, 0)], Some(dt(8, 0)));
+        let _ = crate::app::update(&mut state, Event::Boot(snap));
+        state.inbox.items.push(crate::inbox_item::InboxItem {
+            id: 7,
+            kind: crate::inbox_item::InboxKind::Info,
+            priority: crate::inbox_item::Priority::Normal,
+            title: "title".to_string(),
+            body: "body".to_string(),
+            when: None,
+            read: false,
+        });
+        state
+    }
+
+    fn todo(text: &str, due_day: Option<u8>) -> crate::todo::Todo {
+        crate::todo::Todo {
+            id: 1,
+            text: text.to_string(),
+            done: false,
+            importance: crate::todo::Importance::Medium,
+            due_date: due_day.map(|day| crate::todo::TodoDue {
+                year: 2026,
+                month: 8,
+                day,
+            }),
+            repeat: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_tracks_inbox_item_body_on_the_detail_screen() {
+        let mut state = state_with_inbox_item();
+        state.screen = crate::app::Screen::InboxItem { index: 0 };
+
+        let before = ViewModel::from_state(&state).data_fingerprint;
+        state.inbox.items[0].body.push_str(" (edited)");
+        let after = ViewModel::from_state(&state).data_fingerprint;
+
+        assert_ne!(before, after, "detail body must invalidate the render");
+    }
+
+    #[test]
+    fn fingerprint_tracks_todo_fields_the_list_and_grid_draw() {
+        let mut state = state_with_inbox_item();
+        state.todos.todos = vec![todo("ship it", Some(20))];
+        state.screen = crate::app::Screen::WeekView {
+            year: 2026,
+            month: 8,
+            day: 20,
+        };
+
+        let before = ViewModel::from_state(&state).data_fingerprint;
+        state.todos.todos[0].importance = crate::todo::Importance::High;
+        let after_importance = ViewModel::from_state(&state).data_fingerprint;
+        assert_ne!(
+            before, after_importance,
+            "importance changes the row the week view draws"
+        );
+
+        state.todos.todos[0].due_date = Some(crate::todo::TodoDue {
+            year: 2026,
+            month: 8,
+            day: 21,
+        });
+        let after_due = ViewModel::from_state(&state).data_fingerprint;
+        assert_ne!(
+            after_importance, after_due,
+            "due date changes which calendar cell the grid marks"
+        );
+    }
+
+    #[test]
+    fn fingerprint_tracks_data_behind_calendar_week_view_and_home() {
+        let mut state = state_with_inbox_item();
+        state.todos.todos = vec![todo("ship it", Some(20))];
+
+        for screen in [
+            crate::app::Screen::Calendar(crate::app::CalendarState {
+                year: 2026,
+                month: 8,
+                selected_day: 20,
+            }),
+            crate::app::Screen::WeekView {
+                year: 2026,
+                month: 8,
+                day: 20,
+            },
+            crate::app::Screen::Home,
+        ] {
+            state.screen = screen.clone();
+            let before = ViewModel::from_state(&state).data_fingerprint;
+            assert_ne!(
+                before, 0,
+                "{screen:?} must not collapse to a null fingerprint"
+            );
+
+            state.todos.todos.push(todo("a second one", Some(20)));
+            let after = ViewModel::from_state(&state).data_fingerprint;
+            assert_ne!(before, after, "{screen:?} must notice a new todo");
+            state.todos.todos.pop();
+        }
+    }
+
+    #[test]
+    fn fingerprint_tracks_the_wifi_flag_the_home_screen_draws() {
+        let mut state = crate::app::AppState::default();
+        let snap = boot_snapshot(vec![], Some(dt(8, 0)));
+        let _ = crate::app::update(&mut state, Event::Boot(snap));
+        state.screen = crate::app::Screen::Home;
+
+        let before = ViewModel::from_state(&state).data_fingerprint;
+        state.config.wifi_ssid = Some("MyAP".to_string());
+        state.config.wifi_has_password = true;
+        let after = ViewModel::from_state(&state).data_fingerprint;
+
+        assert_ne!(before, after, "home draws the wifi flag");
+    }
+
+    #[test]
+    fn fingerprint_tracks_alarm_label_and_repeat() {
+        let mut state = crate::app::AppState::default();
+        let snap = boot_snapshot(vec![alarm(1, 8, 0)], Some(dt(8, 0)));
+        let _ = crate::app::update(&mut state, Event::Boot(snap));
+        state.screen = crate::app::Screen::AlarmList { selected: 0 };
+
+        let before = ViewModel::from_state(&state).data_fingerprint;
+        state.alarms.alarms[0].repeat = Repeat::Weekly {
+            days: vec![1, 3, 5],
+        };
+        let after_repeat = ViewModel::from_state(&state).data_fingerprint;
+        assert_ne!(before, after_repeat, "repeat is part of the drawn row");
+
+        state.alarms.alarms[0].label = "wake up".to_string();
+        let after_label = ViewModel::from_state(&state).data_fingerprint;
+        assert_ne!(after_repeat, after_label, "label is part of the drawn row");
     }
 }

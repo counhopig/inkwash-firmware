@@ -30,11 +30,11 @@
 > `sync`(16K) 与 `ble`(16K) 因硬件互斥**永不同时工作**，合并可省 16 KiB；
 > `usb-rx`+`usb-writer` 合并再省 8 KiB。详见 `hardware-assessment.md`。
 
-### 看门狗覆盖（关键缺口）
+### 看门狗覆盖（第四轮已补上 `effect-task`）
 
 `CONFIG_ESP_TASK_WDT_TIMEOUT_S=10` + `CONFIG_ESP_TASK_WDT_PANIC=y`（`sdkconfig.defaults:58-59`）。
 
-**只有 4 个线程订阅了 TWDT**：
+**5 个线程订阅了 TWDT**（第四轮新增 `effect-task`）：
 
 | 订阅点 | 线程 |
 |---|---|
@@ -42,14 +42,19 @@
 | `rtc_executor.rs:152` | `rtc` |
 | `sync_task.rs:127` | `sync` |
 | `audio_task.rs:83` | `audio` |
+| `effect_task.rs:290`（第四轮新增） | `effect-task` |
 
-**未订阅**：`epd`、`ble`、`effect-task`、`usb-console-rx`、`usb-console-writer`。
+**仍未订阅**：`epd`、`ble`、`usb-console-rx`、`usb-console-writer`。
 
-其中 **`effect-task` 最严重**：它是唯一 NVS 写入执行者。若它挂起（不 disconnect、
-不返回），`main.rs:1579` 的 `try_next_notice` 永远收不到东西 →
-`worker_batch_in_flight` 永远为 true → `reduce_effect_batches` 在 `main.rs:1637`
+`effect-task` 原本是最严重的一个：它是唯一 NVS 写入执行者。它若挂起（不 disconnect、
+不返回），`main.rs:1583` 的 `try_next_notice` 永远收不到东西 →
+`worker_batch_in_flight` 永远为 true → `reduce_effect_batches` 在 `main.rs:1639`
 直接 break → **所有持久化永久停摆，而设备看起来完全正常**（时钟走、闹钟响、界面刷新，
-只是改动不再落盘）。无超时、无计数、无恢复路径。见 `review-findings.md` P0-1。
+只是改动不再落盘）。
+
+现在它在 `run()` 开头 `watchdog::subscribe()`，并用 `recv_timeout(1 s)` 替代无限
+`recv()`：空闲超时喂狗，每批执行前也喂一次（否则连续批次会饿死喂狗点）。
+挂起 10 s 即触发 TWDT panic → 重启，代价是丢失在途写入，但不再是静默停摆。
 
 ### 一个隐式单线程契约
 

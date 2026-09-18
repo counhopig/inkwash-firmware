@@ -52,6 +52,7 @@ impl UsbConsole {
 }
 
 fn read_commands(tx: SyncSender<(Option<String>, control::Command)>) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_USB_RX);
     let mut stdin = io::stdin();
     let mut byte = [0u8; 1];
     let mut line_buf = Vec::new();
@@ -182,6 +183,7 @@ impl UsbReplyWriter {
 }
 
 fn run_reply_writer(rx: Receiver<QueuedReply>, completion_tx: SyncSender<ReplyWriteAck>) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_USB_WRITER);
     while let Ok(queued) = rx.recv() {
         let result = write_frame(&queued.frame).map_err(|err| err.to_string());
         if completion_tx
@@ -204,90 +206,4 @@ fn write_frame(frame: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(frame.as_bytes())?;
     stdout.flush()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pending_staging_is_bounded_without_dropping_channel_commands() {
-        let (tx, rx) = mpsc::sync_channel(PENDING_COMMAND_CAPACITY);
-        let mut console = UsbConsole {
-            rx,
-            pending: VecDeque::with_capacity(PENDING_COMMAND_CAPACITY),
-        };
-        for _ in 0..PENDING_COMMAND_CAPACITY {
-            console
-                .pending
-                .push_back((None, control::Command::GetStatus));
-            tx.send((None, control::Command::GetStatus)).unwrap();
-        }
-
-        console.stage_pending();
-        assert_eq!(console.pending.len(), PENDING_COMMAND_CAPACITY);
-        assert_eq!(console.rx.try_iter().count(), PENDING_COMMAND_CAPACITY);
-
-        assert!(console.poll_command().is_some());
-        assert_eq!(console.pending.len(), PENDING_COMMAND_CAPACITY - 1);
-        console.stage_pending();
-        assert_eq!(console.pending.len(), PENDING_COMMAND_CAPACITY);
-        assert_eq!(console.rx.try_iter().count(), PENDING_COMMAND_CAPACITY - 1);
-    }
-
-    #[test]
-    fn reply_writer_returns_owned_frame_when_full() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let (_completion_tx, completion_rx) = mpsc::sync_channel(1);
-        let mut writer = UsbReplyWriter {
-            tx,
-            completion_rx,
-            next_sequence: 1,
-        };
-        rx.try_iter();
-        writer
-            .tx
-            .try_send(QueuedReply {
-                sequence: 77,
-                frame: "occupied".into(),
-            })
-            .unwrap();
-
-        let queued = writer.prepare(&control::Reply::Busy, Some("retry"));
-        let error = writer.enqueue_owned(queued).unwrap_err();
-        let ReplyQueueError::Full(queued) = error else {
-            panic!("expected bounded writer backpressure");
-        };
-        assert_eq!(queued.sequence, 1);
-        assert!(queued.frame.contains("retry"));
-    }
-
-    #[test]
-    fn owned_reply_retries_with_the_same_sequence_after_backpressure() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let (_completion_tx, completion_rx) = mpsc::sync_channel(1);
-        let mut writer = UsbReplyWriter {
-            tx,
-            completion_rx,
-            next_sequence: 1,
-        };
-        writer
-            .tx
-            .try_send(QueuedReply {
-                sequence: 99,
-                frame: "occupied".into(),
-            })
-            .unwrap();
-
-        let queued = writer.prepare(&control::Reply::Busy, Some("owned"));
-        let returned = match writer.enqueue_owned(queued) {
-            Err(ReplyQueueError::Full(queued)) => queued,
-            other => panic!("expected owned full reply, got {other:?}"),
-        };
-        assert_eq!(returned.sequence, 1);
-        assert!(returned.frame.contains("owned"));
-        assert_eq!(rx.try_recv().unwrap().sequence, 99);
-        assert_eq!(writer.retry(returned).unwrap(), ());
-        assert_eq!(rx.try_recv().unwrap().sequence, 1);
-    }
 }

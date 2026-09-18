@@ -24,7 +24,10 @@ impl TodoStore {
     }
 
     pub fn load(&self) -> Result<Vec<Todo>> {
-        Ok(read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_TODOS)?.unwrap_or_default())
+        let mut todos: Vec<Todo> =
+            read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_TODOS)?.unwrap_or_default();
+        inkwash_logic::sanitize::sanitize_todos(&mut todos);
+        Ok(todos)
     }
 
     pub fn save(&self, todos: &[Todo]) -> Result<()> {

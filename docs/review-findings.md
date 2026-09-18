@@ -2,6 +2,26 @@
 
 > 行号基于 commit `b30c3af`（`11e469c` 只新增了本目录，未动源码）。
 > P0 项已用算术复算或可执行测试确认；标注 **(未验证)** 的项需要真机日志。
+>
+> 🔴 **真机新增 P0-5（第六轮实测）**：HTTPS/TLS 在设备上必然
+> `MBEDTLS_ERR_SSL_ALLOC_FAILED`，同步从未成功——A/B 证实与本次修复无关。
+> 详见本文件 P0-5 与 `verification.md` §7。
+>
+> 🔴 **真机新增 P0-6（第六轮实测）**：命令压力下间歇性硬崩溃（堆破坏迹象），
+> 落点在**本轮未改动**的 `command_sessions.rs`；已排除本轮 `effect_task` 看门狗改动，
+> 但**基线 6 次全 0 而含本轮改动的构建出现 4 次事件**，
+> **不能排除本轮改动影响触发概率，也不能断言既存**。发布定性前需先取证。
+>
+> 🔧 **第四轮已实施修复**：完整处置状态见 [`fixes.md`](fixes.md)。
+> 已修：P0-1、P0-2、P0-3、P1-1、P1-2、P1-5、P1-8、P1-9、P1-10、P1-11、P1-13、
+> 验证基建（固件测试 + CI 门禁 + `.gitattributes`）。
+>
+> 🔁 **第五轮（评审独立复现后）又修了两处**：① P1-10 的指纹修复还漏了
+> "分钟与数据同时变化时只刷时钟区域"这一层（刷完即缓存新指纹 → 下次 `Noop`）；
+> ② P1-11 的 deadline 原先锚在可修改的 RTC 墙钟上，调时区会提前/延后触发，
+> 已改为单调时钟。另外收窄了 §6 关于 `#[test]` 编译行为的表述范围。
+> **P0-4 未改代码**（需单独立项，理由见该条与 `fixes.md`）。
+> 本文件以下内容保留**发现时的原始行号与分析**，未随修复回填。
 
 severity 定义：
 - **P0** — 可导致设备重启（panic → abort → reboot），或使核心功能静默失效 / 永久卡死
@@ -131,6 +151,12 @@ ControlRequest::ClearAlarms => {
 |---|---|---|
 | ENTER 键消音 | `app.rs:1865-1869` | `screen == AlarmRinging && matches!(alarm_runtime, Firing{..})` |
 | 5 分钟自动消音 | `app.rs:2644-2654` | `Firing { ring_deadline_unix: Some(..) }` |
+
+> 🔁 **第六轮补充**：该自动消音原先锚在**墙钟**上，因此"响铃期间调整时区"
+> 会提前消音或永不消音。现已与提醒、配对超时一起改为单调 `PowerPoll.now_ticks`
+> （字段 `ring_deadline_ticks`，由 `expire_ring_auto_silence` 判定）。
+> 这与 P0-3 是**同一条不变式**的两个侧面：响铃这条出路不能依赖任何可被外部
+> 改动的量。详见 `fixes.md`。
 | `transition_button` 兜底 | `app.rs:1877-1891` | 该屏幕白名单**不含 `AlarmRinging`**，落到 `vec![]` |
 
 `ClearAlarms` 把 `alarm_runtime` 打成 `Disarmed` 后三条路同时失效：
@@ -260,7 +286,234 @@ fn take_for_callback(&mut self, conn_handle: u16) -> Option<NotifyAttempt> {
 > ⚠️ 动这块会同时踩到 `logic/src/lib.rs:148` 的契约测试
 > （`assert!(BLE_SOURCE.contains("retired_handles: [u64; 1024]"))`），需一并更新。
 
+> 🔧 **第四轮未修改此处代码**。复核再次确认上述约束成立，因此**没有**做"清位"或
+> "改 attempt_id 集合"这类看似顺手的修改。两条根治路线的取舍（以及"路线 2 会让
+> 重连后偶发丢一条应答、靠幂等重放恢复"这一行为代价）写在 [`fixes.md`](fixes.md)。
+> **立项前先做一件事**：真机抓断开-重连日志比对两次 `conn_handle`——
+> 若 NimBLE 不复用 handle，本条不成立。
+
 ---
+
+## P0-5 · HTTPS/TLS 在真机上必然失败 → 设备永远拿不到服务端内容 ✅ 真机实测
+
+**位置**：`rust-firmware/src/sync.rs` 的 HTTPS 建连路径（`esp-idf-svc` 的
+`EspHttpConnection` / `esp-tls`），触发点在 sync 任务与 urgent poll。
+
+**真机证据**（第六轮，`esp32s3` rev v0.2 / 16 MB，MAC `20:6e:f1:b4:7d:e4`）：
+
+```
+I (16661) inkwash_note4::wifi: Wi-Fi connected to 'Ccloude_2.4G'
+E (18733) esp-tls-mbedtls: mbedtls_ssl_setup returned -0x7F00
+E (18734) esp-tls: create_ssl_handle failed
+E (18734) esp-tls: Failed to open new connection
+E (18736) HTTP_CLIENT: Connection failed, sock < 0
+W (19311) inkwash_note4::ctx: Urgent poll failed: POST …/api/sync failed to start: ESP_ERR_HTTP_CONNECT
+```
+
+- `-0x7F00` = **`MBEDTLS_ERR_SSL_ALLOC_FAILED`**：不是证书、不是 DNS、不是凭据，
+  而是 **TLS 上下文内存分配失败**。
+- **100% 复现**：每次 Wi-Fi 连上后约 2 s 必失败；随后每约 8 s 重试一次，全部失败。
+- `sync_now` 命令直接回 `error`：`failed to start: ESP_ERR_HTTP_CONNECT`。
+- **A/B 已证实与本次修复无关**：在**基线 `0f493d7`**（未打任何本轮改动）上
+  以完全相同的方式失败（同样的 `-0x7F00`）。
+
+**为什么是 P0**：设备的产品前提是"只消费不生产、从服务端拉结构化 JSON"
+（见 `hardware-assessment.md` §十）。TLS 建不起来意味着：
+
+1. **alarms / todos / inbox 永远无法从服务端同步**——内容功能实质失效；
+2. **NTP 校时永不发生**（`sync.rs` 的日常 RTC 对齐挂在同一个连接窗口里）；
+3. 每 8 s 一次"连 Wi-Fi → TLS 失败"的空转，持续耗电；
+4. 设备看起来"在工作"（时钟走、界面刷新、协议应答正常），
+   **只有内容永远不更新**——正是本项目最典型的那种静默失效。
+
+**与已有结论的关系**：`hardware-assessment.md` §八 的疑点 1 预测
+"交棒释放的内存比代码认为的少"；本条是该方向的**实测落点**——
+`mbedtls_ssl_setup` 需要一块较大的连续内 RAM，而当前内 RAM 预算（9 线程栈
+>160 KiB + NimBLE/Wi-Fi 缓冲）已无余量。`review-findings.md` 的 P0-4、
+`hardware-assessment.md` §一 的"24 KiB 可回收"建议，现在有了直接动机。
+
+#### 堆取证结果（第六轮下半场，`verification.md` §7.6）
+
+已按上述第 1、2 步取了证据（插桩 `heap_probe.rs`，原始日志与 ELF 在
+`logs/hw-forensics/`）：
+
+- **70 / 70 次同步尝试全部失败**（run1 15 + run2 27 + run3 28），`request-ok` 0 次；
+  `EspHttpConnection::new` 从未失败 → 失败点在 TLS 会话建立。
+- 失败时刻：`int_free` ≈ 24.6–28.7 KB，但 **`int_largest` 只有 7.7–12.3 KB**；
+  `dma_largest` 同量级；**`psram_free` ≈ 8.37 MB 基本未用**。
+- 生成的 sdkconfig：
+  `ASYMMETRIC_CONTENT_LEN=y`、`SSL_IN_CONTENT_LEN=16384`、`SSL_OUT_CONTENT_LEN=4096`、
+  `MBEDTLS_DYNAMIC_BUFFER` **未开**、`MBEDTLS_EXTERNAL_MEM_ALLOC` **未开**。
+
+**失败分配的实际尺寸与 caps（第 ① 步，已从烧入 ELF 反汇编确认）**：
+
+- 失败的是 `mbedtls_ssl_setup`（`ssl_tls.c:1386`）的**第 1 次**分配
+  `ssl->in_buf = mbedtls_calloc(1, 16717)`：
+  反汇编常量为 `movi.n a11,77` + `addmi a11,0x4100` = **`0x414D` = 16,717 B**
+  （= `13 头部 + 320 载荷开销 + SSL_IN_CONTENT_LEN 16384`）。
+  第 2 次 `ssl->out_buf = calloc(1, 4429)`（`0x114D`）**从未被尝试**——
+  `in_buf` 失败即 `goto error`。
+- **caps**：生效分支 `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y` ⇒
+  `heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)`；
+  `MALLOC_CAP_INTERNAL` 要求内存"不得在 flash/spiram cache 关闭时消失"，
+  **不允许 PSRAM**——8.37 MB 空闲 PSRAM 是**按 caps 不允许用**，不是"没用上"。
+- **失败瞬间的池**（HEAPPROBE 用同一 caps 掩码）：`int_free` 24,575–28,731 B（够）、
+  **`int_largest` 7,680–12,288 B（不够）**。
+
+**机制层面已确认**：失败是"没有足够大的**连续**内部块"，而非"内存不足"。
+这解释了"总空闲够却 100% 失败""PSRAM 始终充沛"两个观测。
+
+> ⚠️ **边界**：确认的是失败的**直接机制**；**没有**验证任何修法，
+> 也**没有**排除 `esp-tls` 此前对内部堆的占用/碎片化对"最大连续块仅 7.7–12.3 KB"
+> 的贡献。**P0-5 的修复仍未确定**；A/B 依然只支持"基线也存在"。
+> `CONFIG_MBEDTLS_DYNAMIC_BUFFER` / `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`
+> （或下调 `SSL_IN_CONTENT_LEN`）是**待验证的候选修法**，不是结论。
+
+#### 对照实验 ②：仅 `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y`（`verification.md` §7.7）
+
+单变量，生成的 sdkconfig 差异只有 3 行（唯一行为变更即该变量）。
+二进制确认生效：`mbedtls_ssl_setup` 不再一次性分配 in/out 缓冲，
+改为 I/O 时按实际记录长度增长。
+
+| | 基线 | 实验 |
+|---|---|---|
+| `mbedtls_ssl_setup` 失败 | 70/70 | **0/45** |
+| `request-ok` / `Sync fetched` | 0 / 0 | **24 / 17** |
+| 复位 | 1 次 | 0 |
+
+**但根因未消除**：失败点从 setup 移到 handshake，尺寸从 16,717 B 降到 ~4,770 B，
+在 `int_largest` 掉到 4,608 时**仍然失败**（21/45）。阈值完全自洽
+（`int_largest` 7680 → 全成功；4608 → 全失败）。
+故该选项是**缓解而非修法**。
+
+**仍待证明**：17 次 `Sync fetched` 全是 `0 alarms, 0 todos, 0 inbox`，
+服务端返回空列表，因此"**非空数据被实际应用**"**未被证明**；
+需先在服务端放入至少一条 alarm/todo 再复跑。
+
+**实验 ①（非空数据应用）已完成**：放入 1 alarm + 1 todo 后，
+`Sync fetched: 1 alarms, 1 todos` → 设备 NVS 与服务器 payload 逐字段一致 →
+硬复位后字节相同。**应用与持久化成立**（`verification.md` §7.8）。
+
+**实验 ③（`EXTERNAL_MEM_ALLOC`，单变量）**：`mbedtls_ssl_setup` 失败 70→**0**，
+`request-ok` **40/40**，**分配失败（任何形式）0**，`Sync fetched` 29。
+分配维度上优于实验②（22 次失败）。**但 P0-6 仍发生**：
+一次 `Guru Meditation (LoadProhibited)`，落点
+`ctx::DeviceContext::poll_alarm_snapshot`（`EXCVADDR=0x0c`）—— **第三个不同落点**，
+且 `ctx.rs` 未被改动。**TLS 100% 成功时崩溃照样出现。**
+
+**下一步**：
+
+1. 若要继续收窄 P0-5：`EXTERNAL_MEM_ALLOC` 把全部 mbedTLS 分配搬到 PSRAM
+   （非 DMA、更慢），牵动面大；可再试下调 `SSL_IN_CONTENT_LEN` 等更窄的变量；
+2. P0-6 需独立立项：三个落点（缓存析构 / 异常保存 / RTC 快照轮询）
+   指向"状态被破坏"而非某一处代码，建议按 `verification.md` §7.5 的顺序取证；
+3. 查清碎片化趋势（12288 → 4608）。
+   （原先记的"证书签名校验失败"已更正：`0x4290` = `RSA_PUBLIC_FAILED` 叠加
+   `MPI_ALLOC_FAILED`，**同属分配失败**，见 `verification.md` §7.7。）
+
+> ⚠️ 这条是**真机实测**结论，且**不由本轮修复引入**；本轮修复未触碰 TLS/sync 路径。
+
+## P0-6 · 命令压力下间歇性崩溃（堆破坏迹象）⚠️ 真机复现，归因未定
+
+**真机证据**（第六轮；`esp32s3` rev v0.2 / 16 MB，MAC `20:6e:f1:b4:7d:e4`）：
+连续 `set_timezone` 压力 + soak 后出现两种硬崩溃，符号化后落点为：
+
+```
+RawVecInner::deallocate
+  → <RawVec<u8> as Drop>::drop
+    → drop_in_place::<[command_sessions::CachedReply]>
+      → VecDeque<CachedReply>::truncate
+        → CommandSessions::begin        ← logic/src/command_sessions.rs:58
+          → inkwash_note4::main
+```
+
+即 `begin()` 的 `cached.clear()` 在析构缓存应答时读到**损坏的堆指针**
+（`EXCVADDR = 0x3f`）。另一次是 `Double exception`、回溯 `CORRUPTED`、
+CPU0/CPU1 同时 dump——典型的堆/栈被破坏后表象。
+
+**复现率**（`40 次 set_timezone + 60 s soak`，同一脚本）：
+
+| 构建 | 会话数 | Guru 事件 |
+|---|---|---|
+| 基线 `0f493d7` | 6 | **0** |
+| 本轮逻辑改动 + 还原 `effect_task.rs` | 6 | **1** |
+| 完整修复 | 3 | **1** |
+| 完整修复（60 写 / 120 s） | 1 | **2** |
+
+复现入口：`python3 scripts/smoke-note4.py --stress 40 --soak 100`。
+
+**归因**：
+
+- ✅ **与 P0-1 的 `effect_task` 看门狗改动无关** —— 把它还原到基线后崩溃照旧。
+- ✅ 崩溃现场 `command_sessions.rs` **本轮未改动**；`logic` 内无 `unsafe`。
+- ⚠️ **但基线 6 次全 0、含本轮改动的构建 5 个会话 4 次事件**，
+  样本小且间歇，**不足以断定是既存缺陷**；也不能排除本轮改动影响了触发概率。
+- 高度可疑的共同因子是**预存的 P0-5**（每 8 s 一次 `mbedtls_ssl_setup`
+  `ALLOC_FAILED` + Wi-Fi 重连churn）。
+
+**为什么值得单列 P0**：这是**内存安全**问题，且触发条件是普通命令流量，
+不是极端输入。`CommandSessions` 是每条命令都会走的路径。
+
+**取证进展（第七、八轮，细节见 `verification.md` §7.7–§7.11）**：
+
+| 轮 | 变量 | 结果 |
+|---|---|---|
+| ⑦ | 堆取证（`HEAPPROBE`） | TLS 失败分配 = `ssl->in_buf` 16,717 B，caps 禁 PSRAM |
+| ⑦ | `DYNAMIC_BUFFER=y` | setup 失败 70/70 → 0/45，但需求降到 ~4,770 B 仍会失败（缓解非修法） |
+| ⑦ | `EXTERNAL_MEM_ALLOC=y` | `request-ok` 40/40、分配失败 0；**崩溃仍出现** |
+| ⑧ | 栈高水位 | 8 任务余量 >56%、无下降趋势 → **未观察到常规栈耗尽** |
+| ⑧ | `HEAP_POISONING_COMPREHENSIVE=y` | 1 次崩溃，`EXCVADDR = 0xcecece00` |
+
+**目前能确认的**：崩溃现场出现了**填充模式特征**的异常地址
+（`0x3f`、`0xa5a5a5b1`、`0xcecece00`），落点先后为
+`command_sessions.rs` 缓存析构、`_xt_context_save` 双异常、
+`ctx::DeviceContext::poll_alarm_snapshot`（`EXCVADDR=0x0c`）。
+
+**仍不能确认的（边界）**：
+
+- `0xcecece00` 与 `MALLOC_FILL_PATTERN`、`0xa5a5a5b1` 与 `tskSTACK_FILL_BYTE`
+  只是**吻合**，**不能据此断定来源是未初始化的堆/栈对象**——
+  错误复制、失效引用、指针破坏都能传播这类模式。
+- **无毒化断言不能排除越界写或释放后使用**；且 canary 断言通常定位
+  **检测现场与受损块**，不保证指出写坏指令。故**不以"多跑抓 canary"为依据**。
+- **未初始化读取、破坏源、责任模块均未确定**；
+  各项改动（含本轮修复）对**触发概率**的影响**未排除**。
+- 崩溃落点**不等于**写坏位置（双异常还掩盖了原始帧）。
+
+**建议**：定性之前**不要发布**。下一步改为**静态审查 FFI/C 边界**
+（见 P0-6 审查清单），不再叠加设备侧诊断变量。
+
+## P2-8 · 潜在死锁：BLE 生命周期邮箱的"无超时阻塞发送"（**未证明，未修复**）
+
+**登记性质**：这是**单独登记的潜在死锁候选**，
+**不是**已找到的 P0-6 内存破坏源，也**不作为缺陷**，在证明可达之前**不修**。
+
+**位置**：`rust-firmware/src/ble_control.rs:205-213`（`send_lifecycle`）——
+两跳投递都是"邮箱满则 `Condvar::wait` 且**无超时**"：
+
+```
+NimBLE host task --send_lifecycle--> session 邮箱(16) --worker 循环(:669)--> 转发
+     --send_lifecycle--> BleControl 邮箱(16) --main(:1319)--> 状态机
+```
+
+**假设的死锁交错（尚待证明）**：
+
+1. session 邮箱累计满 16 条生命周期事件，消费者（worker）尚未排空；
+2. 此刻 `BleControl::stop` 到达 → worker 处理 `Stop` → `session.take()`
+   → `Drop` → `shutdown_nimble()` → `nimble_port_stop()`
+   **阻塞等待 host task 处理停止事件**；
+3. host task 正阻塞在第 1 步的 `send_lifecycle` 里，而唯一消费者（worker）
+   已进入 `shutdown_nimble` 不再排空 → **双方互等**，BLE worker 永久挂起。
+
+**为什么现在不能判定为缺陷**：需要证明"第 1 步已满 16 且第 2 步紧随其后"
+这一状态**可达**。当前只是"理论可能"：worker 每 ~20 ms 排空一次，
+且 `main`(:1319) 是第二个独立消费者，单连接外设要在该窗口内堆积 16 次事件
+难度很大——但**未做测量，也未构造**。
+
+**若要推进**，需要：构造可复现的事件序列（或在真机上统计邮箱深度上界），
+证明"满 16 且消费者停摆"可发生；在此之前既不算缺陷也不修。
+
+**关联**：`docs/verification.md` §7.13 观察 C。
 
 ## P1 · 数据与边界
 
@@ -385,6 +638,7 @@ fn take_for_callback(&mut self, conn_handle: u16) -> Option<NotifyAttempt> {
 |---|---|---|---|
 | `Calendar` | **恒 0**（`_` 分支） | `draw_calendar_grid(.., todos)` `screens.rs:103-137`，画 due 圆点 | 待办变化不重绘 |
 | `WeekView` | **恒 0**（`_` 分支） | `draw_week_view(.., todos, ..)` `screens.rs:292-402`，逐日列出待办 | **新增待办不出现** |
+| **`Home`**（第四轮补漏） | **恒 0**（`_` 分支） | `draw_home_surface`（`app_runner.rs:512-533`）渲染下一闹钟、待办计数与今日到期数、未读角标、Wi-Fi 标志 | **闹钟/待办/未读变化时 Home 不重绘**；Home 是停留最久的页面，可见度高于上面两个 |
 
 **缺口二:已采集的 4 个屏幕,字段比实际绘制的少**：
 
@@ -407,10 +661,16 @@ fn take_for_callback(&mut self, conn_handle: u16) -> Option<NotifyAttempt> {
 `ViewModel::from_state` 两组指纹完全相同。
 
 **修法**：指纹必须覆盖该屏幕实际渲染读到的**全部**状态，包括当前落进 `_` 分支的
-`Calendar` / `WeekView`。逐字段列举容易再次漏（本条已经漏了两轮），
+`Calendar` / `WeekView` / `Home`。逐字段列举容易再次漏（本条已经漏了两轮），
 更稳妥的做法是**直接 hash 渲染层的输出**——对列表页 hash `format_*_row`
 的结果字符串，对 `Calendar` / `WeekView` hash 参与绘制的待办投影，
 让"画什么"和"比什么"在结构上无法脱钩。
+
+> ⚠️ **第五轮补充：补全指纹本身还不够。** `plan_render` 的 Home 分支**先**判断
+> 分钟变化并返回 `PartialRegion::Clock`，于是"分钟 + 数据同时变化"时只刷时钟区域；
+> 完成后注册表缓存了**新**指纹，下一次比较直接 `Noop`，图标/计数永久停在旧状态。
+> **只改指纹会让这个缺口变得更隐蔽**：以前是"数据变化不重绘"，现在是"重绘了一部分
+> 却记成全部完成"。时钟局刷必须附加"其他渲染数据未变"的前提。
 
 ### P1-11 · BLE 配对超时是死代码，配对页无超时
 

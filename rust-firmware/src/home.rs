@@ -60,7 +60,9 @@ pub fn render(
     let mut cursor_x = battery_x;
     if wifi_configured {
         cursor_x = cursor_x.saturating_sub(CLUSTER_GAP + icons::WIFI.width as usize);
-        let wifi_y = 7 + battery_icon.rows.len() - icons::WIFI.rows.len();
+        let wifi_y = 7usize
+            .saturating_add(battery_icon.rows.len())
+            .saturating_sub(icons::WIFI.rows.len());
         icons::draw_icon(canvas, cursor_x, wifi_y, &icons::WIFI);
     }
 

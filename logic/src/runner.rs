@@ -211,4 +211,57 @@ mod tests {
         };
         assert!(!batch_is_worker_safe(&main_batch));
     }
+
+    struct FailingExecutor;
+
+    impl EffectExecutor for FailingExecutor {
+        fn run(&mut self, _effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
+            Err((EffectCategory::Persist, "disk full".into()))
+        }
+    }
+
+    fn two_effect_batch(policy: FailurePolicy) -> EffectBatch {
+        EffectBatch {
+            id: EffectBatchId(9),
+            operation_id: OperationId(4),
+            render_generation: None,
+            effects: vec![
+                Effect::PersistTimezone(0),
+                Effect::SetSyncInterval { minutes: 30 },
+            ],
+            failure_policy: policy,
+        }
+    }
+
+    #[test]
+    fn continue_policy_reports_every_effect_failure() {
+        let notices = execute_batch(
+            two_effect_batch(FailurePolicy::Continue),
+            &mut FailingExecutor,
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|n| matches!(n, BatchNotice::Failed(_)))
+                .count(),
+            2,
+            "Continue must run and report every effect in the batch"
+        );
+    }
+
+    #[test]
+    fn abort_batch_policy_stops_after_the_first_failure() {
+        let notices = execute_batch(
+            two_effect_batch(FailurePolicy::AbortBatch),
+            &mut FailingExecutor,
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|n| matches!(n, BatchNotice::Failed(_)))
+                .count(),
+            1,
+            "AbortBatch must stop at the first failure and emit exactly one notice"
+        );
+    }
 }

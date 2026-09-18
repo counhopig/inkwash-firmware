@@ -27,7 +27,10 @@ impl AlarmStore {
     }
 
     pub fn load(&self) -> Result<Vec<StoredAlarm>> {
-        Ok(read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_ALARMS)?.unwrap_or_default())
+        let mut alarms: Vec<StoredAlarm> =
+            read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_ALARMS)?.unwrap_or_default();
+        inkwash_logic::sanitize::sanitize_alarms(&mut alarms);
+        Ok(alarms)
     }
 
     pub fn save(&self, alarms: &[StoredAlarm]) -> Result<()> {

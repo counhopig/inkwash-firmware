@@ -6,7 +6,7 @@ use crate::datetime::{weekday_from_days, DateTime};
 
 pub use crate::datetime::{date_from_days, days_since_epoch};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Repeat {
     Daily,
 

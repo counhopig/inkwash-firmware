@@ -79,6 +79,7 @@ impl AudioTask {
 }
 
 fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_AUDIO);
     log::info!("Audio task running");
     let watchdog_subscribed = match watchdog::subscribe() {
         Ok(()) => true,

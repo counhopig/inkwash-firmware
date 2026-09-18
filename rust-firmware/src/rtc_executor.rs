@@ -149,6 +149,7 @@ impl RtcExecutor {
 }
 
 fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_RTC);
     let watchdog_subscribed = match crate::watchdog::subscribe() {
         Ok(()) => true,
         Err(err) => {

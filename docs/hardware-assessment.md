@@ -282,22 +282,27 @@ EPD 阻塞刷新数秒，但被 supersede + 矩形并集（`epd_task.rs:109-149`
 
 | 命令 | 能挡住什么 | 挡不住什么 |
 |---|---|---|
-| `cargo check --target xtensa-esp32s3-espidf` | 生产代码的类型/语法回归 | ❌ **默认不检查 `#[cfg(test)]`**，那 4 个测试照样漏过 |
-| `cargo check --all-targets --target ...` | ✅ 含测试目标，能抓到这 4 个 | 不链接，抓不到体积 |
+| `cargo check --target xtensa-esp32s3-espidf` | 生产代码的类型/语法回归 | ❌ **默认不检查 `#[cfg(test)]`** |
+| `cargo check --all-targets --target ...` | 生产代码的类型/语法回归 | ❌ **第四轮证伪：同样抓不到 `cfg(test)`** —— `Cargo.toml` 的 `harness = false` 让 cargo 只传 `--cfg test` 而不传 `--test`，函数体不被类型检查（见 `verification.md` §6） |
+| `cargo +stable fmt --check` | 格式回归 | 不链接、不做类型检查；但**不需要 ESP-IDF** |
 | `cargo build --release --target ...` + size 检查 | ✅ app 体积 | 需要完整 ESP-IDF 工具链，CI 成本最高 |
 
 所以建议是分层的：
 
-1. **最低成本、最高回报**：`cargo check --all-targets` —— 这一条就能抓到那 4 个测试，
-   `espup` 在 CI 上装得动，不需要链接器。
-2. **次优替代**：把这类纯逻辑测试（`execute_batch` 的顺序 / Continue / AbortBatch
-   本来就不碰硬件）挪进**主机可编译的 harness**，跟着 `logic` 一起在 CI 跑。
-   这比给固件加门禁更划算——它们本来就不该住在固件 crate 里。
+1. **最低成本、无条件可上**：`cargo +stable fmt --check`（已加入 CI 的
+   `firmware-format` job）。它不需要 ESP-IDF，能挡住格式与部分解析层回归。
+2. **纯逻辑测试搬进主机 harness**（已实施）：`execute_batch` 的顺序 / `Continue` /
+   `AbortBatch` 本来就不碰硬件，现在住在 `logic/src/runner.rs`，跟着 410 个主机测试
+   一起在 CI 真跑。这比给固件加门禁更划算——它们本来就不该住在固件 crate 里。
+   ⚠️ **不要指望 `cargo check --all-targets`**：第四轮实测它对固件的
+   `#[cfg(test)]` 完全无效（`harness = false`）。
 3. **app 体积门禁必须实际构建**，`check` 拿不到产物。考虑到"刷错变砖不可回滚"，
    这一条值得单独付出工具链成本，哪怕只在 release tag 上跑。
 
-**即便如此，加编译门禁仍是本次评审里杠杆最高的一个结构性修改**——
-只是要写成 `--all-targets`，不是裸 `check`。
+**即便如此，加固件侧门禁仍是本次评审里杠杆最高的一个结构性修改**——
+但第四轮已证伪"`--all-targets` 就够了"：对 `harness = false` 的 bin，
+`cfg(test)` 函数体根本不进类型检查。可无条件落地的第一条是 `cargo +stable fmt --check`；
+真正要挡住固件类型回归，仍需一条带 ESP-IDF 的构建 job。
 
 ### b. 补偿机制本身已经坏了两处
 
@@ -387,10 +392,11 @@ CI 只跑 `ubuntu-latest`（LF 检出），永远看不到这条。
 
 **我会让它过设计评审，但在补上三件事之前不会批准量产：**
 
-1. **加固件编译门禁**：`cargo check --all-targets --target xtensa-esp32s3-espidf`
-   （`--all-targets` 是关键，裸 `check` 不看 `#[cfg(test)]`，抓不到那 4 个测试），
-   体积门禁另需实际构建。杠杆最高——它会立刻暴露那 4 个编译不过的测试，
-   以及未来所有同类回归。**更划算的替代**：把这几个纯逻辑测试挪进主机 harness。
+1. **加固件侧门禁**：可无条件先上 `cargo +stable fmt --check`（已加 CI）；
+   类型回归门禁需要带 ESP-IDF 的 `cargo check --target xtensa-esp32s3-espidf`
+   ——但**不要写 `--all-targets`**：第四轮实测它对 `harness = false` 的固件
+   `cfg(test)` 完全无效。**更划算的替代（已实施）**：把那几个纯逻辑测试
+   （`execute_batch` 的 Continue / AbortBatch）挪进主机 harness，在 CI 真跑。
 2. **两条不变式收口**：校验收到"数据进入设备"的唯一入口；
    阻断页（`AlarmRinging` / `Reminder` / `BlePairing`）给无条件出路。
    这一条同时消掉 P0-2、P0-3、P1-1、P1-2、P1-13 五条缺陷。

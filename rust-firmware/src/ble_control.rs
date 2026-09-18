@@ -538,6 +538,7 @@ fn run(
     lifecycle_sender: LifecycleSender,
     result_tx: mpsc::SyncSender<BleTaskResult>,
 ) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_BLE);
     let mut session = None;
     let mut active_session_id = None;
     loop {

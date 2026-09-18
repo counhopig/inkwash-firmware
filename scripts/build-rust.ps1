@@ -8,7 +8,7 @@ $projectDir = Join-Path $PSScriptRoot "..\rust-firmware"
 # Locate ESP-IDF without hardcoding an install path: honor $env:IDF_PATH
 # when set, else probe the conventional install locations and pick the
 # newest match. (Mirrors scripts/build-rust.sh; Windows side remains
-# unverified on a real toolchain - see docs.)
+# unverified on a real toolchain - see docs/verification.md.)
 $idfRoot = $null
 if ($env:IDF_PATH) {
     $idfRoot = $env:IDF_PATH

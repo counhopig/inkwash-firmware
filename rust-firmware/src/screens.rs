@@ -4,9 +4,10 @@ use crate::canvas::Canvas;
 use crate::ctx::DeviceContext;
 use crate::display::Rect;
 use crate::inbox::InboxItem;
-use crate::rtc::{is_leap, DateTime};
+use crate::rtc::DateTime;
 use crate::todos::Importance;
 use crate::ui::{draw_rows, footer, header};
+use inkwash_logic::datetime::{days_in_month, weekday_of};
 
 pub const LIST_TEXT_MAX_WIDTH: usize = 334;
 
@@ -123,7 +124,10 @@ pub(crate) fn draw_calendar_grid(
                         .is_some_and(|d| d.year == dt.year && d.month == dt.month && d.day == day),
                 };
                 if fires {
-                    marks[day as usize].todo = Some(todo.importance);
+                    let slot = &mut marks[day as usize].todo;
+                    if slot.map_or(true, |current| todo.importance > current) {
+                        *slot = Some(todo.importance);
+                    }
                 }
             }
         }
@@ -301,15 +305,9 @@ pub(crate) fn draw_week_view(
     let (_, sm, sd) = alarms::date_from_days(start);
     let (_, em, ed) = alarms::date_from_days(start + 6);
     let title = if sm == em {
-        format!("{} {}-{}", MONTH_NAMES[(sm - 1) as usize], sd, ed)
+        format!("{} {}-{}", month_name(sm), sd, ed)
     } else {
-        format!(
-            "{} {} - {} {}",
-            MONTH_NAMES[(sm - 1) as usize],
-            sd,
-            MONTH_NAMES[(em - 1) as usize],
-            ed
-        )
+        format!("{} {} - {} {}", month_name(sm), sd, month_name(em), ed)
     };
 
     let mut canvas = ctx.board.display.canvas_mut();
@@ -342,7 +340,7 @@ pub(crate) fn draw_week_view(
         if is_today {
             canvas.fill_rect(x + COL_WIDTH - 7, CARD_TOP + 4, 3, 3, true);
         }
-        let weekday_text = WEEKDAY_SHORT[weekday as usize];
+        let weekday_text = weekday_short(weekday);
         let weekday_w = Canvas::text_small_width(weekday_text);
         canvas.draw_text_small(x + (COL_WIDTH - weekday_w) / 2, WEEKDAY_Y, weekday_text);
         let date_text = d.to_string();
@@ -379,7 +377,11 @@ pub(crate) fn draw_week_view(
                     let ellipsis_w = Canvas::text_small_width("...");
                     let mut end = line.len();
                     while end > 0 && Canvas::text_small_width(&line[..end]) + ellipsis_w > text_w {
-                        end -= 1;
+                        end = line[..end]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
                     }
                     canvas.draw_text_small(text_x, y_cursor, &line[..end]);
                     canvas.draw_text_small(
@@ -401,22 +403,15 @@ pub(crate) fn draw_week_view(
     drop(canvas);
 }
 
-fn days_in_month(year: u16, month: u8) -> u8 {
-    const DAYS: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if month == 2 && is_leap(year as i64) {
-        29
-    } else {
-        DAYS[(month - 1) as usize]
-    }
+fn month_name(month: u8) -> &'static str {
+    MONTH_NAMES
+        .get(month.wrapping_sub(1) as usize)
+        .copied()
+        .unwrap_or("???")
 }
 
-fn weekday_of(year: u16, month: u8, day: u8) -> u8 {
-    const T: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    let mut y = year as i64;
-    if month < 3 {
-        y -= 1;
-    }
-    ((y + y / 4 - y / 100 + y / 400 + T[(month - 1) as usize] + day as i64) % 7) as u8
+fn weekday_short(index: u8) -> &'static str {
+    WEEKDAY_SHORT.get(index as usize).copied().unwrap_or("??")
 }
 
 fn format_alarm_row(alarm: &StoredAlarm) -> String {
@@ -424,7 +419,7 @@ fn format_alarm_row(alarm: &StoredAlarm) -> String {
     let when = match &alarm.repeat {
         Repeat::Daily => format!("{:02}:{:02} DAILY", alarm.hour, alarm.minute),
         Repeat::Weekly { days } => {
-            let weekdays: Vec<&str> = days.iter().map(|d| WEEKDAY_SHORT[*d as usize]).collect();
+            let weekdays: Vec<&str> = days.iter().map(|d| weekday_short(*d)).collect();
             format!(
                 "{:02}:{:02} {}",
                 alarm.hour,
@@ -599,7 +594,7 @@ fn format_todo_row(todo: &crate::todos::Todo, now: Option<&DateTime>) -> String 
         } else if let Some(due) = todo.due_date {
             row.push_str(&format!(" - {:02}/{:02}", due.month, due.day));
         } else if let Some(Repeat::Weekly { days }) = &todo.repeat {
-            let weekdays: Vec<&str> = days.iter().map(|d| WEEKDAY_SHORT[*d as usize]).collect();
+            let weekdays: Vec<&str> = days.iter().map(|d| weekday_short(*d)).collect();
             row.push_str(" - ");
             row.push_str(&weekdays.join(","));
         }
@@ -630,6 +625,10 @@ fn render_inbox_page(board: &mut Note4Board, inbox: &[InboxItem], selected: usiz
 
 pub(crate) fn draw_inbox_item_detail(board: &mut Note4Board, items: &[InboxItem], selected: usize) {
     let Some(item) = items.get(selected).cloned() else {
+        let mut canvas = board.display.canvas_mut();
+        canvas.clear();
+        header(&mut canvas, "INBOX");
+        drop(canvas);
         return;
     };
     let mut canvas = board.display.canvas_mut();

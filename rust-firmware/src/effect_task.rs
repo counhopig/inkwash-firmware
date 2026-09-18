@@ -1,6 +1,9 @@
 use anyhow::Result;
 use parking_lot::Mutex;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{
+    sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
+};
+use std::time::Duration;
 
 use inkwash_logic::app::{Effect, EffectBatch};
 use inkwash_logic::runner::{
@@ -18,6 +21,8 @@ const BATCH_CHANNEL_CAP: usize = 1;
 const NOTICE_CHANNEL_CAP: usize = 8;
 
 const EFFECT_TASK_STACK: usize = 16 * 1024;
+
+const IDLE_DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct BatchResult {
@@ -282,7 +287,29 @@ fn run(
     batch_rx: Receiver<EffectBatch>,
     notice_tx: SyncSender<BatchResult>,
 ) {
-    while let Ok(batch) = batch_rx.recv() {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_EFFECT);
+    let watchdog_subscribed = match crate::watchdog::subscribe() {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("effect-task watchdog subscribe failed: {err}");
+            false
+        }
+    };
+
+    loop {
+        let batch = match batch_rx.recv_timeout(IDLE_DRAIN) {
+            Ok(batch) => batch,
+            Err(RecvTimeoutError::Timeout) => {
+                if watchdog_subscribed {
+                    crate::watchdog::feed();
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if watchdog_subscribed {
+            crate::watchdog::feed();
+        }
         let result = BatchResult {
             notices: execute_batch(batch, &mut executor),
         };
@@ -344,140 +371,5 @@ impl EffectTask {
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(EffectTaskError::Disconnected),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use inkwash_logic::app::{Effect, EffectBatch, FailurePolicy};
-    use inkwash_logic::runner::{BatchNotice, EffectExecutor};
-
-    struct RecordingExecutor {
-        effects: Vec<Effect>,
-    }
-
-    impl EffectExecutor for RecordingExecutor {
-        fn run(&mut self, effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
-            self.effects.push(effect.clone());
-            Ok(EffectOutcome::Completed(
-                inkwash_logic::app::EffectOutput::RenderDone,
-            ))
-        }
-    }
-
-    #[test]
-    fn execute_batch_processes_effects_in_order() {
-        let effects = vec![
-            Effect::PersistTimezone(0),
-            Effect::SetSyncInterval { minutes: 30 },
-        ];
-        let batch = EffectBatch {
-            id: 1,
-            operation_id: None,
-            render_generation: 0,
-            effects,
-            failure_policy: FailurePolicy::Continue,
-        };
-
-        let mut exec = RecordingExecutor {
-            effects: Vec::new(),
-        };
-        let notices = execute_batch(batch, &mut exec);
-
-        assert_eq!(exec.effects.len(), 2);
-        assert!(notices
-            .iter()
-            .all(|n| matches!(n, BatchNotice::Completed(_))));
-    }
-
-    #[test]
-    fn execute_batch_continues_past_failure_on_continue() {
-        struct FailingExecutor;
-        impl EffectExecutor for FailingExecutor {
-            fn run(&mut self, _effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
-                Err((EffectCategory::Persist, "disk full".into()))
-            }
-        }
-
-        let batch = EffectBatch {
-            id: 1,
-            operation_id: None,
-            render_generation: 0,
-            effects: vec![
-                Effect::PersistTimezone(0),
-                Effect::SetSyncInterval { minutes: 30 },
-            ],
-            failure_policy: FailurePolicy::Continue,
-        };
-
-        let mut exec = FailingExecutor;
-        let notices = execute_batch(batch, &mut exec);
-        assert_eq!(
-            notices
-                .iter()
-                .filter(|n| matches!(n, BatchNotice::Failed(_)))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn execute_batch_aborts_on_failure_with_abortbatch() {
-        struct FailingExecutor;
-        impl EffectExecutor for FailingExecutor {
-            fn run(&mut self, _effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
-                Err((EffectCategory::Persist, "disk full".into()))
-            }
-        }
-
-        let batch = EffectBatch {
-            id: 1,
-            operation_id: None,
-            render_generation: 0,
-            effects: vec![
-                Effect::PersistTimezone(0),
-                Effect::SetSyncInterval { minutes: 30 },
-            ],
-            failure_policy: FailurePolicy::AbortBatch,
-        };
-
-        let mut exec = FailingExecutor;
-        let notices = execute_batch(batch, &mut exec);
-        assert_eq!(
-            notices
-                .iter()
-                .filter(|n| matches!(n, BatchNotice::Failed(_)))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn abortbatch_failure_still_produces_one_owned_batch_result() {
-        struct FailingExecutor;
-        impl EffectExecutor for FailingExecutor {
-            fn run(&mut self, _effect: &Effect) -> Result<EffectOutcome, (EffectCategory, String)> {
-                Err((EffectCategory::Persist, "disk full".into()))
-            }
-        }
-
-        let batch = EffectBatch {
-            id: 7,
-            operation_id: None,
-            render_generation: 0,
-            effects: vec![
-                Effect::PersistTimezone(0),
-                Effect::SetSyncInterval { minutes: 30 },
-            ],
-            failure_policy: FailurePolicy::AbortBatch,
-        };
-        let mut exec = FailingExecutor;
-        let result = BatchResult {
-            notices: execute_batch(batch, &mut exec),
-        };
-
-        assert_eq!(result.notices.len(), 1);
-        assert!(matches!(result.notices[0], BatchNotice::Failed(_)));
     }
 }

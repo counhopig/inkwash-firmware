@@ -7,6 +7,7 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use crate::alarms::AlarmStore;
+use crate::heap_probe;
 use crate::inbox::InboxStore;
 use crate::rtc::DateTime;
 use crate::storage::PersistedCounters;
@@ -126,10 +127,12 @@ fn https_post(
         timeout: Some(HTTP_TIMEOUT),
         ..Default::default()
     };
-    let mut client = HttpClient::wrap(
-        EspHttpConnection::new(&config)
-            .map_err(|e| anyhow!("HTTP connection setup failed: {e}"))?,
-    );
+    heap_probe::snapshot("https_post:before-conn-new");
+    let mut client = HttpClient::wrap(EspHttpConnection::new(&config).map_err(|e| {
+        heap_probe::snapshot("https_post:conn-new-failed");
+        anyhow!("HTTP connection setup failed: {e}")
+    })?);
+    heap_probe::snapshot("https_post:conn-new-ok");
 
     let content_length = body.len().to_string();
     let mut headers: Vec<(&str, &str)> = vec![
@@ -144,9 +147,11 @@ fn https_post(
         headers.push(("authorization", &auth_header));
     }
 
-    let mut request = client
-        .request(Method::Post, url, &headers)
-        .map_err(|e| anyhow!("POST {url} failed to start: {e}"))?;
+    let mut request = client.request(Method::Post, url, &headers).map_err(|e| {
+        heap_probe::snapshot("https_post:request-failed");
+        anyhow!("POST {url} failed to start: {e}")
+    })?;
+    heap_probe::snapshot("https_post:request-ok");
     let mut written = 0usize;
     while written < body.len() {
         watchdog::feed();
@@ -181,6 +186,8 @@ pub fn fetch_and_apply(
     _now: &DateTime,
 ) -> Result<SyncOutcome> {
     watchdog::feed();
+    heap_probe::note_sync_attempt();
+    heap_probe::snapshot("fetch_and_apply:entry");
 
     let local_alarms = alarm_store
         .load()
@@ -221,6 +228,7 @@ pub fn fetch_and_apply(
         serde_json::to_vec(&upload).map_err(|e| anyhow!("device sync JSON encode failed: {e}"))?;
 
     let mut buf = PsramBuffer::new(RESPONSE_BUF_LEN)?;
+    heap_probe::snapshot("fetch_and_apply:after-psram-buf");
     let (bytes_read, new_etag) = https_post(
         server_url,
         token,
@@ -343,6 +351,8 @@ fn maybe_ntp_epoch(counters: &PersistedCounters, now: &DateTime) -> Option<u64> 
 }
 
 pub fn poll_urgent(counters: &PersistedCounters, wifi_mgr: &mut wifi::WifiManager) -> Result<bool> {
+    heap_probe::note_sync_attempt();
+    heap_probe::snapshot("poll_urgent:entry");
     let creds = counters
         .wifi_creds()?
         .ok_or_else(|| anyhow!("Wi-Fi not configured"))?;
@@ -351,6 +361,7 @@ pub fn poll_urgent(counters: &PersistedCounters, wifi_mgr: &mut wifi::WifiManage
         .ok_or_else(|| anyhow!("Server not configured"))?;
 
     wifi_mgr.connect(&creds)?;
+    heap_probe::snapshot("poll_urgent:after-wifi-connect");
 
     let result = (|| -> Result<bool> {
         let mut buf = [0u8; 256];
@@ -371,5 +382,6 @@ pub fn poll_urgent(counters: &PersistedCounters, wifi_mgr: &mut wifi::WifiManage
     })();
 
     wifi_mgr.disconnect();
+    heap_probe::snapshot("poll_urgent:exit");
     result
 }

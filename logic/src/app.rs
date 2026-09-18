@@ -87,7 +87,7 @@ pub struct ReminderState {
 
     pub screen_before: Box<Screen>,
 
-    pub deadline_unix: u64,
+    pub deadline_ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +193,7 @@ impl Default for AlarmAddState {
 pub struct BlePairingState {
     pub phase: BlePairingPhase,
 
-    pub pairing_deadline_unix: Option<u64>,
+    pub pairing_deadline_ticks: Option<u64>,
 
     pub session_id: u64,
 
@@ -204,7 +204,7 @@ impl Default for BlePairingState {
     fn default() -> Self {
         Self {
             phase: BlePairingPhase::Waiting,
-            pairing_deadline_unix: None,
+            pairing_deadline_ticks: None,
             session_id: 0,
             input_released: false,
         }
@@ -706,7 +706,7 @@ pub enum AlarmRuntimeState {
         ack: CommitState,
         persistence: CommitState,
 
-        ring_deadline_unix: Option<u64>,
+        ring_deadline_ticks: Option<u64>,
     },
     WaitingForRearm {
         fired_alarm_id: u8,
@@ -813,6 +813,7 @@ pub struct AppState {
     pending_light_sleep_disable: Option<OperationId>,
     last_activity_ticks: Option<u64>,
     idle_since_ticks: Option<u64>,
+    last_power_poll_ticks: u64,
     op_counter: u64,
     batch_counter: u64,
     screen_before_ring: Screen,
@@ -884,6 +885,7 @@ impl Default for AppState {
             pending_light_sleep_disable: None,
             last_activity_ticks: None,
             idle_since_ticks: None,
+            last_power_poll_ticks: 0,
             pending_residue_ack: None,
             pending_residue_time: None,
             pending_alarm_list_edit: None,
@@ -905,6 +907,12 @@ impl Default for AppState {
 }
 
 const RETRY_BACKOFF_MINUTES: u64 = 1;
+
+const BLE_PAIRING_TIMEOUT_MS: u64 = 120_000;
+
+const REMINDER_TIMEOUT_MS: u64 = 120_000;
+
+const RING_AUTO_SILENCE_MS: u64 = 300_000;
 
 impl AppState {
     fn next_operation_id(&mut self) -> OperationId {
@@ -1093,6 +1101,72 @@ fn app_sleep_inputs(state: &AppState, poll: PowerPoll) -> SleepInputs {
 }
 
 fn transition_power_poll(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
+    state.last_power_poll_ticks = poll.now_ticks;
+    let mut batches = expire_ble_pairing(state, poll.now_ticks);
+    batches.extend(expire_ring_auto_silence(state, poll.now_ticks));
+    batches.extend(expire_reminder(state, poll.now_ticks));
+    batches.extend(power_poll_sleep(state, poll));
+    batches
+}
+
+fn expire_ring_auto_silence(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> {
+    let due = state.screen == Screen::AlarmRinging
+        && matches!(
+            &state.alarm_runtime,
+            AlarmRuntimeState::Firing {
+                ring_deadline_ticks: Some(deadline),
+                ..
+            } if now_ticks >= *deadline
+        );
+    if due {
+        return dismiss_ringing(state);
+    }
+    vec![]
+}
+
+fn expire_reminder(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> {
+    let due = matches!(
+        &state.screen,
+        Screen::Reminder(ReminderState { deadline_ticks, .. }) if now_ticks >= *deadline_ticks
+    );
+    if due {
+        return dismiss_reminder(state);
+    }
+    vec![]
+}
+
+fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> {
+    let Screen::BlePairing(st) = &state.screen else {
+        return vec![];
+    };
+    if !matches!(
+        st.phase,
+        BlePairingPhase::Waiting | BlePairingPhase::Pairing
+    ) || !st.pairing_deadline_ticks.is_some_and(|d| now_ticks >= d)
+    {
+        return vec![];
+    }
+
+    if let Screen::BlePairing(st) = &mut state.screen {
+        st.phase = BlePairingPhase::Failure("pairing timeout".into());
+        st.pairing_deadline_ticks = None;
+    }
+    state.screen = Screen::Settings {
+        selected: SETTINGS_BLE_PAIRING_ROW,
+    };
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StopBlePairing],
+        ),
+        render_batch(state),
+    ]
+}
+
+fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     if poll.activity_observed {
         state.last_activity_ticks = Some(poll.now_ticks);
         state.idle_since_ticks = None;
@@ -1707,7 +1781,7 @@ fn resolve_rtc_alarm(state: &mut AppState, now: DateTime, aie: bool) -> Vec<Effe
                     operation_id: persist_id,
                 },
 
-                ring_deadline_unix: Some(now.to_unix() + 300),
+                ring_deadline_ticks: Some(state.last_power_poll_ticks + RING_AUTO_SILENCE_MS),
             };
             state.screen = Screen::AlarmRinging;
 
@@ -1801,6 +1875,20 @@ fn dismiss_ringing(state: &mut AppState) -> Vec<EffectBatch> {
     ]
 }
 
+fn leave_stranded_ringing(state: &mut AppState) -> Vec<EffectBatch> {
+    state.screen = state.screen_before_ring.clone();
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StopTone],
+        ),
+        render_batch(state),
+    ]
+}
+
 fn transition_reminder_due(state: &mut AppState, payload: ReminderPayload) -> Vec<EffectBatch> {
     if state.screen == Screen::AlarmRinging
         || matches!(state.screen, Screen::Reminder(_))
@@ -1808,16 +1896,11 @@ fn transition_reminder_due(state: &mut AppState, payload: ReminderPayload) -> Ve
     {
         return vec![];
     }
-    let deadline = state
-        .clock
-        .now
-        .map(|now| now.to_unix() + 120)
-        .unwrap_or_else(|| crate::datetime::DateTime::from_unix(0).to_unix() + 120);
     state.screen = Screen::Reminder(ReminderState {
         kind: payload.kind,
         lines: payload.lines,
         screen_before: Box::new(state.screen.clone()),
-        deadline_unix: deadline,
+        deadline_ticks: state.last_power_poll_ticks + REMINDER_TIMEOUT_MS,
     });
     state.render_generation = state.render_generation.next();
     if !payload.urgent_read_ids.is_empty() || payload.todo_date.is_some() {
@@ -1862,12 +1945,18 @@ fn dismiss_reminder(state: &mut AppState) -> Vec<EffectBatch> {
 }
 
 fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
-    if matches!(button, ButtonEvent::Pressed(ButtonId::Enter))
-        && state.screen == Screen::AlarmRinging
-        && matches!(&state.alarm_runtime, AlarmRuntimeState::Firing { .. })
-    {
-        dismiss_ringing(state)
-    } else if matches!(state.screen, Screen::Reminder(_))
+    if state.screen == Screen::AlarmRinging {
+        if matches!(&state.alarm_runtime, AlarmRuntimeState::Firing { .. }) {
+            return if matches!(button, ButtonEvent::Pressed(ButtonId::Enter)) {
+                dismiss_ringing(state)
+            } else {
+                vec![]
+            };
+        }
+        return leave_stranded_ringing(state);
+    }
+
+    if matches!(state.screen, Screen::Reminder(_))
         && matches!(
             button,
             ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_)
@@ -2085,7 +2174,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         };
                         state.screen = Screen::BlePairing(BlePairingState {
                             phase: BlePairingPhase::Waiting,
-                            pairing_deadline_unix: None,
+                            pairing_deadline_ticks: Some(
+                                state.last_power_poll_ticks + BLE_PAIRING_TIMEOUT_MS,
+                            ),
                             session_id,
                             input_released: false,
                         });
@@ -2638,50 +2729,6 @@ fn transition_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
             cal.year = now.year;
             cal.month = now.month;
             cal.selected_day = cal.selected_day.min(dim).max(1);
-        }
-    }
-
-    if state.screen == Screen::AlarmRinging {
-        if let AlarmRuntimeState::Firing {
-            ring_deadline_unix: Some(deadline),
-            ..
-        } = state.alarm_runtime
-        {
-            if now.to_unix() >= deadline {
-                batches.extend(dismiss_ringing(state));
-            }
-        }
-    }
-
-    if let Screen::Reminder(ReminderState { deadline_unix, .. }) = state.screen {
-        if now.to_unix() >= deadline_unix {
-            batches.extend(dismiss_reminder(state));
-        }
-    }
-
-    if let Screen::BlePairing(st) = &state.screen {
-        if st.pairing_deadline_unix.is_some_and(|d| now.to_unix() >= d)
-            && matches!(
-                st.phase,
-                BlePairingPhase::Waiting | BlePairingPhase::Pairing
-            )
-        {
-            if let Screen::BlePairing(st) = &mut state.screen {
-                st.phase = BlePairingPhase::Failure("pairing timeout".into());
-                st.pairing_deadline_unix = None;
-            }
-
-            state.screen = Screen::Settings {
-                selected: SETTINGS_BLE_PAIRING_ROW,
-            };
-            state.render_generation = state.render_generation.next();
-            batches.push(batch(
-                state,
-                OperationId(0),
-                FailurePolicy::Continue,
-                vec![Effect::StopBlePairing],
-            ));
-            batches.push(render_batch(state));
         }
     }
 
@@ -3407,6 +3454,11 @@ fn transition_command(
         ControlRequest::ClearAlarms => {
             let persist_op = state.next_operation_id();
             let rtc_op = state.next_operation_id();
+
+            let was_ringing = matches!(state.alarm_runtime, AlarmRuntimeState::Firing { .. });
+            if was_ringing {
+                state.screen = state.screen_before_ring.clone();
+            }
             state.alarms.alarms.clear();
 
             state.alarm_runtime = AlarmRuntimeState::Disarmed;
@@ -3419,21 +3471,29 @@ fn transition_command(
             );
 
             state.render_generation = state.render_generation.next();
-            vec![
-                render_batch(state),
-                batch(
+            let mut batches = Vec::new();
+            if was_ringing {
+                batches.push(batch(
                     state,
-                    persist_op,
-                    FailurePolicy::AbortBatch,
-                    vec![Effect::PersistAlarms(vec![])],
-                ),
-                batch(
-                    state,
-                    rtc_op,
-                    FailurePolicy::AbortBatch,
-                    vec![Effect::DisableRtcAlarm],
-                ),
-            ]
+                    OperationId(0),
+                    FailurePolicy::Continue,
+                    vec![Effect::StopTone],
+                ));
+            }
+            batches.push(render_batch(state));
+            batches.push(batch(
+                state,
+                persist_op,
+                FailurePolicy::AbortBatch,
+                vec![Effect::PersistAlarms(vec![])],
+            ));
+            batches.push(batch(
+                state,
+                rtc_op,
+                FailurePolicy::AbortBatch,
+                vec![Effect::DisableRtcAlarm],
+            ));
+            batches
         }
         ControlRequest::GetStatus => {
             let status = Reply::Status {
@@ -7178,42 +7238,146 @@ mod tests {
     }
 
     #[test]
-    fn ble_pairing_deadline_tick_times_out_and_exits_to_settings() {
+    fn entering_ble_pairing_arms_a_real_deadline() {
         let mut state = AppState::default();
         let _ = update(
             &mut state,
             Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
         );
-        state.screen = Screen::BlePairing(BlePairingState {
-            phase: BlePairingPhase::Pairing,
-            pairing_deadline_unix: Some(dt(8, 1).to_unix()),
-            ..Default::default()
-        });
+        enter_ble_pairing(&mut state, 5_000);
 
-        let batches = update(&mut state, Event::Tick(dt(8, 0)));
+        let Screen::BlePairing(st) = &state.screen else {
+            panic!("expected the BLE pairing screen, got {:?}", state.screen);
+        };
+        assert_eq!(
+            st.pairing_deadline_ticks,
+            Some(5_000 + BLE_PAIRING_TIMEOUT_MS),
+            "entering pairing must arm the timeout against the monotonic poll clock"
+        );
+    }
+
+    fn power_poll_at(now_ticks: u64) -> PowerPoll {
+        PowerPoll {
+            now_ticks,
+            activity_observed: false,
+            final_display_pending: false,
+            final_persist_pending: false,
+            usb_connected: false,
+            event_queue_empty: true,
+            input_latch_clear: true,
+            wake_plan_confirmed: true,
+            network_resumable: false,
+            light_wake_after_ms: 1_000,
+        }
+    }
+
+    fn enter_ble_pairing(state: &mut AppState, at_ticks: u64) {
+        let _ = update(state, Event::PowerPoll(power_poll_at(at_ticks)));
+        state.screen = Screen::Settings {
+            selected: SETTINGS_BLE_PAIRING_ROW,
+        };
+        let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
+    }
+
+    #[test]
+    fn ble_pairing_times_out_on_monotonic_ticks_not_the_wall_clock() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        enter_ble_pairing(&mut state, 0);
         assert!(matches!(state.screen, Screen::BlePairing(_)));
-        assert!(!batches
+
+        let before = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(BLE_PAIRING_TIMEOUT_MS - 1)),
+        );
+        assert!(matches!(state.screen, Screen::BlePairing(_)));
+        assert!(!before
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StopBlePairing)));
 
-        let batches = update(&mut state, Event::Tick(dt(8, 1)));
+        let after = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(BLE_PAIRING_TIMEOUT_MS)),
+        );
         assert_eq!(
             state.screen,
             Screen::Settings {
                 selected: SETTINGS_BLE_PAIRING_ROW,
             }
         );
-        assert!(batches
+        assert!(after
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StopBlePairing)));
         assert!(
-            batches
+            after
                 .iter()
                 .flat_map(|b| &b.effects)
                 .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
             "timeout exits must render the restored Settings surface"
+        );
+    }
+
+    #[test]
+    fn timezone_change_during_pairing_does_not_shift_the_timeout() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        enter_ble_pairing(&mut state, 1_000);
+
+        let requested = update(
+            &mut state,
+            Event::BleCommand(ControlRequest::SetTimezone { offset_minutes: 60 }),
+        );
+        let time_op = requested
+            .iter()
+            .find(|b| {
+                b.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::WriteRtcTime(_)))
+            })
+            .map(|b| b.operation_id)
+            .expect("SetTimezone must stage an RTC write");
+
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: time_op,
+                render_generation: None,
+                output: EffectOutput::RtcTimeWritten(dt(9, 0)),
+            }),
+        );
+        let ticked = update(&mut state, Event::Tick(dt(9, 0)));
+
+        assert_eq!(
+            state.clock.now,
+            Some(dt(9, 0)),
+            "the timezone jump must have moved the wall clock"
+        );
+        assert!(
+            matches!(state.screen, Screen::BlePairing(_)),
+            "an hour of wall-clock movement must not end a 120 s pairing window"
+        );
+        assert!(!ticked
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopBlePairing)));
+
+        let _ = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(1_000 + BLE_PAIRING_TIMEOUT_MS - 1)),
+        );
+        assert!(
+            matches!(state.screen, Screen::BlePairing(_)),
+            "the window is measured from ticks, not from the shifted wall clock"
         );
     }
 
@@ -8991,6 +9155,98 @@ mod tests {
     }
 
     #[test]
+    fn clear_alarms_while_ringing_silences_tone_and_restores_screen() {
+        let mut state = AppState {
+            screen: Screen::AlarmList { selected: 0 },
+            ..Default::default()
+        };
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let _ = update(
+            &mut state,
+            Event::RtcAlarmSnapshotReady(RtcAlarmSnapshot {
+                now: dt(9, 0),
+                alarm_flag: true,
+                alarm_interrupt_enabled: true,
+            }),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(matches!(
+            state.alarm_runtime,
+            AlarmRuntimeState::Firing { .. }
+        ));
+
+        let batches = update(&mut state, Event::UsbCommand(ControlRequest::ClearAlarms));
+
+        assert!(
+            batches
+                .iter()
+                .any(|b| b.effects.contains(&Effect::StopTone)),
+            "clearing alarms mid-ring must silence the tone"
+        );
+        assert_eq!(
+            state.screen,
+            Screen::AlarmList { selected: 0 },
+            "clearing alarms mid-ring must leave the blocked ringing page"
+        );
+        assert!(state.alarms.alarms.is_empty());
+        assert_eq!(state.alarm_runtime, AlarmRuntimeState::Disarmed);
+    }
+
+    #[test]
+    fn clear_alarms_while_ringing_leaves_no_dead_end_for_buttons() {
+        let mut state = AppState::default();
+        state.alarms.alarms = vec![alarm(1, 9, 0)];
+        let _ = update(
+            &mut state,
+            Event::RtcAlarmSnapshotReady(RtcAlarmSnapshot {
+                now: dt(9, 0),
+                alarm_flag: true,
+                alarm_interrupt_enabled: true,
+            }),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::ClearAlarms));
+
+        for button in [
+            ButtonEvent::Pressed(ButtonId::Enter),
+            ButtonEvent::Pressed(ButtonId::Up),
+            ButtonEvent::LongPressed(ButtonId::Down),
+        ] {
+            let mut probe = state.clone();
+            let _ = update(&mut probe, Event::Button(button));
+            assert_ne!(
+                probe.screen,
+                Screen::AlarmRinging,
+                "{button:?} must not strand the device on the ringing page"
+            );
+        }
+    }
+
+    #[test]
+    fn any_button_escapes_a_stranded_alarm_ringing_page() {
+        let mut state = AppState {
+            screen_before_ring: Screen::TodoList { selected: 0 },
+            screen: Screen::AlarmRinging,
+            alarm_runtime: AlarmRuntimeState::Disarmed,
+            ..Default::default()
+        };
+
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+
+        assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+        assert!(
+            batches
+                .iter()
+                .any(|b| b.effects.contains(&Effect::StopTone)),
+            "escaping a stranded ringing page must silence the tone"
+        );
+    }
+
+    #[test]
     fn clear_alarms_rtc_failure_replies_error_and_releases_slot() {
         let mut state = AppState::default();
         state.alarms.alarms = vec![alarm(1, 9, 0)];
@@ -9066,13 +9322,18 @@ mod tests {
     }
 
     #[test]
-    fn firing_alarm_tick_before_deadline_keeps_ringing() {
+    fn firing_alarm_wall_clock_jump_does_not_silence_the_ring() {
         let mut state = AppState::default();
         let snapshot = boot_snapshot(vec![alarm(1, 9, 0)], Some(dt(9, 0)), true, true);
         let _ = update(&mut state, Event::Boot(snapshot));
         assert_eq!(state.screen, Screen::AlarmRinging);
-        let batches = update(&mut state, Event::Tick(dt(9, 1)));
-        assert_eq!(state.screen, Screen::AlarmRinging);
+
+        let batches = update(&mut state, Event::Tick(dt(20, 0)));
+        assert_eq!(
+            state.screen,
+            Screen::AlarmRinging,
+            "an 11-hour wall-clock jump must not cut the 5-minute ring window short"
+        );
         assert!(!batches
             .iter()
             .flat_map(|b| &b.effects)
@@ -9090,7 +9351,20 @@ mod tests {
             AlarmRuntimeState::Firing { .. }
         ));
 
-        let batches = update(&mut state, Event::Tick(dt(9, 6)));
+        let before = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(RING_AUTO_SILENCE_MS - 1)),
+        );
+        assert_eq!(state.screen, Screen::AlarmRinging);
+        assert!(!before
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopTone)));
+
+        let batches = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(RING_AUTO_SILENCE_MS)),
+        );
         assert_eq!(state.screen, Screen::Home);
         assert!(matches!(
             state.alarm_runtime,
@@ -9507,7 +9781,7 @@ mod tests {
     }
 
     #[test]
-    fn reminder_deadline_tick_dismisses() {
+    fn reminder_deadline_dismisses_on_the_monotonic_clock() {
         let mut state = AppState::default();
         let _ = update(
             &mut state,
@@ -9524,9 +9798,51 @@ mod tests {
         );
         assert!(matches!(state.screen, Screen::Reminder(_)));
 
-        let batches = update(&mut state, Event::Tick(dt(8, 3)));
+        let before = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(REMINDER_TIMEOUT_MS - 1)),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+        assert!(!before
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopTone)));
+
+        let batches = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(REMINDER_TIMEOUT_MS)),
+        );
         assert_eq!(state.screen, Screen::Home);
         assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StopTone)));
+    }
+
+    #[test]
+    fn reminder_wall_clock_jump_does_not_dismiss_it() {
+        let mut state = AppState::default();
+        let _ = update(
+            &mut state,
+            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
+        );
+        let _ = update(
+            &mut state,
+            Event::ReminderDue(ReminderPayload {
+                kind: ReminderKind::Todo,
+                lines: vec!["due".into()],
+                urgent_read_ids: vec![],
+                todo_date: None,
+            }),
+        );
+        assert!(matches!(state.screen, Screen::Reminder(_)));
+
+        let batches = update(&mut state, Event::Tick(dt(20, 0)));
+        assert!(
+            matches!(state.screen, Screen::Reminder(_)),
+            "a 12-hour wall-clock jump must not cut the 120 s reminder short"
+        );
+        assert!(!batches
             .iter()
             .flat_map(|b| &b.effects)
             .any(|e| matches!(e, Effect::StopTone)));

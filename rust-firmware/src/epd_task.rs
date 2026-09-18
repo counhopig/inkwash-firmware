@@ -258,6 +258,7 @@ fn run(
     notify_rx: Receiver<()>,
     completions: Arc<CompletionMailbox>,
 ) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_EPD);
     let mut scratch: Vec<u8> = Vec::with_capacity(canvas::WIDTH * canvas::HEIGHT / 8);
     loop {
         while let Some(cmd) = slot.pending.lock().take() {
@@ -361,33 +362,4 @@ fn check_epd(operation: &str, result: i32) -> Result<()> {
         bail!("{operation} failed with ESP-IDF error 0x{result:04x}");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn completion(request_id: u64) -> EpdCompletion {
-        EpdCompletion {
-            kind: RefreshKind::Full,
-            request_id,
-            ok: true,
-            recovered: false,
-            superseded: false,
-        }
-    }
-
-    #[test]
-    fn completion_mailbox_is_bounded_and_reservation_is_lossless() {
-        let mailbox = CompletionMailbox::new();
-        for request_id in 0..COMPLETION_CAPACITY as u64 {
-            assert!(mailbox.reserve());
-            mailbox.complete_reserved(completion(request_id));
-        }
-        assert!(!mailbox.reserve());
-        assert_eq!(mailbox.try_recv().unwrap().request_id, 0);
-        assert!(mailbox.reserve());
-        mailbox.complete_reserved(completion(99));
-        assert_eq!(mailbox.try_recv().unwrap().request_id, 1);
-    }
 }

@@ -6,10 +6,13 @@ ESP32-S3 notebook. Firmware written in Rust (esp-idf), with a companion
 server and PC tool in sibling repos.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Target-Zectrix%20Note%204-black.svg)](docs/development-guide.md)
+[![Platform](https://img.shields.io/badge/Target-Zectrix%20Note%204-black.svg)](docs/README.md)
 [![Lang](https://img.shields.io/badge/Rust-1.96%20(esp)-orange.svg)](rust-firmware/rust-toolchain.toml)
 
-![Home](docs/screenshots/home.png)
+> The original `docs/development-guide.md` and `docs/screenshots/` were removed
+> in commit `b30c3af`. The rebuilt [`docs/`](docs/README.md) set documents the
+> architecture and the source review; board reference and flashing details live
+> in [`docs/verification.md`](docs/verification.md).
 
 ## Current release
 
@@ -36,7 +39,7 @@ structured JSON over Wi-Fi — the device is not an image-serving thin client.
 - **Config** — Wi-Fi / server / timezone pushed over USB serial or BLE by
   the desktop tool; no on-device text input.
 
-![Calendar](docs/screenshots/calendar.png) ![Week view](docs/screenshots/week-view.png) ![Inbox](docs/screenshots/inbox.png)
+> Screenshots were removed with the original doc set (`b30c3af`).
 
 ## Architecture
 
@@ -65,11 +68,11 @@ flowchart LR
 This repo is **only for the black-and-white Zectrix Note 4**
 (ESP32-S3-WROOM-1 N16R8, 4.2″ 400×300 SSD2683 EPD). The Note 4 and the
 Note 4C have different displays and firmware — **do not flash one onto
-the other**. Full board details in [`docs/development-guide.md`](docs/development-guide.md) (§3 Board Reference).
+the other**. Hardware and RAM budget details in [`docs/hardware-assessment.md`](docs/hardware-assessment.md).
 
 ## Quick start
 
-Requires an ESP-IDF toolchain (see [`docs/development-guide.md`](docs/development-guide.md)).
+Requires an ESP-IDF toolchain (see [`docs/verification.md`](docs/verification.md) §4).
 
 ```bash
 cd rust-firmware
@@ -85,7 +88,7 @@ espflash flash --port /dev/tty.usbmodem1101 \
 > **Red lines** (flashing the wrong thing = brick): DIO flash mode only
 > (never QIO), never mix Note 4 / Note 4C images, never `esp_wifi_stop()`
 > or `esp_restart()` — restart via the deep-sleep path. See
-> [`docs/development-guide.md`](docs/development-guide.md).
+> [`docs/verification.md`](docs/verification.md) §4.
 
 ## Feature highlights
 

@@ -4,7 +4,7 @@ use esp_idf_svc::sys::TickType_t;
 use crate::board::SharedI2c;
 
 pub use inkwash_logic::alarm_regs::AlarmRegs;
-pub use inkwash_logic::datetime::{is_leap, DateTime};
+pub use inkwash_logic::datetime::DateTime;
 
 pub const PCF8563_ADDR: u8 = 0x51;
 const I2C_TIMEOUT_TICKS: TickType_t = 100;

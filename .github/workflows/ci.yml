@@ -31,3 +31,22 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  firmware-format:
+    name: inkwash-note4 (format)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-firmware
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # rust-toolchain.toml pins espup's `esp` toolchain, which CI does not
+      # install; +stable overrides it for rustfmt only, and needs no ESP-IDF.
+      - name: Format check
+        run: cargo +stable fmt --check

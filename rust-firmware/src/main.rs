@@ -14,6 +14,7 @@ mod epd_task;
 mod font5x7;
 mod font8x16;
 mod font_cjk;
+mod heap_probe;
 mod home;
 mod icons;
 mod inbox;
@@ -86,6 +87,27 @@ fn main() -> Result<()> {
         "Inkwash NOTE4 Rust bring-up starting (git {})",
         env!("GIT_REV")
     );
+    #[cfg(all(feature = "p06_diag", not(feature = "p06_validate")))]
+    unsafe {
+        unsafe extern "C" {
+            fn p06_arm();
+        }
+        p06_arm();
+        log::warn!("p06 diag: recorder armed only (no artificial trigger)");
+    }
+    #[cfg(feature = "p06_validate")]
+    unsafe {
+        unsafe extern "C" {
+            fn p06_arm();
+            fn p06_v2_trigger();
+            fn p06_v3_trigger2();
+        }
+        p06_arm();
+        log::warn!("p06 validation: recorder armed; triggering V2 fault now");
+        p06_v2_trigger();
+        p06_v3_trigger2(); /* V3：首录 DONE 之后的第二次故障（仅一次） */
+    }
+    heap_probe::register_current_task(heap_probe::SLOT_MAIN);
     if let Err(err) = watchdog::subscribe() {
         log::warn!("Task watchdog subscribe failed: {err}");
     }
@@ -394,6 +416,7 @@ fn main() -> Result<()> {
     let power_ticks_origin = Instant::now();
     let mut last_activity = Instant::now();
     let mut status_last = Instant::now();
+    let mut stack_last = Instant::now();
     let mut clock_last = Instant::now();
     let mut usb_host_was_connected = false;
 
@@ -421,6 +444,10 @@ fn main() -> Result<()> {
         }
         let now = Instant::now();
 
+        if now.duration_since(stack_last) >= Duration::from_secs(10) {
+            stack_last = now;
+            heap_probe::log_registered_stacks("periodic");
+        }
         if now.duration_since(status_last) >= Duration::from_secs(1) {
             status_last = now;
             if let Err(err) = report_power_state(ctx.board) {
@@ -1073,9 +1100,11 @@ fn run_safe_mode(
         crate::ui::header(&mut canvas, "SAFE MODE");
         canvas.draw_text_prop(8, 60, 1, "CORE DATA UNAVAILABLE");
 
-        let (r1, r2) = if reason.len() > 40 {
-            let (head, rest) = reason.split_at(40);
-            (head.to_string(), rest.chars().take(40).collect::<String>())
+        let (r1, r2) = if reason.chars().count() > 40 {
+            let mut chars = reason.chars();
+            let head: String = chars.by_ref().take(40).collect();
+            let tail: String = chars.take(40).collect();
+            (head, tail)
         } else {
             (reason.to_string(), String::new())
         };
@@ -1468,6 +1497,12 @@ pub(crate) fn dispatch_or_retain(
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
 ) -> anyhow::Result<()> {
+    if matches!(
+        event,
+        inkwash_logic::app::Event::UsbCommand(_) | inkwash_logic::app::Event::BleCommand(_)
+    ) {
+        heap_probe::note_control_command();
+    }
     match dispatch_app_runner(runner, event, ctx) {
         Ok(()) => Ok(()),
         Err(error) => match error.downcast::<DispatchSaturated>() {

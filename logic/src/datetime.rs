@@ -95,6 +95,10 @@ pub(crate) fn weekday_from_days(days: i64) -> u8 {
     ((days + 4).rem_euclid(7)) as u8
 }
 
+pub fn weekday_of(year: u16, month: u8, day: u8) -> u8 {
+    weekday_from_days(days_since_epoch(year, month, day))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +196,41 @@ mod tests {
         let near_epoch = DateTime::from_unix(30);
         let shifted = near_epoch.shifted_minutes(-10);
         assert_eq!(shifted.to_unix(), 0);
+    }
+
+    #[test]
+    fn weekday_of_matches_zeller_for_the_anchors() {
+        for &(year, month, day) in &[
+            (1970u16, 1u8, 1u8),
+            (2000, 1, 1),
+            (2024, 1, 1),
+            (2026, 8, 22),
+        ] {
+            assert_eq!(
+                weekday_of(year, month, day),
+                zeller_weekday(year as i64, month as i64, day as i64),
+                "{year}-{month}-{day}"
+            );
+        }
+    }
+
+    #[test]
+    fn weekday_of_tolerates_out_of_range_months() {
+        for month in [0u8, 13, 25, u8::MAX] {
+            assert!(
+                weekday_of(2026, month, 15) < 7,
+                "weekday must stay in 0..=6 for month {month}"
+            );
+        }
+    }
+
+    #[test]
+    fn days_in_month_tolerates_out_of_range_months() {
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(2026, 1), 31);
+        for month in [0u8, 13, 25, u8::MAX] {
+            assert!(days_in_month(2026, month) >= 28);
+        }
     }
 }

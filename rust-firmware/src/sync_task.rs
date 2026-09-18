@@ -124,6 +124,7 @@ impl SyncTask {
 }
 
 fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<SyncCommand>) {
+    crate::heap_probe::register_current_task(crate::heap_probe::SLOT_SYNC);
     let watchdog_subscribed = match crate::watchdog::subscribe() {
         Ok(()) => true,
         Err(err) => {
