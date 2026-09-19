@@ -31,7 +31,8 @@ def extract_layout():
 def build_offsets():
     body = extract_layout()
     fields = ["state", "core", "cause", "seq", "f_pc", "f_ps", "f_a0", "f_a1",
-              "f_exccause", "f_excvaddr", "frame_ptr", "prev_handler", "live_ps"]
+              "f_exccause", "f_excvaddr", "frame_ptr", "prev_handler", "live_ps",
+              "panic_abort_details"]
     lines = ["#include <stdio.h>", "#include <stddef.h>", body, "int main(void){"]
     lines.append('  printf("frame.size %zu\\n", sizeof(p06_frame_t));')
     lines.append('  printf("rec.size %zu\\n", sizeof(p06_rec_t));')
@@ -77,6 +78,7 @@ def decode(region, off, nonce):
             "f_pc": u(r + off["rec.f_pc"]), "f_excvaddr": u(r + off["rec.f_excvaddr"]),
             "f_exccause": u(r + off["rec.f_exccause"]),
             "prev_handler": u(r + off["rec.prev_handler"]),
+            "panic_abort_details": u(r + off["rec.panic_abort_details"]),
         }
         if st == ST_CLAIMED:
             return "INCOMPLETE", rec
@@ -163,11 +165,12 @@ def main():
         return 0
     EXPECT["excvaddr"] = int(a.vaddr, 0)
     EXPECT["cause"] = int(a.cause, 0)
-    pc = elf_trigger_pc(a.elf)
-    print("从最终 ELF 提取的期望 PC = 0x%08X（%s）" % (pc, a.elf))
     if a.selftest:
-        return selftest(off, pc)
+        return selftest(off, 0x42123456)
     if a.dump:
+        pc = elf_trigger_pc(a.elf)
+        print("从最终 ELF 提取的期望 PC = 0x%08X（%s）" % (pc, a.elf))
+        EXPECT["pc"] = pc
         raw = pathlib.Path(a.dump).read_bytes()
         n = int(a.nonce, 0) if a.nonce else struct.unpack_from("<I", raw, 4)[0]
         v, d = decode(raw, off, n)

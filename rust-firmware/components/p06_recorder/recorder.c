@@ -15,6 +15,10 @@
 #define P06_IRAM __attribute__((section(".iram1")))
 #define P06_NOINIT __attribute__((section(".rtc_noinit")))
 
+#include "esp_ipc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 /* 与本轮 ELF 核对的 XtExcFrame 布局一致（窗口 ABI；XCHAL_HAVE_LOOPS 开；SWPRI/OVLY 关）*/
 /* P06_LAYOUT_BEGIN （纯注释标记：供主机侧解码器提取布局，不改变代码生成） */
 typedef struct {
@@ -60,6 +64,7 @@ typedef struct {
     unsigned int prev_handler;
     /* —— 记录时刻的特殊寄存器（**不是**首次异常状态，独立标注）—— */
     unsigned int live_ps, live_epc1, live_exccause, live_excvaddr;
+    unsigned int panic_abort_details;
 } p06_rec_t;
 
 typedef struct {
@@ -77,7 +82,11 @@ unsigned int g_p06_nonce;
 unsigned int g_p06_state[P06_SLOTS];
 unsigned int g_p06_seq[2];
 unsigned int g_p06_missed[2];            /* 本启动周期的 nonce（DRAM 副本） */
-void *g_p06_prev[P06_CAUSES];        /* 实际旧 handler（不硬编码默认值） */
+void *g_p06_prev[2][P06_CAUSES];     /* 每核的实际旧 handler */
+unsigned int g_p06_install_mask;
+unsigned int g_p06_verify_mask;
+unsigned int g_p06_verify_fail[2];
+extern const char *g_panic_abort_details;
 
 static __attribute__((always_inline)) inline P06_IRAM int
 p06_cas(volatile unsigned int *p, unsigned int expect, unsigned int want)
@@ -123,15 +132,16 @@ static __attribute__((always_inline)) inline P06_IRAM void p06_fill(p06_rec_t *r
     r->prev_handler = (unsigned int)(unsigned long)prev;
     r->live_ps = p06_live_ps(); r->live_epc1 = p06_live_epc1();
     r->live_exccause = p06_live_exccause(); r->live_excvaddr = p06_live_excvaddr();
+    r->panic_abort_details = (unsigned int)(unsigned long)g_panic_abort_details;
 }
 
 /* 记录路径：CAS + 存储，无 call、无 flash 访问、不写任何特殊寄存器 */
 extern void xt_unhandled_exception(p06_frame_t *frame);   /* 表内默认项 */
 
 #define P06_BODY(N)                                                              \
-    void *prev = g_p06_prev[N];                                                  \
     unsigned int core = p06_core();                                              \
     unsigned int ci = (core < 2u) ? core : 1u;                                   \
+    void *prev = g_p06_prev[ci][N];                                              \
     if (g_p06.magic != P06_MAGIC || g_p06.nonce != g_p06_nonce) {                \
         g_p06_missed[ci]++;                                                      \
     } else {                                                                     \
@@ -180,7 +190,6 @@ P06_IRAM void p06_boot_init(unsigned int nonce)
 
 /* ===================== 组件集成部分（相对 V1 产物新增） ===================== */
 typedef void (*p06_exc_handler_t)(p06_frame_t *);
-extern p06_exc_handler_t xt_set_exception_handler(int n, p06_exc_handler_t f);
 
 static p06_exc_handler_t const p06_handlers[P06_CAUSES] = {
     p06_h0,  p06_h1,  p06_h2,  p06_h3,  p06_h4,  p06_h5,  p06_h6,  p06_h7,
@@ -197,11 +206,27 @@ static P06_IRAM unsigned int p06_make_nonce(void)
     return v | 1u;
 }
 
-P06_IRAM void p06_install(void)
+static void p06_install_on_current_core(void *arg)
 {
+    (void)arg;
+    unsigned int core = p06_core();
+    unsigned int ci = (core < 2u) ? core : 1u;
     for (int c = 0; c < P06_CAUSES; ++c) {
-        g_p06_prev[c] = (void *)xt_set_exception_handler(c, p06_handlers[c]);
+        g_p06_prev[ci][c] =
+            (void *)xt_set_exception_handler(c, (xt_exc_handler)p06_handlers[c]);
     }
+    __sync_synchronize();
+    g_p06_install_mask |= 1u << ci;
+
+    unsigned int failures = 0;
+    for (int c = 0; c < P06_CAUSES; ++c) {
+        xt_exc_handler current =
+            xt_set_exception_handler(c, (xt_exc_handler)p06_handlers[c]);
+        if (current != (xt_exc_handler)p06_handlers[c]) failures |= 1u << c;
+    }
+    g_p06_verify_fail[ci] = failures;
+    __sync_synchronize();
+    g_p06_verify_mask |= 1u << ci;
 }
 
 __attribute__((noinline)) void p06_v2_trigger(void)
@@ -215,6 +240,21 @@ __attribute__((noinline)) void p06_v2_trigger(void)
         ::: "a8", "a9", "memory");
 }
 
+static void p06_v2_trigger_ipc(void *arg)
+{
+    (void)arg;
+    p06_v2_trigger();
+}
+
+void p06_v2_trigger_core1(void)
+{
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    (void)esp_ipc_call_blocking(1, p06_v2_trigger_ipc, 0);
+#else
+    p06_v2_trigger();
+#endif
+}
+
 __attribute__((noinline)) void p06_v3_trigger2(void)
 {
     /* V3 第二次故障：读另一处无效地址（0x10），与第一次(0)不同且可从 ELF 定位。
@@ -226,8 +266,27 @@ __attribute__((noinline)) void p06_v3_trigger2(void)
 }
 
 /* 显式入口：由验证固件在可审计的位置调用（不使用构造器，避免初始化顺序不确定） */
-P06_IRAM void p06_arm(void)
+P06_IRAM unsigned int p06_arm(void)
 {
     p06_boot_init(p06_make_nonce());
-    p06_install();
+    g_p06_install_mask = 0;
+    g_p06_verify_mask = 0;
+    g_p06_verify_fail[0] = 0;
+    g_p06_verify_fail[1] = 0;
+
+    unsigned int current = p06_core();
+    p06_install_on_current_core(0);
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    unsigned int other = current ^ 1u;
+    if (esp_ipc_call_blocking(other, p06_install_on_current_core, 0) != ESP_OK) {
+        return 0;
+    }
+#endif
+    __sync_synchronize();
+    unsigned int expected = (1u << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1u;
+    if (g_p06_install_mask != expected || g_p06_verify_mask != expected ||
+        g_p06_verify_fail[0] != 0 || g_p06_verify_fail[1] != 0) {
+        return 0;
+    }
+    return expected;
 }

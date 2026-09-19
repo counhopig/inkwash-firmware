@@ -41,4 +41,5 @@ bindings_module = "zectrix_epd"
 
 [features]
 p06_validate = []
+p06_validate_core1 = []
 p06_diag = []

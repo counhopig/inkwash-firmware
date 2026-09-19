@@ -87,25 +87,41 @@ fn main() -> Result<()> {
         "Inkwash NOTE4 Rust bring-up starting (git {})",
         env!("GIT_REV")
     );
-    #[cfg(all(feature = "p06_diag", not(feature = "p06_validate")))]
+    #[cfg(all(
+        feature = "p06_diag",
+        not(feature = "p06_validate"),
+        not(feature = "p06_validate_core1")
+    ))]
     unsafe {
         unsafe extern "C" {
-            fn p06_arm();
+            fn p06_arm() -> u32;
         }
-        p06_arm();
-        log::warn!("p06 diag: recorder armed only (no artificial trigger)");
+        let mask = p06_arm();
+        log::warn!("p06 diag: recorder arm mask={mask:#x} (no artificial trigger)");
     }
     #[cfg(feature = "p06_validate")]
     unsafe {
         unsafe extern "C" {
-            fn p06_arm();
+            fn p06_arm() -> u32;
             fn p06_v2_trigger();
             fn p06_v3_trigger2();
         }
-        p06_arm();
+        let mask = p06_arm();
+        assert_eq!(mask, 0x3, "p06 recorder did not arm and verify both cores");
         log::warn!("p06 validation: recorder armed; triggering V2 fault now");
         p06_v2_trigger();
         p06_v3_trigger2(); /* V3：首录 DONE 之后的第二次故障（仅一次） */
+    }
+    #[cfg(all(feature = "p06_validate_core1", not(feature = "p06_validate")))]
+    unsafe {
+        unsafe extern "C" {
+            fn p06_arm() -> u32;
+            fn p06_v2_trigger_core1();
+        }
+        let mask = p06_arm();
+        assert_eq!(mask, 0x3, "p06 recorder did not arm and verify both cores");
+        log::warn!("p06 validation: recorder armed; triggering core 1 V2 fault now");
+        p06_v2_trigger_core1();
     }
     heap_probe::register_current_task(heap_probe::SLOT_MAIN);
     if let Err(err) = watchdog::subscribe() {

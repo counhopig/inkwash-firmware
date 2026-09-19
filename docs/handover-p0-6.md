@@ -59,9 +59,10 @@
     CAS 目标在 **DRAM**（避免对 RTC 慢速 RAM 施加原子语义）；
   - **链回真实旧 handler**（`xt_set_exception_handler` 的返回值）；`prev == 0` 时调
     **`xt_unhandled_exception`**（否则会"返回但不处理"⇒ 反复执行同一故障指令 ⇒ WDT）。
-  - **构建门控**：`p06_diag`（只 `p06_arm()`，**无人工触发**）／`p06_validate`（含 V2/V3 触发器）。
-- **覆盖边界（务必先读）**：**只安装 core 0**（`xt_set_exception_handler` 按
-  `cause*portNUM_PROCESSORS + core_id` 索引）；覆盖 **cause 0..31**；
+  - **构建门控**：`p06_diag`（只 `p06_arm()`，**无人工触发**）／`p06_validate`（core 0 V2/V3）／
+    `p06_validate_core1`（core 1 V2）。三种诊断构建都会先在两核安装并复核 handler 表。
+- **覆盖边界（务必先读）**：在 **core 0 和 core 1** 分别安装（`xt_set_exception_handler` 按
+  `cause*portNUM_PROCESSORS + core_id` 索引），旧 handler 也按「核 × cause」保存；覆盖 **cause 0..31**；
   **不覆盖**：表分发**之前**分流的 1(syscall)/5(alloca)/4(level-1 中断)/≥32(coproc)、cause≥32、
   **双重异常**、**建帧/`_xt_context_save`/PS 改写阶段**的再异常。
 - **主机侧验收解码器** `tools/p06_accept.py`（单文件、仅标准库）：布局由宿主 cc 编译真实结构体取得；
@@ -96,23 +97,28 @@
   **不能**覆盖整个历史期间；win3 小 uptime 更可能来自**未清缓冲的陈旧数据**，但**该解释仍缺证据**。
 
 ## 8. 设备与链路当前状态（接手人必读）
-- **设备处于 halted**（最后一次只读采集时 halt；OpenOCD 会话已退出）。
-- **USB-Serial-JTAG 控制台失效**：端口节点在，但静听 0 字节、`system_profiler` 看不到该 USB 设备
-  ⇒ 需**现场重插 USB / 断电重上电**恢复。**切勿把"端口节点存在"当作链路正常。**
-- **外部 RTC（PCF8563）读失败**：使部分 `set_timezone` 返回 error（命令到达率受影响，分析需计入）。
-- 反复的 attach/halt/reset/断点操作**疑似**是控制台失效的诱因（未证实）。
+- 设备运行 `p06_diag`，记录器双核武装掩码为 `0x3`。
+- USB-Serial-JTAG 在 JTAG `reset run` 后已恢复；`get_status` 应答正常。
+- PCF8563 开机读取正常，`vl=false`。
+- USB 节点只能用于定位设备，刷写前仍必须核对 USB 序列号/MAC。
 
-## 9. 下一步（用户已批准的约束，尚未实施）
-1. **双核扩展**（记录器）：
-   - 旧 handler 按 **「核 × cause」** 保存（避免第二核覆盖第一核的链回信息）；
-   - **全局记录区只初始化一次**；
-   - **明确等待两核安装完成**后才开始观测；**分别核对两核异常表**；
-   - 采集清单**加入 `g_panic_abort_details`**（指针 + 字符串）。
-2. **core 1 受控捕获验证**：逐字段比对记录与异常帧（沿用 V2 判据）。
-3. **之后**才恢复控制台 → 核对 RTC 与命令应答正常 → 再恢复压力测试。
-4. 是否推进**更早的向量入口捕获**（以覆盖建帧阶段/双重异常）留待决定。
+## 9. core 1 受控捕获结果（2026-09-19）
+- USB 序列号和芯片自报均确认目标 MAC 为 `20:6E:F1:B4:7D:E4`，ESP32-S3 rev v0.2，16 MB。
+- `p06_validate_core1` 在 core 1 触发 cause 28；记录状态 `DONE`，`f_pc=0x421880D1`，
+  与最终 ELF 的故障指令地址一致，`f_excvaddr=0`。
+- PC、PS、A0–A15、SAR、EXCCAUSE、EXCVADDR、LBEG、LEND、LCOUNT，共 **24/24 个稳定字段**
+  与 `frame_ptr=0x3FCAF610` 指向的异常帧逐字相等。
+- `exit` 不能用 panic 停机后的帧做事后相等判据：记录器入口值为 `0x3FCAF6C0`，
+  默认 panic/coredump 链路随后把帧内值改为 `0xDEADBEEF`。原“25/25 事后相等”判据修正为
+  “24/24 稳定字段相等，`exit` 按时序单独判定”。
+- 记录区 SHA-256：`62eb12a28a7015f7ae46e174c4228db4ae0caa28c45b908306620e0012346fc5`。
+- 异常帧 SHA-256：`0c867546368b6810639d92e16200a4c5ba3167c01bef69f147c49e4cad7c8898`。
 
-## 10. 归档位置与校验
+## 10. 下一步
+1. 恢复压力测试。
+2. 是否推进**更早的向量入口捕获**（以覆盖建帧阶段/双重异常）留待决定。
+
+## 11. 归档位置与校验
 - 仓库内：`logs/hw-forensics/**`（**被 `.gitignore` 忽略**，不会随提交保存）：
   `p0-6-halt/`（保留现场、栈/TCB/链表、解码器证据、OpenOCD 原始输出）、`p0-6-coredump/`、
   `p0-6-first-exception/`、`p0-6-v2/`、`p0-6-v3/`、`p0-6-diag/`、`p0-6-stacks/` 等。
@@ -120,7 +126,7 @@
   `FILELIST.txt` + `MANIFEST.sha256`（逐文件 SHA256，`shasum -c MANIFEST.sha256` 可复核）。
   ⇒ **换机前请一并复制该目录**；`logs/` 不受提交保护。
 
-## 11. 快速上手（命令）
+## 12. 快速上手（命令）
 ```sh
 # 主机测试
 cd logic && cargo test --locked
@@ -129,6 +135,7 @@ cd logic && cargo test --locked
 cargo build --release                          # 默认（记录器组件不启用任何入口）
 cargo build --release --features p06_diag      # 诊断：只装记录器，无人工触发
 cargo build --release --features p06_validate  # 验证：含 V2/V3 人工触发
+cargo build --release --features p06_validate_core1 # 验证：core 1 V2 人工触发
 
 # 刷机（红线：DIO/16mb/80mhz + 指定分区表）
 espflash flash --port /dev/cu.usbmodem1101 --chip esp32s3 --flash-size 16mb \
