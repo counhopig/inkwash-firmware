@@ -56,6 +56,18 @@ pub const TASK_SLOTS: [&str; 9] = [
     "usb-console-writer",
 ];
 
+const TASK_STACK_BYTES: [usize; 9] = [
+    32 * 1024,
+    8 * 1024,
+    12 * 1024,
+    16 * 1024,
+    16 * 1024,
+    16 * 1024,
+    8 * 1024,
+    12 * 1024,
+    8 * 1024,
+];
+
 pub const SLOT_MAIN: usize = 0;
 pub const SLOT_RTC: usize = 1;
 pub const SLOT_EPD: usize = 2;
@@ -84,6 +96,12 @@ pub fn log_registered_stacks(stage: &str) {
         let hwm = unsafe {
             esp_idf_svc::sys::uxTaskGetStackHighWaterMark2(handle as esp_idf_svc::sys::TaskHandle_t)
         };
-        log::info!("STACKPROBE {stage} task={name} hwm_free={hwm} bytes");
+        let stack_start = unsafe {
+            esp_idf_svc::sys::pxTaskGetStackStart(handle as esp_idf_svc::sys::TaskHandle_t) as usize
+        };
+        let stack_end = stack_start.saturating_add(TASK_STACK_BYTES[slot]);
+        log::info!(
+            "STACKPROBE {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
+        );
     }
 }
