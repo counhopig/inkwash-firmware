@@ -13,6 +13,11 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+# Full display snapshots are 15,000 bytes and may queue while the EPD worker
+# is busy. Route allocations above 4 KiB to PSRAM instead of repeatedly
+# consuming and fragmenting the DMA-capable internal heap.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
 
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../partitions.csv"
@@ -36,6 +41,11 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # `CONFIG_FREERTOS_IDLE_TIME_BEFORE_ENTERING_LIGHT_SLEEP` is the pre-5.x
 # name; IDF 5.5 calls it `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`.
 CONFIG_PM_ENABLE=y
+# CPU retention needs a large contiguous internal allocation each time this
+# firmware dynamically enables light sleep. IDF 5.5.5 ignores allocation
+# failure in esp_pm_configure(), so keep automatic light sleep but do not
+# request CPU-domain power-down.
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=200
 CONFIG_NVS_ENABLED=y
@@ -90,8 +100,17 @@ CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
 
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
+# The device only performs short HTTPS synchronizations. Keep Wi-Fi's
+# DMA-capable internal-RAM footprint below the space needed by the display,
+# USB, RTC and worker tasks that are already alive when Wi-Fi starts.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
 CONFIG_HEAP_POISONING_COMPREHENSIVE=y
 
 CONFIG_ESP_COREDUMP_ENABLE_TO_UART=y
 
-CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+# Production devices must recover from a panic or TWDT event instead of
+# remaining permanently unresponsive until a manual power cycle.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y

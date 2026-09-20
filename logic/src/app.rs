@@ -3422,6 +3422,16 @@ fn transition_command(
             )]
         }
         ControlRequest::SetServer { url, token } => {
+            if !valid_server_url(&url) {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "Server URL must be an HTTPS URL without embedded credentials"
+                            .into(),
+                    },
+                )];
+            }
             let cfg_op = state.next_operation_id();
             let clear_op = state.next_operation_id();
             let cfg = DeviceConfig {
@@ -3556,6 +3566,19 @@ fn transition_command(
             ]
         }
     }
+}
+
+fn valid_server_url(url: &str) -> bool {
+    const MAX_SERVER_URL_LEN: usize = 240;
+
+    if url.len() > MAX_SERVER_URL_LEN {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@') && !authority.chars().any(char::is_whitespace)
 }
 
 fn set_pending_reply(
@@ -4450,6 +4473,42 @@ mod tests {
             })
         }));
         assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn set_server_rejects_insecure_or_credentialed_urls_without_persisting() {
+        for url in [
+            "http://sync.example",
+            "https://",
+            "https://user:password@sync.example",
+            "https://sync example",
+        ] {
+            let mut state = AppState::default();
+            let batches = update(
+                &mut state,
+                Event::UsbCommand(ControlRequest::SetServer {
+                    url: url.into(),
+                    token: "secret".into(),
+                }),
+            );
+
+            assert!(state.pending_usb_reply.is_none());
+            assert!(batches
+                .iter()
+                .any(|batch| batch.effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        Effect::Reply {
+                            channel: Channel::Usb,
+                            reply: Reply::Error { .. }
+                        }
+                    )
+                })));
+            assert!(!batches.iter().any(|batch| batch
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistConfig(_)))));
+        }
     }
 
     #[test]

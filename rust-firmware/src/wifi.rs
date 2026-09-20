@@ -25,6 +25,8 @@ pub struct WifiManager {
 
     started: bool,
 
+    driver_init_failed: bool,
+
     suspended_was_started: bool,
 }
 
@@ -35,15 +37,26 @@ impl WifiManager {
             sysloop: sysloop.clone(),
             used: false,
             started: false,
+            driver_init_failed: false,
             suspended_was_started: false,
         })
     }
 
     fn ensure_driver(&mut self) -> Result<&mut EspWifi<'static>> {
         if self.wifi.is_none() {
+            if self.driver_init_failed {
+                return Err(anyhow!(
+                    "Wi-Fi driver initialization already failed this boot; refusing an unsafe retry"
+                ));
+            }
             let modem = unsafe { Peripherals::steal() }.modem;
-            let wifi = EspWifi::new(modem, self.sysloop.clone(), None)
-                .context("failed to create Wi-Fi driver with netif")?;
+            let wifi = match EspWifi::new(modem, self.sysloop.clone(), None) {
+                Ok(wifi) => wifi,
+                Err(err) => {
+                    self.driver_init_failed = true;
+                    return Err(anyhow!("failed to create Wi-Fi driver with netif: {err}"));
+                }
+            };
             self.wifi = Some(wifi);
             log::info!("Wi-Fi driver constructed");
         }
@@ -58,6 +71,14 @@ impl WifiManager {
     }
 
     pub fn connect(&mut self, creds: &WifiCreds) -> Result<()> {
+        let result = self.connect_inner(creds);
+        if result.is_err() {
+            self.disconnect();
+        }
+        result
+    }
+
+    fn connect_inner(&mut self, creds: &WifiCreds) -> Result<()> {
         self.ensure_driver()?;
 
         esp_idf_svc::sys::esp!(unsafe {

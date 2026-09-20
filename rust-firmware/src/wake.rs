@@ -12,6 +12,7 @@ struct WakeCtx {
     gpio: i32,
 }
 
+#[link_section = ".iram1.wake_isr"]
 unsafe extern "C" fn wake_isr(ctx: *mut c_void) {
     let ctx = unsafe { &*(ctx as *const WakeCtx) };
     unsafe {

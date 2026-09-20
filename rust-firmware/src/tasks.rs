@@ -4,7 +4,8 @@ pub fn spawn_internal_stack<F>(name: &str, stack_size: usize, body: F) -> Result
 where
     F: FnOnce() + Send + 'static,
 {
-    let mut cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
+    let default_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
+    let mut cfg = default_cfg;
     cfg.stack_size = stack_size;
     cfg.stack_alloc_caps =
         esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
@@ -17,7 +18,6 @@ where
         .stack_size(stack_size)
         .spawn(body);
 
-    let default_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
     if let Err(err) =
         esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_pthread_set_cfg(&default_cfg) })
     {

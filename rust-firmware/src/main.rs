@@ -399,6 +399,9 @@ fn main() -> Result<()> {
         pending_alarm_status: None,
         pending_alarm_snapshot: None,
         pending_clock_read: None,
+        retired_alarm_status: std::collections::VecDeque::new(),
+        retired_alarm_snapshots: std::collections::VecDeque::new(),
+        retired_clock_reads: std::collections::VecDeque::new(),
         effect_task: &effect_task,
         pending_effect_batch: None,
         pending_effect_batches: std::collections::VecDeque::new(),
@@ -843,10 +846,7 @@ fn main() -> Result<()> {
                     reply.clone(),
                 );
                 if is_time_write && matches!(reply, control::Reply::Ok) {
-                    ctx.pending_alarm_status = None;
-                    ctx.pending_alarm_snapshot = None;
-                    ctx.pending_clock_read = None;
-                    ctx.alarm_poll.observe_alarm_flag(false);
+                    ctx.invalidate_rtc_reads_after_time_write();
                 }
             }
         }
@@ -2141,7 +2141,10 @@ fn collect_sleep_inputs(
         || ctx.pending_ble_reply_latch.is_some();
     let rtc_read_in_flight = ctx.pending_alarm_status.is_some()
         || ctx.pending_alarm_snapshot.is_some()
-        || ctx.pending_clock_read.is_some();
+        || ctx.pending_clock_read.is_some()
+        || !ctx.retired_alarm_status.is_empty()
+        || !ctx.retired_alarm_snapshots.is_empty()
+        || !ctx.retired_clock_reads.is_empty();
     inkwash_logic::power_state::SleepInputs {
         input_pending,
         page_allows_sleep: matches!(state.screen, inkwash_logic::app::Screen::Home)

@@ -958,7 +958,7 @@ impl BleSession {
                         }
                     }
                     Err(err) => {
-                        log::warn!("BLE: failed to parse command '{line}': {err}");
+                        log::warn!("BLE: failed to parse command ({} bytes): {err}", line.len());
                         args.reject();
                     }
                 },

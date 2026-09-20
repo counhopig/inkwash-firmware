@@ -869,6 +869,7 @@ dependencies = [
  "anyhow",
  "embedded-svc",
  "embuild",
+ "enumset",
  "esp-idf-svc",
  "esp32-nimble",
  "heapless 0.9.3",

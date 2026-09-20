@@ -18,33 +18,33 @@ const IDLE_DRAIN: Duration = Duration::from_secs(1);
 
 enum RtcCommand {
     ReadTime {
-        reply: Sender<Result<DateTime>>,
+        reply: SyncSender<Result<DateTime>>,
     },
 
     WriteTime {
         dt: DateTime,
-        reply: Sender<Result<()>>,
+        reply: SyncSender<Result<()>>,
     },
 
     AlarmStatus {
-        reply: Sender<Result<AlarmStatus>>,
+        reply: SyncSender<Result<AlarmStatus>>,
     },
 
     Snapshot {
-        reply: Sender<Result<RtcAlarmSnapshot>>,
+        reply: SyncSender<Result<RtcAlarmSnapshot>>,
     },
 
     Acknowledge {
-        reply: Sender<Result<()>>,
+        reply: SyncSender<Result<()>>,
     },
 
     Disable {
-        reply: Sender<Result<()>>,
+        reply: SyncSender<Result<()>>,
     },
 
     Program {
         regs: AlarmRegs,
-        reply: Sender<Result<()>>,
+        reply: SyncSender<Result<()>>,
     },
 }
 
@@ -74,19 +74,19 @@ impl RtcExecutor {
     }
 
     pub fn read_time(&self) -> Result<DateTime> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::ReadTime { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn request_read_time(&self) -> Result<Receiver<Result<DateTime>>> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::ReadTime { reply: reply_tx })?;
         Ok(reply_rx)
     }
 
     pub fn write_time(&self, dt: &DateTime) -> Result<()> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::WriteTime {
             dt: *dt,
             reply: reply_tx,
@@ -95,44 +95,44 @@ impl RtcExecutor {
     }
 
     pub fn alarm_status(&self) -> Result<AlarmStatus> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::AlarmStatus { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn request_alarm_status(&self) -> Result<Receiver<Result<AlarmStatus>>> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::AlarmStatus { reply: reply_tx })?;
         Ok(reply_rx)
     }
 
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Result<RtcAlarmSnapshot> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::Snapshot { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn request_snapshot(&self) -> Result<Receiver<Result<RtcAlarmSnapshot>>> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::Snapshot { reply: reply_tx })?;
         Ok(reply_rx)
     }
 
     pub fn acknowledge(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::Acknowledge { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn disable(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::Disable { reply: reply_tx })?;
         reply_rx.recv()?
     }
 
     pub fn program(&self, regs: &AlarmRegs) -> Result<()> {
-        let (reply_tx, reply_rx) = channel();
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.try_send(RtcCommand::Program {
             regs: *regs,
             reply: reply_tx,

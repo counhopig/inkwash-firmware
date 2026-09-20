@@ -23,6 +23,7 @@ esp-idf-hal = { path = "../vendor/esp-idf-hal" }
 anyhow = "1"
 inkwash-logic = { path = "../logic" }
 embedded-svc = "0.29"
+enumset = "1"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section"] }
 esp32-nimble = "0.12"
 heapless = "0.9"

@@ -304,14 +304,14 @@ struct zectrix_epd_t {
     esp_err_t SetTemperatureForOtp() {
         esp_err_t err = SendCommand(0x40);
         if (err == ESP_OK) err = WaitBusy("temperature read");
+        // The panel shares one data pin for write and temperature read. The
+        // ESP-IDF SPI master cannot change that pin direction in place, and
+        // tearing down and recreating the whole bus for every full refresh is
+        // unsafe: spi_bus_free() can race the driver's device bookkeeping and
+        // assert in spi_bus_deinit_lock. Use the controller's documented
+        // room-temperature fallback instead; all subsequent transfers keep
+        // the single, long-lived TX bus instance.
         uint8_t temperature = 25;
-        if (err == ESP_OK && owns_bus) {
-            err = ReadData(&temperature);
-        }
-        if (err == ESP_ERR_NOT_SUPPORTED) {
-            temperature = 25;
-            err = ESP_OK;
-        }
         uint8_t encoded = 244;
         if (temperature <= 5) encoded = 232;
         else if (temperature <= 10) encoded = 235;

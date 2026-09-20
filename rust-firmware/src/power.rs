@@ -95,7 +95,7 @@ pub fn wake_cause() -> WakeCause {
 pub fn configure_light_sleep() -> Result<()> {
     prepare_light_sleep_wakeups()?;
     set_light_sleep_enabled(true)?;
-    log::info!("Light sleep armed: keys GPIO0/18/39 wake");
+    log::info!("Automatic light sleep requested; GPIO0/18/39 wake sources configured");
     Ok(())
 }
 

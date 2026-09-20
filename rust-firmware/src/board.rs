@@ -169,6 +169,9 @@ impl Note4Board {
         let key_up = Button::new(pins.gpio39.into(), Pull::Up, crate::button::ButtonId::Up)?;
         let key_down = Button::new(pins.gpio18.into(), Pull::Up, crate::button::ButtonId::Down)?;
 
+        esp_idf_svc::hal::gpio::init_isr_alloc_flags(enumset::enum_set!(
+            esp_idf_svc::hal::interrupt::InterruptType::Iram
+        ));
         let wake = crate::wake::Waker::new(&crate::power::WAKE_PINS);
         wake.subscribe(crate::power::GPIO_NUM_0)?;
         wake.subscribe(crate::power::GPIO_NUM_39)?;

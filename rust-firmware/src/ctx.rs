@@ -283,6 +283,10 @@ pub struct DeviceContext<'a> {
     pub pending_alarm_snapshot:
         Option<Receiver<anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot>>>,
     pub pending_clock_read: Option<Receiver<anyhow::Result<DateTime>>>,
+    pub retired_alarm_status: VecDeque<Receiver<anyhow::Result<crate::rtc_executor::AlarmStatus>>>,
+    pub retired_alarm_snapshots:
+        VecDeque<Receiver<anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot>>>,
+    pub retired_clock_reads: VecDeque<Receiver<anyhow::Result<DateTime>>>,
     pub effect_task: &'a crate::effect_task::EffectTask,
     pub pending_effect_batch: Option<inkwash_logic::app::EffectBatch>,
 
@@ -631,16 +635,14 @@ impl DeviceContext<'_> {
             }
         }
         if is_time_write && matches!(reply, Some(Reply::Ok)) {
-            self.pending_alarm_status = None;
-            self.pending_alarm_snapshot = None;
-            self.pending_clock_read = None;
-            self.alarm_poll.observe_alarm_flag(false);
+            self.invalidate_rtc_reads_after_time_write();
         }
         let changed = matches!(reply, Some(Reply::Ok));
         Ok((changes_visible_state && changed, true))
     }
 
     pub fn poll_alarm_snapshot(&mut self) -> anyhow::Result<bool> {
+        self.drain_retired_rtc_reads();
         if !self.app_runner_enabled {
             return Ok(false);
         }
@@ -700,6 +702,25 @@ impl DeviceContext<'_> {
         let firing = false;
 
         Ok(firing)
+    }
+
+    pub fn invalidate_rtc_reads_after_time_write(&mut self) {
+        if let Some(reply) = self.pending_alarm_status.take() {
+            self.retired_alarm_status.push_back(reply);
+        }
+        if let Some(reply) = self.pending_alarm_snapshot.take() {
+            self.retired_alarm_snapshots.push_back(reply);
+        }
+        if let Some(reply) = self.pending_clock_read.take() {
+            self.retired_clock_reads.push_back(reply);
+        }
+        self.alarm_poll.observe_alarm_flag(false);
+    }
+
+    pub fn drain_retired_rtc_reads(&mut self) {
+        drain_retired_replies(&mut self.retired_alarm_status);
+        drain_retired_replies(&mut self.retired_alarm_snapshots);
+        drain_retired_replies(&mut self.retired_clock_reads);
     }
 
     pub fn settle_sleep_reads(&mut self, timeout: Duration) {
@@ -1056,5 +1077,17 @@ impl DeviceContext<'_> {
             inkwash_logic::app::Event::SetWifiVerified(result),
             self,
         )
+    }
+}
+
+fn drain_retired_replies<T>(replies: &mut VecDeque<Receiver<anyhow::Result<T>>>) {
+    let pending = replies.len();
+    for _ in 0..pending {
+        let Some(reply) = replies.pop_front() else {
+            break;
+        };
+        if matches!(reply.try_recv(), Err(TryRecvError::Empty)) {
+            replies.push_back(reply);
+        }
     }
 }
