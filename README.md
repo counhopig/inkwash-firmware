@@ -81,6 +81,7 @@ cargo build --release          # or ./scripts/build-rust.sh --release
 espflash flash --port /dev/tty.usbmodem1101 \
   --chip esp32s3 --flash-size 16mb \
   --flash-mode dio --flash-freq 80mhz \
+  --bootloader target/xtensa-esp32s3-espidf/release/bootloader.bin \
   --partition-table partitions.csv \
   --non-interactive target/xtensa-esp32s3-espidf/release/inkwash-note4
 ```

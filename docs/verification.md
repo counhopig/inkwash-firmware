@@ -254,6 +254,7 @@ firmware-format:              # 第四轮新增
 
 ```bash
 espflash flash --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
+  --bootloader rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin \
   --partition-table rust-firmware/partitions.csv --non-interactive inkwash-note4
 ```
 

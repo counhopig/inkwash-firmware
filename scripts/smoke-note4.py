@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+from pathlib import Path
 import re
 import sys
 import time
@@ -19,6 +20,7 @@ def parse_args():
     parser.add_argument("--soak", type=float, default=60.0)
     parser.add_argument("--stress", type=int, default=20)
     parser.add_argument("--reply-timeout", type=float, default=20.0)
+    parser.add_argument("--log-file", help="write the complete raw serial log to this path")
     return parser.parse_args()
 
 
@@ -86,7 +88,11 @@ def main():
     results = []
     link = Link(args.port, args.baud)
     try:
-        status, _ = link.request({"cmd": "get_status", "id": "smoke-status"}, 8)
+        status = None
+        ready_deadline = time.monotonic() + 30
+        while not status and time.monotonic() < ready_deadline:
+            status, _ = link.request(
+                {"cmd": "get_status", "id": "smoke-status"}, 3)
         if not status:
             print("FAIL  get_status: no reply")
             return 1
@@ -135,6 +141,9 @@ def main():
         link.close()
 
     lines = link.log
+    if args.log_file:
+        Path(args.log_file).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("serial log:", args.log_file)
     trouble = [l for l in lines for pat in TROUBLE if pat.lower() in l.lower()]
     results.append(("no panic / watchdog / reset during soak", not trouble))
     for line in trouble[:5]:
