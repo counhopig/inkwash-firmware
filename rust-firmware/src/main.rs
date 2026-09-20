@@ -334,7 +334,8 @@ fn main() -> Result<()> {
         }
     };
 
-    let boot_result = collect_boot_snapshot(boot_core, &counters, &todo_store, &inbox_store, clock);
+    let boot_result =
+        collect_boot_snapshot(boot_core, &counters, &todo_store, &inbox_store, clock)?;
     let scheduler_config = inkwash_logic::app::SyncSchedulerConfig {
         now_unix: clock.map(|now| now.to_unix()).unwrap_or(0),
         interval_minutes: counters.sync_interval_minutes().unwrap_or(60),
@@ -1309,30 +1310,29 @@ fn collect_boot_snapshot(
     todo_store: &TodoStore,
     inbox_store: &InboxStore,
     clock: Option<DateTime>,
-) -> BootSnapshotResult {
-    let todos = todo_store.load().unwrap_or_else(|err| {
-        log::warn!("Todo NVS load failed (using empty list): {err}");
-        Vec::new()
-    });
-    let inbox = inbox_store.load().unwrap_or_else(|err| {
-        log::warn!("Inbox NVS load failed (using empty list): {err}");
-        Vec::new()
-    });
-    let config = counters.device_config().ok().flatten().unwrap_or_else(|| {
-        inkwash_logic::device_config::DeviceConfig {
-            server_url: String::new(),
-            auth_token: String::new(),
-        }
-    });
+) -> anyhow::Result<BootSnapshotResult> {
+    let todos = todo_store
+        .load()
+        .map_err(|err| anyhow::anyhow!("Todo NVS load failed: {err}"))?;
+    let inbox = inbox_store
+        .load()
+        .map_err(|err| anyhow::anyhow!("Inbox NVS load failed: {err}"))?;
+    let config =
+        counters
+            .device_config()?
+            .unwrap_or_else(|| inkwash_logic::device_config::DeviceConfig {
+                server_url: String::new(),
+                auth_token: String::new(),
+            });
     let wake_cause = power::wake_cause();
 
-    let wifi = counters.wifi_creds().ok().flatten();
+    let wifi = counters.wifi_creds()?;
     let status = inkwash_logic::app::DeviceStatus {
         wifi_ssid: wifi.as_ref().map(|creds| creds.ssid.clone()),
         wifi_has_password: wifi.is_some_and(|creds| !creds.password.is_empty()),
-        timezone_offset_minutes: counters.timezone_offset_minutes().unwrap_or(0),
+        timezone_offset_minutes: counters.timezone_offset_minutes()?,
     };
-    BootSnapshotResult {
+    Ok(BootSnapshotResult {
         snapshot: inkwash_logic::app::BootSnapshot {
             wake_cause,
             now: clock,
@@ -1344,7 +1344,7 @@ fn collect_boot_snapshot(
             config,
             status,
         },
-    }
+    })
 }
 
 fn poll_ble_lifecycle(

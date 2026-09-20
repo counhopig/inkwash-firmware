@@ -17,6 +17,30 @@ fn bin_to_bcd(b: u8) -> u8 {
     ((b / 10) << 4) | (b % 10)
 }
 
+fn validate_datetime(dt: &DateTime) -> Result<()> {
+    if !(2000..=2099).contains(&dt.year)
+        || !(1..=12).contains(&dt.month)
+        || dt.day == 0
+        || dt.day > inkwash_logic::datetime::days_in_month(dt.year, dt.month)
+        || dt.weekday > 6
+        || dt.hour > 23
+        || dt.minute > 59
+        || dt.second > 59
+    {
+        return Err(anyhow!(
+            "invalid PCF8563 date/time {:04}-{:02}-{:02} weekday={} {:02}:{:02}:{:02}",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.weekday,
+            dt.hour,
+            dt.minute,
+            dt.second
+        ));
+    }
+    Ok(())
+}
+
 pub struct Pcf8563 {
     bus: SharedI2c,
     addr: u8,
@@ -61,7 +85,7 @@ impl Pcf8563 {
         let mut buf = [0u8; 7];
         self.read_regs(0x02, &mut buf)?;
         let voltage_low = buf[0] & 0x80 != 0;
-        Ok(DateTime {
+        let dt = DateTime {
             second: bcd_to_bin(buf[0] & 0x7F),
             minute: bcd_to_bin(buf[1] & 0x7F),
             hour: bcd_to_bin(buf[2] & 0x3F),
@@ -70,10 +94,13 @@ impl Pcf8563 {
             month: bcd_to_bin(buf[5] & 0x1F),
             year: 2000 + bcd_to_bin(buf[6]) as u16,
             voltage_low,
-        })
+        };
+        validate_datetime(&dt)?;
+        Ok(dt)
     }
 
     pub fn write_time(&mut self, dt: &DateTime) -> Result<()> {
+        validate_datetime(dt)?;
         let year_offset = (dt.year % 100) as u8;
         let payload = [
             bin_to_bcd(dt.second) & 0x7F,

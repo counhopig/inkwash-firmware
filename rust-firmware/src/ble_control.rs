@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::{Arc as StdArc, Condvar, Mutex as StdMutex};
+use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -199,17 +199,14 @@ fn send_notify_tx(sender: &NotifyTxSender, event: NotifyTxEvent) {
 
 #[derive(Clone)]
 struct LifecycleSender {
-    mailbox: StdArc<(StdMutex<LifecycleMailbox>, Condvar)>,
+    mailbox: StdArc<StdMutex<LifecycleMailbox>>,
 }
 
 fn send_lifecycle(sender: &LifecycleSender, event: BleLifecycle) {
-    let (lock, available) = &*sender.mailbox;
-    let mut mailbox = lock.lock().expect("BLE lifecycle mailbox poisoned");
-    while mailbox.queue.len() >= CHANNEL_CAPACITY {
-        mailbox = available
-            .wait(mailbox)
-            .expect("BLE lifecycle mailbox poisoned while waiting");
-    }
+    let mut mailbox = sender
+        .mailbox
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     mailbox.push(event);
 }
 
@@ -223,6 +220,7 @@ struct LifecycleMailbox {
     next_sequence: u64,
     delivered_sequence: u64,
     queue: VecDeque<SequencedLifecycle>,
+    overflow_latest: Option<SequencedLifecycle>,
 }
 
 impl Default for LifecycleMailbox {
@@ -231,6 +229,7 @@ impl Default for LifecycleMailbox {
             next_sequence: 1,
             delivered_sequence: 0,
             queue: VecDeque::with_capacity(CHANNEL_CAPACITY),
+            overflow_latest: None,
         }
     }
 }
@@ -242,7 +241,12 @@ impl LifecycleMailbox {
             event,
         };
         self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
-        self.queue.push_back(observation);
+        if self.queue.len() < CHANNEL_CAPACITY {
+            self.queue.push_back(observation);
+        } else {
+            self.overflow_latest = Some(observation);
+            log::warn!("BLE lifecycle mailbox saturated; retaining latest state");
+        }
     }
 
     fn pop(&mut self) -> Option<BleLifecycle> {
@@ -250,6 +254,9 @@ impl LifecycleMailbox {
         if let Some(observation) = observation {
             debug_assert!(observation.sequence > self.delivered_sequence);
             self.delivered_sequence = self.delivered_sequence.max(observation.sequence);
+            if let Some(latest) = self.overflow_latest.take() {
+                self.queue.push_back(latest);
+            }
             Some(observation.event)
         } else {
             None
@@ -257,14 +264,8 @@ impl LifecycleMailbox {
     }
 }
 
-fn poll_lifecycle(mailbox: &StdArc<(StdMutex<LifecycleMailbox>, Condvar)>) -> Option<BleLifecycle> {
-    let (lock, available) = &**mailbox;
-    let mut mailbox = lock.lock().ok()?;
-    let event = mailbox.pop();
-    if event.is_some() {
-        available.notify_one();
-    }
-    event
+fn poll_lifecycle(mailbox: &StdArc<StdMutex<LifecycleMailbox>>) -> Option<BleLifecycle> {
+    mailbox.lock().ok()?.pop()
 }
 
 enum WorkerCommand {
@@ -304,7 +305,7 @@ struct WorkerLaunch {
 pub struct BleControl {
     command_tx: mpsc::SyncSender<WorkerCommand>,
     rx: mpsc::Receiver<BleCommand>,
-    lifecycle_mailbox: StdArc<(StdMutex<LifecycleMailbox>, Condvar)>,
+    lifecycle_mailbox: StdArc<StdMutex<LifecycleMailbox>>,
     result_rx: mpsc::Receiver<BleTaskResult>,
 
     worker_launch: Option<WorkerLaunch>,
@@ -317,8 +318,7 @@ impl BleControl {
     pub fn spawn() -> Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let lifecycle_mailbox =
-            StdArc::new((StdMutex::new(LifecycleMailbox::default()), Condvar::new()));
+        let lifecycle_mailbox = StdArc::new(StdMutex::new(LifecycleMailbox::default()));
         let lifecycle_mailbox_for_worker = StdArc::clone(&lifecycle_mailbox);
         let (result_tx, result_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
 
@@ -795,7 +795,7 @@ fn log_stack_high_watermark(stage: &str) {
 struct BleSession {
     rx: mpsc::Receiver<BleCommand>,
     _tx: mpsc::SyncSender<BleCommand>,
-    lifecycle_mailbox: StdArc<(StdMutex<LifecycleMailbox>, Condvar)>,
+    lifecycle_mailbox: StdArc<StdMutex<LifecycleMailbox>>,
     notify_tx_rx: mpsc::Receiver<NotifyTxEvent>,
     notify_tx_pending: StdArc<StdMutex<VecDeque<NotifyTxEvent>>>,
     notify_attempts: StdArc<StdMutex<NotifyAttemptMailbox>>,
@@ -853,8 +853,7 @@ impl BleSession {
         let ble_advertising = device.get_advertising();
         let server = device.get_server();
 
-        let lifecycle_mailbox =
-            StdArc::new((StdMutex::new(LifecycleMailbox::default()), Condvar::new()));
+        let lifecycle_mailbox = StdArc::new(StdMutex::new(LifecycleMailbox::default()));
         let lifecycle_sender = LifecycleSender {
             mailbox: Arc::clone(&lifecycle_mailbox),
         };

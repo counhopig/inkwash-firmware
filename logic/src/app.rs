@@ -3350,6 +3350,15 @@ fn transition_command(
             }
             let timezone_offset = state.config.timezone_offset_minutes as i32;
             let target_time = DateTime::from_unix(epoch_secs).shifted_minutes(timezone_offset);
+            if !(2000..=2099).contains(&target_time.year) {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "RTC local time must remain between 2000-01-01 and 2099-12-31 after timezone conversion".into(),
+                    },
+                )];
+            }
             let clear_op = state.next_operation_id();
             let time_op = state.next_operation_id();
             set_pending_reply(
@@ -3399,6 +3408,15 @@ fn transition_command(
             )]
         }
         ControlRequest::SetWifi { ssid, password } => {
+            if !valid_wifi_credentials(&ssid, &password) {
+                return vec![reply_batch(
+                    state,
+                    channel,
+                    Reply::Error {
+                        message: "Wi-Fi SSID must be 1-32 bytes; password must be empty, 8-63 bytes, or a 64-digit hexadecimal PSK".into(),
+                    },
+                )];
+            }
             let op = state.next_operation_id();
             let creds = WifiCreds {
                 ssid: ssid.clone(),
@@ -3422,13 +3440,14 @@ fn transition_command(
             )]
         }
         ControlRequest::SetServer { url, token } => {
-            if !valid_server_url(&url) {
+            if !valid_server_url(&url) || token.len() > MAX_AUTH_TOKEN_LEN {
                 return vec![reply_batch(
                     state,
                     channel,
                     Reply::Error {
-                        message: "Server URL must be an HTTPS URL without embedded credentials"
-                            .into(),
+                        message: format!(
+                            "Server URL must be an HTTPS URL without embedded credentials and token must not exceed {MAX_AUTH_TOKEN_LEN} bytes"
+                        ),
                     },
                 )];
             }
@@ -3579,6 +3598,16 @@ fn valid_server_url(url: &str) -> bool {
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     !authority.is_empty() && !authority.contains('@') && !authority.chars().any(char::is_whitespace)
+}
+
+const MAX_AUTH_TOKEN_LEN: usize = 255;
+
+fn valid_wifi_credentials(ssid: &str, password: &str) -> bool {
+    let ssid_valid = !ssid.is_empty() && ssid.len() <= 32;
+    let password_valid = password.is_empty()
+        || (8..=63).contains(&password.len())
+        || (password.len() == 64 && password.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    ssid_valid && password_valid
 }
 
 fn set_pending_reply(
@@ -4512,6 +4541,35 @@ mod tests {
     }
 
     #[test]
+    fn set_server_rejects_token_that_cannot_be_read_back_from_nvs() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetServer {
+                url: "https://sync.example".into(),
+                token: "x".repeat(MAX_AUTH_TOKEN_LEN + 1),
+            }),
+        );
+
+        assert!(state.pending_usb_reply.is_none());
+        assert!(!batches.iter().any(|batch| batch
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistConfig(_)))));
+        assert!(batches
+            .iter()
+            .any(|batch| batch.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::Reply {
+                        reply: Reply::Error { .. },
+                        ..
+                    }
+                )
+            })));
+    }
+
+    #[test]
     fn state_changing_commands_emit_a_render_on_visible_change() {
         let mut state = AppState::default();
         state.clock.now = Some(dt(10, 0));
@@ -4533,14 +4591,14 @@ mod tests {
             &mut state,
             Event::UsbCommand(ControlRequest::SetWifi {
                 ssid: "net".into(),
-                password: "pw".into(),
+                password: "password".into(),
             }),
         );
         let done = update(
             &mut state,
             Event::SetWifiVerified(Ok(WifiCreds {
                 ssid: "net".into(),
-                password: "pw".into(),
+                password: "password".into(),
             })),
         );
         assert_eq!(state.config.wifi_ssid, None);
@@ -4617,13 +4675,41 @@ mod tests {
     }
 
     #[test]
+    fn set_wifi_rejects_credentials_outside_802_11_limits() {
+        let invalid = [
+            (String::new(), String::new()),
+            ("s".repeat(33), String::new()),
+            ("ssid".into(), "short".into()),
+            ("ssid".into(), "g".repeat(64)),
+            ("ssid".into(), "x".repeat(65)),
+        ];
+
+        for (ssid, password) in invalid {
+            let mut state = AppState::default();
+            let batches = update(
+                &mut state,
+                Event::UsbCommand(ControlRequest::SetWifi { ssid, password }),
+            );
+            assert!(state.pending_usb_reply.is_none());
+            assert!(!batches.iter().any(|batch| batch
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StartSetWifi(_)))));
+        }
+
+        assert!(valid_wifi_credentials("ssid", ""));
+        assert!(valid_wifi_credentials("ssid", "12345678"));
+        assert!(valid_wifi_credentials("ssid", &"a".repeat(64)));
+    }
+
+    #[test]
     fn set_wifi_success_applies_facts_and_replies_ok_on_the_channel() {
         let mut state = AppState::default();
         let batches = update(
             &mut state,
             Event::BleCommand(ControlRequest::SetWifi {
                 ssid: "home-wifi".into(),
-                password: "sekrit".into(),
+                password: "sekrit12".into(),
             }),
         );
         assert!(state.pending_ble_reply.is_some());
@@ -4640,7 +4726,7 @@ mod tests {
             &mut state,
             Event::SetWifiVerified(Ok(WifiCreds {
                 ssid: "home-wifi".into(),
-                password: "sekrit".into(),
+                password: "sekrit12".into(),
             })),
         );
         let persist_op = verified
@@ -4685,7 +4771,7 @@ mod tests {
             &mut state,
             Event::UsbCommand(ControlRequest::SetWifi {
                 ssid: "home-wifi".into(),
-                password: "wrong".into(),
+                password: "wrongpass".into(),
             }),
         );
         let done = update(
@@ -5130,6 +5216,26 @@ mod tests {
             state.pending_usb_reply.is_none(),
             "slot released on confirm"
         );
+    }
+
+    #[test]
+    fn set_rtc_rejects_local_time_outside_pcf8563_century() {
+        for (epoch_secs, offset_minutes) in
+            [(946_684_800, -1), (4_102_444_799, 1), (4_102_444_800, 0)]
+        {
+            let mut state = AppState::default();
+            state.config.timezone_offset_minutes = offset_minutes;
+            let batches = update(
+                &mut state,
+                Event::UsbCommand(ControlRequest::SetRtc { epoch_secs }),
+            );
+
+            assert!(state.pending_usb_reply.is_none());
+            assert!(!batches.iter().any(|batch| batch
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::WriteRtcTime(_)))));
+        }
     }
 
     #[test]

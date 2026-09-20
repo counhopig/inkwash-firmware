@@ -156,42 +156,57 @@ impl Es8311 {
         duration_secs: f32,
         amplitude: i16,
     ) -> Result<()> {
-        self.pa_enable.set_high()?;
-        thread::sleep(Duration::from_millis(10));
-        self.i2s.tx_enable()?;
+        let playback = (|| -> Result<()> {
+            self.pa_enable.set_high()?;
+            thread::sleep(Duration::from_millis(10));
+            self.i2s.tx_enable()?;
 
-        const CHUNK_FRAMES: usize = 256;
-        let mut chunk = [0u8; CHUNK_FRAMES * 4];
-        let sample_rate = SAMPLE_RATE_HZ as f32;
-        let total_frames = (sample_rate * duration_secs) as usize;
+            const CHUNK_FRAMES: usize = 256;
+            let mut chunk = [0u8; CHUNK_FRAMES * 4];
+            let sample_rate = SAMPLE_RATE_HZ as f32;
+            let total_frames = (sample_rate * duration_secs) as usize;
 
-        let mut result = Ok(());
-        let mut frame = 0usize;
-        while frame < total_frames {
-            let n = CHUNK_FRAMES.min(total_frames - frame);
-            for i in 0..n {
-                let t = (frame + i) as f32 / sample_rate;
-                let s =
-                    (amplitude as f32 * (2.0 * std::f32::consts::PI * freq_hz * t).sin()) as i16;
-                let bytes = s.to_le_bytes();
-                chunk[i * 4..i * 4 + 2].copy_from_slice(&bytes);
-                chunk[i * 4 + 2..i * 4 + 4].copy_from_slice(&bytes);
+            let mut frame = 0usize;
+            while frame < total_frames {
+                let n = CHUNK_FRAMES.min(total_frames - frame);
+                for i in 0..n {
+                    let t = (frame + i) as f32 / sample_rate;
+                    let s = (amplitude as f32 * (2.0 * std::f32::consts::PI * freq_hz * t).sin())
+                        as i16;
+                    let bytes = s.to_le_bytes();
+                    chunk[i * 4..i * 4 + 2].copy_from_slice(&bytes);
+                    chunk[i * 4 + 2..i * 4 + 4].copy_from_slice(&bytes);
+                }
+                self.i2s
+                    .write_all(&chunk[..n * 4], I2S_WRITE_TIMEOUT_TICKS)
+                    .map_err(|err| anyhow!("I2S write failed: {err}"))?;
+                frame += n;
             }
-            if let Err(err) = self.i2s.write_all(&chunk[..n * 4], I2S_WRITE_TIMEOUT_TICKS) {
-                result = Err(anyhow!("I2S write failed: {err}"));
-                break;
-            }
-            frame += n;
+            Ok(())
+        })();
+
+        let cleanup = self.drain_and_disable();
+        match (playback, cleanup) {
+            (Err(playback), Err(cleanup)) => Err(anyhow!(
+                "audio playback failed: {playback:#}; cleanup also failed: {cleanup:#}"
+            )),
+            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
         }
-
-        self.drain_and_disable();
-        result
     }
 
-    fn drain_and_disable(&mut self) {
+    fn drain_and_disable(&mut self) -> Result<()> {
         thread::sleep(Duration::from_millis(150));
-        let _ = self.i2s.tx_disable();
-        let _ = self.pa_enable.set_low();
+        let tx_result = self.i2s.tx_disable();
+        let pa_result = self.pa_enable.set_low();
+        match (tx_result, pa_result) {
+            (Err(tx), Err(pa)) => Err(anyhow!(
+                "I2S disable failed: {tx}; PA disable also failed: {pa}"
+            )),
+            (Err(err), Ok(())) => Err(anyhow!("I2S disable failed: {err}")),
+            (Ok(()), Err(err)) => Err(anyhow!("PA disable failed: {err}")),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 

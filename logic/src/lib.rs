@@ -121,14 +121,14 @@ mod ble_memory_contract {
     }
 
     #[test]
-    fn ble_lifecycle_callbacks_retain_full_channel_observations() {
+    fn ble_lifecycle_callbacks_never_block_the_nimble_host() {
         assert!(BLE_SOURCE.contains("struct LifecycleSender"));
         assert!(BLE_SOURCE.contains("fn send_lifecycle"));
         assert!(BLE_SOURCE.contains("struct LifecycleMailbox"));
         assert!(BLE_SOURCE.contains("queue: VecDeque<SequencedLifecycle>"));
-        assert!(BLE_SOURCE.contains("Condvar"));
-        assert!(BLE_SOURCE.contains("while mailbox.queue.len() >= CHANNEL_CAPACITY"));
-        assert!(!BLE_SOURCE.contains("latest: Option<SequencedLifecycle>"));
+        assert!(BLE_SOURCE.contains("overflow_latest: Option<SequencedLifecycle>"));
+        assert!(!BLE_SOURCE.contains("Condvar"));
+        assert!(!BLE_SOURCE.contains("while mailbox.queue.len() >= CHANNEL_CAPACITY"));
         assert!(BLE_SOURCE.contains("poll_lifecycle(&self.lifecycle_mailbox"));
         assert!(BLE_SOURCE.contains(
             "send_lifecycle(\n                &lc_tx,\n                BleLifecycle::Connected"

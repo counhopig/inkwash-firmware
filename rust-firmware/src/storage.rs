@@ -16,9 +16,11 @@ const KEY_RTC_ALIGN_EPOCH: &str = "rtc_align_epoch";
 
 const KEY_TODO_REMINDED_DATE: &str = "todo_rem_date";
 
-const WIFI_CRED_MAX_LEN: usize = 64;
+const WIFI_CRED_MAX_LEN: usize = 65;
 
 const SERVER_CONFIG_MAX_LEN: usize = 256;
+const MAX_SERVER_URL_LEN: usize = 240;
+const MAX_AUTH_TOKEN_LEN: usize = SERVER_CONFIG_MAX_LEN - 1;
 
 const NUM_STR_MAX_LEN: usize = 20;
 
@@ -63,6 +65,13 @@ impl PersistedCounters {
     }
 
     pub fn save_wifi_creds(&self, creds: &WifiCreds) -> Result<()> {
+        let valid_password = creds.password.is_empty()
+            || (8..=63).contains(&creds.password.len())
+            || (creds.password.len() == 64
+                && creds.password.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        if creds.ssid.is_empty() || creds.ssid.len() > 32 || !valid_password {
+            return Err(anyhow!("Wi-Fi credentials exceed 802.11 limits"));
+        }
         nvs_blob::write_scalar(&self.nvs, KEY_WIFI_SSID, &creds.ssid)?;
         nvs_blob::write_scalar(&self.nvs, KEY_WIFI_PASS, &creds.password)
     }
@@ -82,6 +91,18 @@ impl PersistedCounters {
     }
 
     pub fn save_device_config(&self, cfg: &DeviceConfig) -> Result<()> {
+        if cfg.server_url.len() > MAX_SERVER_URL_LEN {
+            return Err(anyhow!(
+                "server URL is {} bytes (max {MAX_SERVER_URL_LEN})",
+                cfg.server_url.len()
+            ));
+        }
+        if cfg.auth_token.len() > MAX_AUTH_TOKEN_LEN {
+            return Err(anyhow!(
+                "authentication token is {} bytes (max {MAX_AUTH_TOKEN_LEN})",
+                cfg.auth_token.len()
+            ));
+        }
         nvs_blob::write_scalar(&self.nvs, KEY_SERVER_URL, &cfg.server_url)?;
         nvs_blob::write_scalar(&self.nvs, KEY_AUTH_TOKEN, &cfg.auth_token)
     }
