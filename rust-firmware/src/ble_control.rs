@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use esp32_nimble::utilities::mutex::Mutex;
 use esp32_nimble::{
+    enums::{AuthReq, SecurityIOCap},
     uuid128, BLEAdvertisementData, BLECharacteristic, BLEDevice, NimbleProperties, NotifyTxStatus,
 };
 
@@ -52,6 +53,7 @@ pub struct BleCommand {
 pub enum BleTaskResult {
     Started {
         session_id: u64,
+        passkey: u32,
     },
     Failed {
         session_id: u64,
@@ -557,13 +559,17 @@ fn run(
                     continue;
                 }
                 log_stack_high_watermark("before BLE init");
-                match BleSession::start(session_id) {
+                let passkey = unsafe { esp_idf_svc::sys::esp_random() } % 1_000_000;
+                match BleSession::start(session_id, passkey) {
                     Ok(new_session) => {
                         session = Some(new_session);
                         active_session_id = Some(session_id);
                         log_stack_high_watermark("after BLE init");
                         if result_tx
-                            .send(BleTaskResult::Started { session_id })
+                            .send(BleTaskResult::Started {
+                                session_id,
+                                passkey,
+                            })
                             .is_err()
                         {
                             break;
@@ -818,7 +824,7 @@ struct InflightReply {
 }
 
 impl BleSession {
-    fn start(session_id: u64) -> Result<Self> {
+    fn start(session_id: u64, passkey: u32) -> Result<Self> {
         let free = unsafe { esp_idf_svc::sys::heap_caps_get_free_size(BLE_INTERNAL_CAPS) };
         let largest =
             unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS) };
@@ -829,7 +835,7 @@ impl BleSession {
             ));
         }
         BLEDevice::init();
-        let result = Self::start_initialized(session_id);
+        let result = Self::start_initialized(session_id, passkey);
         if result.is_err() {
             Self::shutdown_nimble();
         }
@@ -848,8 +854,14 @@ impl BleSession {
         }
     }
 
-    fn start_initialized(session_id: u64) -> Result<Self> {
+    fn start_initialized(session_id: u64, passkey: u32) -> Result<Self> {
         let device = BLEDevice::take();
+        device
+            .security()
+            .set_auth(AuthReq::Bond | AuthReq::Mitm | AuthReq::Sc)
+            .set_passkey(passkey)
+            .set_io_cap(SecurityIOCap::DisplayOnly)
+            .resolve_rpa();
         let ble_advertising = device.get_advertising();
         let server = device.get_server();
 
@@ -928,12 +940,16 @@ impl BleSession {
         });
 
         let control_service = server.create_service(uuid128!(SERVICE_UUID));
-        let write_char = control_service
-            .lock()
-            .create_characteristic(uuid128!(WRITE_CHAR_UUID), NimbleProperties::WRITE);
+        let write_char = control_service.lock().create_characteristic(
+            uuid128!(WRITE_CHAR_UUID),
+            NimbleProperties::WRITE | NimbleProperties::WRITE_ENC | NimbleProperties::WRITE_AUTHEN,
+        );
         let notify_char = control_service.lock().create_characteristic(
             uuid128!(NOTIFY_CHAR_UUID),
-            NimbleProperties::READ | NimbleProperties::NOTIFY,
+            NimbleProperties::READ
+                | NimbleProperties::READ_ENC
+                | NimbleProperties::READ_AUTHEN
+                | NimbleProperties::NOTIFY,
         );
         notify_char.lock().set_value(b"");
 

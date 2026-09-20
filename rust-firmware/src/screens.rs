@@ -506,14 +506,22 @@ pub(crate) fn draw_reminder(
     drop(canvas);
 }
 
-pub(crate) fn draw_ble_pairing(board: &mut Note4Board) {
+pub(crate) fn draw_ble_pairing(board: &mut Note4Board, passkey: Option<u32>) {
     let mut canvas = board.display.canvas_mut();
     canvas.clear();
     header(&mut canvas, "BLE PAIRING");
-    canvas.draw_text_prop(8, 40, 1, "CONNECTING...");
-    canvas.draw_text_prop(8, 60, 1, "Service UUID:");
-    canvas.draw_text_prop(8, 72, 1, "d2c25e50-");
-    canvas.draw_text_prop(8, 84, 1, "5e22-48d8...");
+    match passkey {
+        Some(passkey) => {
+            canvas.draw_text_prop(8, 40, 1, "PAIRING CODE:");
+            canvas.draw_text_prop(8, 56, 2, &format!("{passkey:06}"));
+        }
+        None => {
+            canvas.draw_text_prop(8, 40, 1, "CONNECTING...");
+        }
+    }
+    canvas.draw_text_prop(8, 88, 1, "Service UUID:");
+    canvas.draw_text_prop(8, 100, 1, "d2c25e50-");
+    canvas.draw_text_prop(8, 112, 1, "5e22-48d8...");
     footer(&mut canvas, "HOLD ENTER BACK");
 }
 

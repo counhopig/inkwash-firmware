@@ -497,8 +497,8 @@ fn draw_sm_surface(
         RenderView::NumberPick { stage, value } => {
             crate::screens::draw_number_pick(ctx.board, stage, value);
         }
-        RenderView::BlePairing => {
-            crate::screens::draw_ble_pairing(ctx.board);
+        RenderView::BlePairing { passkey } => {
+            crate::screens::draw_ble_pairing(ctx.board, passkey);
         }
         RenderView::AlarmRinging => {
             crate::screens::draw_alarm_ringing(ctx.board);

@@ -241,7 +241,7 @@ fn surface_kind(view: &RenderView) -> SurfaceKind {
         RenderView::WeekView { .. }
         | RenderView::InboxItem { .. }
         | RenderView::NumberPick { .. }
-        | RenderView::BlePairing
+        | RenderView::BlePairing { .. }
         | RenderView::AlarmRinging
         | RenderView::Reminder { .. } => SurfaceKind::ReadOnlySurface,
     }

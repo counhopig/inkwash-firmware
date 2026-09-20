@@ -22,7 +22,7 @@ pub fn priority(event: &Event) -> Priority {
         | Event::RtcAlarmSnapshotReady(_)
         | Event::UsbCommand(_)
         | Event::BleCommand(_)
-        | Event::BlePairingStarted
+        | Event::BlePairingStarted { .. }
         | Event::BlePairingSucceeded(_)
         | Event::BlePairingFailed(_)
         | Event::ReminderDue(_)

@@ -145,7 +145,12 @@ impl Screen {
                 stage: *stage,
                 value: *value,
             },
-            Screen::BlePairing(_) => RenderView::BlePairing,
+            Screen::BlePairing(state) => RenderView::BlePairing {
+                passkey: match state.phase {
+                    BlePairingPhase::Pairing { passkey } => Some(passkey),
+                    _ => None,
+                },
+            },
             Screen::AlarmRinging => RenderView::AlarmRinging,
             Screen::Reminder(ReminderState { kind, lines, .. }) => RenderView::Reminder {
                 kind: *kind,
@@ -214,7 +219,7 @@ impl Default for BlePairingState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlePairingPhase {
     Waiting,
-    Pairing,
+    Pairing { passkey: u32 },
     Success,
     Failure(String),
 }
@@ -452,7 +457,9 @@ pub enum RenderView {
         selected: usize,
     },
 
-    BlePairing,
+    BlePairing {
+        passkey: Option<u32>,
+    },
 
     AlarmRinging,
 
@@ -646,7 +653,9 @@ pub enum Event {
     RtcAlarmSnapshotReady(RtcAlarmSnapshot),
     UsbCommand(ControlRequest),
     BleCommand(ControlRequest),
-    BlePairingStarted,
+    BlePairingStarted {
+        passkey: u32,
+    },
     BlePairingSucceeded(BlePairingResult),
     BlePairingFailed(BlePairingFailure),
     BleDisconnected,
@@ -1030,7 +1039,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
             state.pending_urgent_poll = None;
             vec![]
         }
-        Event::BlePairingStarted => transition_ble_pairing_started(state),
+        Event::BlePairingStarted { passkey } => transition_ble_pairing_started(state, passkey),
         Event::BlePairingSucceeded(result) => transition_ble_pairing_succeeded(state, result),
         Event::BlePairingFailed(failure) => transition_ble_pairing_failed(state, failure),
         Event::BleDisconnected => transition_ble_disconnected(state),
@@ -1141,7 +1150,7 @@ fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> 
     };
     if !matches!(
         st.phase,
-        BlePairingPhase::Waiting | BlePairingPhase::Pairing
+        BlePairingPhase::Waiting | BlePairingPhase::Pairing { .. }
     ) || !st.pairing_deadline_ticks.is_some_and(|d| now_ticks >= d)
     {
         return vec![];
@@ -1452,12 +1461,12 @@ fn schedule_sync_from_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBat
     )]
 }
 
-fn transition_ble_pairing_started(state: &mut AppState) -> Vec<EffectBatch> {
+fn transition_ble_pairing_started(state: &mut AppState, passkey: u32) -> Vec<EffectBatch> {
     if !matches!(state.screen, Screen::BlePairing(_)) {
         return vec![];
     }
     if let Screen::BlePairing(st) = &mut state.screen {
-        st.phase = BlePairingPhase::Pairing;
+        st.phase = BlePairingPhase::Pairing { passkey };
     }
     state.render_generation = state.render_generation.next();
     vec![render_batch(state)]
@@ -7268,11 +7277,11 @@ mod tests {
             ..Default::default()
         });
 
-        let batches = update(&mut state, Event::BlePairingStarted);
+        let batches = update(&mut state, Event::BlePairingStarted { passkey: 123456 });
         assert_eq!(
             state.screen,
             Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Pairing,
+                phase: BlePairingPhase::Pairing { passkey: 123456 },
                 ..Default::default()
             })
         );
@@ -7325,7 +7334,7 @@ mod tests {
             Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
         );
         state.screen = Screen::BlePairing(BlePairingState {
-            phase: BlePairingPhase::Pairing,
+            phase: BlePairingPhase::Pairing { passkey: 123456 },
             ..Default::default()
         });
 
@@ -7338,11 +7347,11 @@ mod tests {
             })
         );
 
-        let batches = update(&mut state, Event::BlePairingStarted);
+        let batches = update(&mut state, Event::BlePairingStarted { passkey: 123456 });
         assert_eq!(
             state.screen,
             Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Pairing,
+                phase: BlePairingPhase::Pairing { passkey: 123456 },
                 ..Default::default()
             })
         );
@@ -7397,7 +7406,7 @@ mod tests {
             Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
         );
         assert_eq!(state.screen, Screen::Home);
-        let batches = update(&mut state, Event::BlePairingStarted);
+        let batches = update(&mut state, Event::BlePairingStarted { passkey: 123456 });
         assert_eq!(state.screen, Screen::Home);
         assert!(batches.iter().all(|b| b.effects.is_empty()));
     }
@@ -7560,7 +7569,7 @@ mod tests {
                 Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
             );
             state.screen = Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Pairing,
+                phase: BlePairingPhase::Pairing { passkey: 123456 },
                 ..Default::default()
             });
             let batches = update(&mut state, Event::Button(b));
@@ -7580,7 +7589,7 @@ mod tests {
             Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
         );
         state.screen = Screen::BlePairing(BlePairingState {
-            phase: BlePairingPhase::Pairing,
+            phase: BlePairingPhase::Pairing { passkey: 123456 },
             ..Default::default()
         });
         let batches = update(
@@ -7691,11 +7700,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let _ = update(&mut state, Event::BlePairingStarted);
+        let _ = update(&mut state, Event::BlePairingStarted { passkey: 123456 });
         assert!(matches!(
             state.screen,
             Screen::BlePairing(BlePairingState {
-                phase: BlePairingPhase::Pairing,
+                phase: BlePairingPhase::Pairing { .. },
                 input_released: true,
                 ..
             })
@@ -9250,7 +9259,7 @@ mod tests {
                     phase: BlePairingPhase::Waiting,
                     ..Default::default()
                 }),
-                RenderView::BlePairing,
+                RenderView::BlePairing { passkey: None },
             ),
         ];
         for (screen, view) in cases {

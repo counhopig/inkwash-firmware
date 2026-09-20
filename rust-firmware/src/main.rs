@@ -569,9 +569,13 @@ fn main() -> Result<()> {
         }
         while let Some(result) = ctx.ble_control.poll_result() {
             let (session_id, event) = match result {
-                ble_control::BleTaskResult::Started { session_id } => {
-                    (session_id, inkwash_logic::app::Event::BlePairingStarted)
-                }
+                ble_control::BleTaskResult::Started {
+                    session_id,
+                    passkey,
+                } => (
+                    session_id,
+                    inkwash_logic::app::Event::BlePairingStarted { passkey },
+                ),
                 ble_control::BleTaskResult::Failed {
                     session_id,
                     message,
@@ -1381,7 +1385,6 @@ fn poll_ble_lifecycle(
                     ctx.command_sessions
                         .begin(control::Channel::Ble, generation);
                 }
-                dispatch_or_retain(runner, inkwash_logic::app::Event::BlePairingStarted, ctx)?;
                 changed = true;
             }
             ble_control::BleLifecycle::Disconnected {

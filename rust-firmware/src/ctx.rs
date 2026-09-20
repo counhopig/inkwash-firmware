@@ -106,7 +106,7 @@ impl PendingDispatchSources {
                 self.ble_command = Some(event);
                 Ok(())
             }
-            Event::BlePairingStarted
+            Event::BlePairingStarted { .. }
             | Event::BlePairingSucceeded(_)
             | Event::BlePairingFailed(_)
             | Event::BleDisconnected => {

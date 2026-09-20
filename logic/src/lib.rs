@@ -112,7 +112,7 @@ mod ble_memory_contract {
             .find("if session.is_some()")
             .expect("worker must guard duplicate Start commands");
         let start_init = BLE_SOURCE
-            .find("match BleSession::start(session_id)")
+            .find("match BleSession::start(session_id, passkey)")
             .expect("worker must initialize after duplicate Start guard");
         assert!(start_guard < start_init);
         assert!(BLE_SOURCE.contains("active_session_id"));
@@ -137,6 +137,16 @@ mod ble_memory_contract {
             "send_lifecycle(\n                &lc_tx,\n                BleLifecycle::Disconnected"
         ));
         assert!(!BLE_SOURCE.contains("let _ = lc_tx.try_send(BleLifecycle"));
+    }
+
+    #[test]
+    fn ble_control_characteristics_require_authenticated_encryption() {
+        assert!(BLE_SOURCE.contains("AuthReq::Bond | AuthReq::Mitm | AuthReq::Sc"));
+        assert!(BLE_SOURCE.contains("SecurityIOCap::DisplayOnly"));
+        assert!(BLE_SOURCE.contains("NimbleProperties::WRITE_ENC"));
+        assert!(BLE_SOURCE.contains("NimbleProperties::WRITE_AUTHEN"));
+        assert!(BLE_SOURCE.contains("BleTaskResult::Started"));
+        assert!(BLE_SOURCE.contains("passkey,"));
     }
 
     #[test]
