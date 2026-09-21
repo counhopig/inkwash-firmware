@@ -1,9 +1,13 @@
 use anyhow::{anyhow, Result};
+use parking_lot::Mutex;
+
+static PTHREAD_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn spawn_internal_stack<F>(name: &str, stack_size: usize, body: F) -> Result<()>
 where
     F: FnOnce() + Send + 'static,
 {
+    let _config_guard = PTHREAD_CONFIG_LOCK.lock();
     let default_cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
     let mut cfg = default_cfg;
     cfg.stack_size = stack_size;

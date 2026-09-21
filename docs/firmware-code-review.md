@@ -41,7 +41,7 @@
 
 ### 验证结果
 
-- `cargo test --locked`：418 项测试通过
+- `cargo test --locked`：419 项测试通过
 - `cargo fmt --check`：通过
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
@@ -61,7 +61,7 @@
 
 1. 整体架构质量较高。业务状态机、Effect 执行层和硬件任务边界清晰，复杂异步操作有显式完成反馈和代际检查。
 2. 并发设计经过了较多压力场景考虑。RTC、EPD、同步、BLE、音频和 USB 均采用独立执行上下文，多数队列具有固定容量和背压处理。
-3. 纯逻辑层具备 418 项主机测试，是本项目最值得保留的工程资产之一。
+3. 纯逻辑层具备 419 项主机测试，是本项目最值得保留的工程资产之一。
 4. BLE 控制通道已要求 LE Secure Connections、MITM、动态六位 passkey，以及加密并认证的读写权限；该边界应通过真实客户端继续做负向互操作验证。
 5. Wi-Fi 密码和服务端 Bearer Token 存储于普通 NVS，而 Secure Boot、Flash Encryption 和 NVS Encryption 均未启用。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
@@ -150,7 +150,7 @@
 
 ### 2.11 已落实的可靠性与安全边界
 
-- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 418 项主机测试。
+- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 419 项主机测试。
 - `rust-firmware/src/wifi.rs:60`：`connect()` 的所有失败出口都会执行 `disconnect()`，避免连接或 DHCP 超时后遗留驱动状态。
 - `rust-firmware/src/ble_control.rs:961`：BLE 命令解析失败只记录长度和错误，不再输出可能含 Wi-Fi 密码或 Token 的原始 payload。
 - `rust-firmware/src/ble_control.rs:857`、`:944`：BLE 使用动态六位 passkey、LE Secure Connections、MITM 和 bonding；控制特征要求加密且认证后才能读写。
@@ -166,6 +166,11 @@
 - `logic/src/app.rs`、`rust-firmware/src/storage.rs`：服务端 Token 在状态机入口和持久化层均限制为 255 字节，与 NVS 读缓冲一致。
 - `rust-firmware/src/storage.rs`：Wi-Fi 凭据和服务端配置分别保存为单个带版本的 NVS blob，写入不会再产生 SSID/密码或 URL/Token 新旧混合；读取端保留旧键兼容迁移，并对持久化内容重新校验。
 - `rust-firmware/src/inbox.rs`：Inbox 条目与待确认已读 ID 合并为单个版本化 NVS blob；pending 集合只保留当前最多 32 个条目中的 ID，条目截断和序列化容量使用同一预算，已读标记与待上传确认原子落盘。
+- `logic/src/app.rs`：命令确认只按唯一 operation ID 关联，不再被并发同步的 metadata/RTC 收尾全局屏蔽；实机复现的永久 `busy` 已由回归测试覆盖，修复后 10/10 压力写入和 11/11 smoke 通过。
+- `rust-firmware/src/power.rs`：DFS 运行频率范围为 40–160 MHz；Wi-Fi、SPI 和 I2S 驱动仍由 ESP-IDF 的 PM lock 保证外设活跃期时钟，授权真机 smoke 未出现时序、WDT 或复位异常。
+- `rust-firmware/src/epd_task.rs`：EPD worker 订阅 Task Watchdog，空闲等待每秒喂狗，刷新前后也喂狗；底层 BUSY 超时仍为 2 秒，非预期的 SPI/锁永久阻塞可由 10 秒 WDT 捕获。
+- `rust-firmware/src/tasks.rs`：pthread 默认配置的读取、修改、线程创建与恢复由进程内全局互斥串行化，避免并发创建 worker 时互相覆盖栈能力策略。
+- `rust-firmware/src/wake.rs`：GPIO ISR 在通知唤醒更高优先级任务后调用 Xtensa `_frxt_setup_switch()` 请求立即调度，保持 ISR 路径位于 IRAM。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
@@ -174,7 +179,7 @@
 - `rust-firmware/build.rs`：构建期校验 CJK 索引长度、严格排序、cell 唯一性与范围，并确认 12px/16px 字模具有完整的 94×94 网格长度。
 - `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 factory 分区生成应用镜像以执行 4 MiB 容量门禁。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
-- 以上状态通过 fmt、clippy、418 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
+- 以上状态通过 fmt、clippy、419 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
 ## 3. 改进建议
 
@@ -208,24 +213,6 @@
 - 风险：双 4 MiB 应用槽约占 8 MiB，会显著压缩当前 LittleFS 空间。
 - 验证：执行断电注入、损坏镜像、首次启动崩溃、版本降级和空间不足测试。
 
-#### P1-3 DFS 实际未生效
-
-- 位置：`rust-firmware/src/power.rs:106`
-- 证据：`max_freq_mhz` 和 `min_freq_mhz` 都等于默认 CPU 频率，实际为 160 MHz。
-- 影响：自动 Light Sleep 有效，但运行态或短空闲期不能降频。
-- 建议：实测后将最低频率设为 40 或 80 MHz；EPD、I2S、Wi-Fi 活跃阶段使用 PM lock 保证时钟要求。
-- 示例：
-
-```rust
-let config = esp_pm_config_t {
-    max_freq_mhz: 160,
-    min_freq_mhz: 40,
-    light_sleep_enable: enabled,
-};
-```
-
-- 验证：分别测量 Home 空闲、按键、音频、Wi-Fi 和 EPD 刷新场景的电流及响应时间。
-
 #### P1-4 任务优先级和核心亲和性没有明确策略
 
 - 位置：`rust-firmware/src/tasks.rs` 及各任务的 `thread::Builder` 调用
@@ -233,14 +220,6 @@ let config = esp_pm_config_t {
 - 影响：任务调度依赖 pthread 默认值，无法明确保证 RTC、告警音频、UI 和后台同步的响应顺序。
 - 建议：先记录实际 task priority/core，再以最小调整保证 RTC 和告警控制高于后台同步；不要在缺少测量时大范围提高优先级。
 - 验证：Wi-Fi TLS、EPD 全刷和音频同时运行时测量按键和告警响应延迟。
-
-#### P1-5 EPD 任务未加入 Task Watchdog
-
-- 位置：`rust-firmware/src/epd_task.rs:255`
-- 证据：主任务、RTC、同步、音频和 Effect worker 会订阅或喂 WDT，EPD worker 没有订阅。
-- 影响：虽然 BUSY 等待有超时，但 SPI 驱动、互斥锁或其他未预见阻塞仍可能让显示任务永久失效而不触发恢复。
-- 建议：为 EPD 任务加入 WDT，并在长刷新过程的受控边界喂狗；避免在不可控无限等待中简单订阅。
-- 验证：模拟 BUSY 常高、SPI 错误和队列堵塞。
 
 #### P1-6 BLE 断开重连后可能永久拒绝回复
 
@@ -283,22 +262,6 @@ let config = esp_pm_config_t {
 - 影响：ESP-IDF API、C/C++ 组件、链接和分区问题可能直到人工发布时才暴露。
 - 建议：增加带缓存的 ESP-IDF/Rust-ESP release build job，至少在 nightly 或合并前执行。
 - 验证：CI 上传 ELF、map、partition table，并检查应用镜像不超过分区容量。
-
-#### P2-2 ISR 没有请求立即任务切换
-
-- 位置：`rust-firmware/src/wake.rs:15`
-- 证据：`xTaskGenericNotifyFromISR` 返回 `higher_prio_woken`，但 ISR 没有执行 `portYIELD_FROM_ISR`。
-- 影响：通知可能等到下一调度 tick 才被处理；当前 1 kHz tick 下通常为毫秒级影响。
-- 建议：若实测需要降低唤醒延迟，在 `higher_prio_woken != 0` 时使用 ESP-IDF Xtensa 对应的 ISR yield API。
-- 验证：使用逻辑分析仪测量 GPIO 边沿到任务响应的最坏延迟。
-
-#### P2-3 pthread 栈策略恢复与并发保护
-
-- 位置：`rust-firmware/src/tasks.rs:7`
-- 证据：原实现曾在修改后才读取“恢复值”，导致 internal-stack 策略泄漏；现已改为修改前保存并在 spawn 后恢复，但修改/创建/恢复仍没有全局串行保护。
-- 影响：当前启动顺序下已消除确定性泄漏；若未来从多个任务并发创建线程，仍可能互相覆盖全局 pthread 配置。
-- 建议：用全局互斥封装修改、spawn、恢复三步，或统一所有 Rust 任务创建入口。
-- 验证：记录每个任务的 stack capabilities，并做并发创建压力测试。
 
 #### P2-4 周期诊断日志偏频繁
 

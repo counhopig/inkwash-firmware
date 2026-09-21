@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
@@ -259,15 +260,33 @@ fn run(
     completions: Arc<CompletionMailbox>,
 ) {
     crate::heap_probe::register_current_task(crate::heap_probe::SLOT_EPD);
+    let watchdog_subscribed = match crate::watchdog::subscribe() {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("EPD task watchdog subscription failed: {err:#}");
+            false
+        }
+    };
     let mut scratch: Vec<u8> = Vec::with_capacity(canvas::WIDTH * canvas::HEIGHT / 8);
     loop {
         while let Some(cmd) = slot.pending.lock().take() {
+            if watchdog_subscribed {
+                crate::watchdog::feed();
+            }
             let completion = execute(driver.0, &cmd, &mut scratch);
+            if watchdog_subscribed {
+                crate::watchdog::feed();
+            }
 
             completions.send(completion);
         }
-        if notify_rx.recv().is_err() {
-            break;
+        match notify_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {
+                if watchdog_subscribed {
+                    crate::watchdog::feed();
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 

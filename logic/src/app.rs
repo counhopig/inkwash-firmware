@@ -3009,14 +3009,13 @@ fn transition_effect_completed(
                 }
             }
         }
-        EffectOutput::RtcTimeWritten(written_time)
-            if state.pending_sync_metadata.is_none()
-                || state.pending_sync_metadata_op == Some(completion.operation_id) =>
-        {
+        EffectOutput::RtcTimeWritten(written_time) => {
+            let is_sync_time_write =
+                state.pending_sync_metadata_op == Some(completion.operation_id);
             state.clock.now = Some(written_time);
             if state.pending_rtc.is_none() {
                 let rtc_batches = program_alarm_for(state, &written_time);
-                if state.pending_sync_metadata.is_some() {
+                if is_sync_time_write {
                     state.pending_sync_rtc_op = rtc_batches.first().map(|b| b.operation_id);
                     if let Some(rtc_op) = state.pending_sync_rtc_op {
                         state.sync = SyncState::Applying { request_id: rtc_op };
@@ -3098,9 +3097,7 @@ fn transition_effect_completed(
     if matches!(
         completion.output,
         EffectOutput::Persisted(_) | EffectOutput::RtcProgrammed | EffectOutput::RtcTimeWritten(_)
-    ) && state.pending_sync_metadata.is_none()
-        && state.pending_sync_rtc_op.is_none()
-    {
+    ) {
         for channel in [Channel::Usb, Channel::Ble] {
             if let Some((found_channel, reply)) =
                 resolve_command_confirmation(state, completion.operation_id, channel)
@@ -5053,6 +5050,77 @@ mod tests {
             })
         }));
         assert!(state.pending_usb_reply.is_none());
+    }
+
+    #[test]
+    fn set_timezone_completion_is_not_blocked_by_sync_metadata() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+
+        let batches = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetTimezone { offset_minutes: 60 }),
+        );
+        let time_op = batches
+            .iter()
+            .find(|batch| {
+                batch
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::WriteRtcTime(_)))
+            })
+            .expect("timezone RTC write")
+            .operation_id;
+        let persist_op = batches
+            .iter()
+            .find(|batch| {
+                batch
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::PersistTimezone(_)))
+            })
+            .expect("timezone persist")
+            .operation_id;
+
+        state.pending_sync_metadata = Some(PendingSyncMetadata {
+            last_sync_epoch: 1,
+            ntp_epoch: Some(2),
+        });
+        state.pending_sync_metadata_op = Some(OperationId(u64::MAX));
+
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: time_op,
+                render_generation: None,
+                output: EffectOutput::RtcTimeWritten(dt(11, 0)),
+            }),
+        );
+        let done = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: persist_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Timezone),
+            }),
+        );
+
+        assert_eq!(state.clock.now, Some(dt(11, 0)));
+        assert_eq!(state.config.timezone_offset_minutes, 60);
+        assert!(state.pending_usb_reply.is_none());
+        assert!(done.iter().any(|batch| batch.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Reply {
+                    channel: Channel::Usb,
+                    reply: Reply::Ok
+                }
+            )
+        })));
     }
 
     #[test]

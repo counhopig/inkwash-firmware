@@ -106,7 +106,7 @@ pub fn disable_light_sleep() -> Result<()> {
 fn set_light_sleep_enabled(enabled: bool) -> Result<()> {
     let config = esp_pm_config_t {
         max_freq_mhz: esp_idf_svc::sys::CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ as i32,
-        min_freq_mhz: esp_idf_svc::sys::CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ as i32,
+        min_freq_mhz: 40,
         light_sleep_enable: enabled,
     };
     let ret = unsafe { esp_pm_configure(&config as *const esp_pm_config_t as *const c_void) };

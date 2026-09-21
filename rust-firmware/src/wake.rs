@@ -2,9 +2,10 @@ use core::ffi::c_void;
 
 use anyhow::Result;
 use esp_idf_svc::sys::{
-    eNotifyAction_eSetValueWithOverwrite, gpio_int_type_t_GPIO_INTR_LOW_LEVEL, gpio_intr_disable,
-    gpio_intr_enable, gpio_isr_handler_add, gpio_set_intr_type, xTaskGenericNotifyFromISR,
-    xTaskGenericNotifyWait, xTaskGetCurrentTaskHandle, BaseType_t, TaskHandle_t, TickType_t,
+    _frxt_setup_switch, eNotifyAction_eSetValueWithOverwrite, gpio_int_type_t_GPIO_INTR_LOW_LEVEL,
+    gpio_intr_disable, gpio_intr_enable, gpio_isr_handler_add, gpio_set_intr_type,
+    xTaskGenericNotifyFromISR, xTaskGenericNotifyWait, xTaskGetCurrentTaskHandle, BaseType_t,
+    TaskHandle_t, TickType_t,
 };
 
 struct WakeCtx {
@@ -27,6 +28,9 @@ unsafe extern "C" fn wake_isr(ctx: *mut c_void) {
             core::ptr::null_mut(),
             &mut higher_prio_woken,
         );
+        if higher_prio_woken != 0 {
+            _frxt_setup_switch();
+        }
     }
 }
 
