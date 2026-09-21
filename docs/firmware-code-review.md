@@ -55,7 +55,7 @@
 - 显式使用构建产物 `bootloader.bin` 刷写后，实机二级 bootloader 与应用均报告 ESP-IDF v5.5.5；启动日志同时确认 DIO 和 16 MB Flash
 - 最终构建刷写后的基础 smoke 与 400 秒 soak 均为 11/11：状态查询、校时、重复命令缓存、非法参数拒绝、配置恢复、串口连续性及无 panic/WDT/reset 均通过
 - Wi-Fi 连接超时后固件恢复自动 Light Sleep；新配置下 CPU retention 申请错误不再出现，日志准确表述为“已请求自动 Light Sleep，唤醒源已配置”
-- 未进行实机功耗、BLE 安全交互、掉电或故障注入测试
+- 未进行实机功耗、BLE 安全交互、掉电或故障注入测试；当前 Linux 环境没有 PowerShell，`backup-flash.ps1` 仅完成静态审查，尚未在 Windows 上执行
 
 ## 1. 执行摘要
 
@@ -170,6 +170,7 @@
 - `rust-firmware/build.rs`：支持 `SOURCE_DATE_EPOCH`，相同源码和指定时间戳可生成稳定的构建时间元数据；非法值会直接终止构建。
 - `rust-firmware/build.rs`：递归声明两个本地 ESP-IDF 组件的源码、头文件和 CMake 文件为构建依赖，驱动修改会触发 Cargo/embuild 重新配置。
 - `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 factory 分区生成应用镜像以执行 4 MiB 容量门禁。
+- `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
 - 以上状态通过 fmt、clippy、418 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
 ## 3. 改进建议
@@ -328,15 +329,7 @@ let config = esp_pm_config_t {
 - 建议：先完成所有本地校验和 `gh auth status`，确认 tag 不冲突且提交正确；最后阶段再创建/推送不可变标签和 Release。失败时明确报告每个远端状态，不吞错。
 - 验证：在未登录、同名 tag 指向其他提交、附件上传失败和第二远端不存在的情形运行 dry-run。
 
-#### P2-6 Flash 备份脚本没有核验授权设备身份
-
-- 位置：`scripts/backup-flash.ps1:1-16`
-- 证据：脚本仅接收串口名并直接读取完整 16 MiB Flash，没有读取和比对 MAC、芯片型号或 Flash 容量。
-- 影响：多设备环境中可能对错误 ESP32 执行操作；虽然读取本身不改写 Flash，但生成的文件会被错误标记为 Note 4 工厂备份，并破坏恢复链可信度。
-- 建议：执行任何读写前解析 `esptool chip_id/flash_id`，强制匹配授权 Note 4 MAC `20:6E:F1:B4:7D:E4`、ESP32-S3 和 16 MiB，并把身份元数据与哈希写入备份清单。
-- 验证：授权设备可备份；错误 MAC、非 S3、容量不符和无法识别身份时必须在读取前退出。
-
-#### P2-7 约 11.9 MiB storage 分区当前未被使用
+#### P2-6 约 11.9 MiB storage 分区当前未被使用
 
 - 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
 - 证据：`storage` 数据分区占 `0xBF0000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 24 KiB NVS。
@@ -344,7 +337,7 @@ let config = esp_pm_config_t {
 - 建议：先确认产品路线；若无需用户文件，重新分配给双 OTA、加密 core dump 或更宽裕的 NVS。不要仅为“利用空间”引入文件系统。
 - 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
 
-#### P2-8 字体索引与字模资源缺少构建期一致性校验
+#### P2-7 字体索引与字模资源缺少构建期一致性校验
 
 - 位置：`rust-firmware/src/font_cjk.rs:14-58`；`tools/generate_cjk_font.py`
 - 证据：索引读取本身按 4 字节条目遍历，但 `glyph16()`/`glyph12()` 使用索引中的 cell 直接切片，没有检查字模长度；资源错配会在渲染时 panic。
@@ -352,7 +345,7 @@ let config = esp_pm_config_t {
 - 建议：生成或构建阶段检查 index 长度为 4 的倍数、排序唯一、最大 cell 同时落入两套字模范围，并生成校验摘要。
 - 验证：对截断字模、越界 cell、乱序和重复 code point 建立生成器失败测试。
 
-#### P2-9 ADC 通道通过 `Peripherals::steal()` 重建所有权
+#### P2-8 ADC 通道通过 `Peripherals::steal()` 重建所有权
 
 - 位置：`rust-firmware/src/board.rs:278-284`
 - 证据：每次电池采样都以 `unsafe { Peripherals::steal() }` 重新取得 GPIO4 token，而不是在 `Board` 初始化时建立并持有 ADC channel。
@@ -360,7 +353,7 @@ let config = esp_pm_config_t {
 - 建议：初始化时创建并保存 ADC channel，采样时只借用；把 `steal()` 限制在确有底层所有权证明的集中边界。
 - 验证：编译期确认 GPIO4 不能被第二个驱动取得，并连续执行 ADC、Wi-Fi、EPD 并发压力测试。
 
-#### P2-10 量产配置与诊断配置尚未分离
+#### P2-9 量产配置与诊断配置尚未分离
 
 - 位置：`rust-firmware/sdkconfig.defaults:110-116`
 - 证据：默认配置同时启用综合堆毒化、INFO 日志和 UART core dump。这些设置适合当前 P0 定位，但会增加运行开销、日志暴露和 panic 后恢复时间。
