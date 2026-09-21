@@ -41,19 +41,19 @@
 
 ### 验证结果
 
-- `cargo test --locked`：414 项测试通过
+- `cargo test --locked`：418 项测试通过
 - `cargo fmt --check`：通过
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- 当前 release 应用镜像为 2,659,232 字节，占 4 MiB factory 分区的 63.40%
+- 当前 release 应用镜像为 2,642,048 字节，占 4 MiB factory 分区的 62.99%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
 - 烧录后日志确认主循环、RTC、EPD、同步、音频、Effect 和 USB 任务均能启动，各任务观测到的剩余栈约 6.2–19.8 KiB
-- 高频 `set_timezone` 压力仍可复现 Double exception：最新 200 次运行完成 178 次，首次异常约在第 133 次；完整日志为 `/tmp/inkwash-smoke-iram-200.log`。因此当前镜像不能判定为稳定发布版
+- 高频 `set_timezone` 压力曾稳定复现 Double exception。完整 core dump 将最新异常定位到 main 任务为 RTC 状态轮询创建一次性回复通道时的堆分配路径；RTC executor 现使用单个可复用回复通道并串行化请求，不再为每次轮询分配通道。修复后的 400 秒实机 soak 连续运行到 402,719 ms，11/11 检查通过，无 panic、WDT、reset 或串口断线。尚未完成 1,000 次压力门槛，因此该发布阻断项仍保持开放
 - 显式使用构建产物 `bootloader.bin` 刷写后，实机二级 bootloader 与应用均报告 ESP-IDF v5.5.5；启动日志同时确认 DIO 和 16 MB Flash
-- 最终构建刷写后的基础 smoke 为 10/10：状态查询、校时、重复命令缓存、非法参数拒绝、配置恢复及短时无 panic/WDT/reset均通过
+- 最终构建刷写后的基础 smoke 与 400 秒 soak 均为 11/11：状态查询、校时、重复命令缓存、非法参数拒绝、配置恢复、串口连续性及无 panic/WDT/reset 均通过
 - Wi-Fi 连接超时后固件恢复自动 Light Sleep；新配置下 CPU retention 申请错误不再出现，日志准确表述为“已请求自动 Light Sleep，唤醒源已配置”
 - 未进行实机功耗、BLE 安全交互、掉电或故障注入测试
 
@@ -61,17 +61,17 @@
 
 1. 整体架构质量较高。业务状态机、Effect 执行层和硬件任务边界清晰，复杂异步操作有显式完成反馈和代际检查。
 2. 并发设计经过了较多压力场景考虑。RTC、EPD、同步、BLE、音频和 USB 均采用独立执行上下文，多数队列具有固定容量和背压处理。
-3. 纯逻辑层具备 414 项主机测试，是本项目最值得保留的工程资产之一。
-4. 最大安全风险是 BLE 控制通道没有认证、绑定、MITM 或加密访问要求，却能执行网络配置、服务端配置、清除闹钟和修改时钟等命令。
+3. 纯逻辑层具备 418 项主机测试，是本项目最值得保留的工程资产之一。
+4. BLE 控制通道已要求 LE Secure Connections、MITM、动态六位 passkey，以及加密并认证的读写权限；该边界应通过真实客户端继续做负向互操作验证。
 5. Wi-Fi 密码和服务端 Bearer Token 存储于普通 NVS，而 Secure Boot、Flash Encryption 和 NVS Encryption 均未启用。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
 7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
 8. 当前分区布局不支持 OTA、升级失败回滚或远程安全维护。
 9. Light Sleep 与 tickless idle 已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。运行态最低频率仍为 160 MHz。
 10. 同步应用会连续更新多个 NVS 对象而没有事务或 generation 标记；掉电或写入失败可能留下跨数据集的部分提交状态。
-11. 真机已稳定复现命令压力下的上下文/栈破坏：异常返回地址出现 `0xA5A5A5A5`，最新一次另一核处于 idle，说明问题尚未关闭，必须作为发布阻断项。
+11. 真机 core dump 已把最新 Double exception 收敛到 RTC 高频轮询创建一次性回复通道时的分配器路径；改为复用通道后 400 秒 soak 通过，但尚未达到 1,000 次压力发布门槛，因此仍作为发布阻断项跟踪。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
-13. 建议优先完成内存破坏定位、BLE 授权和敏感数据保护，再推进 OTA、原子持久化与功耗优化。
+13. 建议优先完成长期压力验证、BLE 安全互操作测试和敏感数据保护，再推进 OTA、原子持久化与功耗优化。
 14. 同步层虽然保存了 ETag，却没有发送 `If-None-Match`，且只接受 HTTP 200；当前 ETag 机制实际上没有形成条件请求闭环。
 15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
 16. 生产配置仍启用 UART core dump 和综合堆毒化：前者可能经 USB 暴露内存中的密码与 Token，后者适合定位当前 P0，但不宜直接作为最终量产配置。
@@ -150,45 +150,25 @@
 
 ### 2.11 已落实的可靠性与安全边界
 
-- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 414 项主机测试。
+- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 418 项主机测试。
 - `rust-firmware/src/wifi.rs:60`：`connect()` 的所有失败出口都会执行 `disconnect()`，避免连接或 DHCP 超时后遗留驱动状态。
 - `rust-firmware/src/ble_control.rs:961`：BLE 命令解析失败只记录长度和错误，不再输出可能含 Wi-Fi 密码或 Token 的原始 payload。
+- `rust-firmware/src/ble_control.rs:857`、`:944`：BLE 使用动态六位 passkey、LE Secure Connections、MITM 和 bonding；控制特征要求加密且认证后才能读写。
 - `rust-firmware/sdkconfig.defaults:97`：prod panic 策略为 `CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y`；生成的 sdkconfig 已确认 halt 关闭、reboot 开启。
 - `rust-firmware/sdkconfig.defaults:39`：显式关闭 IDF 5.5.5 不能可靠初始化的 CPU retention，保留自动 Light Sleep；真机连接超时后成功恢复 Light Sleep，不再出现 retention 内存错误。
 - `rust-firmware/components/zectrix_epd/zectrix_epd.cc`：OTP 刷新不再在运行期重新配置并释放共享 SPI bus，消除了已稳定复现的 `spi_bus_deinit_lock` 断言路径。
 - `rust-firmware/src/wake.rs`、`board.rs`、`sdkconfig.defaults`：GPIO 唤醒 ISR、ISR 服务和 GPIO 控制函数均配置为 IRAM-safe；ELF 已确认 `wake_isr` 与 `gpio_intr_disable` 位于 `0x4037xxxx` IRAM 区间。
-- `rust-firmware/src/rtc_executor.rs`、`ctx.rs`：RTC 一次性回复改为有界通道；校时后不再立即析构仍在飞行的接收端，而是排空后释放。
+- `rust-firmware/src/rtc_executor.rs`、`ctx.rs`：RTC executor 使用单个容量为 1 的可复用回复通道，所有克隆句柄通过互斥接收端串行完成请求；250 ms 告警轮询不再反复创建和销毁一次性通道，瞬时 I²C 错误记录后留待下次轮询重试。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
-- 以上状态通过 fmt、clippy、414 项单元测试、release 交叉构建和授权真机启动日志验证。
+- 以上状态通过 fmt、clippy、418 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
 ## 3. 改进建议
 
 ### P0 必须修复
 
-#### P0-1 BLE 控制接口缺少认证和加密要求
-
-- 位置：`rust-firmware/src/ble_control.rs:931`、`:943`；`logic/src/protocol.rs:9`
-- 证据：写特征只声明 `NimbleProperties::WRITE`；未设置 passkey、bonding、MITM、Security Manager 或 encrypted-write 权限；实际配置为 `CONFIG_BT_NIMBLE_SM_LVL=0`。BLE 命令包含 `SetWifi`、`SetServer`、`SetRtc` 和 `ClearAlarms`。
-- 影响：配对页面开启期间，附近任意 BLE 客户端可能修改敏感配置或设备状态。限制为单连接不能替代身份授权。
-- 建议：至少启用 LE Secure Connections + MITM，写特征要求加密和认证；增加短时有效、屏幕显示的应用层配对码或 challenge。
-- 示例：
-
-```rust
-// 伪代码，具体 API 名称需按 esp32-nimble 0.12 核对。
-BLEDevice::set_security_auth(true, true, true); // bonding, MITM, SC
-BLEDevice::set_security_passkey(displayed_passkey);
-
-create_characteristic(
-    WRITE_CHAR_UUID,
-    NimbleProperties::WRITE | NimbleProperties::WRITE_ENC,
-);
-```
-
-- 验证：未配对客户端写入必须失败；测试错误 passkey、重连、删除 bond、第二客户端和 ATT 抓包。
-
-#### P0-2 敏感凭据存入未加密 NVS
+#### P0-1 敏感凭据存入未加密 NVS
 
 - 位置：`rust-firmware/src/storage.rs:55`、`:70`；`rust-firmware/sdkconfig.defaults`
 - 证据：Wi-Fi 密码和 Bearer Token 分别写入 `wifi_pass`、`auth_token`；实际生成配置未启用 Secure Boot、Flash Encryption 或 NVS Encryption。
@@ -196,13 +176,13 @@ create_characteristic(
 - 建议：生产配置启用 Secure Boot V2、Flash Encryption 和加密 NVS；开发与生产配置分离，量产流程单独管理 eFuse。
 - 验证：离线读取 Flash 不应出现密码或 Token 明文；未签名固件应无法启动；验证量产、升级和恢复流程。
 
-#### P0-3 真机压力测试仍存在上下文/栈破坏
+#### P0-2 真机压力测试尚未达到发布门槛
 
 - 位置：`rust-firmware/src/main.rs`、`ctx.rs`、`rtc_executor.rs`、`effect_task.rs`、`epd_task.rs` 及 Rust/C/FFI 边界。
-- 证据：在授权实机上连续执行 `set_timezone` 已多次复现 `LoadProhibited` 或 Double exception。修复 SPI bus 释放、Wi-Fi 失败重试、RTC 回复析构竞态、PSRAM 阈值和 GPIO ISR IRAM 后，最新 200 次测试仍只完成 178 次；异常前第 133 次命令已回复，Core 0 回溯损坏且 A0 为 `0xA5A5A5A5`，Core 1 明确在 idle。各已注册任务 high-water mark 仍有至少约 6.2 KiB。生成配置启用了综合堆毒化，但未在异常前报告普通 heap corruption。
-- 事实边界：崩溃落点不等于越界写入点；填充模式吻合也不能单独证明是未初始化读取、栈溢出或释放后使用。现有证据只能确认发生过内存安全故障，不能把责任归于 `CommandSessions`、TLS 或某一轮修改。
-- 影响：普通控制命令压力即可触发设备崩溃；在启用自动重启后可能演变成重启循环或在写 NVS 时复位。
-- 建议：下一步给每个任务记录 TCB、栈起止地址和当前 core，把异常 SP `0x3fcb37xx` 映射到具体任务；随后对该任务的所有 FFI 写入和通道生命周期做二分。保留固定 ELF、完整 UART core dump和综合堆毒化，不再用崩溃最终 PC 直接推断写坏点。
+- 证据：授权实机曾在连续 `set_timezone` 场景复现 `LoadProhibited` 和 Double exception。最新完整 core dump 显示崩溃任务为 main，A1 位于其合法栈区且剩余栈约 19 KiB；保存的栈帧将执行路径恢复为 `RtcExecutor::alarm_status → sync_channel → RawVec::try_allocate_in → malloc → esp_psram_check_ptr_addr`。RTC executor 改用启动时创建的复用回复通道后，400 秒 soak 连续运行至 402,719 ms，完成 11/11 检查且无 panic、WDT、reset 或串口断线。
+- 事实边界：该结果证明已移除最新可复现崩溃路径的高频动态分配，并显著改善短期稳定性；400 秒单设备测试不能等价于长期稳定性证明，也不能排除其他独立故障路径。
+- 影响：若仍存在未覆盖的内存安全故障，设备可能在同步、显示或 NVS 写入期间重启；当前证据不足以批准稳定发布。
+- 建议：保留固定 ELF、完整 UART core dump、任务栈范围日志和综合堆毒化，继续做有硬截止的长压测；测试脚本必须设置串口写超时，避免主机 USB 端点异常导致测试自身无限挂起。
 - 验证：至少连续 1,000 次同一压力命令零 panic/WDT/reset，并在混合 EPD、NVS、Wi-Fi 和 USB 场景重复；保存 ELF SHA、map、sdkconfig、原始日志和 core dump。未达到前不得关闭此 P0。
 
 ### P1 建议改进
@@ -318,7 +298,7 @@ let config = esp_pm_config_t {
 
 - 位置：`rust-firmware/sdkconfig.defaults:112`；`rust-firmware/src/storage.rs:55-86`；`rust-firmware/src/sync.rs:144-147`
 - 证据：配置启用 `CONFIG_ESP_COREDUMP_ENABLE_TO_UART=y`；运行期内存会包含 Wi-Fi 密码、Bearer Token 和 HTTP Authorization header，USB Serial/JTAG 控制台无需身份认证即可读取 panic 输出。
-- 影响：获得设备短时物理访问或串口日志的人可能从 core dump 提取敏感信息。当前 core dump 对定位 P0-3 很有价值，但不适合作为默认量产策略。
+- 影响：获得设备短时物理访问或串口日志的人可能从 core dump 提取敏感信息。当前 core dump 对定位 P0-2 很有价值，但不适合作为默认量产策略。
 - 建议：保留专用诊断 profile；量产 profile 改为加密 Flash 中的 core dump 分区，或关闭完整 core dump、仅保留脱敏后的复位原因和故障计数。
 - 验证：对诊断转储执行字符串扫描，确认风险范围；量产镜像触发受控 panic 后不得在 USB 输出 RAM 内容。
 
@@ -465,7 +445,7 @@ let config = esp_pm_config_t {
 - 位置：`rust-firmware/sdkconfig.defaults:110-116`
 - 证据：默认配置同时启用综合堆毒化、INFO 日志和 UART core dump。这些设置适合当前 P0 定位，但会增加运行开销、日志暴露和 panic 后恢复时间。
 - 影响：单一 profile 难以同时满足故障定位和量产的性能、安全、恢复时延要求。
-- 建议：保留当前 diagnostic profile 直至 P0-3 关闭；另建 production defaults，明确日志级别、core dump 去向、堆检查级别和安全启动参数。两种 profile 都应纳入 CI 构建。
+- 建议：保留当前 diagnostic profile 直至 P0-2 关闭；另建 production defaults，明确日志级别、core dump 去向、堆检查级别和安全启动参数。两种 profile 都应纳入 CI 构建。
 - 验证：比较两种镜像的体积、内部堆、性能和故障输出，并确保生产 profile 不泄露敏感内存。
 
 ## 4. 快速收益清单

@@ -176,6 +176,12 @@ impl WifiManager {
         if ret != 0 {
             log::warn!("esp_wifi_disconnect failed: 0x{ret:x}");
         }
+        if let Some(wifi) = self.wifi.as_mut() {
+            if let Err(err) = wifi.stop() {
+                log::warn!("failed to stop Wi-Fi after disconnect: {err}");
+            }
+        }
+        self.started = false;
     }
 
     pub fn suspend_for_ble(&mut self) -> Result<()> {

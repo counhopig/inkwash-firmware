@@ -8,6 +8,7 @@ import time
 
 try:
     import serial
+    from serial import SerialException
 except ImportError:
     sys.stderr.write("pyserial is required: python3 -m pip install pyserial\n")
     raise SystemExit(2)
@@ -26,7 +27,8 @@ def parse_args():
 
 class Link:
     def __init__(self, port, baud):
-        self.serial = serial.Serial(port=None, baudrate=baud, timeout=0.05)
+        self.serial = serial.Serial(
+            port=None, baudrate=baud, timeout=0.05, write_timeout=2.0)
         self.serial.dtr = False
         self.serial.rts = False
         self.serial.port = port
@@ -75,6 +77,15 @@ class Link:
         while time.monotonic() < end:
             self._pump()
 
+    def request_until_ready(self, payload, wait):
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            reply, _ = self.request(payload, min(5.0, deadline - time.monotonic()))
+            if not reply or reply.get("status") != "busy":
+                return reply
+            time.sleep(0.1)
+        return None
+
 
 TROUBLE = [
     "Task watchdog got triggered", "Guru Meditation", "abort()",
@@ -87,6 +98,7 @@ def main():
     args = parse_args()
     results = []
     link = Link(args.port, args.baud)
+    link_error = None
     try:
         status = None
         ready_deadline = time.monotonic() + 30
@@ -128,7 +140,7 @@ def main():
         writes_ok = 0
         for index in range(args.stress):
             value = 480 if index % 2 == 0 else 60
-            reply, _ = link.request(
+            reply = link.request_until_ready(
                 {"cmd": "set_timezone", "offset_minutes": value,
                  "id": "smoke-stress-%d" % index}, args.reply_timeout)
             if reply and reply.get("status") == "ok":
@@ -137,15 +149,30 @@ def main():
         results.append(("persistence writes complete", writes_ok == args.stress))
 
         link.drain(args.soak)
+    except SerialException as err:
+        link_error = str(err)
+        print("FAIL  serial link:", link_error)
     finally:
         link.close()
 
     lines = link.log
+    if link_error:
+        time.sleep(1.0)
+        try:
+            recovery = Link(args.port, args.baud)
+            try:
+                recovery.drain(10.0)
+                lines.extend(recovery.log)
+            finally:
+                recovery.close()
+        except SerialException as err:
+            lines.append("host recovery open failed: %s" % err)
     if args.log_file:
         Path(args.log_file).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print("serial log:", args.log_file)
     trouble = [l for l in lines for pat in TROUBLE if pat.lower() in l.lower()]
     results.append(("no panic / watchdog / reset during soak", not trouble))
+    results.append(("serial link stayed connected", link_error is None))
     for line in trouble[:5]:
         print("  trouble:", line)
 

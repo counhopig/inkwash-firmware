@@ -59,7 +59,8 @@ const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 
 const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-const RTC_READ_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
+const ALARM_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 const SAFE_MODE_REPLY_CAPACITY: usize = usb_console::REPLY_WRITER_CAPACITY;
 
 const BUILD_EPOCH_SECS: u64 = build_epoch_secs();
@@ -397,12 +398,6 @@ fn main() -> Result<()> {
         pending_sleep_kick: None,
         prepared_wake_plan: None,
         alarm_poll: inkwash_logic::alarm_flow::AlarmPoll::new(),
-        pending_alarm_status: None,
-        pending_alarm_snapshot: None,
-        pending_clock_read: None,
-        retired_alarm_status: std::collections::VecDeque::new(),
-        retired_alarm_snapshots: std::collections::VecDeque::new(),
-        retired_clock_reads: std::collections::VecDeque::new(),
         effect_task: &effect_task,
         pending_effect_batch: None,
         pending_effect_batches: std::collections::VecDeque::new(),
@@ -438,6 +433,9 @@ fn main() -> Result<()> {
     let mut status_last = Instant::now();
     let mut stack_last = Instant::now();
     let mut clock_last = Instant::now();
+    let mut alarm_status_last = Instant::now()
+        .checked_sub(ALARM_STATUS_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut usb_host_was_connected = false;
 
     loop {
@@ -480,16 +478,10 @@ fn main() -> Result<()> {
         } else {
             CLOCK_POLL_INTERVAL
         };
-        if ctx.pending_clock_read.is_none() && now.duration_since(clock_last) >= clock_interval {
+        if now.duration_since(clock_last) >= clock_interval {
             clock_last = now;
-            match ctx.rtc.request_read_time() {
-                Ok(reply) => ctx.pending_clock_read = Some(reply),
-                Err(err) => log::warn!("RTC read_time request failed: {err}"),
-            }
-        }
-        if let Some(reply) = ctx.pending_clock_read.take() {
-            match reply.try_recv() {
-                Ok(Ok(dt)) => {
+            match ctx.rtc.read_time() {
+                Ok(dt) => {
                     let changed = clock
                         .as_ref()
                         .map(|prev| {
@@ -508,20 +500,17 @@ fn main() -> Result<()> {
                     dispatch_or_retain(&app_runner, inkwash_logic::app::Event::Tick(dt), &mut ctx)
                         .map(|_| ())?
                 }
-                Ok(Err(err)) => log::warn!("PCF8563 read_time failed: {err}"),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.pending_clock_read = Some(reply);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    log::warn!("RTC read_time executor disconnected");
-                }
+                Err(err) => log::warn!("PCF8563 read_time failed: {err}"),
             }
         }
 
-        if ctx.poll_alarm_snapshot()? {
-            let _ = ctx
-                .alarm_poll
-                .consume_for(inkwash_logic::alarm_flow::AlarmSource::Home);
+        if now.duration_since(alarm_status_last) >= ALARM_STATUS_POLL_INTERVAL {
+            alarm_status_last = now;
+            if ctx.poll_alarm_snapshot()? {
+                let _ = ctx
+                    .alarm_poll
+                    .consume_for(inkwash_logic::alarm_flow::AlarmSource::Home);
+            }
         }
 
         let usb_host_connected = power::usb_host_connected();
@@ -987,7 +976,6 @@ fn main() -> Result<()> {
         let interacted = user_activity;
 
         if let Some(kick) = ctx.pending_sleep_kick.take() {
-            ctx.settle_sleep_reads(RTC_READ_SETTLE_TIMEOUT);
             let event = match &kick.effect {
                 inkwash_logic::app::Effect::PrepareSleep { token, .. } => {
                     let wake_plan_confirmed =
@@ -2142,12 +2130,6 @@ fn collect_sleep_inputs(
     let pending_ble_reply = !ctx.pending_ble_replies.is_empty()
         || !ctx.pending_ble_deliveries.is_empty()
         || ctx.pending_ble_reply_latch.is_some();
-    let rtc_read_in_flight = ctx.pending_alarm_status.is_some()
-        || ctx.pending_alarm_snapshot.is_some()
-        || ctx.pending_clock_read.is_some()
-        || !ctx.retired_alarm_status.is_empty()
-        || !ctx.retired_alarm_snapshots.is_empty()
-        || !ctx.retired_clock_reads.is_empty();
     inkwash_logic::power_state::SleepInputs {
         input_pending,
         page_allows_sleep: matches!(state.screen, inkwash_logic::app::Screen::Home)
@@ -2169,7 +2151,6 @@ fn collect_sleep_inputs(
             || !matches!(state.sync, inkwash_logic::app::SyncState::Idle)
             || state.urgent_poll_in_flight()
             || worker_in_flight
-            || rtc_read_in_flight
             || pending_usb_reply
             || pending_usb_reply_latch
             || pending_ble_reply

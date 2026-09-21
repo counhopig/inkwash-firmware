@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::time::Duration;
+use std::sync::mpsc::TryRecvError;
 
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
@@ -279,14 +278,6 @@ pub struct DeviceContext<'a> {
 
     pub alarm_poll: inkwash_logic::alarm_flow::AlarmPoll,
 
-    pub pending_alarm_status: Option<Receiver<anyhow::Result<crate::rtc_executor::AlarmStatus>>>,
-    pub pending_alarm_snapshot:
-        Option<Receiver<anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot>>>,
-    pub pending_clock_read: Option<Receiver<anyhow::Result<DateTime>>>,
-    pub retired_alarm_status: VecDeque<Receiver<anyhow::Result<crate::rtc_executor::AlarmStatus>>>,
-    pub retired_alarm_snapshots:
-        VecDeque<Receiver<anyhow::Result<inkwash_logic::app::RtcAlarmSnapshot>>>,
-    pub retired_clock_reads: VecDeque<Receiver<anyhow::Result<DateTime>>>,
     pub effect_task: &'a crate::effect_task::EffectTask,
     pub pending_effect_batch: Option<inkwash_logic::app::EffectBatch>,
 
@@ -642,108 +633,36 @@ impl DeviceContext<'_> {
     }
 
     pub fn poll_alarm_snapshot(&mut self) -> anyhow::Result<bool> {
-        self.drain_retired_rtc_reads();
         if !self.app_runner_enabled {
             return Ok(false);
         }
-
-        if let Some(reply) = self.pending_alarm_snapshot.take() {
-            match reply.try_recv() {
-                Ok(Ok(snapshot)) => {
-                    self.alarm_poll.mark_snapshot_dispatched();
-                    self.dispatch_event(inkwash_logic::app::Event::RtcAlarmSnapshotReady(
-                        snapshot,
-                    ))?;
-                    return Ok(matches!(
-                        self.app_runner.borrow().state().screen,
-                        inkwash_logic::app::Screen::AlarmRinging
-                    ));
-                }
-                Ok(Err(err)) => {
+        let status = match self.rtc.alarm_status() {
+            Ok(status) => status,
+            Err(err) => {
+                log::warn!("RTC alarm status read failed: {err:#}");
+                return Ok(false);
+            }
+        };
+        if self.alarm_poll.observe_alarm_flag(status.alarm_flag) {
+            let snapshot = match self.rtc.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
                     log::warn!("RTC alarm snapshot read failed; stays retryable: {err:#}");
-                }
-                Err(TryRecvError::Empty) => {
-                    self.pending_alarm_snapshot = Some(reply);
                     return Ok(false);
                 }
-                Err(TryRecvError::Disconnected) => {
-                    log::warn!("RTC alarm snapshot executor disconnected");
-                }
-            }
+            };
+            self.alarm_poll.mark_snapshot_dispatched();
+            self.dispatch_event(inkwash_logic::app::Event::RtcAlarmSnapshotReady(snapshot))?;
+            return Ok(matches!(
+                self.app_runner.borrow().state().screen,
+                inkwash_logic::app::Screen::AlarmRinging
+            ));
         }
-
-        if let Some(reply) = self.pending_alarm_status.take() {
-            match reply.try_recv() {
-                Ok(Ok(status)) => {
-                    if self.alarm_poll.observe_alarm_flag(status.alarm_flag) {
-                        match self.rtc.request_snapshot() {
-                            Ok(snapshot) => self.pending_alarm_snapshot = Some(snapshot),
-                            Err(err) => log::warn!("RTC snapshot request failed: {err:#}"),
-                        }
-                    }
-                }
-                Ok(Err(err)) => log::warn!("RTC alarm status read failed: {err:#}"),
-                Err(TryRecvError::Empty) => {
-                    self.pending_alarm_status = Some(reply);
-                    return Ok(false);
-                }
-                Err(TryRecvError::Disconnected) => {
-                    log::warn!("RTC alarm status executor disconnected");
-                }
-            }
-        }
-
-        if self.pending_alarm_status.is_none() && self.pending_alarm_snapshot.is_none() {
-            match self.rtc.request_alarm_status() {
-                Ok(status) => self.pending_alarm_status = Some(status),
-                Err(err) => log::warn!("RTC alarm status request failed: {err:#}"),
-            }
-        }
-        let firing = false;
-
-        Ok(firing)
+        Ok(false)
     }
 
     pub fn invalidate_rtc_reads_after_time_write(&mut self) {
-        if let Some(reply) = self.pending_alarm_status.take() {
-            self.retired_alarm_status.push_back(reply);
-        }
-        if let Some(reply) = self.pending_alarm_snapshot.take() {
-            self.retired_alarm_snapshots.push_back(reply);
-        }
-        if let Some(reply) = self.pending_clock_read.take() {
-            self.retired_clock_reads.push_back(reply);
-        }
         self.alarm_poll.observe_alarm_flag(false);
-    }
-
-    pub fn drain_retired_rtc_reads(&mut self) {
-        drain_retired_replies(&mut self.retired_alarm_status);
-        drain_retired_replies(&mut self.retired_alarm_snapshots);
-        drain_retired_replies(&mut self.retired_clock_reads);
-    }
-
-    pub fn settle_sleep_reads(&mut self, timeout: Duration) {
-        let Some(reply) = self.pending_alarm_status.take() else {
-            return;
-        };
-        match reply.recv_timeout(timeout) {
-            Ok(Ok(status)) => {
-                if self.alarm_poll.observe_alarm_flag(status.alarm_flag) {
-                    match self.rtc.request_snapshot() {
-                        Ok(snapshot) => self.pending_alarm_snapshot = Some(snapshot),
-                        Err(err) => log::warn!("RTC snapshot request failed: {err:#}"),
-                    }
-                }
-            }
-            Ok(Err(err)) => log::warn!("RTC alarm status read failed: {err:#}"),
-            Err(RecvTimeoutError::Timeout) => {
-                self.pending_alarm_status = Some(reply);
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                log::warn!("RTC alarm status executor disconnected");
-            }
-        }
     }
 
     pub fn start_sync(&mut self, now: DateTime) -> Result<bool> {
@@ -1077,17 +996,5 @@ impl DeviceContext<'_> {
             inkwash_logic::app::Event::SetWifiVerified(result),
             self,
         )
-    }
-}
-
-fn drain_retired_replies<T>(replies: &mut VecDeque<Receiver<anyhow::Result<T>>>) {
-    let pending = replies.len();
-    for _ in 0..pending {
-        let Some(reply) = replies.pop_front() else {
-            break;
-        };
-        if matches!(reply.try_recv(), Err(TryRecvError::Empty)) {
-            replies.push_back(reply);
-        }
     }
 }

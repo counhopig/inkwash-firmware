@@ -1417,9 +1417,7 @@ fn transition_urgent_poll_completed(state: &mut AppState, available: bool) -> Ve
 }
 
 fn transition_urgent_poll_failed(state: &mut AppState) -> Vec<EffectBatch> {
-    if state.pending_urgent_poll.take().is_some() {
-        state.sync_scheduler.rollback_urgent_boundary();
-    }
+    state.pending_urgent_poll.take();
     vec![]
 }
 
@@ -3209,7 +3207,6 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
         EffectError::Sync(_) => {
             if state.pending_urgent_poll == Some(failure.operation_id) {
                 state.pending_urgent_poll = None;
-                state.sync_scheduler.rollback_urgent_boundary();
             }
             if matches!(state.sync, SyncState::Running { .. })
                 && state.pending_usb_reply.is_none()
@@ -5371,7 +5368,7 @@ mod tests {
     }
 
     #[test]
-    fn urgent_poll_failure_restores_boundary_for_retry() {
+    fn urgent_poll_failure_waits_for_the_next_boundary() {
         let mut state = AppState::default();
         state.connectivity.wifi_configured = true;
         state.connectivity.server_configured = true;
@@ -5404,7 +5401,18 @@ mod tests {
                 error: EffectError::Sync("poll failed".into()),
             }),
         );
-        assert!(update(&mut state, Event::Tick(tick))
+        assert!(!update(&mut state, Event::Tick(tick))
+            .iter()
+            .any(|batch| batch
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PollUrgent))));
+        let next_boundary = DateTime {
+            minute: 1,
+            second: 1,
+            ..boot_now
+        };
+        assert!(update(&mut state, Event::Tick(next_boundary))
             .iter()
             .any(|b| b.effects.iter().any(|e| matches!(e, Effect::PollUrgent))));
     }

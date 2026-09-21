@@ -1,6 +1,7 @@
 use std::sync::mpsc::{
     channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
 };
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -17,35 +18,20 @@ const RTC_COMMAND_CAPACITY: usize = 8;
 const IDLE_DRAIN: Duration = Duration::from_secs(1);
 
 enum RtcCommand {
-    ReadTime {
-        reply: SyncSender<Result<DateTime>>,
-    },
+    ReadTime,
+    WriteTime(DateTime),
+    AlarmStatus,
+    Snapshot,
+    Acknowledge,
+    Disable,
+    Program(AlarmRegs),
+}
 
-    WriteTime {
-        dt: DateTime,
-        reply: SyncSender<Result<()>>,
-    },
-
-    AlarmStatus {
-        reply: SyncSender<Result<AlarmStatus>>,
-    },
-
-    Snapshot {
-        reply: SyncSender<Result<RtcAlarmSnapshot>>,
-    },
-
-    Acknowledge {
-        reply: SyncSender<Result<()>>,
-    },
-
-    Disable {
-        reply: SyncSender<Result<()>>,
-    },
-
-    Program {
-        regs: AlarmRegs,
-        reply: SyncSender<Result<()>>,
-    },
+enum RtcReply {
+    DateTime(Result<DateTime>),
+    AlarmStatus(Result<AlarmStatus>),
+    Snapshot(Result<RtcAlarmSnapshot>),
+    Unit(Result<()>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,87 +43,79 @@ pub struct AlarmStatus {
 #[derive(Clone)]
 pub struct RtcExecutor {
     tx: SyncSender<RtcCommand>,
+    replies: Arc<Mutex<Receiver<RtcReply>>>,
 }
 
 impl RtcExecutor {
     pub fn spawn(bus: SharedI2c) -> Result<Self> {
         let (tx, rx) = sync_channel(RTC_COMMAND_CAPACITY);
+        let (reply_tx, reply_rx) = sync_channel(1);
         let (probe_tx, probe_rx) = channel();
         std::thread::Builder::new()
             .name("rtc".to_string())
             .stack_size(RTC_TASK_STACK)
-            .spawn(move || run(bus, rx, probe_tx))?;
+            .spawn(move || run(bus, rx, reply_tx, probe_tx))?;
         match probe_rx.recv()? {
-            Ok(()) => Ok(Self { tx }),
+            Ok(()) => Ok(Self {
+                tx,
+                replies: Arc::new(Mutex::new(reply_rx)),
+            }),
             Err(err) => bail!("RTC executor probe failed: {err}"),
         }
     }
 
     pub fn read_time(&self) -> Result<DateTime> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::ReadTime { reply: reply_tx })?;
-        reply_rx.recv()?
-    }
-
-    pub fn request_read_time(&self) -> Result<Receiver<Result<DateTime>>> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::ReadTime { reply: reply_tx })?;
-        Ok(reply_rx)
+        match self.request(RtcCommand::ReadTime)? {
+            RtcReply::DateTime(result) => result,
+            _ => bail!("RTC executor returned a mismatched read-time reply"),
+        }
     }
 
     pub fn write_time(&self, dt: &DateTime) -> Result<()> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::WriteTime {
-            dt: *dt,
-            reply: reply_tx,
-        })?;
-        reply_rx.recv()?
+        self.request_unit(RtcCommand::WriteTime(*dt))
     }
 
     pub fn alarm_status(&self) -> Result<AlarmStatus> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::AlarmStatus { reply: reply_tx })?;
-        reply_rx.recv()?
-    }
-
-    pub fn request_alarm_status(&self) -> Result<Receiver<Result<AlarmStatus>>> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::AlarmStatus { reply: reply_tx })?;
-        Ok(reply_rx)
+        match self.request(RtcCommand::AlarmStatus)? {
+            RtcReply::AlarmStatus(result) => result,
+            _ => bail!("RTC executor returned a mismatched alarm-status reply"),
+        }
     }
 
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Result<RtcAlarmSnapshot> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::Snapshot { reply: reply_tx })?;
-        reply_rx.recv()?
-    }
-
-    pub fn request_snapshot(&self) -> Result<Receiver<Result<RtcAlarmSnapshot>>> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::Snapshot { reply: reply_tx })?;
-        Ok(reply_rx)
+        match self.request(RtcCommand::Snapshot)? {
+            RtcReply::Snapshot(result) => result,
+            _ => bail!("RTC executor returned a mismatched snapshot reply"),
+        }
     }
 
     pub fn acknowledge(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::Acknowledge { reply: reply_tx })?;
-        reply_rx.recv()?
+        self.request_unit(RtcCommand::Acknowledge)
     }
 
     pub fn disable(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::Disable { reply: reply_tx })?;
-        reply_rx.recv()?
+        self.request_unit(RtcCommand::Disable)
     }
 
     pub fn program(&self, regs: &AlarmRegs) -> Result<()> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.try_send(RtcCommand::Program {
-            regs: *regs,
-            reply: reply_tx,
-        })?;
-        reply_rx.recv()?
+        self.request_unit(RtcCommand::Program(*regs))
+    }
+
+    fn request_unit(&self, command: RtcCommand) -> Result<()> {
+        match self.request(command)? {
+            RtcReply::Unit(result) => result,
+            _ => bail!("RTC executor returned a mismatched unit reply"),
+        }
+    }
+
+    fn request(&self, command: RtcCommand) -> Result<RtcReply> {
+        let replies = self
+            .replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.try_send(command)?;
+        Ok(replies.recv()?)
     }
 
     fn try_send(&self, command: RtcCommand) -> Result<()> {
@@ -148,7 +126,12 @@ impl RtcExecutor {
     }
 }
 
-fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
+fn run(
+    bus: SharedI2c,
+    rx: Receiver<RtcCommand>,
+    reply: SyncSender<RtcReply>,
+    probe_tx: Sender<Result<()>>,
+) {
     crate::heap_probe::register_current_task(crate::heap_probe::SLOT_RTC);
     let watchdog_subscribed = match crate::watchdog::subscribe() {
         Ok(()) => true,
@@ -181,45 +164,35 @@ fn run(bus: SharedI2c, rx: Receiver<RtcCommand>, probe_tx: Sender<Result<()>>) {
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        match cmd {
-            RtcCommand::ReadTime { reply } => {
-                let result = rtc.read_time();
-                let _ = reply.send(result);
-            }
-            RtcCommand::WriteTime { dt, reply } => {
-                let result = rtc.write_time(&dt);
-                let _ = reply.send(result);
-            }
-            RtcCommand::AlarmStatus { reply } => {
+        let response = match cmd {
+            RtcCommand::ReadTime => RtcReply::DateTime(rtc.read_time()),
+            RtcCommand::WriteTime(dt) => RtcReply::Unit(rtc.write_time(&dt)),
+            RtcCommand::AlarmStatus => {
                 let result = read_alarm_status(&mut rtc);
                 if let Ok(status) = &result {
                     latch.observe_alarm_flag(status.alarm_flag);
                 }
-                let _ = reply.send(result);
+                RtcReply::AlarmStatus(result)
             }
-            RtcCommand::Snapshot { reply } => {
-                let result = snapshot_or_latch(&mut rtc, &mut latch);
-                let _ = reply.send(result);
-            }
-            RtcCommand::Acknowledge { reply } => {
+            RtcCommand::Snapshot => RtcReply::Snapshot(snapshot_or_latch(&mut rtc, &mut latch)),
+            RtcCommand::Acknowledge => {
                 let result = rtc.ack_alarm();
                 if result.is_ok() {
                     latch.on_ack_or_disable_success();
                 }
-                let _ = reply.send(result);
+                RtcReply::Unit(result)
             }
-            RtcCommand::Disable { reply } => {
+            RtcCommand::Disable => {
                 let result = rtc.clear_alarm();
                 if result.is_ok() {
                     latch.on_ack_or_disable_success();
                 }
-                let _ = reply.send(result);
+                RtcReply::Unit(result)
             }
-            RtcCommand::Program { regs, reply } => {
-                let result = rtc.set_alarm(&regs);
-
-                let _ = reply.send(result);
-            }
+            RtcCommand::Program(regs) => RtcReply::Unit(rtc.set_alarm(&regs)),
+        };
+        if reply.send(response).is_err() {
+            break;
         }
 
         if inkwash_logic::worker_heartbeat::should_feed_after_command(watchdog_subscribed) {
