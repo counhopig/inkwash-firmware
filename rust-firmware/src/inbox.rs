@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
+use serde::{Deserialize, Serialize};
 
 use crate::nvs_blob::{read_blob, write_blob};
 
@@ -8,13 +9,22 @@ pub use inkwash_logic::inbox_item::{InboxItem, InboxKind, Priority};
 const NAMESPACE: &str = "inkwash_inbox";
 const KEY_ITEMS: &str = "items";
 const KEY_PENDING: &str = "pending";
-const BLOB_BUF_LEN: usize = 4096;
+const KEY_STATE: &str = "state_v1";
+const LEGACY_BLOB_BUF_LEN: usize = 4096;
+const STATE_BLOB_BUF_LEN: usize = 6144;
 
 pub const MAX_ITEMS: usize = 32;
 
 const MAX_BODY_CHARS: usize = 300;
 
 const BLOB_HEADROOM: usize = 256;
+
+#[derive(Default, Deserialize, Serialize)]
+struct InboxState {
+    version: u8,
+    items: Vec<InboxItem>,
+    pending_read: Vec<u64>,
+}
 
 pub struct InboxStore {
     nvs: EspDefaultNvs,
@@ -27,27 +37,39 @@ impl InboxStore {
         Ok(Self { nvs })
     }
 
-    fn read_blob<T: for<'de> serde::Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
-        read_blob::<BLOB_BUF_LEN, _>(&self.nvs, key)
+    fn load_state(&self) -> Result<InboxState> {
+        if let Some(state) = read_blob::<STATE_BLOB_BUF_LEN, InboxState>(&self.nvs, KEY_STATE)? {
+            if state.version != 1 {
+                return Err(anyhow!("unsupported inbox state version {}", state.version));
+            }
+            return Ok(state);
+        }
+
+        Ok(InboxState {
+            version: 1,
+            items: read_blob::<LEGACY_BLOB_BUF_LEN, _>(&self.nvs, KEY_ITEMS)?.unwrap_or_default(),
+            pending_read: read_blob::<LEGACY_BLOB_BUF_LEN, _>(&self.nvs, KEY_PENDING)?
+                .unwrap_or_default(),
+        })
     }
 
-    fn write_blob<T: serde::Serialize + ?Sized>(&self, key: &str, value: &T) -> Result<()> {
-        write_blob::<BLOB_BUF_LEN, _>(&self.nvs, key, value)
+    fn save_state(&self, state: &InboxState) -> Result<()> {
+        write_blob::<STATE_BLOB_BUF_LEN, _>(&self.nvs, KEY_STATE, state)
     }
 
     pub fn load(&self) -> Result<Vec<InboxItem>> {
-        Ok(self.read_blob(KEY_ITEMS)?.unwrap_or_default())
+        Ok(self.load_state()?.items)
     }
 
     pub fn save(&self, items: &[InboxItem]) -> Result<()> {
-        let pending = self.pending_read()?;
-        let pending = inkwash_logic::reminder_dedup::merge_pending_read(&pending, items);
+        let current = self.load_state()?;
+        let pending =
+            inkwash_logic::reminder_dedup::merge_pending_read(&current.pending_read, items);
         let mut owned: Vec<InboxItem> = items.to_vec();
         owned.truncate(MAX_ITEMS);
 
         inkwash_logic::reminder_dedup::apply_pending_read(&mut owned, &pending);
 
-        let budget = BLOB_BUF_LEN.saturating_sub(BLOB_HEADROOM);
         for item in owned.iter_mut() {
             if item.body.chars().count() > MAX_BODY_CHARS {
                 item.body = format!(
@@ -56,39 +78,54 @@ impl InboxStore {
                 );
             }
         }
-        while owned.len() > 1
-            && serde_json::to_vec(&owned)
-                .map(|v| v.len())
+        let mut state = InboxState {
+            version: 1,
+            items: owned,
+            pending_read: pending,
+        };
+        let budget = STATE_BLOB_BUF_LEN.saturating_sub(BLOB_HEADROOM);
+        while state.items.len() > 1
+            && serde_json::to_vec(&state)
+                .map(|bytes| bytes.len())
                 .unwrap_or(usize::MAX)
                 > budget
         {
-            owned.pop();
+            state.items.pop();
         }
-        self.write_blob(KEY_ITEMS, &owned)?;
-        self.write_blob(KEY_PENDING, &pending)
+        state
+            .pending_read
+            .retain(|seq| state.items.iter().any(|item| item.id == *seq));
+        if serde_json::to_vec(&state)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > budget
+        {
+            return Err(anyhow!("inbox state exceeds storage budget"));
+        }
+        self.save_state(&state)
     }
 
     pub fn pending_read(&self) -> Result<Vec<u64>> {
-        Ok(self.read_blob(KEY_PENDING)?.unwrap_or_default())
+        Ok(self.load_state()?.pending_read)
     }
 
     pub fn mark_read(&self, seq: u64) -> Result<()> {
-        let mut items = self.load()?;
-        let mut pending = self.pending_read()?;
-        if let Some(item) = items.iter_mut().find(|it| it.id == seq) {
-            item.read = true;
+        let mut state = self.load_state()?;
+        let Some(item) = state.items.iter_mut().find(|item| item.id == seq) else {
+            return Err(anyhow!("inbox item {seq} not found"));
+        };
+        item.read = true;
+        if !state.pending_read.contains(&seq) {
+            state.pending_read.push(seq);
         }
-        if !pending.contains(&seq) {
-            pending.push(seq);
-        }
-        self.write_blob(KEY_ITEMS, &items)?;
-        self.write_blob(KEY_PENDING, &pending)
+        self.save_state(&state)
     }
 
     pub fn ack_read(&self, acked: &[u64]) -> Result<()> {
-        let pending = self.pending_read()?;
-        let remaining = inkwash_logic::reminder_dedup::ack_pending_read(&pending, acked);
-        self.write_blob(KEY_PENDING, &remaining)
+        let mut state = self.load_state()?;
+        state.pending_read =
+            inkwash_logic::reminder_dedup::ack_pending_read(&state.pending_read, acked);
+        self.save_state(&state)
     }
 
     pub fn unread_urgent(&self) -> Result<Vec<u64>> {

@@ -164,6 +164,8 @@
 - `rust-firmware/src/main.rs:1296`：启动快照对 Todo、Inbox、设备配置、Wi-Fi 和时区读取错误统一返回失败，仅在 key 确实不存在时采用默认值。
 - `rust-firmware/src/ble_control.rs:204`：BLE 生命周期回调使用非阻塞、定长并保留最新状态的邮箱；队列饱和时压缩状态，不阻塞 NimBLE host 回调线程。
 - `logic/src/app.rs`、`rust-firmware/src/storage.rs`：服务端 Token 在状态机入口和持久化层均限制为 255 字节，与 NVS 读缓冲一致。
+- `rust-firmware/src/storage.rs`：Wi-Fi 凭据和服务端配置分别保存为单个带版本的 NVS blob，写入不会再产生 SSID/密码或 URL/Token 新旧混合；读取端保留旧键兼容迁移，并对持久化内容重新校验。
+- `rust-firmware/src/inbox.rs`：Inbox 条目与待确认已读 ID 合并为单个版本化 NVS blob；pending 集合只保留当前最多 32 个条目中的 ID，条目截断和序列化容量使用同一预算，已读标记与待上传确认原子落盘。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
@@ -205,14 +207,6 @@
 - 建议：若产品需要远程维护，改为 `otadata + ota_0 + ota_1`，实现 HTTPS OTA、镜像签名、首次启动自检和 `esp_ota_mark_app_valid_cancel_rollback`。
 - 风险：双 4 MiB 应用槽约占 8 MiB，会显著压缩当前 LittleFS 空间。
 - 验证：执行断电注入、损坏镜像、首次启动崩溃、版本降级和空间不足测试。
-
-#### P1-2 Wi-Fi 和服务端配置不是原子提交
-
-- 位置：`rust-firmware/src/storage.rs:65`、`:84`
-- 证据：SSID 与密码、URL 与 Token 分别写入两个 NVS key；中途掉电可只更新其中一项。
-- 影响：设备可能启动到新旧配置混合状态，导致认证失败或把旧 Token 发送到新地址。
-- 建议：将成组配置序列化为单个带版本的 blob；需要更强掉电一致性时使用 staging key 和 active generation。
-- 验证：在每个 NVS 写入点注入复位，重启后应只看到完整旧配置或完整新配置。
 
 #### P1-3 DFS 实际未生效
 
@@ -263,14 +257,6 @@ let config = esp_pm_config_t {
 - 影响：掉电、NVS 空间不足或单次写失败可能形成“新 alarms + 旧 todos”“内容已覆盖但 dirty 标记未清”或“数据已写但 ETag 未推进”等跨集合不一致。状态机当次不会确认成功，但重启后会读到部分新数据。
 - 建议：为同步快照增加 generation/commit marker。先写带同一 generation 的 staging 数据，全部成功后原子切换 active generation；最小方案至少应最后写 commit marker，并在启动时只接纳完整 generation。
 - 验证：在每个写入步骤后注入复位和错误，重启后必须得到完整旧快照或完整新快照，不能出现混合状态。
-
-#### P1-8 Inbox pending-read 集合无条目上限且双写不原子
-
-- 位置：`rust-firmware/src/inbox.rs:42`、`:75`
-- 证据：`mark_read()` 对 `pending` 只做去重后 `push`，没有数量或序列化大小上限；随后先写 `items` 再写 `pending`。两者共享 4096 字节上限，但只对 inbox items 做截断和预算控制。
-- 影响：长时间离线或服务端不确认 read ack 时，pending ID 会持续增长，最终使 `KEY_PENDING` 写入失败；写入失败前 `KEY_ITEMS` 可能已标记为已读，形成 UI 状态与待上传确认不一致。
-- 建议：为 pending 集合设置由序列化预算推导的硬上限；将 items 和 pending 合并为一个版本化 blob，或使用 generation/commit marker。达到上限时应保留最旧未确认项并显式告警，不能静默丢失。
-- 验证：生成超过容量的唯一 ID、在两次写入之间注入复位，并测试服务端部分 ack、重复 ack 和长期离线场景。
 
 #### P1-9 ETag 被保存但没有用于条件请求
 
@@ -361,20 +347,18 @@ let config = esp_pm_config_t {
 1. CI 保存 release 产物大小、map 文件和分区表。
 2. STACKPROBE 改为诊断开关或低栈阈值告警。
 3. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
-4. 为 Inbox pending-read 增加序列化容量检查和明确错误日志。
-5. 发布前检查工作区、GitHub 登录状态和同名标签指向，再推送不可变标签。
+4. 发布前检查工作区、GitHub 登录状态和同名标签指向，再推送不可变标签。
 
 ## 5. 中期与长期建议
 
 ### 中期
 
-- 将 Wi-Fi 和服务端配置改为单 blob、带版本、可原子切换的持久化格式。
 - 在 CI 中加入完整固件交叉构建、map 检查和分区容量检查。
 - 建立 RTC I2C、EPD BUSY、BLE 未授权访问和 Wi-Fi 失败清理的组件测试。
 - 明确任务优先级、核心亲和性和 internal/PSRAM 栈策略。
 - 复用现有 smoke 和串口采集脚本建立硬件在环测试。
 - 对 NVS 提交执行掉电注入测试。
-- 为同步快照和 Inbox 状态设计 generation/commit marker，消除多 key 部分提交。
+- 为同步快照设计 generation/commit marker，消除多 key 部分提交。
 - 建立 BLE 断开重连测试，验证 `conn_handle` 复用和迟到 notify 回调归属。
 - 对历史内存破坏建立固定版本、固定脚本、固定证据格式的发布阻断回归门禁。
 
