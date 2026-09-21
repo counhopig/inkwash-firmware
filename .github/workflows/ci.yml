@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   logic:
     name: inkwash-logic (host tests)
@@ -50,3 +53,37 @@ jobs:
       # install; +stable overrides it for rustfmt only, and needs no ESP-IDF.
       - name: Format check
         run: cargo +stable fmt --check
+
+  firmware-build:
+    name: inkwash-note4 (ESP32-S3 release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ESP-IDF 5.5.5
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: v5.5.5
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+
+      - name: Build release firmware
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: ./scripts/build-rust.sh --release --locked
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkwash-note4-esp32s3
+          if-no-files-found: error
+          path: |
+            rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
+            rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin
+            rust-firmware/target/xtensa-esp32s3-espidf/release/partition-table.bin
+            rust-firmware/target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*/out/build/libespidf.map

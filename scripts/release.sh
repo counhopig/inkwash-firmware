@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-# Builds the release firmware locally (this repo builds with a real ESP-IDF
-# toolchain, which is impractical on CI) and publishes it to a GitHub Release.
+# Builds the release firmware locally and publishes it to a GitHub Release.
 #
 # Usage (run from the repo root):
 #   ./scripts/release.sh v0.2.0
 #
-# Steps: build the release ELF -> create/verify the tag -> push it to both
-# remotes -> create the GitHub Release and upload the firmware. Requires
-# `gh` authenticated (see `gh auth status`).
+# Requires an authenticated `gh` CLI session.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,7 +13,7 @@ if [ -z "$TAG" ]; then
     echo "usage: $0 <tag>   e.g. $0 v0.2.0" >&2
     exit 1
 fi
-if [[ "$TAG" != v* ]]; then
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
     echo "tags should look like 'v1.2.3'" >&2
     exit 1
 fi
@@ -26,6 +23,24 @@ ELF="rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4"
 BOOTLOADER="rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin"
 PARTITIONS="rust-firmware/partitions.csv"
 PARTITIONS_BIN="rust-firmware/target/xtensa-esp32s3-espidf/release/partition-table.bin"
+
+if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    echo "release requires a clean working tree" >&2
+    exit 1
+fi
+HEAD="$(git rev-parse --verify HEAD)"
+command -v gh >/dev/null || {
+    echo "gh is required to publish the release" >&2
+    exit 1
+}
+gh auth status >/dev/null
+gh repo view "$REPO" >/dev/null
+if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1 \
+    || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 \
+    || gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    echo "tag or release already exists: $TAG" >&2
+    exit 1
+fi
 
 echo "==> Building release firmware..."
 ./scripts/build-rust.sh --release
@@ -76,18 +91,11 @@ espflash save-image --skip-update-check --chip esp32s3 \
     --target-app-partition factory \
     "$ELF" "$verify_dir/inkwash-note4.bin" >/dev/null
 
-echo "==> Tagging $TAG"
-if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-    git tag -a "$TAG" -m "inkwash-firmware $TAG"
-fi
-
-echo "==> Pushing tag to origin and github"
-git push origin "$TAG"
-git push github "$TAG" 2>/dev/null || true
-
-echo "==> Creating GitHub Release and uploading firmware"
+echo "==> Creating draft GitHub Release and uploading firmware"
 gh release create "$TAG" "$ELF" "$BOOTLOADER" "$PARTITIONS" \
     --repo "$REPO" \
+    --target "$HEAD" \
+    --draft \
     --title "Inkwash Firmware $TAG" \
     --notes "Firmware for the Zectrix Note 4 e-paper device. Flash with:
 
@@ -97,6 +105,14 @@ espflash flash --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80
   --partition-table partitions.csv --non-interactive \\
   inkwash-note4
 \`\`\`
-" || gh release upload "$TAG" "$ELF" "$BOOTLOADER" "$PARTITIONS" --repo "$REPO" --clobber
+"
+
+echo "==> Publishing GitHub Release"
+gh release edit "$TAG" --repo "$REPO" --draft=false
+
+git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+if git remote get-url github >/dev/null 2>&1; then
+    git push github "refs/tags/$TAG"
+fi
 
 echo "==> Done: https://github.com/$REPO/releases/tag/$TAG"

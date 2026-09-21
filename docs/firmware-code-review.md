@@ -171,6 +171,8 @@
 - `rust-firmware/src/epd_task.rs`：EPD worker 订阅 Task Watchdog，空闲等待每秒喂狗，刷新前后也喂狗；底层 BUSY 超时仍为 2 秒，非预期的 SPI/锁永久阻塞可由 10 秒 WDT 捕获。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置的读取、修改、线程创建与恢复由进程内全局互斥串行化，避免并发创建 worker 时互相覆盖栈能力策略。
 - `rust-firmware/src/wake.rs`：GPIO ISR 在通知唤醒更高优先级任务后调用 Xtensa `_frxt_setup_switch()` 请求立即调度，保持 ISR 路径位于 IRAM。
+- `.github/workflows/ci.yml`：CI 安装固定 ESP-IDF 5.5.5 和 ESP32-S3 Xtensa Rust 工具链，执行 `--release --locked` 完整交叉构建并上传 ELF、bootloader、分区表和 linker map。
+- `scripts/release.sh`：发布前要求干净工作区，校验 GitHub 登录、仓库、标签和 Release 冲突；构建验证完成后先创建带完整附件的 draft Release，最后发布并同步次要远端标签，中途失败不会产生公开但附件不完整的 Release。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
@@ -255,14 +257,6 @@
 
 ### P2 优化项
 
-#### P2-1 CI 不执行固件交叉构建
-
-- 位置：`.github/workflows/ci.yml`
-- 证据：CI 执行逻辑测试、Clippy 和格式检查；固件只检查格式。
-- 影响：ESP-IDF API、C/C++ 组件、链接和分区问题可能直到人工发布时才暴露。
-- 建议：增加带缓存的 ESP-IDF/Rust-ESP release build job，至少在 nightly 或合并前执行。
-- 验证：CI 上传 ELF、map、partition table，并检查应用镜像不超过分区容量。
-
 #### P2-4 周期诊断日志偏频繁
 
 - 位置：`rust-firmware/src/main.rs:463`、`:467`
@@ -270,14 +264,6 @@
 - 影响：长期运行时会增加串口输出、格式化和唤醒开销。
 - 建议：发布配置降低频率，或只在低栈、低内存和状态变化时输出。
 - 验证：比较诊断开启和关闭时的平均电流及自动 Light Sleep 占比。
-
-#### P2-5 发布流程可能留下已推送但未完成的版本标签
-
-- 位置：`scripts/release.sh:35-56`
-- 证据：脚本在检查 `gh` 登录状态、目标 release 是否可创建以及附件上传是否成功前，先创建并向 `origin` 推送 tag；向 `github` 推送的失败还被 `|| true` 忽略。
-- 影响：发布失败会留下远端正式标签但没有完整 Release/附件，重试时语义不清晰；标签也未检查是否指向当前 HEAD、工作区是否干净。
-- 建议：先完成所有本地校验和 `gh auth status`，确认 tag 不冲突且提交正确；最后阶段再创建/推送不可变标签和 Release。失败时明确报告每个远端状态，不吞错。
-- 验证：在未登录、同名 tag 指向其他提交、附件上传失败和第二远端不存在的情形运行 dry-run。
 
 #### P2-6 约 11.9 MiB storage 分区当前未被使用
 
@@ -307,16 +293,13 @@
 
 以下改动通常可在 1–2 小时内完成，且风险较低：
 
-1. CI 保存 release 产物大小、map 文件和分区表。
-2. STACKPROBE 改为诊断开关或低栈阈值告警。
-3. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
-4. 发布前检查工作区、GitHub 登录状态和同名标签指向，再推送不可变标签。
+1. STACKPROBE 改为诊断开关或低栈阈值告警。
+2. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
 
 ## 5. 中期与长期建议
 
 ### 中期
 
-- 在 CI 中加入完整固件交叉构建、map 检查和分区容量检查。
 - 建立 RTC I2C、EPD BUSY、BLE 未授权访问和 Wi-Fi 失败清理的组件测试。
 - 明确任务优先级、核心亲和性和 internal/PSRAM 栈策略。
 - 复用现有 smoke 和串口采集脚本建立硬件在环测试。
