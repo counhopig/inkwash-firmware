@@ -10,6 +10,8 @@ fn main() {
         println!("cargo:rustc-env=INKWASH_P06_VALIDATE=1");
     }
     println!("cargo:rerun-if-changed=Cargo.toml");
+    emit_tree_rerun_if_changed(std::path::Path::new("components/zectrix_epd"));
+    emit_tree_rerun_if_changed(std::path::Path::new("components/p06_recorder"));
 
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     let build_epoch = match std::env::var("SOURCE_DATE_EPOCH") {
@@ -37,6 +39,41 @@ fn main() {
     println!("cargo:rustc-env=GIT_REV={git_rev}");
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn emit_tree_rerun_if_changed(root: &std::path::Path) {
+    let mut entries = std::fs::read_dir(root)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read native component '{}': {err}",
+                root.display()
+            )
+        })
+        .map(|entry| {
+            entry.unwrap_or_else(|err| {
+                panic!(
+                    "failed to inspect native component '{}': {err}",
+                    root.display()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type().unwrap_or_else(|err| {
+            panic!(
+                "failed to inspect native component '{}': {err}",
+                path.display()
+            )
+        });
+        if file_type.is_dir() {
+            emit_tree_rerun_if_changed(&path);
+        } else if file_type.is_file() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 fn emit_git_ref_rerun_if_changed() {

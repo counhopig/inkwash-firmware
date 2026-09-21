@@ -168,6 +168,7 @@
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
 - `rust-firmware/build.rs`：支持 `SOURCE_DATE_EPOCH`，相同源码和指定时间戳可生成稳定的构建时间元数据；非法值会直接终止构建。
+- `rust-firmware/build.rs`：递归声明两个本地 ESP-IDF 组件的源码、头文件和 CMake 文件为构建依赖，驱动修改会触发 Cargo/embuild 重新配置。
 - `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 factory 分区生成应用镜像以执行 4 MiB 容量门禁。
 - 以上状态通过 fmt、clippy、418 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
@@ -319,15 +320,7 @@ let config = esp_pm_config_t {
 - 建议：发布配置降低频率，或只在低栈、低内存和状态变化时输出。
 - 验证：比较诊断开启和关闭时的平均电流及自动 Light Sleep 占比。
 
-#### P2-5 本地 C/C++ 组件变更可能未触发 Cargo 增量重建
-
-- 位置：`rust-firmware/build.rs`；`rust-firmware/components/zectrix_epd/`、`components/p06_recorder/`
-- 证据：项目 `build.rs` 只声明跟踪 Cargo 配置、自身和 Git ref；本次审查中修改外部组件源后，增量构建没有重新编译对应 C++，必须清理 ESP32-S3 target 后才得到新产物。
-- 影响：开发者可能测试或发布旧的 native object，而误以为源码改动已经进入 ELF。这是构建正确性风险，不只是构建速度问题。
-- 建议：为两个组件源、头文件和 `CMakeLists.txt` 建立明确的 rerun/reconfigure 依赖；发布构建至少使用隔离的新 target 目录，并验证 ELF 中的版本标记或对象时间戳。
-- 验证：只改一个 C/C++ 可观测常量，执行普通增量构建，确认对应对象被重编译且 ELF 行为变化。
-
-#### P2-6 发布流程可能留下已推送但未完成的版本标签
+#### P2-5 发布流程可能留下已推送但未完成的版本标签
 
 - 位置：`scripts/release.sh:35-56`
 - 证据：脚本在检查 `gh` 登录状态、目标 release 是否可创建以及附件上传是否成功前，先创建并向 `origin` 推送 tag；向 `github` 推送的失败还被 `|| true` 忽略。
@@ -335,7 +328,7 @@ let config = esp_pm_config_t {
 - 建议：先完成所有本地校验和 `gh auth status`，确认 tag 不冲突且提交正确；最后阶段再创建/推送不可变标签和 Release。失败时明确报告每个远端状态，不吞错。
 - 验证：在未登录、同名 tag 指向其他提交、附件上传失败和第二远端不存在的情形运行 dry-run。
 
-#### P2-7 Flash 备份脚本没有核验授权设备身份
+#### P2-6 Flash 备份脚本没有核验授权设备身份
 
 - 位置：`scripts/backup-flash.ps1:1-16`
 - 证据：脚本仅接收串口名并直接读取完整 16 MiB Flash，没有读取和比对 MAC、芯片型号或 Flash 容量。
@@ -343,7 +336,7 @@ let config = esp_pm_config_t {
 - 建议：执行任何读写前解析 `esptool chip_id/flash_id`，强制匹配授权 Note 4 MAC `20:6E:F1:B4:7D:E4`、ESP32-S3 和 16 MiB，并把身份元数据与哈希写入备份清单。
 - 验证：授权设备可备份；错误 MAC、非 S3、容量不符和无法识别身份时必须在读取前退出。
 
-#### P2-8 约 11.9 MiB storage 分区当前未被使用
+#### P2-7 约 11.9 MiB storage 分区当前未被使用
 
 - 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
 - 证据：`storage` 数据分区占 `0xBF0000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 24 KiB NVS。
@@ -351,7 +344,7 @@ let config = esp_pm_config_t {
 - 建议：先确认产品路线；若无需用户文件，重新分配给双 OTA、加密 core dump 或更宽裕的 NVS。不要仅为“利用空间”引入文件系统。
 - 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
 
-#### P2-9 字体索引与字模资源缺少构建期一致性校验
+#### P2-8 字体索引与字模资源缺少构建期一致性校验
 
 - 位置：`rust-firmware/src/font_cjk.rs:14-58`；`tools/generate_cjk_font.py`
 - 证据：索引读取本身按 4 字节条目遍历，但 `glyph16()`/`glyph12()` 使用索引中的 cell 直接切片，没有检查字模长度；资源错配会在渲染时 panic。
@@ -359,7 +352,7 @@ let config = esp_pm_config_t {
 - 建议：生成或构建阶段检查 index 长度为 4 的倍数、排序唯一、最大 cell 同时落入两套字模范围，并生成校验摘要。
 - 验证：对截断字模、越界 cell、乱序和重复 code point 建立生成器失败测试。
 
-#### P2-10 ADC 通道通过 `Peripherals::steal()` 重建所有权
+#### P2-9 ADC 通道通过 `Peripherals::steal()` 重建所有权
 
 - 位置：`rust-firmware/src/board.rs:278-284`
 - 证据：每次电池采样都以 `unsafe { Peripherals::steal() }` 重新取得 GPIO4 token，而不是在 `Board` 初始化时建立并持有 ADC channel。
@@ -367,7 +360,7 @@ let config = esp_pm_config_t {
 - 建议：初始化时创建并保存 ADC channel，采样时只借用；把 `steal()` 限制在确有底层所有权证明的集中边界。
 - 验证：编译期确认 GPIO4 不能被第二个驱动取得，并连续执行 ADC、Wi-Fi、EPD 并发压力测试。
 
-#### P2-11 量产配置与诊断配置尚未分离
+#### P2-10 量产配置与诊断配置尚未分离
 
 - 位置：`rust-firmware/sdkconfig.defaults:110-116`
 - 证据：默认配置同时启用综合堆毒化、INFO 日志和 UART core dump。这些设置适合当前 P0 定位，但会增加运行开销、日志暴露和 panic 后恢复时间。
@@ -384,7 +377,6 @@ let config = esp_pm_config_t {
 3. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
 4. 为 Inbox pending-read 增加序列化容量检查和明确错误日志。
 5. 发布前检查工作区、GitHub 登录状态和同名标签指向，再推送不可变标签。
-6. 为本地 C/C++ 组件声明完整的 Cargo 重建依赖。
 
 ## 5. 中期与长期建议
 
