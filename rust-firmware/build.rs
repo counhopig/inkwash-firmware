@@ -11,11 +11,18 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=Cargo.toml");
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    println!("cargo:rustc-env=BUILD_EPOCH_SECS={now}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let build_epoch = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value
+            .parse::<u64>()
+            .unwrap_or_else(|err| panic!("invalid SOURCE_DATE_EPOCH '{value}': {err}")),
+        Err(std::env::VarError::NotPresent) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+        Err(err) => panic!("failed to read SOURCE_DATE_EPOCH: {err}"),
+    };
+    println!("cargo:rustc-env=BUILD_EPOCH_SECS={build_epoch}");
 
     emit_git_ref_rerun_if_changed();
 

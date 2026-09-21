@@ -25,12 +25,56 @@ REPO="counhopig/inkwash-firmware"
 ELF="rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4"
 BOOTLOADER="rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin"
 PARTITIONS="rust-firmware/partitions.csv"
+PARTITIONS_BIN="rust-firmware/target/xtensa-esp32s3-espidf/release/partition-table.bin"
 
 echo "==> Building release firmware..."
 ./scripts/build-rust.sh --release
 test -f "$ELF" || { echo "expected firmware not found at $ELF" >&2; exit 1; }
 test -f "$BOOTLOADER" || { echo "expected bootloader not found at $BOOTLOADER" >&2; exit 1; }
 test -f "$PARTITIONS" || { echo "expected partition table not found at $PARTITIONS" >&2; exit 1; }
+test -f "$PARTITIONS_BIN" || { echo "expected generated partition table not found at $PARTITIONS_BIN" >&2; exit 1; }
+
+sdkconfigs=(rust-firmware/target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*/out/sdkconfig)
+SDKCONFIG=""
+for candidate in "${sdkconfigs[@]}"; do
+    if [ -f "$candidate" ] && { [ -z "$SDKCONFIG" ] || [ "$candidate" -nt "$SDKCONFIG" ]; }; then
+        SDKCONFIG="$candidate"
+    fi
+done
+if [ -z "$SDKCONFIG" ]; then
+    echo "release sdkconfig not found" >&2
+    exit 1
+fi
+
+require_config() {
+    if ! grep -Fqx "$1" "$SDKCONFIG"; then
+        echo "release sdkconfig does not contain required setting: $1" >&2
+        exit 1
+    fi
+}
+
+require_config 'CONFIG_IDF_TARGET="esp32s3"'
+require_config 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y'
+require_config 'CONFIG_ESPTOOLPY_FLASHMODE_DIO=y'
+require_config 'CONFIG_ESPTOOLPY_FLASHFREQ_80M=y'
+
+command -v espflash >/dev/null || {
+    echo "espflash is required to verify the generated partition table" >&2
+    exit 1
+}
+verify_dir="$(mktemp -d)"
+trap 'rm -rf "$verify_dir"' EXIT
+espflash partition-table --skip-update-check --to-binary \
+    --output "$verify_dir/partition-table.bin" "$PARTITIONS" >/dev/null
+if ! cmp -s "$verify_dir/partition-table.bin" "$PARTITIONS_BIN"; then
+    echo "generated partition table does not match $PARTITIONS" >&2
+    exit 1
+fi
+espflash save-image --skip-update-check --chip esp32s3 \
+    --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
+    --bootloader "$BOOTLOADER" --partition-table "$PARTITIONS" \
+    --target-app-partition factory \
+    "$ELF" "$verify_dir/inkwash-note4.bin" >/dev/null
 
 echo "==> Tagging $TAG"
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then

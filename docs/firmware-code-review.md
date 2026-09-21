@@ -159,9 +159,16 @@
 - `rust-firmware/components/zectrix_epd/zectrix_epd.cc`：OTP 刷新不再在运行期重新配置并释放共享 SPI bus，消除了已稳定复现的 `spi_bus_deinit_lock` 断言路径。
 - `rust-firmware/src/wake.rs`、`board.rs`、`sdkconfig.defaults`：GPIO 唤醒 ISR、ISR 服务和 GPIO 控制函数均配置为 IRAM-safe；ELF 已确认 `wake_isr` 与 `gpio_intr_disable` 位于 `0x4037xxxx` IRAM 区间。
 - `rust-firmware/src/rtc_executor.rs`、`ctx.rs`：RTC executor 使用单个容量为 1 的可复用回复通道，所有克隆句柄通过互斥接收端串行完成请求；250 ms 告警轮询不再反复创建和销毁一次性通道，瞬时 I²C 错误记录后留待下次轮询重试。
+- `rust-firmware/src/rtc.rs`、`logic/src/app.rs`：RTC 读写均校验 2000–2099 年、真实月日、weekday 和时分秒范围；`SetRtc` 在时区换算后再次检查 PCF8563 可表达年份。
+- `rust-firmware/src/audio.rs`：播放和初始化失败都会进入统一清理路径，按顺序关闭 I²S 与功放，并组合报告主错误和清理错误。
+- `rust-firmware/src/main.rs:1296`：启动快照对 Todo、Inbox、设备配置、Wi-Fi 和时区读取错误统一返回失败，仅在 key 确实不存在时采用默认值。
+- `rust-firmware/src/ble_control.rs:204`：BLE 生命周期回调使用非阻塞、定长并保留最新状态的邮箱；队列饱和时压缩状态，不阻塞 NimBLE host 回调线程。
+- `logic/src/app.rs`、`rust-firmware/src/storage.rs`：服务端 Token 在状态机入口和持久化层均限制为 255 字节，与 NVS 读缓冲一致。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
+- `rust-firmware/build.rs`：支持 `SOURCE_DATE_EPOCH`，相同源码和指定时间戳可生成稳定的构建时间元数据；非法值会直接终止构建。
+- `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 factory 分区生成应用镜像以执行 4 MiB 容量门禁。
 - 以上状态通过 fmt、clippy、418 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
 ## 3. 改进建议
@@ -196,15 +203,7 @@
 - 风险：双 4 MiB 应用槽约占 8 MiB，会显著压缩当前 LittleFS 空间。
 - 验证：执行断电注入、损坏镜像、首次启动崩溃、版本降级和空间不足测试。
 
-#### P1-2 Light Sleep 的 CPU power-down 与动态内存策略不兼容
-
-- 位置：`rust-firmware/src/main.rs` 电源管理和唤醒源配置路径；`rust-firmware/sdkconfig.defaults` 的 PM/tickless 配置
-- 证据：授权真机每次启用 Light Sleep 时都输出 `Failed to enable CPU power down during light sleep`。IDF 源码 `components/esp_hw_support/lowpower/port/esp32s3/sleep_cpu.c:166` 显示 CPU retention 需要 `MALLOC_CAP_RETENTION` 连续内存，失败返回 `ESP_ERR_NO_MEM`；`components/esp_pm/pm_impl.c:504` 调用 `esp_pm_sleep_configure(config)` 却没有检查返回值，最终 `esp_pm_configure()` 仍返回 `ESP_OK`。
-- 影响：固件会把部分失败当作成功，CPU 电源域实际没有关闭；反复启停还会在内部堆上分配和释放 retention 内存。
-- 建议：`sdkconfig.defaults` 已显式设置 `CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n`，保留自动 Light Sleep，并将应用日志改为只陈述请求状态和唤醒源配置。若未来要恢复 CPU-domain power-down，应在启动早期一次性预留 retention 内存，并先修补或升级 IDF 的错误传播。
-- 验证：串口已确认 CPU retention 错误消失，Wi-Fi 超时后自动 Light Sleep 恢复。当前还可手动验证 GPIO0/18/39 唤醒、RTC 闹钟和 USB 重连。实际 idle/Light Sleep 电流属于需要功耗分析仪的外部验证，不作为当前完成前提。
-
-#### P1-3 Wi-Fi 和服务端配置不是原子提交
+#### P1-2 Wi-Fi 和服务端配置不是原子提交
 
 - 位置：`rust-firmware/src/storage.rs:65`、`:84`
 - 证据：SSID 与密码、URL 与 Token 分别写入两个 NVS key；中途掉电可只更新其中一项。
@@ -212,7 +211,7 @@
 - 建议：将成组配置序列化为单个带版本的 blob；需要更强掉电一致性时使用 staging key 和 active generation。
 - 验证：在每个 NVS 写入点注入复位，重启后应只看到完整旧配置或完整新配置。
 
-#### P1-4 DFS 实际未生效
+#### P1-3 DFS 实际未生效
 
 - 位置：`rust-firmware/src/power.rs:106`
 - 证据：`max_freq_mhz` 和 `min_freq_mhz` 都等于默认 CPU 频率，实际为 160 MHz。
@@ -230,15 +229,7 @@ let config = esp_pm_config_t {
 
 - 验证：分别测量 Home 空闲、按键、音频、Wi-Fi 和 EPD 刷新场景的电流及响应时间。
 
-#### P1-5 RTC 读取值缺少合法性校验
-
-- 位置：`rust-firmware/src/rtc.rs:60`
-- 证据：BCD 转换后直接构造 `DateTime`，没有验证秒、分、时、月、日和 weekday 范围。
-- 影响：I2C 干扰、寄存器损坏或未初始化值可能进入日期、调度和告警算法。
-- 建议：读取后执行统一的 `DateTime::validate()`；非法值进入重新校时或安全降级流程。
-- 验证：mock 非法 BCD、月 0、日 0、2 月 31 日和 weekday 7。
-
-#### P1-6 任务优先级和核心亲和性没有明确策略
+#### P1-4 任务优先级和核心亲和性没有明确策略
 
 - 位置：`rust-firmware/src/tasks.rs` 及各任务的 `thread::Builder` 调用
 - 证据：任务只设置名称和栈大小，没有显式 priority 或 affinity；仅 Wi-Fi 系统任务在配置中固定到 Core 1。
@@ -246,7 +237,7 @@ let config = esp_pm_config_t {
 - 建议：先记录实际 task priority/core，再以最小调整保证 RTC 和告警控制高于后台同步；不要在缺少测量时大范围提高优先级。
 - 验证：Wi-Fi TLS、EPD 全刷和音频同时运行时测量按键和告警响应延迟。
 
-#### P1-7 EPD 任务未加入 Task Watchdog
+#### P1-5 EPD 任务未加入 Task Watchdog
 
 - 位置：`rust-firmware/src/epd_task.rs:255`
 - 证据：主任务、RTC、同步、音频和 Effect worker 会订阅或喂 WDT，EPD worker 没有订阅。
@@ -254,7 +245,7 @@ let config = esp_pm_config_t {
 - 建议：为 EPD 任务加入 WDT，并在长刷新过程的受控边界喂狗；避免在不可控无限等待中简单订阅。
 - 验证：模拟 BUSY 常高、SPI 错误和队列堵塞。
 
-#### P1-8 BLE 断开重连后可能永久拒绝回复
+#### P1-6 BLE 断开重连后可能永久拒绝回复
 
 - 位置：`rust-firmware/src/ble_control.rs:104`、`:126`、`:147`
 - 证据：`NotifyAttemptMailbox` 使用 8 KiB 的 `retired_handles: [u64; 1024]`；`quarantine()` 和 `release_generation()` 会置位，但当前实现没有任何清位路径。`arm()` 会永久拒绝退休 handle。
@@ -262,7 +253,7 @@ let config = esp_pm_config_t {
 - 建议：先建立可靠的旧 notify 回调排空边界，或更换不依赖仅有 `conn_handle` 的完成关联模型；在确认回调归属前不要采用“连接时清位”的表面修复。
 - 验证：在同一配对会话中反复断开/重连，记录每代 `conn_handle`、generation、attempt_id 和 notify 回调。如果 handle 被复用，应确认新请求仍能收到回复且旧回调不能完成新请求。
 
-#### P1-9 同步数据应用存在跨 key 部分提交
+#### P1-7 同步数据应用存在跨 key 部分提交
 
 - 位置：`rust-firmware/src/effect_task.rs:104`
 - 证据：`ApplySyncedData` 依次写 alarms、todos、inbox、pending-read ack、alarm dirty set、todo dirty set 和 ETag。任一步失败只会返回错误，不会回滚前面已成功的 NVS 写入。
@@ -270,7 +261,7 @@ let config = esp_pm_config_t {
 - 建议：为同步快照增加 generation/commit marker。先写带同一 generation 的 staging 数据，全部成功后原子切换 active generation；最小方案至少应最后写 commit marker，并在启动时只接纳完整 generation。
 - 验证：在每个写入步骤后注入复位和错误，重启后必须得到完整旧快照或完整新快照，不能出现混合状态。
 
-#### P1-10 Inbox pending-read 集合无条目上限且双写不原子
+#### P1-8 Inbox pending-read 集合无条目上限且双写不原子
 
 - 位置：`rust-firmware/src/inbox.rs:42`、`:75`
 - 证据：`mark_read()` 对 `pending` 只做去重后 `push`，没有数量或序列化大小上限；随后先写 `items` 再写 `pending`。两者共享 4096 字节上限，但只对 inbox items 做截断和预算控制。
@@ -278,15 +269,7 @@ let config = esp_pm_config_t {
 - 建议：为 pending 集合设置由序列化预算推导的硬上限；将 items 和 pending 合并为一个版本化 blob，或使用 generation/commit marker。达到上限时应保留最旧未确认项并显式告警，不能静默丢失。
 - 验证：生成超过容量的唯一 ID、在两次写入之间注入复位，并测试服务端部分 ack、重复 ack 和长期离线场景。
 
-#### P1-11 启动时将持久化读取失败误当作空配置
-
-- 位置：`rust-firmware/src/main.rs:1313-1333`
-- 证据：Todo、Inbox 读取失败后直接使用空列表；`device_config()`、`wifi_creds()` 的错误经 `.ok().flatten()` 丢弃；时区读取失败回退为 UTC。相比之下，Alarm 读取失败会阻止构造正常启动快照。
-- 影响：NVS 损坏、字符串超出读缓冲或格式迁移失败时，设备可能表现为数据被清空或配置丢失；后续操作还可能把默认值写回，降低数据恢复机会。
-- 建议：区分 `NotFound` 与 `Corrupt/TooLong/DecodeError`。仅缺少 key 时使用默认值；其余错误进入明确的降级模式并保留原始数据，至少在 UI/USB 状态中暴露持久化故障。
-- 验证：分别注入 key 不存在、JSON 损坏、超长字符串和 NVS 读错误，确认只有第一种使用默认值，其余情况不会被报告为“未配置”。
-
-#### P1-12 ETag 被保存但没有用于条件请求
+#### P1-9 ETag 被保存但没有用于条件请求
 
 - 位置：`rust-firmware/src/sync.rs:179-239`、`:294`
 - 证据：`fetch_and_apply()` 的参数名为 `_etag` 且未使用；调用 `https_post()` 时额外 header 为空。HTTP 层只接受状态码 200，标准条件请求的 304 会被当作错误。
@@ -294,45 +277,13 @@ let config = esp_pm_config_t {
 - 建议：发送 `If-None-Match`，显式把 304 映射为 `NotModified`，且 304 时不重写业务数据；若服务端协议并不支持 ETag，则删除该状态，避免伪机制。
 - 验证：服务端依次返回 200+ETag、304、更新后的 200，确认请求头、状态机、NVS 写入次数和同步时间符合预期。
 
-#### P1-13 UART core dump 会暴露运行内存中的凭据
+#### P1-10 UART core dump 会暴露运行内存中的凭据
 
 - 位置：`rust-firmware/sdkconfig.defaults:112`；`rust-firmware/src/storage.rs:55-86`；`rust-firmware/src/sync.rs:144-147`
 - 证据：配置启用 `CONFIG_ESP_COREDUMP_ENABLE_TO_UART=y`；运行期内存会包含 Wi-Fi 密码、Bearer Token 和 HTTP Authorization header，USB Serial/JTAG 控制台无需身份认证即可读取 panic 输出。
 - 影响：获得设备短时物理访问或串口日志的人可能从 core dump 提取敏感信息。当前 core dump 对定位 P0-2 很有价值，但不适合作为默认量产策略。
 - 建议：保留专用诊断 profile；量产 profile 改为加密 Flash 中的 core dump 分区，或关闭完整 core dump、仅保留脱敏后的复位原因和故障计数。
 - 验证：对诊断转储执行字符串扫描，确认风险范围；量产镜像触发受控 panic 后不得在 USB 输出 RAM 内容。
-
-#### P1-14 RTC 允许范围在时区换算后越出芯片年份范围
-
-- 位置：`logic/src/app.rs:3339-3353`；`rust-firmware/src/rtc.rs:60-86`
-- 证据：`SetRtc` 先验证 UTC epoch 位于 2000-01-01 至 2100-01-01，再叠加 `[-12h,+14h]` 时区。边界值可变为 1999 或 2100；PCF8563 写入使用 `dt.year % 100`，读取固定加 2000。
-- 影响：例如 2000-01-01 UTC 配负时区会写成 `99` 并读回 2099；2100 边界会读回 2000，造成日期、闹钟和同步调度跨世纪错误。
-- 建议：对换算后的本地时间再次验证为 2000-01-01 00:00:00 至 2099-12-31 23:59:59，并让 `rtc.write_time()` 自身也拒绝越界或非法字段。
-- 验证：覆盖最小/最大 UTC、-720/+840 分钟、闰日及 2099 年末的单元测试和 RTC 写读回测试。
-
-#### P1-15 音频失败路径可能让功放保持开启
-
-- 位置：`rust-firmware/src/audio.rs:153-195`
-- 证据：代码先拉高 `pa_enable`，之后 `i2s.tx_enable()?` 可提前返回而不执行清理；正常清理中的 `tx_disable()` 和 `pa_enable.set_low()` 错误被直接忽略。
-- 影响：I2S 或 GPIO 异常时功放可能持续上电，带来静态功耗、噪声和热风险，且上层只看到原始错误而不知道清理是否失败。
-- 建议：用作用域 guard 保证所有出口关闭功放；合并并记录主错误与清理错误。关闭功放应优先于等待 drain。
-- 验证：注入 `tx_enable`、写入、`tx_disable` 和 GPIO 失败，逐项确认最终 PA 电平和错误日志。
-
-#### P1-16 BLE 生命周期回调可被有界邮箱无限阻塞
-
-- 位置：`rust-firmware/src/ble_control.rs:205-213`
-- 证据：`send_lifecycle()` 在队列达到 16 项时通过条件变量无限等待；该函数由 NimBLE 连接/断开等回调调用。只有主循环消费后才会唤醒。
-- 影响：主循环停顿或饱和时会阻塞 NimBLE host 回调线程，进而拖住断连、协议栈清理和反初始化；这与回调应短小且不可无限等待的约束冲突。
-- 建议：回调只写入非阻塞、预分配邮箱；用序号/状态压缩保证最终连接状态不丢，并把可靠重放放到 worker 线程，禁止在 NimBLE 回调等待主循环。
-- 验证：暂停主循环并制造超过 16 次生命周期事件，确认 NimBLE host 仍可运行、停止和重新启动，且最终状态一致。
-
-#### P1-17 服务端 Token 缺少与 NVS 缓冲一致的长度校验
-
-- 位置：`logic/src/app.rs:3424-3462`；`rust-firmware/src/storage.rs:21`、`:70-86`；`rust-firmware/src/usb_console.rs` 的 512 字节命令行上限
-- 证据：URL 限制为 240 字节，但 Token 没有独立上限；写入使用不定长 `set_str`，读回固定 256 字节缓冲。协议允许构造超过读缓冲能力但仍小于整行上限的 Token。
-- 影响：配置命令可能当次持久化成功，重启后却因缓冲不足无法读取；结合 P1-11 又会被静默表现为服务端未配置。
-- 建议：在协议入口按 UTF-8 字节数限制 Token，并使限制小于 NVS 读缓冲扣除终止符后的容量；写入层也应重复校验。
-- 验证：测试 254、255、256 字节及多字节 UTF-8 Token 的写入、重启读回和错误回复。
 
 ### P2 优化项
 
@@ -344,23 +295,7 @@ let config = esp_pm_config_t {
 - 建议：增加带缓存的 ESP-IDF/Rust-ESP release build job，至少在 nightly 或合并前执行。
 - 验证：CI 上传 ELF、map、partition table，并检查应用镜像不超过分区容量。
 
-#### P2-2 发布脚本缺少最终目标参数校验
-
-- 位置：`scripts/release.sh:27`
-- 证据：发布前只检查 ELF 存在，没有解析生成配置和分区表确认 ESP32-S3、16 MB、DIO、80 MHz 及指定布局。
-- 影响：环境或默认值漂移时可能发布错误目标产物。
-- 建议：发布脚本自动校验最终 sdkconfig 和 partition-table.bin，并生成 SHA-256 与构建元数据。
-- 验证：人为改变一个 Flash 参数，发布脚本应立即失败。
-
-#### P2-3 构建不可复现
-
-- 位置：`rust-firmware/build.rs:14`
-- 证据：每次构建都会把当前 UNIX 时间写入 `BUILD_EPOCH_SECS`。
-- 影响：同一提交和工具链重复构建会产生不同二进制，不利于供应链审计。
-- 建议：优先读取 `SOURCE_DATE_EPOCH`，仅在开发构建中回退到当前时间。
-- 验证：指定相同 `SOURCE_DATE_EPOCH` 连续构建并比较镜像哈希。
-
-#### P2-4 ISR 没有请求立即任务切换
+#### P2-2 ISR 没有请求立即任务切换
 
 - 位置：`rust-firmware/src/wake.rs:15`
 - 证据：`xTaskGenericNotifyFromISR` 返回 `higher_prio_woken`，但 ISR 没有执行 `portYIELD_FROM_ISR`。
@@ -368,7 +303,7 @@ let config = esp_pm_config_t {
 - 建议：若实测需要降低唤醒延迟，在 `higher_prio_woken != 0` 时使用 ESP-IDF Xtensa 对应的 ISR yield API。
 - 验证：使用逻辑分析仪测量 GPIO 边沿到任务响应的最坏延迟。
 
-#### P2-5 pthread 栈策略恢复与并发保护
+#### P2-3 pthread 栈策略恢复与并发保护
 
 - 位置：`rust-firmware/src/tasks.rs:7`
 - 证据：原实现曾在修改后才读取“恢复值”，导致 internal-stack 策略泄漏；现已改为修改前保存并在 spawn 后恢复，但修改/创建/恢复仍没有全局串行保护。
@@ -376,7 +311,7 @@ let config = esp_pm_config_t {
 - 建议：用全局互斥封装修改、spawn、恢复三步，或统一所有 Rust 任务创建入口。
 - 验证：记录每个任务的 stack capabilities，并做并发创建压力测试。
 
-#### P2-6 周期诊断日志偏频繁
+#### P2-4 周期诊断日志偏频繁
 
 - 位置：`rust-firmware/src/main.rs:463`、`:467`
 - 证据：每秒采集电源状态，每 10 秒逐任务输出 stack high-water mark。
@@ -384,15 +319,7 @@ let config = esp_pm_config_t {
 - 建议：发布配置降低频率，或只在低栈、低内存和状态变化时输出。
 - 验证：比较诊断开启和关闭时的平均电流及自动 Light Sleep 占比。
 
-#### P2-7 缺少应用镜像体积门禁
-
-- 位置：`.github/workflows/ci.yml`、`scripts/release.sh`、`rust-firmware/partitions.csv`
-- 证据：当前 release 应用镜像为 2,659,232 字节，占 4,194,304 字节 factory 槽的 63.40%；当前 CI 和发布脚本均未检查镜像占用比例。
-- 影响：目前仍有约 1.47 MiB 余量，但新增 TLS、安全启动、OTA 或字体资源后可能持续增长；超限会在发布或刷写阶段才暴露。
-- 建议：CI 生成应用镜像并设置绝对上限和预警阈值，例如超过分区 85% 时失败、75% 时告警；采用 OTA 双槽后按 OTA 槽的新尺寸重新设定门禁。
-- 验证：CI 输出镜像字节数、分区字节数和百分比，并用人为缩小分区的测试确认门禁生效。
-
-#### P2-8 本地 C/C++ 组件变更可能未触发 Cargo 增量重建
+#### P2-5 本地 C/C++ 组件变更可能未触发 Cargo 增量重建
 
 - 位置：`rust-firmware/build.rs`；`rust-firmware/components/zectrix_epd/`、`components/p06_recorder/`
 - 证据：项目 `build.rs` 只声明跟踪 Cargo 配置、自身和 Git ref；本次审查中修改外部组件源后，增量构建没有重新编译对应 C++，必须清理 ESP32-S3 target 后才得到新产物。
@@ -400,7 +327,7 @@ let config = esp_pm_config_t {
 - 建议：为两个组件源、头文件和 `CMakeLists.txt` 建立明确的 rerun/reconfigure 依赖；发布构建至少使用隔离的新 target 目录，并验证 ELF 中的版本标记或对象时间戳。
 - 验证：只改一个 C/C++ 可观测常量，执行普通增量构建，确认对应对象被重编译且 ELF 行为变化。
 
-#### P2-9 发布流程可能留下已推送但未完成的版本标签
+#### P2-6 发布流程可能留下已推送但未完成的版本标签
 
 - 位置：`scripts/release.sh:35-56`
 - 证据：脚本在检查 `gh` 登录状态、目标 release 是否可创建以及附件上传是否成功前，先创建并向 `origin` 推送 tag；向 `github` 推送的失败还被 `|| true` 忽略。
@@ -408,7 +335,7 @@ let config = esp_pm_config_t {
 - 建议：先完成所有本地校验和 `gh auth status`，确认 tag 不冲突且提交正确；最后阶段再创建/推送不可变标签和 Release。失败时明确报告每个远端状态，不吞错。
 - 验证：在未登录、同名 tag 指向其他提交、附件上传失败和第二远端不存在的情形运行 dry-run。
 
-#### P2-10 Flash 备份脚本没有核验授权设备身份
+#### P2-7 Flash 备份脚本没有核验授权设备身份
 
 - 位置：`scripts/backup-flash.ps1:1-16`
 - 证据：脚本仅接收串口名并直接读取完整 16 MiB Flash，没有读取和比对 MAC、芯片型号或 Flash 容量。
@@ -416,7 +343,7 @@ let config = esp_pm_config_t {
 - 建议：执行任何读写前解析 `esptool chip_id/flash_id`，强制匹配授权 Note 4 MAC `20:6E:F1:B4:7D:E4`、ESP32-S3 和 16 MiB，并把身份元数据与哈希写入备份清单。
 - 验证：授权设备可备份；错误 MAC、非 S3、容量不符和无法识别身份时必须在读取前退出。
 
-#### P2-11 约 11.9 MiB storage 分区当前未被使用
+#### P2-8 约 11.9 MiB storage 分区当前未被使用
 
 - 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
 - 证据：`storage` 数据分区占 `0xBF0000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 24 KiB NVS。
@@ -424,7 +351,7 @@ let config = esp_pm_config_t {
 - 建议：先确认产品路线；若无需用户文件，重新分配给双 OTA、加密 core dump 或更宽裕的 NVS。不要仅为“利用空间”引入文件系统。
 - 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
 
-#### P2-12 字体索引与字模资源缺少构建期一致性校验
+#### P2-9 字体索引与字模资源缺少构建期一致性校验
 
 - 位置：`rust-firmware/src/font_cjk.rs:14-58`；`tools/generate_cjk_font.py`
 - 证据：索引读取本身按 4 字节条目遍历，但 `glyph16()`/`glyph12()` 使用索引中的 cell 直接切片，没有检查字模长度；资源错配会在渲染时 panic。
@@ -432,7 +359,7 @@ let config = esp_pm_config_t {
 - 建议：生成或构建阶段检查 index 长度为 4 的倍数、排序唯一、最大 cell 同时落入两套字模范围，并生成校验摘要。
 - 验证：对截断字模、越界 cell、乱序和重复 code point 建立生成器失败测试。
 
-#### P2-13 ADC 通道通过 `Peripherals::steal()` 重建所有权
+#### P2-10 ADC 通道通过 `Peripherals::steal()` 重建所有权
 
 - 位置：`rust-firmware/src/board.rs:278-284`
 - 证据：每次电池采样都以 `unsafe { Peripherals::steal() }` 重新取得 GPIO4 token，而不是在 `Board` 初始化时建立并持有 ADC channel。
@@ -440,7 +367,7 @@ let config = esp_pm_config_t {
 - 建议：初始化时创建并保存 ADC channel，采样时只借用；把 `steal()` 限制在确有底层所有权证明的集中边界。
 - 验证：编译期确认 GPIO4 不能被第二个驱动取得，并连续执行 ADC、Wi-Fi、EPD 并发压力测试。
 
-#### P2-14 量产配置与诊断配置尚未分离
+#### P2-11 量产配置与诊断配置尚未分离
 
 - 位置：`rust-firmware/sdkconfig.defaults:110-116`
 - 证据：默认配置同时启用综合堆毒化、INFO 日志和 UART core dump。这些设置适合当前 P0 定位，但会增加运行开销、日志暴露和 panic 后恢复时间。
@@ -452,16 +379,12 @@ let config = esp_pm_config_t {
 
 以下改动通常可在 1–2 小时内完成，且风险较低：
 
-1. RTC 读取结果增加日期和时间范围校验。
-2. 确认生成的 sdkconfig 中 CPU-domain power-down 已关闭，并用串口确认原 retention 申请错误不再出现。
-3. 发布脚本检查芯片、Flash 容量、模式、频率和分区表。
-4. CI 保存 release 产物大小、map 文件和分区表。
-5. STACKPROBE 改为诊断开关或低栈阈值告警。
-6. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
-7. `build.rs` 支持 `SOURCE_DATE_EPOCH`。
-8. 为 Inbox pending-read 增加序列化容量检查和明确错误日志。
-9. 在 CI 中加入应用镜像占用率门禁；当前基线为 2,659,232 / 4,194,304 字节（63.40%）。
-10. 让 smoke 脚本轮询设备 ready，而不是依赖固定 0.3 秒串口等待；USB 关闭会触发延迟复位，现有脚本可能误报首次 `get_status` 超时。
+1. CI 保存 release 产物大小、map 文件和分区表。
+2. STACKPROBE 改为诊断开关或低栈阈值告警。
+3. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
+4. 为 Inbox pending-read 增加序列化容量检查和明确错误日志。
+5. 发布前检查工作区、GitHub 登录状态和同名标签指向，再推送不可变标签。
+6. 为本地 C/C++ 组件声明完整的 Cargo 重建依赖。
 
 ## 5. 中期与长期建议
 
