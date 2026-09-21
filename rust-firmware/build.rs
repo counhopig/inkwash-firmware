@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     emit_tree_rerun_if_changed(std::path::Path::new("components/zectrix_epd"));
     emit_tree_rerun_if_changed(std::path::Path::new("components/p06_recorder"));
+    validate_cjk_assets(std::path::Path::new("assets"));
 
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     let build_epoch = match std::env::var("SOURCE_DATE_EPOCH") {
@@ -39,6 +40,58 @@ fn main() {
     println!("cargo:rustc-env=GIT_REV={git_rev}");
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn validate_cjk_assets(root: &std::path::Path) {
+    const GRID_CELLS: usize = 94 * 94;
+    const CELL_BYTES_16: usize = 32;
+    const CELL_BYTES_12: usize = 24;
+
+    let index_path = root.join("cjk_index.bin");
+    let font16_path = root.join("hzk16.bin");
+    let font12_path = root.join("hzk12.bin");
+    for path in [&index_path, &font16_path, &font12_path] {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let index = std::fs::read(&index_path)
+        .unwrap_or_else(|err| panic!("failed to read '{}': {err}", index_path.display()));
+    let font16 = std::fs::read(&font16_path)
+        .unwrap_or_else(|err| panic!("failed to read '{}': {err}", font16_path.display()));
+    let font12 = std::fs::read(&font12_path)
+        .unwrap_or_else(|err| panic!("failed to read '{}': {err}", font12_path.display()));
+
+    assert_eq!(
+        index.len() % 4,
+        0,
+        "CJK index length must be a multiple of four bytes"
+    );
+    assert_eq!(
+        font16.len(),
+        GRID_CELLS * CELL_BYTES_16,
+        "16px CJK font has an unexpected length"
+    );
+    assert_eq!(
+        font12.len(),
+        GRID_CELLS * CELL_BYTES_12,
+        "12px CJK font has an unexpected length"
+    );
+
+    let mut previous_codepoint = None;
+    let mut cells = std::collections::HashSet::with_capacity(index.len() / 4);
+    for entry in index.chunks_exact(4) {
+        let codepoint = u16::from_le_bytes([entry[0], entry[1]]);
+        let cell = usize::from(u16::from_le_bytes([entry[2], entry[3]]));
+        if let Some(previous) = previous_codepoint {
+            assert!(
+                codepoint > previous,
+                "CJK index codepoints must be strictly increasing"
+            );
+        }
+        assert!(cell < GRID_CELLS, "CJK index cell {cell} is out of range");
+        assert!(cells.insert(cell), "CJK index cell {cell} is duplicated");
+        previous_codepoint = Some(codepoint);
+    }
 }
 
 fn emit_tree_rerun_if_changed(root: &std::path::Path) {
