@@ -8,6 +8,7 @@ use crate::power_state::{SleepInputs, SleepKind, SleepState, SleepToken};
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
 use crate::todo::Todo;
 use crate::wake_cause::WakeCause;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct RenderGeneration(pub u64);
@@ -548,7 +549,7 @@ pub enum SyncResult {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncedData {
     pub alarms: Vec<StoredAlarm>,
     pub todos: Vec<Todo>,

@@ -15,6 +15,8 @@ const KEY_TIMEZONE_OFFSET: &str = "timezone_min";
 const KEY_SYNC_INTERVAL_MIN: &str = "sync_interval_min";
 const KEY_LAST_SYNC_EPOCH: &str = "last_sync_epoch";
 const KEY_RTC_ALIGN_EPOCH: &str = "rtc_align_epoch";
+const KEY_SYNC_APPLY_JOURNAL: &str = "sync_jrn_v1";
+const SYNC_APPLY_JOURNAL_MAX_LEN: usize = 12 * 1024;
 
 const KEY_TODO_REMINDED_DATE: &str = "todo_rem_date";
 
@@ -193,6 +195,29 @@ impl PersistedCounters {
                 auth_token: cfg.auth_token.clone(),
             },
         )
+    }
+
+    pub fn save_sync_apply_journal(&self, data: &inkwash_logic::app::SyncedData) -> Result<()> {
+        nvs_blob::write_blob::<SYNC_APPLY_JOURNAL_MAX_LEN, _>(
+            &self.nvs,
+            KEY_SYNC_APPLY_JOURNAL,
+            data,
+        )
+    }
+
+    pub fn sync_apply_journal(&self) -> Result<Option<inkwash_logic::app::SyncedData>> {
+        nvs_blob::read_dynamic_blob(
+            &self.nvs,
+            KEY_SYNC_APPLY_JOURNAL,
+            SYNC_APPLY_JOURNAL_MAX_LEN,
+        )
+    }
+
+    pub fn clear_sync_apply_journal(&self) -> Result<()> {
+        self.nvs
+            .remove(KEY_SYNC_APPLY_JOURNAL)
+            .map(|_| ())
+            .map_err(|e| anyhow!("NVS remove({KEY_SYNC_APPLY_JOURNAL}) failed: {e}"))
     }
 
     pub fn sync_interval_minutes(&self) -> Result<u16> {

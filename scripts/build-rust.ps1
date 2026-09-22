@@ -93,6 +93,17 @@ if (-not $env:LIBCLANG_PATH) {
 
 Push-Location $projectDir
 try {
+    $partitionHash = "v2:" + (Get-FileHash -Algorithm SHA256 "partitions.csv").Hash.ToLowerInvariant()
+    $partitionStamp = "target\.inkwash-partitions.sha256"
+    if ((Test-Path "target") -and
+        ((-not (Test-Path $partitionStamp)) -or
+         ((Get-Content $partitionStamp -Raw).Trim() -ne $partitionHash))) {
+        & cargo clean
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo clean for partition-table rebuild failed with exit code $LASTEXITCODE"
+        }
+    }
+
     $cargoArgs = @("build")
     if ($Release) {
         $cargoArgs += "--release"
@@ -102,6 +113,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
+    New-Item -ItemType Directory -Force "target" | Out-Null
+    Set-Content -Path $partitionStamp -Value $partitionHash -Encoding Ascii
 } finally {
     Pop-Location
 }

@@ -30,7 +30,7 @@
 | CPU 默认频率 | 160 MHz |
 | BLE | NimBLE Peripheral，最多一个连接 |
 | TLS | mbedTLS 完整证书包 |
-| 分区 | NVS 24 KiB、OTA metadata 8 KiB、双 4 MiB OTA 槽、core dump 512 KiB、LittleFS 7.375 MiB |
+| 分区 | NVS 64 KiB、OTA metadata 8 KiB、双 4 MiB OTA 槽、core dump 512 KiB、LittleFS 7.375 MiB |
 | OTA | 双槽与 bootloader 回滚已启用；远程下载协议尚未实现 |
 | Secure Boot | 未启用 |
 | Flash/NVS 加密 | 未启用 |
@@ -46,7 +46,7 @@
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- 当前 release 应用镜像为 2,658,432 字节，占 4 MiB OTA 槽的 63.38%
+- 当前 release 应用镜像为 2,664,272 字节，占 4 MiB OTA 槽的 63.52%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
@@ -54,6 +54,7 @@
 - 高频 `set_timezone` 压力曾稳定复现 Double exception。完整 core dump 将最新异常定位到 main 任务为 RTC 状态轮询创建一次性回复通道时的堆分配路径；RTC executor 现使用单个可复用回复通道并串行化请求，不再为每次轮询分配通道。修复后的 400 秒实机 soak 连续运行到 402,719 ms，11/11 检查通过，无 panic、WDT、reset 或串口断线。尚未完成 1,000 次压力门槛，因此该发布阻断项仍保持开放
 - 显式使用构建产物 `bootloader.bin` 刷写后，实机二级 bootloader 与应用均报告 ESP-IDF v5.5.5；启动日志同时确认 DIO 和 16 MB Flash
 - 最终构建刷写后的基础 smoke 与 400 秒 soak 均为 11/11：状态查询、校时、重复命令缓存、非法参数拒绝、配置恢复、串口连续性及无 panic/WDT/reset 均通过
+- NVS 扩容和同步 journal 版本刷写后保留了原 Wi-Fi、服务端及时区配置；10/10 持久化压力与 11/11 smoke 通过，期间两次 HTTPS 同步均成功应用包含 20 条 inbox 的快照
 - Wi-Fi 连接超时后固件恢复自动 Light Sleep；新配置下 CPU retention 申请错误不再出现，日志准确表述为“已请求自动 Light Sleep，唤醒源已配置”
 - 未进行实机功耗、BLE 安全交互、掉电或故障注入测试；当前 Linux 环境没有 PowerShell，`backup-flash.ps1` 仅完成静态审查，尚未在 Windows 上执行
 
@@ -68,7 +69,7 @@
 7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
 8. 当前分区布局具备双 OTA 槽和回滚元数据，应用会在核心外设、NVS、任务及状态机启动成功后确认待验证镜像；仓库与服务端尚无远程 OTA 下载协议。
 9. Light Sleep、tickless idle 与 40–160 MHz 动态调频已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。
-10. 同步应用会连续更新多个 NVS 对象而没有事务或 generation 标记；掉电或写入失败可能留下跨数据集的部分提交状态。
+10. 同步应用先持久化完整 journal，再更新各 NVS namespace，全部成功后清除 journal；启动在读取业务状态前强制重放未完成事务，避免掉电后暴露跨数据集混合状态。
 11. 真机 core dump 已把最新 Double exception 收敛到 RTC 高频轮询创建一次性回复通道时的分配器路径；改为复用通道后 400 秒 soak 通过，但尚未达到 1,000 次压力发布门槛，因此仍作为发布阻断项跟踪。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
 13. 建议优先完成长期压力验证、BLE 安全互操作测试和敏感数据保护，再推进 OTA 传输协议、原子持久化与功耗优化。
@@ -184,6 +185,7 @@
 - `rust-firmware/build.rs`：构建期校验 CJK 索引长度、严格排序、cell 唯一性与范围，并确认 12px/16px 字模具有完整的 94×94 网格长度。
 - `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 `ota_0` 生成应用镜像以执行 4 MiB 容量门禁。
 - `rust-firmware/partitions.csv`、`rust-firmware/src/main.rs:1099`：双槽、回滚 metadata 和 512 KiB core dump 分区已经落地；待验证镜像只有在 RTC、NVS、主要工作任务和状态机启动成功后才确认有效。
+- `rust-firmware/src/sync_apply.rs`、`storage.rs`：同步快照采用持久化 redo journal；启动先重放再构造 `BootSnapshot`，写入失败则进入安全模式，不会把部分提交的数据交给业务状态机。NVS 扩至 64 KiB，为最大 12 KiB journal 和现有对象保留整理空间。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
 - 以上状态通过 fmt、clippy、419 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
@@ -218,20 +220,12 @@
 - 建议：先记录实际 task priority/core，再以最小调整保证 RTC 和告警控制高于后台同步；不要在缺少测量时大范围提高优先级。
 - 验证：Wi-Fi TLS、EPD 全刷和音频同时运行时测量按键和告警响应延迟。
 
-#### P1-7 同步数据应用存在跨 key 部分提交
-
-- 位置：`rust-firmware/src/effect_task.rs:104`
-- 证据：`ApplySyncedData` 依次写 alarms、todos、inbox、pending-read ack、alarm dirty set 和 todo dirty set。任一步失败只会返回错误，不会回滚前面已成功的 NVS 写入。
-- 影响：掉电、NVS 空间不足或单次写失败可能形成“新 alarms + 旧 todos”或“内容已覆盖但 dirty 标记未清”等跨集合不一致。状态机当次不会确认成功，但重启后会读到部分新数据。
-- 建议：为同步快照增加 generation/commit marker。先写带同一 generation 的 staging 数据，全部成功后原子切换 active generation；最小方案至少应最后写 commit marker，并在启动时只接纳完整 generation。
-- 验证：在每个写入步骤后注入复位和错误，重启后必须得到完整旧快照或完整新快照，不能出现混合状态。
-
 ### P2 优化项
 
 #### P2-6 7.375 MiB storage 分区当前未被使用
 
 - 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
-- 证据：`storage` 数据分区占 `0x760000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 24 KiB NVS。
+- 证据：`storage` 数据分区占 `0x760000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 64 KiB NVS。
 - 影响：约 46% Flash 空间预留但尚未承担运行功能；这不影响正确性，但分区用途尚未形成产品约定。
 - 建议：确认未来是否存放用户文档或离线资源；不要仅为“利用空间”引入文件系统。
 - 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
@@ -258,7 +252,7 @@
 - 明确任务优先级、核心亲和性和 internal/PSRAM 栈策略。
 - 复用现有 smoke 和串口采集脚本建立硬件在环测试。
 - 对 NVS 提交执行掉电注入测试。
-- 为同步快照设计 generation/commit marker，消除多 key 部分提交。
+- 对同步 redo journal 执行逐写入点掉电注入，验证每次重启都能完成一致重放。
 - 建立 BLE 断开重连测试，验证 `conn_handle` 复用和迟到 notify 回调归属。
 - 对历史内存破坏建立固定版本、固定脚本、固定证据格式的发布阻断回归门禁。
 

@@ -107,20 +107,13 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
             },
             Effect::ApplySyncedData(data) => {
-                let result = (|| -> Result<()> {
-                    self.ctx.alarm_store.save(&data.alarms)?;
-                    self.ctx.todo_store.save(&data.todos)?;
-                    self.ctx.inbox_store.save(&data.inbox)?;
-                    self.ctx.inbox_store.ack_read(&data.inbox_read_acked)?;
-
-                    self.ctx
-                        .alarm_store
-                        .clear_dirty_ids(&data.uploaded_alarm_ids)?;
-                    self.ctx
-                        .todo_store
-                        .clear_dirty_ids(&data.uploaded_todo_ids)?;
-                    Ok(())
-                })();
+                let result = crate::sync_apply::apply(
+                    data,
+                    self.ctx.counters,
+                    self.ctx.alarm_store,
+                    self.ctx.todo_store,
+                    self.ctx.inbox_store,
+                );
                 match result {
                     Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                         inkwash_logic::app::PersistTarget::SyncApply,

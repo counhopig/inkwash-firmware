@@ -34,6 +34,29 @@ pub fn write_blob<const N: usize, T: Serialize + ?Sized>(
         .map_err(|e| anyhow!("NVS set_blob({key}) failed: {e}"))
 }
 
+pub fn read_dynamic_blob<T>(nvs: &EspDefaultNvs, key: &str, max_len: usize) -> Result<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let Some(len) = nvs
+        .blob_len(key)
+        .map_err(|e| anyhow!("NVS blob_len({key}) failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if len > max_len {
+        return Err(anyhow!("{key} blob too large: {len} bytes (max {max_len})"));
+    }
+    let mut bytes = vec![0u8; len];
+    let stored = nvs
+        .get_blob(key, &mut bytes)
+        .map_err(|e| anyhow!("NVS get_blob({key}) failed: {e}"))?
+        .ok_or_else(|| anyhow!("NVS blob {key} disappeared while reading"))?;
+    serde_json::from_slice(stored)
+        .map(Some)
+        .map_err(|e| anyhow!("{key} JSON decode failed: {e}"))
+}
+
 pub fn read_scalar<const N: usize>(nvs: &EspDefaultNvs, key: &str) -> Result<Option<String>> {
     let mut buf = [0u8; N];
     Ok(nvs

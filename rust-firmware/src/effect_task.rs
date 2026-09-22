@@ -102,15 +102,13 @@ impl EffectExecutor for TaskExecutor {
                 }
             }
             Effect::ApplySyncedData(data) => {
-                let result = (|| -> Result<()> {
-                    AlarmStore::save(&d.alarm_store, &data.alarms)?;
-                    TodoStore::save(&d.todo_store, &data.todos)?;
-                    InboxStore::save(&d.inbox_store, &data.inbox)?;
-                    d.inbox_store.ack_read(&data.inbox_read_acked)?;
-                    d.alarm_store.clear_dirty_ids(&data.uploaded_alarm_ids)?;
-                    d.todo_store.clear_dirty_ids(&data.uploaded_todo_ids)?;
-                    Ok(())
-                })();
+                let result = crate::sync_apply::apply(
+                    data,
+                    &d.counters,
+                    &d.alarm_store,
+                    &d.todo_store,
+                    &d.inbox_store,
+                );
                 match result {
                     Ok(()) => Ok(EffectOutcome::Completed(
                         inkwash_logic::app::EffectOutput::Persisted(

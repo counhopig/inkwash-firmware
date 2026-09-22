@@ -27,6 +27,7 @@ mod rtc_executor;
 mod screens;
 mod storage;
 mod sync;
+mod sync_apply;
 mod sync_task;
 mod tasks;
 mod todos;
@@ -193,6 +194,16 @@ fn main() -> Result<()> {
             &format!("Inbox NVS open failed: {err}"),
         ),
     };
+    match sync_apply::recover(&counters, &alarm_store, &todo_store, &inbox_store) {
+        Ok(true) => log::warn!("Recovered an interrupted synchronized-state commit"),
+        Ok(false) => {}
+        Err(err) => run_safe_mode(
+            &mut board,
+            &mut usb_console,
+            &mut usb_reply_writer,
+            &format!("Synchronized-state recovery failed: {err}"),
+        ),
+    }
     let effect_counters = match PersistedCounters::open(effect_partition.clone()) {
         Ok(store) => store,
         Err(err) => run_safe_mode(

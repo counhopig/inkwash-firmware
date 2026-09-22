@@ -46,4 +46,11 @@ if [ -z "${LIBCLANG_PATH:-}" ]; then
 fi
 
 cd rust-firmware
-exec cargo build "$@"
+partition_hash="v2:$(sha256sum partitions.csv | awk '{print $1}')"
+partition_stamp="target/.inkwash-partitions.sha256"
+if [ -d target ] && { [ ! -f "$partition_stamp" ] || [ "$(cat "$partition_stamp")" != "$partition_hash" ]; }; then
+    cargo clean
+fi
+cargo build "$@"
+mkdir -p target
+printf '%s\n' "$partition_hash" > "$partition_stamp"
