@@ -72,6 +72,8 @@ require_config 'CONFIG_IDF_TARGET="esp32s3"'
 require_config 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y'
 require_config 'CONFIG_ESPTOOLPY_FLASHMODE_DIO=y'
 require_config 'CONFIG_ESPTOOLPY_FLASHFREQ_80M=y'
+require_config 'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y'
+require_config 'CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y'
 
 command -v espflash >/dev/null || {
     echo "espflash is required to verify the generated partition table" >&2
@@ -88,7 +90,7 @@ fi
 espflash save-image --skip-update-check --chip esp32s3 \
     --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
     --bootloader "$BOOTLOADER" --partition-table "$PARTITIONS" \
-    --target-app-partition factory \
+    --target-app-partition ota_0 \
     "$ELF" "$verify_dir/inkwash-note4.bin" >/dev/null
 
 echo "==> Creating draft GitHub Release and uploading firmware"

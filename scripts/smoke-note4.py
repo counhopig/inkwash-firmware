@@ -99,6 +99,7 @@ def main():
     results = []
     link = Link(args.port, args.baud)
     link_error = None
+    original = None
     try:
         status = None
         ready_deadline = time.monotonic() + 30

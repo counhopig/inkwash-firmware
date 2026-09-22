@@ -30,8 +30,8 @@
 | CPU 默认频率 | 160 MHz |
 | BLE | NimBLE Peripheral，最多一个连接 |
 | TLS | mbedTLS 完整证书包 |
-| 分区 | NVS 24 KiB、PHY 4 KiB、factory 4 MiB、LittleFS 约 11.9 MiB |
-| OTA | 无 OTA 数据分区和双应用槽 |
+| 分区 | NVS 24 KiB、OTA metadata 8 KiB、双 4 MiB OTA 槽、core dump 512 KiB、LittleFS 7.375 MiB |
+| OTA | 双槽与 bootloader 回滚已启用；远程下载协议尚未实现 |
 | Secure Boot | 未启用 |
 | Flash/NVS 加密 | 未启用 |
 
@@ -46,7 +46,7 @@
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- 当前 release 应用镜像为 2,642,048 字节，占 4 MiB factory 分区的 62.99%
+- 当前 release 应用镜像为 2,658,432 字节，占 4 MiB OTA 槽的 63.38%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
@@ -66,15 +66,15 @@
 5. Wi-Fi 密码和服务端 Bearer Token 存储于普通 NVS，而 Secure Boot、Flash Encryption 和 NVS Encryption 均未启用。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
 7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
-8. 当前分区布局不支持 OTA、升级失败回滚或远程安全维护。
+8. 当前分区布局具备双 OTA 槽和回滚元数据，应用会在核心外设、NVS、任务及状态机启动成功后确认待验证镜像；仓库与服务端尚无远程 OTA 下载协议。
 9. Light Sleep、tickless idle 与 40–160 MHz 动态调频已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。
 10. 同步应用会连续更新多个 NVS 对象而没有事务或 generation 标记；掉电或写入失败可能留下跨数据集的部分提交状态。
 11. 真机 core dump 已把最新 Double exception 收敛到 RTC 高频轮询创建一次性回复通道时的分配器路径；改为复用通道后 400 秒 soak 通过，但尚未达到 1,000 次压力发布门槛，因此仍作为发布阻断项跟踪。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
-13. 建议优先完成长期压力验证、BLE 安全互操作测试和敏感数据保护，再推进 OTA、原子持久化与功耗优化。
+13. 建议优先完成长期压力验证、BLE 安全互操作测试和敏感数据保护，再推进 OTA 传输协议、原子持久化与功耗优化。
 14. 当前 `POST /api/sync` 是带本地变更的合并操作，服务端不会按 ETag 返回 304；固件已移除无效的 ETag 请求状态和 NVS 写入，避免伪缓存机制与额外 Flash 磨损。
 15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
-16. 生产配置仍启用 UART core dump 和综合堆毒化：前者可能经 USB 暴露内存中的密码与 Token，后者适合定位当前 P0，但不宜直接作为最终量产配置。
+16. 完整 core dump 已从 UART 移至 512 KiB Flash 分区，避免 panic 时直接向 USB 主机输出凭据；综合堆毒化仍适合当前 P0 定位，不宜直接作为最终量产配置。
 
 ## 2. 值得肯定的可行设计
 
@@ -182,7 +182,8 @@
 - `rust-firmware/build.rs`：支持 `SOURCE_DATE_EPOCH`，相同源码和指定时间戳可生成稳定的构建时间元数据；非法值会直接终止构建。
 - `rust-firmware/build.rs`：递归声明两个本地 ESP-IDF 组件的源码、头文件和 CMake 文件为构建依赖，驱动修改会触发 Cargo/embuild 重新配置。
 - `rust-firmware/build.rs`：构建期校验 CJK 索引长度、严格排序、cell 唯一性与范围，并确认 12px/16px 字模具有完整的 94×94 网格长度。
-- `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 factory 分区生成应用镜像以执行 4 MiB 容量门禁。
+- `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 `ota_0` 生成应用镜像以执行 4 MiB 容量门禁。
+- `rust-firmware/partitions.csv`、`rust-firmware/src/main.rs:1099`：双槽、回滚 metadata 和 512 KiB core dump 分区已经落地；待验证镜像只有在 RTC、NVS、主要工作任务和状态机启动成功后才确认有效。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
 - 以上状态通过 fmt、clippy、419 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
@@ -204,19 +205,10 @@
 - 证据：授权实机曾在连续 `set_timezone` 场景复现 `LoadProhibited` 和 Double exception。最新完整 core dump 显示崩溃任务为 main，A1 位于其合法栈区且剩余栈约 19 KiB；保存的栈帧将执行路径恢复为 `RtcExecutor::alarm_status → sync_channel → RawVec::try_allocate_in → malloc → esp_psram_check_ptr_addr`。RTC executor 改用启动时创建的复用回复通道后，400 秒 soak 连续运行至 402,719 ms，完成 11/11 检查且无 panic、WDT、reset 或串口断线。
 - 事实边界：该结果证明已移除最新可复现崩溃路径的高频动态分配，并显著改善短期稳定性；400 秒单设备测试不能等价于长期稳定性证明，也不能排除其他独立故障路径。
 - 影响：若仍存在未覆盖的内存安全故障，设备可能在同步、显示或 NVS 写入期间重启；当前证据不足以批准稳定发布。
-- 建议：保留固定 ELF、完整 UART core dump、任务栈范围日志和综合堆毒化，继续做有硬截止的长压测；测试脚本必须设置串口写超时，避免主机 USB 端点异常导致测试自身无限挂起。
+- 建议：保留固定 ELF、Flash core dump、任务栈范围日志和综合堆毒化，继续做有硬截止的长压测；测试脚本必须设置串口写超时，避免主机 USB 端点异常导致测试自身无限挂起。
 - 验证：至少连续 1,000 次同一压力命令零 panic/WDT/reset，并在混合 EPD、NVS、Wi-Fi 和 USB 场景重复；保存 ELF SHA、map、sdkconfig、原始日志和 core dump。未达到前不得关闭此 P0。
 
 ### P1 建议改进
-
-#### P1-1 分区布局不支持 OTA 和回滚
-
-- 位置：`rust-firmware/partitions.csv`
-- 证据：只有单一 `factory` 应用分区，没有 `otadata`、`ota_0`、`ota_1`，仓库中也未发现 OTA 实现。
-- 影响：发布后不能安全远程升级，现场缺陷依赖有线刷写，升级失败时也没有自动回滚路径。
-- 建议：若产品需要远程维护，改为 `otadata + ota_0 + ota_1`，实现 HTTPS OTA、镜像签名、首次启动自检和 `esp_ota_mark_app_valid_cancel_rollback`。
-- 风险：双 4 MiB 应用槽约占 8 MiB，会显著压缩当前 LittleFS 空间。
-- 验证：执行断电注入、损坏镜像、首次启动崩溃、版本降级和空间不足测试。
 
 #### P1-4 任务优先级和核心亲和性没有明确策略
 
@@ -234,28 +226,20 @@
 - 建议：为同步快照增加 generation/commit marker。先写带同一 generation 的 staging 数据，全部成功后原子切换 active generation；最小方案至少应最后写 commit marker，并在启动时只接纳完整 generation。
 - 验证：在每个写入步骤后注入复位和错误，重启后必须得到完整旧快照或完整新快照，不能出现混合状态。
 
-#### P1-10 UART core dump 会暴露运行内存中的凭据
-
-- 位置：`rust-firmware/sdkconfig.defaults:112`；`rust-firmware/src/storage.rs:55-86`；`rust-firmware/src/sync.rs:144-147`
-- 证据：配置启用 `CONFIG_ESP_COREDUMP_ENABLE_TO_UART=y`；运行期内存会包含 Wi-Fi 密码、Bearer Token 和 HTTP Authorization header，USB Serial/JTAG 控制台无需身份认证即可读取 panic 输出。
-- 影响：获得设备短时物理访问或串口日志的人可能从 core dump 提取敏感信息。当前 core dump 对定位 P0-2 很有价值，但不适合作为默认量产策略。
-- 建议：保留专用诊断 profile；量产 profile 改为加密 Flash 中的 core dump 分区，或关闭完整 core dump、仅保留脱敏后的复位原因和故障计数。
-- 验证：对诊断转储执行字符串扫描，确认风险范围；量产镜像触发受控 panic 后不得在 USB 输出 RAM 内容。
-
 ### P2 优化项
 
-#### P2-6 约 11.9 MiB storage 分区当前未被使用
+#### P2-6 7.375 MiB storage 分区当前未被使用
 
 - 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
-- 证据：`storage` 数据分区占 `0xBF0000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 24 KiB NVS。
-- 影响：当前约 74.6% Flash 空间没有承担运行功能，同时 NVS、OTA 和 core dump 空间仍紧张。
-- 建议：先确认产品路线；若无需用户文件，重新分配给双 OTA、加密 core dump 或更宽裕的 NVS。不要仅为“利用空间”引入文件系统。
+- 证据：`storage` 数据分区占 `0x760000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 24 KiB NVS。
+- 影响：约 46% Flash 空间预留但尚未承担运行功能；这不影响正确性，但分区用途尚未形成产品约定。
+- 建议：确认未来是否存放用户文档或离线资源；不要仅为“利用空间”引入文件系统。
 - 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
 
 #### P2-8 量产配置与诊断配置尚未分离
 
 - 位置：`rust-firmware/sdkconfig.defaults:110-116`
-- 证据：默认配置同时启用综合堆毒化、INFO 日志和 UART core dump。这些设置适合当前 P0 定位，但会增加运行开销、日志暴露和 panic 后恢复时间。
+- 证据：默认配置同时启用综合堆毒化、INFO 日志和 Flash core dump。这些设置适合当前 P0 定位，但会增加运行开销和 panic 后恢复时间。
 - 影响：单一 profile 难以同时满足故障定位和量产的性能、安全、恢复时延要求。
 - 建议：保留当前 diagnostic profile 直至 P0-2 关闭；另建 production defaults，明确日志级别、core dump 去向、堆检查级别和安全启动参数。两种 profile 都应纳入 CI 构建。
 - 验证：比较两种镜像的体积、内部堆、性能和故障输出，并确保生产 profile 不泄露敏感内存。
