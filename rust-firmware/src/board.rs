@@ -19,6 +19,11 @@ use crate::display::EpdClient;
 use crate::nfc::{self, NfcTag};
 use crate::power;
 pub type BoardAdc = AdcDriver<'static, esp_idf_svc::hal::adc::ADCU1>;
+type BatteryAdc = AdcChannelDriver<
+    'static,
+    esp_idf_svc::hal::adc::ADCCH3<esp_idf_svc::hal::adc::ADCU1>,
+    BoardAdc,
+>;
 
 pub type SharedI2c = Arc<Mutex<I2cDriver<'static>>>;
 
@@ -43,7 +48,7 @@ pub struct Note4Board {
     charge_done: PinDriver<'static, Input>,
     charge_status: ChargeStatus,
     charge_snapshot: ChargeSnapshot,
-    adc: BoardAdc,
+    battery_adc: BatteryAdc,
 
     last_battery_percent: Option<u8>,
     pub display: EpdClient,
@@ -182,6 +187,7 @@ impl Note4Board {
         let display = EpdClient::new()?;
 
         let adc: BoardAdc = AdcDriver::new(peripherals.adc1)?;
+        let battery_adc = AdcChannelDriver::new(adc, pins.gpio4, &BATTERY_ADC_CHANNEL_CONFIG)?;
 
         let i2c_config = I2cConfig::new().baudrate(I2C_FREQUENCY);
         let i2c = I2cDriver::new(peripherals.i2c0, pins.gpio47, pins.gpio48, &i2c_config)
@@ -231,7 +237,7 @@ impl Note4Board {
             charge_done,
             charge_status: ChargeStatus::new(),
             charge_snapshot: ChargeSnapshot::default(),
-            adc,
+            battery_adc,
             last_battery_percent: None,
             display,
             i2c_bus: i2c_bus.clone(),
@@ -276,15 +282,9 @@ impl Note4Board {
     }
 
     pub fn battery_millivolts(&mut self) -> Result<u16> {
-        let peripherals = unsafe { Peripherals::steal() };
-        let mut channel = AdcChannelDriver::new(
-            &self.adc,
-            peripherals.pins.gpio4,
-            &BATTERY_ADC_CHANNEL_CONFIG,
-        )?;
         let mut sum: u32 = 0;
         for _ in 0..BATTERY_ADC_SAMPLES {
-            sum += self.adc.read(&mut channel)? as u32;
+            sum += self.battery_adc.read()? as u32;
         }
         let avg_mv = (sum / BATTERY_ADC_SAMPLES) as u16;
         let vbat_mv = (avg_mv as u32) * 2;

@@ -173,6 +173,8 @@
 - `rust-firmware/src/wake.rs`：GPIO ISR 在通知唤醒更高优先级任务后调用 Xtensa `_frxt_setup_switch()` 请求立即调度，保持 ISR 路径位于 IRAM。
 - `.github/workflows/ci.yml`：CI 安装固定 ESP-IDF 5.5.5 和 ESP32-S3 Xtensa Rust 工具链，执行 `--release --locked` 完整交叉构建并上传 ELF、bootloader、分区表和 linker map。
 - `scripts/release.sh`：发布前要求干净工作区，校验 GitHub 登录、仓库、标签和 Release 冲突；构建验证完成后先创建带完整附件的 draft Release，最后发布并同步次要远端标签，中途失败不会产生公开但附件不完整的 Release。
+- `rust-firmware/src/board.rs`：GPIO4 与 ADC1 channel 3 在 `Note4Board::take()` 中一次取得，channel 连同 ADC driver 由 Board 全生命周期持有；周期采样不再通过 `Peripherals::steal()` 绕过 HAL 所有权。
+- `rust-firmware/src/main.rs`、`heap_probe.rs`：每秒电源采样和正常栈水位降为 DEBUG；任一任务剩余栈低于 2 KiB 时仍以 WARN 输出，默认 INFO 量产运行不再持续打印正常周期状态。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
@@ -257,14 +259,6 @@
 
 ### P2 优化项
 
-#### P2-4 周期诊断日志偏频繁
-
-- 位置：`rust-firmware/src/main.rs:463`、`:467`
-- 证据：每秒采集电源状态，每 10 秒逐任务输出 stack high-water mark。
-- 影响：长期运行时会增加串口输出、格式化和唤醒开销。
-- 建议：发布配置降低频率，或只在低栈、低内存和状态变化时输出。
-- 验证：比较诊断开启和关闭时的平均电流及自动 Light Sleep 占比。
-
 #### P2-6 约 11.9 MiB storage 分区当前未被使用
 
 - 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
@@ -272,14 +266,6 @@
 - 影响：当前约 74.6% Flash 空间没有承担运行功能，同时 NVS、OTA 和 core dump 空间仍紧张。
 - 建议：先确认产品路线；若无需用户文件，重新分配给双 OTA、加密 core dump 或更宽裕的 NVS。不要仅为“利用空间”引入文件系统。
 - 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
-
-#### P2-7 ADC 通道通过 `Peripherals::steal()` 重建所有权
-
-- 位置：`rust-firmware/src/board.rs:278-284`
-- 证据：每次电池采样都以 `unsafe { Peripherals::steal() }` 重新取得 GPIO4 token，而不是在 `Board` 初始化时建立并持有 ADC channel。
-- 影响：当前 GPIO4 未见其他使用，未发现实际冲突；但该模式绕过 HAL 单例所有权，使未来引脚复用或并发访问无法由类型系统阻止。
-- 建议：初始化时创建并保存 ADC channel，采样时只借用；把 `steal()` 限制在确有底层所有权证明的集中边界。
-- 验证：编译期确认 GPIO4 不能被第二个驱动取得，并连续执行 ADC、Wi-Fi、EPD 并发压力测试。
 
 #### P2-8 量产配置与诊断配置尚未分离
 
@@ -293,8 +279,7 @@
 
 以下改动通常可在 1–2 小时内完成，且风险较低：
 
-1. STACKPROBE 改为诊断开关或低栈阈值告警。
-2. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
+1. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
 
 ## 5. 中期与长期建议
 

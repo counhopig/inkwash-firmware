@@ -1236,7 +1236,7 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
         log::warn!("Charging LED update failed: {err}");
     }
     match board.battery_millivolts() {
-        Ok(vbat_mv) => log::info!(
+        Ok(vbat_mv) => log::debug!(
             "Power state: power_present={} charging={} full={} fault={} no_battery={} vbat_mV={} ({}%)",
             charge.power_present,
             charge.charging,
@@ -1248,7 +1248,7 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
         ),
         Err(err) => {
             log::warn!("Battery ADC read failed: {err}");
-            log::info!(
+            log::debug!(
                 "Power state: power_present={} charging={} full={} fault={} no_battery={} vbat_mV=<n/a>",
                 charge.power_present,
                 charge.charging,

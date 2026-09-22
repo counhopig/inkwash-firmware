@@ -100,8 +100,14 @@ pub fn log_registered_stacks(stage: &str) {
             esp_idf_svc::sys::pxTaskGetStackStart(handle as esp_idf_svc::sys::TaskHandle_t) as usize
         };
         let stack_end = stack_start.saturating_add(TASK_STACK_BYTES[slot]);
-        log::info!(
-            "STACKPROBE {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
-        );
+        if hwm < 2048 {
+            log::warn!(
+                "STACKPROBE {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
+            );
+        } else {
+            log::debug!(
+                "STACKPROBE {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
+            );
+        }
     }
 }
