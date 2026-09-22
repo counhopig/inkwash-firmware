@@ -49,7 +49,7 @@
 - `scripts/build-rust.sh --release --locked`：ESP32-S3 release 交叉构建成功
 - `scripts/build-rust.sh --diagnostic --release --locked`：diagnostic 目标交叉构建成功
 - `scripts/build-secure.sh`：以一次性 RSA-3072 密钥验证 Secure Boot V2、AES-256 Flash Encryption、NVS Encryption 安全生产配置可完整构建；未向实机写入或烧写 eFuse
-- 当前 release 应用镜像为 2,674,192 字节，占 4 MiB factory 分区的 63.76%
+- 当前 release 应用镜像为 2,674,864 字节，占 4 MiB factory 分区的 63.77%
 - `scripts/check-boot-ledger.sh`：用 espflash（README/release 的刷写路径）和 esptool 分别把应用 ELF 转成镜像并解析段表，release、diagnostic、secure 三种构建下都确认没有任何可加载段覆盖 `.rtc_noinit`。三种构建的 RTC 段均为 `0x5000_0008..0x5000_0028`（`.rtc.force_slow`），账本所在的 `0x5000_0000..0x5000_0008` 不在任何段内，因此普通复位触发 bootloader 重新初始化 RTC 段时不会覆写账本；`--self-test` 用构造段表验证“覆盖即失败、不覆盖即通过、无法解析即失败”
 - 上述结论只对最终应用产物成立：IDF 侧中间产物 `libespidf.elf`/`libespidf.bin` 的 `.rtc_noinit` 为空且不含 Rust 侧符号，其 RTC 段从 `0x5000_0000` 开始属于该 ELF 自身的 `.rtc.force_slow`；脚本对该文件会直接报“账本未链接”而不是给出通过结论
 - 启动失败账本的连续计数需要在真机上制造连续异常复位才能观测（可用 `p06_validate` 功能让每次启动注入一次故障），列为外部验证
@@ -203,6 +203,7 @@
 - `logic/src/boot_store.rs`、`rust-firmware/src/main.rs`：启动期每个存储读取都经 `resolve(StoreId, …)` 归类，任一故障都会把设备送入最小安全模式并只报告存储名与故障类别（ASCII、单行、不含任何存储内容）；`read_boot_stores` 在 RTC 初始化之前一次性读全，之后不再出现 `.unwrap_or(default)` 形式的静默降级。
 - `scripts/check-boot-ledger.sh`：镜像段门禁，release、diagnostic、secure 三种构建与 `scripts/release.sh` 都必须在刷写前确认没有可加载段覆盖 `.rtc_noinit`；`--self-test` 覆盖失败与通过两侧，防止门禁本身退化为永远通过。
 - `logic/src/boot_store.rs`、`rust-firmware/src/storage.rs`、`logic/src/app.rs`：同步周期与时区偏移的读取除了解析还做范围校验，界限与写入端共用同一组常量（1–1440 分钟、UTC-12:00–UTC+14:00），越界值归类为 `Corrupt`，不再被截断或夹紧后进入调度与时钟。
+- `rust-firmware/src/main.rs`：最小安全模式按进入原因给出各自的恢复路径。启动循环（`BOOT LOOP DETECTED`）在面板与日志提示 `RESET OR POWER CYCLE TO RETRY`：账本只在可归因的异常复位时累加，任何一次普通复位（复位引脚、USB、断电）都会从零重新计数。存储不可读（`CORE DATA UNAVAILABLE`）提示 `ERASE NVS VIA USB TO RECOVER`：损坏值不会自行恢复，复位只会再次进入安全模式；恢复方式是在核对芯片/容量/MAC 后用 `espflash erase-parts nvs` 擦除业务 NVS（会丢失 Wi-Fi 与服务端凭据以及未同步的本地改动），重刷固件不会清除 NVS。两种情形下安全模式都不写入或擦除任何存储，被拒绝的 USB 命令回执会说明原因；`GetStatus` 仍是固件固定的“未配置”形态，判断原因需要看串口日志。
 - `logic/src/boot_guard.rs`、`rust-firmware/src/boot_ledger.rs`：连续失败启动计数保存在 `.rtc_noinit`（NOLOAD，RTC 域供电期间保留、断电即清零）；只有 panic、任务/中断看门狗、brownout、电源毛刺、CPU lockup 与异常软件复位才累加，断电、复位引脚、USB 复位和深睡唤醒都从零计数；计数只在核心初始化 dispatch 完成后清零；连续三次异常启动进入最小安全模式，且不执行任何 NVS 擦除。
 - `logic/src/diag.rs`、`rust-firmware/src/diag.rs`：队列 Full、BLE 回复重试与放弃、EPD 局刷回退全刷共 9 个固定计数槽，使用饱和原子、无锁、不写 NVS；仅在计数变化时输出一条 `Diagnostics:` 日志（名称 + 增量 + 累计），内容是固定枚举名，不含载荷或凭据。
 - `logic/src/lib.rs`：契约测试新增四项——启动账本必须位于 `.rtc_noinit`、只能在核心初始化 dispatch 之后清零、诊断计数必须使用原子且不引用 NVS、安全模式不得接触任何存储。

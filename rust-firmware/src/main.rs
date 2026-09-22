@@ -70,9 +70,25 @@ const ALARM_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 const SAFE_MODE_REPLY_CAPACITY: usize = usb_console::REPLY_WRITER_CAPACITY;
 
-const SAFE_MODE_CORE_HEADLINE: &str = "CORE DATA UNAVAILABLE";
+/// What the minimum safe mode tells the operator. The recovery hint differs by
+/// cause because the causes do: a boot loop ends with any plain reset, while an
+/// unreadable store stays unreadable until the stored data is replaced, so
+/// telling that operator to "reset to retry" would send them in circles.
+#[derive(Clone, Copy)]
+struct SafeModePanel {
+    headline: &'static str,
+    recovery: &'static str,
+}
 
-const SAFE_MODE_LOOP_HEADLINE: &str = "BOOT LOOP DETECTED";
+const SAFE_MODE_CORE: SafeModePanel = SafeModePanel {
+    headline: "CORE DATA UNAVAILABLE",
+    recovery: "ERASE NVS VIA USB TO RECOVER",
+};
+
+const SAFE_MODE_LOOP: SafeModePanel = SafeModePanel {
+    headline: "BOOT LOOP DETECTED",
+    recovery: "RESET OR POWER CYCLE TO RETRY",
+};
 
 const BUILD_EPOCH_SECS: u64 = build_epoch_secs();
 
@@ -162,7 +178,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("RTC executor start failed: {err}"),
         ),
     };
@@ -173,7 +189,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("NVS partition init failed: {err}"),
         ),
     };
@@ -183,7 +199,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Counters NVS open failed: {err}"),
         ),
     };
@@ -193,7 +209,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Alarm NVS open failed: {err}"),
         ),
     };
@@ -203,7 +219,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Todo NVS open failed: {err}"),
         ),
     };
@@ -216,7 +232,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Inbox NVS open failed: {err}"),
         ),
     };
@@ -227,7 +243,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Synchronized-state recovery failed: {err}"),
         ),
     }
@@ -237,7 +253,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &fault.reason(),
         ),
     };
@@ -246,7 +262,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_LOOP_HEADLINE,
+            SAFE_MODE_LOOP,
             &ledger.reason(),
         );
     }
@@ -256,7 +272,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Effect counters NVS open failed: {err}"),
         ),
     };
@@ -266,7 +282,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Effect alarm NVS open failed: {err}"),
         ),
     };
@@ -276,7 +292,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Effect todo NVS open failed: {err}"),
         ),
     };
@@ -286,7 +302,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             &format!("Effect inbox NVS open failed: {err}"),
         ),
     };
@@ -337,7 +353,7 @@ fn main() -> Result<()> {
                 &mut board,
                 &mut usb_console,
                 &mut usb_reply_writer,
-                SAFE_MODE_CORE_HEADLINE,
+                SAFE_MODE_CORE,
                 &reason,
             );
         }
@@ -348,7 +364,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
-            SAFE_MODE_CORE_HEADLINE,
+            SAFE_MODE_CORE,
             "forced by INKWASH_FORCE_SAFE_MODE=1 (test hook)",
         );
     }
@@ -1180,16 +1196,20 @@ fn run_safe_mode(
     board: &mut Note4Board,
     usb_console: &mut crate::usb_console::UsbConsole,
     usb_reply_writer: &mut UsbReplyWriter,
-    headline: &str,
+    panel: SafeModePanel,
     reason: &str,
 ) -> ! {
-    log::error!("Entering minimum safe mode ({headline}: {reason})");
+    log::error!(
+        "Entering minimum safe mode ({}: {reason}); {}",
+        panel.headline,
+        panel.recovery
+    );
 
     {
         let mut canvas = board.display.canvas_mut();
         canvas.clear();
         crate::ui::header(&mut canvas, "SAFE MODE");
-        canvas.draw_text_prop(8, 60, 1, headline);
+        canvas.draw_text_prop(8, 60, 1, panel.headline);
 
         let (r1, r2) = if reason.chars().count() > 40 {
             let mut chars = reason.chars();
@@ -1204,7 +1224,7 @@ fn run_safe_mode(
             canvas.draw_text_prop(8, 96, 1, &r2);
         }
         canvas.draw_text_prop(8, 140, 1, "STORED DATA UNTOUCHED");
-        canvas.draw_text_prop(8, 156, 1, "USB DIAG; RESET TO RETRY");
+        canvas.draw_text_prop(8, 156, 1, panel.recovery);
         drop(canvas);
         if let Err(err) = board.display.refresh_full() {
             log::error!("Safe-mode error screen refresh failed: {err:#}");
@@ -1241,7 +1261,8 @@ fn run_safe_mode(
                 other => {
                     let reply = inkwash_logic::protocol::Reply::Error {
                         message: format!(
-                            "device is in safe mode (core data unavailable); command {other:?} rejected"
+                            "device is in safe mode ({}); command {other:?} rejected",
+                            panel.headline
                         ),
                     };
                     queue_safe_mode_reply(
