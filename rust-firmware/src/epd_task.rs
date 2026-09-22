@@ -227,10 +227,12 @@ pub fn spawn() -> Result<EpdHandle> {
     });
     let task_slot = Arc::clone(&slot);
     let task_completions = Arc::clone(&completions);
-    std::thread::Builder::new()
-        .name("epd".to_string())
-        .stack_size(EPD_TASK_STACK)
-        .spawn(move || run(driver, task_slot, notify_rx, task_completions))?;
+    crate::tasks::spawn(
+        "epd",
+        EPD_TASK_STACK,
+        crate::tasks::PRIORITY_DISPLAY,
+        move || run(driver, task_slot, notify_rx, task_completions),
+    )?;
     Ok(EpdHandle {
         slot,
         completions,

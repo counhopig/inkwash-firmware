@@ -56,7 +56,7 @@ mod ble_memory_contract {
             "the spawner must restore the default pthread policy"
         );
         assert!(
-            BLE_SOURCE.contains("spawn_internal_stack(\"ble\", BLE_TASK_STACK"),
+            BLE_SOURCE.contains("crate::tasks::PRIORITY_BLE"),
             "the BLE worker must be spawned through the internal-stack helper"
         );
         assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA"));
@@ -71,7 +71,7 @@ mod ble_memory_contract {
     #[test]
     fn effect_worker_uses_an_internal_stack_with_blob_headroom() {
         assert!(
-            EFFECT_SOURCE.contains("spawn_internal_stack(\"effect-task\", EFFECT_TASK_STACK"),
+            EFFECT_SOURCE.contains("crate::tasks::PRIORITY_EFFECT"),
             "the effect worker must be spawned through the internal-stack helper"
         );
         let stack = EFFECT_SOURCE

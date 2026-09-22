@@ -43,10 +43,9 @@ impl AudioTask {
 
         let mailbox = Arc::new(Mutex::new(AudioMailbox::new()));
         let task_mailbox = mailbox.clone();
-        thread::Builder::new()
-            .stack_size(8 * 1024)
-            .name("audio".into())
-            .spawn(move || run(codec, task_mailbox))?;
+        crate::tasks::spawn("audio", 8 * 1024, crate::tasks::PRIORITY_AUDIO, move || {
+            run(codec, task_mailbox)
+        })?;
         Ok(AudioSpawn::Running(AudioTask { mailbox }))
     }
 

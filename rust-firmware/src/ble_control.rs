@@ -366,14 +366,19 @@ impl BleControl {
             return Ok(());
         };
         log::info!("BLE worker thread starting on demand");
-        crate::tasks::spawn_internal_stack("ble", BLE_TASK_STACK, move || {
-            run(
-                launch.command_rx,
-                launch.tx,
-                launch.lifecycle_sender,
-                launch.result_tx,
-            )
-        })
+        crate::tasks::spawn(
+            "ble",
+            BLE_TASK_STACK,
+            crate::tasks::PRIORITY_BLE,
+            move || {
+                run(
+                    launch.command_rx,
+                    launch.tx,
+                    launch.lifecycle_sender,
+                    launch.result_tx,
+                )
+            },
+        )
     }
 
     pub fn start(&mut self, name: &str, session_id: u64) -> Result<()> {

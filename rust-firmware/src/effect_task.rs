@@ -314,9 +314,12 @@ impl EffectTask {
         let (batch_tx, batch_rx) = sync_channel::<EffectBatch>(BATCH_CHANNEL_CAP);
         let (notice_tx, notice_rx) = sync_channel::<BatchResult>(NOTICE_CHANNEL_CAP);
 
-        crate::tasks::spawn_internal_stack("effect-task", EFFECT_TASK_STACK, move || {
-            run(TaskExecutor { drivers }, batch_rx, notice_tx)
-        })?;
+        crate::tasks::spawn(
+            "effect-task",
+            EFFECT_TASK_STACK,
+            crate::tasks::PRIORITY_EFFECT,
+            move || run(TaskExecutor { drivers }, batch_rx, notice_tx),
+        )?;
 
         Ok(Self {
             batch_tx,

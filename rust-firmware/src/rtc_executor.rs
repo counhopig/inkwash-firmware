@@ -51,10 +51,12 @@ impl RtcExecutor {
         let (tx, rx) = sync_channel(RTC_COMMAND_CAPACITY);
         let (reply_tx, reply_rx) = sync_channel(1);
         let (probe_tx, probe_rx) = channel();
-        std::thread::Builder::new()
-            .name("rtc".to_string())
-            .stack_size(RTC_TASK_STACK)
-            .spawn(move || run(bus, rx, reply_tx, probe_tx))?;
+        crate::tasks::spawn(
+            "rtc",
+            RTC_TASK_STACK,
+            crate::tasks::PRIORITY_RTC,
+            move || run(bus, rx, reply_tx, probe_tx),
+        )?;
         match probe_rx.recv()? {
             Ok(()) => Ok(Self {
                 tx,

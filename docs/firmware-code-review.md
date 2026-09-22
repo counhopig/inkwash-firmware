@@ -46,7 +46,7 @@
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- 当前 release 应用镜像为 2,664,272 字节，占 4 MiB OTA 槽的 63.52%
+- 当前 release 应用镜像为 2,667,888 字节，占 4 MiB OTA 槽的 63.61%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
@@ -55,6 +55,7 @@
 - 显式使用构建产物 `bootloader.bin` 刷写后，实机二级 bootloader 与应用均报告 ESP-IDF v5.5.5；启动日志同时确认 DIO 和 16 MB Flash
 - 最终构建刷写后的基础 smoke 与 400 秒 soak 均为 11/11：状态查询、校时、重复命令缓存、非法参数拒绝、配置恢复、串口连续性及无 panic/WDT/reset 均通过
 - NVS 扩容和同步 journal 版本刷写后保留了原 Wi-Fi、服务端及时区配置；10/10 持久化压力与 11/11 smoke 通过，期间两次 HTTPS 同步均成功应用包含 20 条 inbox 的快照
+- 显式任务优先级版本再次通过 10/10 持久化压力和 30 秒 soak，11/11 smoke 全通过；期间无 panic、WDT、reset 或串口断线
 - Wi-Fi 连接超时后固件恢复自动 Light Sleep；新配置下 CPU retention 申请错误不再出现，日志准确表述为“已请求自动 Light Sleep，唤醒源已配置”
 - 未进行实机功耗、BLE 安全交互、掉电或故障注入测试；当前 Linux 环境没有 PowerShell，`backup-flash.ps1` 仅完成静态审查，尚未在 Windows 上执行
 
@@ -186,6 +187,7 @@
 - `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 `ota_0` 生成应用镜像以执行 4 MiB 容量门禁。
 - `rust-firmware/partitions.csv`、`rust-firmware/src/main.rs:1099`：双槽、回滚 metadata 和 512 KiB core dump 分区已经落地；待验证镜像只有在 RTC、NVS、主要工作任务和状态机启动成功后才确认有效。
 - `rust-firmware/src/sync_apply.rs`、`storage.rs`：同步快照采用持久化 redo journal；启动先重放再构造 `BootSnapshot`，写入失败则进入安全模式，不会把部分提交的数据交给业务状态机。NVS 扩至 64 KiB，为最大 12 KiB journal 和现有对象保留整理空间。
+- `rust-firmware/src/tasks.rs`：所有应用 pthread 统一使用 internal RAM 栈、显式优先级和 `CONFIG_FREERTOS_NO_AFFINITY`；RTC 8、音频 7、USB 6、Effect 5、EPD/BLE 4、同步 3，实时告警路径明确高于后台 TLS，同一全局配置锁防止创建线程时策略串扰。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
 - 以上状态通过 fmt、clippy、419 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
 
@@ -209,16 +211,6 @@
 - 影响：若仍存在未覆盖的内存安全故障，设备可能在同步、显示或 NVS 写入期间重启；当前证据不足以批准稳定发布。
 - 建议：保留固定 ELF、Flash core dump、任务栈范围日志和综合堆毒化，继续做有硬截止的长压测；测试脚本必须设置串口写超时，避免主机 USB 端点异常导致测试自身无限挂起。
 - 验证：至少连续 1,000 次同一压力命令零 panic/WDT/reset，并在混合 EPD、NVS、Wi-Fi 和 USB 场景重复；保存 ELF SHA、map、sdkconfig、原始日志和 core dump。未达到前不得关闭此 P0。
-
-### P1 建议改进
-
-#### P1-4 任务优先级和核心亲和性没有明确策略
-
-- 位置：`rust-firmware/src/tasks.rs` 及各任务的 `thread::Builder` 调用
-- 证据：任务只设置名称和栈大小，没有显式 priority 或 affinity；仅 Wi-Fi 系统任务在配置中固定到 Core 1。
-- 影响：任务调度依赖 pthread 默认值，无法明确保证 RTC、告警音频、UI 和后台同步的响应顺序。
-- 建议：先记录实际 task priority/core，再以最小调整保证 RTC 和告警控制高于后台同步；不要在缺少测量时大范围提高优先级。
-- 验证：Wi-Fi TLS、EPD 全刷和音频同时运行时测量按键和告警响应延迟。
 
 ### P2 优化项
 
@@ -249,7 +241,7 @@
 ### 中期
 
 - 建立 RTC I2C、EPD BUSY、BLE 未授权访问和 Wi-Fi 失败清理的组件测试。
-- 明确任务优先级、核心亲和性和 internal/PSRAM 栈策略。
+- 对已明确的任务优先级与不绑核策略做 Wi-Fi TLS、EPD 全刷和音频并发延迟测量。
 - 复用现有 smoke 和串口采集脚本建立硬件在环测试。
 - 对 NVS 提交执行掉电注入测试。
 - 对同步 redo journal 执行逐写入点掉电注入，验证每次重启都能完成一致重放。

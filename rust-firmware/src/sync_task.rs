@@ -72,10 +72,12 @@ pub struct SyncTask {
 impl SyncTask {
     pub fn spawn(partition: EspDefaultNvsPartition, wifi: WifiManager) -> Result<Self> {
         let (tx, rx) = sync_channel(SYNC_COMMAND_CAPACITY);
-        std::thread::Builder::new()
-            .name("sync".to_string())
-            .stack_size(SYNC_TASK_STACK)
-            .spawn(move || run(wifi, partition, rx))?;
+        crate::tasks::spawn(
+            "sync",
+            SYNC_TASK_STACK,
+            crate::tasks::PRIORITY_SYNC,
+            move || run(wifi, partition, rx),
+        )?;
         Ok(Self { tx })
     }
 

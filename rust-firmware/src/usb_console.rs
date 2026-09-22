@@ -25,11 +25,13 @@ pub struct UsbConsole {
 impl UsbConsole {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::sync_channel(PENDING_COMMAND_CAPACITY);
-        thread::Builder::new()
-            .name("usb-console-rx".into())
-            .stack_size(READER_TASK_STACK_SIZE)
-            .spawn(move || read_commands(tx))
-            .expect("USB console receiver thread must start");
+        crate::tasks::spawn(
+            "usb-console-rx",
+            READER_TASK_STACK_SIZE,
+            crate::tasks::PRIORITY_USB,
+            move || read_commands(tx),
+        )
+        .expect("USB console receiver thread must start");
         Self {
             pending: VecDeque::with_capacity(PENDING_COMMAND_CAPACITY),
             rx,
@@ -136,10 +138,13 @@ impl UsbReplyWriter {
     pub fn start() -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(REPLY_WRITER_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::sync_channel(REPLY_WRITER_CAPACITY);
-        thread::Builder::new()
-            .name("usb-console-writer".into())
-            .stack_size(WRITER_TASK_STACK_SIZE)
-            .spawn(move || run_reply_writer(rx, completion_tx))?;
+        crate::tasks::spawn(
+            "usb-console-writer",
+            WRITER_TASK_STACK_SIZE,
+            crate::tasks::PRIORITY_USB,
+            move || run_reply_writer(rx, completion_tx),
+        )
+        .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(Self {
             tx,
             completion_rx,
