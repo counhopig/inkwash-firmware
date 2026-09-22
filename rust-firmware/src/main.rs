@@ -85,6 +85,11 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    let reset_reason = unsafe { esp_idf_svc::sys::esp_reset_reason() };
+    log::info!(
+        "Reset reason: {} ({reset_reason})",
+        reset_reason_name(reset_reason)
+    );
     log::info!(
         "Inkwash NOTE4 Rust bring-up starting (git {})",
         env!("GIT_REV")
@@ -447,7 +452,8 @@ fn main() -> Result<()> {
     let mut alarm_status_last = Instant::now()
         .checked_sub(ALARM_STATUS_POLL_INTERVAL)
         .unwrap_or_else(Instant::now);
-    let mut usb_host_was_connected = false;
+    let mut usb_host_was_connected = true;
+    let mut usb_disconnect_since: Option<Instant> = None;
 
     loop {
         watchdog::feed();
@@ -526,20 +532,24 @@ fn main() -> Result<()> {
         }
 
         let usb_host_connected = power::usb_host_connected();
-        if usb_host_connected && !usb_host_was_connected {
-            ctx.command_sessions
-                .end(control::Channel::Usb, ctx.usb_session_id);
-            ctx.usb_session_id = ctx.usb_session_id.wrapping_add(1).max(1);
-            ctx.command_sessions
-                .begin(control::Channel::Usb, ctx.usb_session_id);
-            ctx.drop_stale_usb_replies();
-        } else if !usb_host_connected && usb_host_was_connected {
-            ctx.command_sessions
-                .end(control::Channel::Usb, ctx.usb_session_id);
-            ctx.usb_session_id = ctx.usb_session_id.wrapping_add(1).max(1);
-            ctx.drop_stale_usb_replies();
+        if usb_host_connected {
+            usb_disconnect_since = None;
+            if !usb_host_was_connected {
+                ctx.command_sessions
+                    .begin(control::Channel::Usb, ctx.usb_session_id);
+                usb_host_was_connected = true;
+            }
+        } else if usb_host_was_connected {
+            let disconnected_at = usb_disconnect_since.get_or_insert(now);
+            if now.duration_since(*disconnected_at) >= Duration::from_secs(10) {
+                ctx.command_sessions
+                    .end(control::Channel::Usb, ctx.usb_session_id);
+                ctx.usb_session_id = ctx.usb_session_id.wrapping_add(1).max(1);
+                ctx.drop_stale_usb_replies();
+                usb_host_was_connected = false;
+                usb_disconnect_since = None;
+            }
         }
-        usb_host_was_connected = usb_host_connected;
 
         let (_usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref())?;
 
@@ -1104,6 +1114,29 @@ fn main() -> Result<()> {
         } else {
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
         }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn reset_reason_name(reason: esp_idf_svc::sys::esp_reset_reason_t) -> &'static str {
+    use esp_idf_svc::sys::*;
+    match reason {
+        esp_reset_reason_t_ESP_RST_POWERON => "power-on",
+        esp_reset_reason_t_ESP_RST_EXT => "external",
+        esp_reset_reason_t_ESP_RST_SW => "software",
+        esp_reset_reason_t_ESP_RST_PANIC => "panic",
+        esp_reset_reason_t_ESP_RST_INT_WDT => "interrupt-watchdog",
+        esp_reset_reason_t_ESP_RST_TASK_WDT => "task-watchdog",
+        esp_reset_reason_t_ESP_RST_WDT => "watchdog",
+        esp_reset_reason_t_ESP_RST_DEEPSLEEP => "deep-sleep",
+        esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
+        esp_reset_reason_t_ESP_RST_SDIO => "sdio",
+        esp_reset_reason_t_ESP_RST_USB => "usb",
+        esp_reset_reason_t_ESP_RST_JTAG => "jtag",
+        esp_reset_reason_t_ESP_RST_EFUSE => "efuse",
+        esp_reset_reason_t_ESP_RST_PWR_GLITCH => "power-glitch",
+        esp_reset_reason_t_ESP_RST_CPU_LOCKUP => "cpu-lockup",
+        _ => "unknown",
     }
 }
 

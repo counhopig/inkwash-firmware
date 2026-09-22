@@ -3056,12 +3056,15 @@ fn transition_effect_completed(
             }
         }
         EffectOutput::Persisted(PersistTarget::Timezone) => {
+            let previous_offset = state.config.timezone_offset_minutes;
             for channel in [Channel::Usb, Channel::Ble] {
                 apply_confirmed_timezone(state, completion.operation_id, channel);
             }
 
-            state.render_generation = state.render_generation.next();
-            batches.push(render_batch(state));
+            if state.config.timezone_offset_minutes != previous_offset {
+                state.render_generation = state.render_generation.next();
+                batches.push(render_batch(state));
+            }
         }
         EffectOutput::Persisted(PersistTarget::WifiCredentials) => {
             for channel in [Channel::Usb, Channel::Ble] {
@@ -4634,6 +4637,34 @@ mod tests {
                 .any(|e| matches!(e, Effect::Render(RenderRequest { .. }))),
             "SetTimezone persist confirm must emit a render (clock offset visible)"
         );
+    }
+
+    #[test]
+    fn setting_the_current_timezone_does_not_refresh_the_display() {
+        let mut state = AppState::default();
+        state.clock.now = Some(dt(10, 0));
+        state.config.timezone_offset_minutes = 120;
+        let _ = update(
+            &mut state,
+            Event::UsbCommand(ControlRequest::SetTimezone {
+                offset_minutes: 120,
+            }),
+        );
+        let tz_op = state.pending_usb_reply.as_ref().unwrap().awaiting_ops[1];
+        let batches = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id: tz_op,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::Timezone),
+            }),
+        );
+        assert!(!batches
+            .iter()
+            .flat_map(|batch| &batch.effects)
+            .any(|effect| matches!(effect, Effect::Render(_))));
     }
 
     #[test]

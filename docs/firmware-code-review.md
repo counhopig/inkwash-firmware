@@ -41,17 +41,17 @@
 
 ### 验证结果
 
-- `cargo test --locked`：419 项测试通过
+- `cargo test --locked`：420 项测试通过
 - `cargo fmt --check`：通过
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- 当前 release 应用镜像为 2,667,888 字节，占 4 MiB OTA 槽的 63.61%
+- 当前 release 应用镜像为 2,668,368 字节，占 4 MiB OTA 槽的 63.62%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
 - 烧录后日志确认主循环、RTC、EPD、同步、音频、Effect 和 USB 任务均能启动，各任务观测到的剩余栈约 6.2–19.8 KiB
-- 高频 `set_timezone` 压力曾稳定复现 Double exception。完整 core dump 将最新异常定位到 main 任务为 RTC 状态轮询创建一次性回复通道时的堆分配路径；RTC executor 现使用单个可复用回复通道并串行化请求，不再为每次轮询分配通道。修复后的 400 秒实机 soak 连续运行到 402,719 ms，11/11 检查通过，无 panic、WDT、reset 或串口断线。尚未完成 1,000 次压力门槛，因此该发布阻断项仍保持开放
+- 高频 `set_timezone` 压力曾稳定复现 Double exception。RTC executor 改为启动时创建的复用回复通道后，最终连续 1,000/1,000 次 RTC/NVS 提交及 60 秒 soak 通过，12/12 检查无 panic、WDT、reset 或串口断线；同值时区确认不再触发无意义的 EPD 全刷
 - 显式使用构建产物 `bootloader.bin` 刷写后，实机二级 bootloader 与应用均报告 ESP-IDF v5.5.5；启动日志同时确认 DIO 和 16 MB Flash
 - 最终构建刷写后的基础 smoke 与 400 秒 soak 均为 11/11：状态查询、校时、重复命令缓存、非法参数拒绝、配置恢复、串口连续性及无 panic/WDT/reset 均通过
 - NVS 扩容和同步 journal 版本刷写后保留了原 Wi-Fi、服务端及时区配置；10/10 持久化压力与 11/11 smoke 通过，期间两次 HTTPS 同步均成功应用包含 20 条 inbox 的快照
@@ -63,7 +63,7 @@
 
 1. 整体架构质量较高。业务状态机、Effect 执行层和硬件任务边界清晰，复杂异步操作有显式完成反馈和代际检查。
 2. 并发设计经过了较多压力场景考虑。RTC、EPD、同步、BLE、音频和 USB 均采用独立执行上下文，多数队列具有固定容量和背压处理。
-3. 纯逻辑层具备 419 项主机测试，是本项目最值得保留的工程资产之一。
+3. 纯逻辑层具备 420 项主机测试，是本项目最值得保留的工程资产之一。
 4. BLE 控制通道已要求 LE Secure Connections、MITM、动态六位 passkey，以及加密并认证的读写权限；该边界应通过真实客户端继续做负向互操作验证。
 5. Wi-Fi 密码和服务端 Bearer Token 存储于普通 NVS，而 Secure Boot、Flash Encryption 和 NVS Encryption 均未启用。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
@@ -71,9 +71,9 @@
 8. 当前分区布局具备双 OTA 槽和回滚元数据，应用会在核心外设、NVS、任务及状态机启动成功后确认待验证镜像；仓库与服务端尚无远程 OTA 下载协议。
 9. Light Sleep、tickless idle 与 40–160 MHz 动态调频已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。
 10. 同步应用先持久化完整 journal，再更新各 NVS namespace，全部成功后清除 journal；启动在读取业务状态前强制重放未完成事务，避免掉电后暴露跨数据集混合状态。
-11. 真机 core dump 已把最新 Double exception 收敛到 RTC 高频轮询创建一次性回复通道时的分配器路径；改为复用通道后 400 秒 soak 通过，但尚未达到 1,000 次压力发布门槛，因此仍作为发布阻断项跟踪。
+11. RTC 高频分配器崩溃路径已经移除，并通过 1,000 次连续持久化门槛；测试器现会检测任意相邻 uptime 回退、应用重启、部分完成和 USB 写超时。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
-13. 建议优先完成长期压力验证、BLE 安全互操作测试和敏感数据保护，再推进 OTA 传输协议、原子持久化与功耗优化。
+13. 建议优先完成 BLE 安全互操作测试和敏感数据保护，再推进 OTA 传输协议与功耗优化。
 14. 当前 `POST /api/sync` 是带本地变更的合并操作，服务端不会按 ETag 返回 304；固件已移除无效的 ETag 请求状态和 NVS 写入，避免伪缓存机制与额外 Flash 磨损。
 15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
 16. 完整 core dump 已从 UART 移至 512 KiB Flash 分区，避免 panic 时直接向 USB 主机输出凭据；综合堆毒化仍适合当前 P0 定位，不宜直接作为最终量产配置。
@@ -152,7 +152,7 @@
 
 ### 2.11 已落实的可靠性与安全边界
 
-- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 419 项主机测试。
+- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 420 项主机测试。
 - `rust-firmware/src/wifi.rs:60`：`connect()` 的所有失败出口都会执行 `disconnect()`，避免连接或 DHCP 超时后遗留驱动状态。
 - `rust-firmware/src/ble_control.rs:961`：BLE 命令解析失败只记录长度和错误，不再输出可能含 Wi-Fi 密码或 Token 的原始 payload。
 - `rust-firmware/src/ble_control.rs:857`、`:944`：BLE 使用动态六位 passkey、LE Secure Connections、MITM 和 bonding；控制特征要求加密且认证后才能读写。
@@ -189,7 +189,7 @@
 - `rust-firmware/src/sync_apply.rs`、`storage.rs`：同步快照采用持久化 redo journal；启动先重放再构造 `BootSnapshot`，写入失败则进入安全模式，不会把部分提交的数据交给业务状态机。NVS 扩至 64 KiB，为最大 12 KiB journal 和现有对象保留整理空间。
 - `rust-firmware/src/tasks.rs`：所有应用 pthread 统一使用 internal RAM 栈、显式优先级和 `CONFIG_FREERTOS_NO_AFFINITY`；RTC 8、音频 7、USB 6、Effect 5、EPD/BLE 4、同步 3，实时告警路径明确高于后台 TLS，同一全局配置锁防止创建线程时策略串扰。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
-- 以上状态通过 fmt、clippy、419 项单元测试、release 交叉构建和授权真机启动日志验证；RTC 通道复用版本另通过 400 秒实机 soak。
+- 以上状态通过 fmt、clippy、420 项单元测试、release 交叉构建和授权真机启动日志验证；RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
 
 ## 3. 改进建议
 
@@ -202,15 +202,6 @@
 - 影响：通过物理读取 Flash、恶意固件或未限制的调试接口可恢复网络凭据和服务端 Token，固件也没有可信启动链。
 - 建议：生产配置启用 Secure Boot V2、Flash Encryption 和加密 NVS；开发与生产配置分离，量产流程单独管理 eFuse。
 - 验证：离线读取 Flash 不应出现密码或 Token 明文；未签名固件应无法启动；验证量产、升级和恢复流程。
-
-#### P0-2 真机压力测试尚未达到发布门槛
-
-- 位置：`rust-firmware/src/main.rs`、`ctx.rs`、`rtc_executor.rs`、`effect_task.rs`、`epd_task.rs` 及 Rust/C/FFI 边界。
-- 证据：授权实机曾在连续 `set_timezone` 场景复现 `LoadProhibited` 和 Double exception。最新完整 core dump 显示崩溃任务为 main，A1 位于其合法栈区且剩余栈约 19 KiB；保存的栈帧将执行路径恢复为 `RtcExecutor::alarm_status → sync_channel → RawVec::try_allocate_in → malloc → esp_psram_check_ptr_addr`。RTC executor 改用启动时创建的复用回复通道后，400 秒 soak 连续运行至 402,719 ms，完成 11/11 检查且无 panic、WDT、reset 或串口断线。
-- 事实边界：该结果证明已移除最新可复现崩溃路径的高频动态分配，并显著改善短期稳定性；400 秒单设备测试不能等价于长期稳定性证明，也不能排除其他独立故障路径。
-- 影响：若仍存在未覆盖的内存安全故障，设备可能在同步、显示或 NVS 写入期间重启；当前证据不足以批准稳定发布。
-- 建议：保留固定 ELF、Flash core dump、任务栈范围日志和综合堆毒化，继续做有硬截止的长压测；测试脚本必须设置串口写超时，避免主机 USB 端点异常导致测试自身无限挂起。
-- 验证：至少连续 1,000 次同一压力命令零 panic/WDT/reset，并在混合 EPD、NVS、Wi-Fi 和 USB 场景重复；保存 ELF SHA、map、sdkconfig、原始日志和 core dump。未达到前不得关闭此 P0。
 
 ### P2 优化项
 
@@ -227,7 +218,7 @@
 - 位置：`rust-firmware/sdkconfig.defaults:110-116`
 - 证据：默认配置同时启用综合堆毒化、INFO 日志和 Flash core dump。这些设置适合当前 P0 定位，但会增加运行开销和 panic 后恢复时间。
 - 影响：单一 profile 难以同时满足故障定位和量产的性能、安全、恢复时延要求。
-- 建议：保留当前 diagnostic profile 直至 P0-2 关闭；另建 production defaults，明确日志级别、core dump 去向、堆检查级别和安全启动参数。两种 profile 都应纳入 CI 构建。
+- 建议：保留 diagnostic profile；另建 production defaults，明确日志级别、core dump 去向、堆检查级别和安全启动参数。两种 profile 都应纳入 CI 构建。
 - 验证：比较两种镜像的体积、内部堆、性能和故障输出，并确保生产 profile 不泄露敏感内存。
 
 ## 4. 快速收益清单

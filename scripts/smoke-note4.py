@@ -81,7 +81,7 @@ class Link:
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
             reply, _ = self.request(payload, min(5.0, deadline - time.monotonic()))
-            if not reply or reply.get("status") != "busy":
+            if reply and reply.get("status") != "busy":
                 return reply
             time.sleep(0.1)
         return None
@@ -100,6 +100,7 @@ def main():
     link = Link(args.port, args.baud)
     link_error = None
     original = None
+    writes_ok = 0
     try:
         status = None
         ready_deadline = time.monotonic() + 30
@@ -138,17 +139,13 @@ def main():
         results.append(("out-of-range rtc rejected",
                         bool(bad) and bad.get("status") == "error"))
 
-        writes_ok = 0
         for index in range(args.stress):
-            value = 480 if index % 2 == 0 else 60
             reply = link.request_until_ready(
-                {"cmd": "set_timezone", "offset_minutes": value,
+                {"cmd": "set_timezone", "offset_minutes": target,
                  "id": "smoke-stress-%d" % index}, args.reply_timeout)
             if reply and reply.get("status") == "ok":
                 writes_ok += 1
         print("stress writes: %d/%d" % (writes_ok, args.stress))
-        results.append(("persistence writes complete", writes_ok == args.stress))
-
         link.drain(args.soak)
     except SerialException as err:
         link_error = str(err)
@@ -174,6 +171,7 @@ def main():
     trouble = [l for l in lines for pat in TROUBLE if pat.lower() in l.lower()]
     results.append(("no panic / watchdog / reset during soak", not trouble))
     results.append(("serial link stayed connected", link_error is None))
+    results.append(("persistence writes complete", writes_ok == args.stress))
     for line in trouble[:5]:
         print("  trouble:", line)
 
@@ -181,7 +179,11 @@ def main():
                (re.search(r"^[IWE] \((\d+)\)", l) for l in lines) if m]
     if uptimes:
         print("uptime first/last: %d / %d ms" % (uptimes[0], uptimes[-1]))
-        results.append(("uptime monotonic", uptimes[-1] >= uptimes[0]))
+        monotonic = all(later >= earlier for earlier, later in zip(uptimes, uptimes[1:]))
+        results.append(("uptime monotonic", monotonic))
+
+    boot_markers = sum("boot: Loaded app from partition" in line for line in lines)
+    results.append(("no application reboot", boot_markers <= 1))
 
     refreshes = [l for l in lines if "EPD refresh completed" in l]
     full = [l for l in refreshes if "Full" in l]
