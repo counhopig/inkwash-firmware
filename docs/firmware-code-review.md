@@ -30,8 +30,8 @@
 | CPU 默认频率 | 160 MHz |
 | BLE | NimBLE Peripheral，最多一个连接 |
 | TLS | mbedTLS 完整证书包 |
-| 分区 | 分区表偏移 64 KiB；NVS 64 KiB、NVS 密钥 4 KiB、OTA metadata 8 KiB、双 4 MiB OTA 槽、core dump 512 KiB、保留区 7.3125 MiB |
-| OTA | 双槽与 bootloader 回滚已启用；远程下载协议尚未实现 |
+| 分区 | 分区表偏移 64 KiB；NVS 64 KiB、NVS 密钥 4 KiB、单个 4 MiB factory 应用分区、core dump 512 KiB、保留区 11.3125 MiB |
+| 固件更新 | 通过 USB 本地刷写，不提供 OTA |
 | Secure Boot | 开发配置关闭；独立安全生产配置启用 V2 RSA 签名 |
 | Flash/NVS 加密 | 开发配置关闭；独立安全生产配置启用 AES-256 release 模式和 NVS 加密 |
 
@@ -47,7 +47,7 @@
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
 - `scripts/build-secure.sh`：Secure Boot V2、AES-256 Flash Encryption、NVS Encryption 安全生产配置交叉构建成功；未向实机写入或烧写 eFuse
-- 当前 release 应用镜像为 2,668,720 字节，占 4 MiB OTA 槽的 63.63%
+- 当前 release 应用镜像为 2,662,864 字节，占 4 MiB factory 分区的 63.49%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
@@ -69,12 +69,12 @@
 5. Wi-Fi 密码和服务端 Bearer Token 由安全生产配置的加密 NVS 保护；Secure Boot V2 和 AES-256 Flash Encryption 使用独立构建目录与外部签名密钥。当前开发机配置刻意保持未烧写 eFuse。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
 7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
-8. 当前分区布局具备双 OTA 槽和回滚元数据，应用会在核心外设、NVS、任务及状态机启动成功后确认待验证镜像；仓库与服务端尚无远程 OTA 下载协议。
+8. 固件面向通过 USB 本地刷写的极客用户，分区布局使用单个 4 MiB factory 应用分区，不引入无需求的 OTA 状态和回滚逻辑。
 9. Light Sleep、tickless idle 与 40–160 MHz 动态调频已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。
 10. 同步应用先持久化完整 journal，再更新各 NVS namespace，全部成功后清除 journal；启动在读取业务状态前强制重放未完成事务，避免掉电后暴露跨数据集混合状态。
 11. RTC 高频分配器崩溃路径已经移除，并通过 1,000 次连续持久化门槛；测试器现会检测任意相邻 uptime 回退、应用重启、部分完成和 USB 写超时。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
-13. 建议优先完成 BLE 安全互操作测试和量产安全配置的工装验证，再推进 OTA 传输协议与功耗优化。
+13. 建议优先完成 BLE 安全互操作测试、量产安全配置的工装验证和功耗优化。
 14. 当前 `POST /api/sync` 是带本地变更的合并操作，服务端不会按 ETag 返回 304；固件已移除无效的 ETag 请求状态和 NVS 写入，避免伪缓存机制与额外 Flash 磨损。
 15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
 16. 完整 core dump 已从 UART 移至 512 KiB Flash 分区，避免 panic 时直接向 USB 主机输出凭据；默认配置使用 light heap poisoning，独立 diagnostic 配置使用 comprehensive poisoning。
@@ -86,14 +86,14 @@
 - 位置：`logic/src/app.rs`、`logic/src/runtime.rs`、`rust-firmware/src/app_runner.rs`
 - 设计：应用状态通过事件更新，硬件动作建模为 `Effect`；异步结果以携带 `operation_id`、`effect_id` 和 `render_generation` 的完成事件回灌。
 - 为什么好：减少 UI、网络、RTC 和显示之间的隐式耦合，能识别陈旧完成事件，并允许绝大部分业务逻辑脱离硬件测试。
-- 建议：继续保持“状态只能经事件修改”的约束；OTA、电池低压和安全状态也应通过同一模型接入。
+- 建议：继续保持“状态只能经事件修改”的约束；电池低压和安全状态也应通过同一模型接入。
 
 ### 2.2 睡眠采用 prepare/commit 两阶段准入
 
 - 位置：`logic/src/power_state.rs`、`rust-firmware/src/main.rs:2111`
 - 设计：进入睡眠前检查输入、显示刷新、持久化、网络、协议回复、RTC 计划和事件队列，并使用带代际的 `SleepToken` 防止陈旧提交。
 - 为什么好：避免回复或 NVS 写入尚未完成时睡眠；新输入会使旧 token 失效，降低睡眠竞态。
-- 建议：引入 OTA 后，将镜像写入和首次启动确认状态纳入相同准入机制。
+- 建议：新增任何长时写入操作时，都应纳入相同准入机制。
 
 ### 2.3 RTC 单一所有者模型
 
@@ -185,12 +185,12 @@
 - `rust-firmware/build.rs`：支持 `SOURCE_DATE_EPOCH`，相同源码和指定时间戳可生成稳定的构建时间元数据；非法值会直接终止构建。
 - `rust-firmware/build.rs`：递归声明两个本地 ESP-IDF 组件的源码、头文件和 CMake 文件为构建依赖，驱动修改会触发 Cargo/embuild 重新配置。
 - `rust-firmware/build.rs`：构建期校验 CJK 索引长度、严格排序、cell 唯一性与范围，并确认 12px/16px 字模具有完整的 94×94 网格长度。
-- `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 `ota_0` 生成应用镜像以执行 4 MiB 容量门禁。
-- `rust-firmware/partitions.csv`、`rust-firmware/src/main.rs:1099`：双槽、回滚 metadata 和 512 KiB core dump 分区已经落地；待验证镜像只有在 RTC、NVS、主要工作任务和状态机启动成功后才确认有效。
+- `scripts/release.sh`：发布前核验最终生成的 ESP32-S3、16 MB、DIO、80 MHz 配置，重新编译并逐字节比对分区表，同时用 `factory` 生成应用镜像以执行 4 MiB 容量门禁。
+- `rust-firmware/partitions.csv`：单个 4 MiB factory 应用分区符合 USB 本地刷写需求；512 KiB core dump 与业务 NVS 分区相互隔离。
 - `rust-firmware/src/sync_apply.rs`、`storage.rs`：同步快照采用持久化 redo journal；启动先重放再构造 `BootSnapshot`，写入失败则进入安全模式，不会把部分提交的数据交给业务状态机。NVS 扩至 64 KiB，为最大 12 KiB journal 和现有对象保留整理空间。
 - `rust-firmware/src/tasks.rs`：所有应用 pthread 统一使用 internal RAM 栈、显式优先级和 `CONFIG_FREERTOS_NO_AFFINITY`；RTC 8、音频 7、USB 6、Effect 5、EPD/BLE 4、同步 3，实时告警路径明确高于后台 TLS，同一全局配置锁防止创建线程时策略串扰。
 - `rust-firmware/sdkconfig.defaults`、`sdkconfig.diagnostic.defaults`：默认量产构建使用 light heap poisoning 和 Flash core dump；`--diagnostic` 使用独立 target 并恢复 comprehensive poisoning。Linux、Windows 构建入口和 CI 均覆盖两种配置，不会互相复用 sdkconfig 或产物。
-- `rust-firmware/partitions.csv`：未使用的 7.3125 MiB 空间标记为 `reserved`，固件不挂载该分区；保留兼容 subtype 仅用于构建工具识别，不会引入文件系统代码。
+- `rust-firmware/partitions.csv`：未使用的 11.3125 MiB 空间标记为 `reserved`，固件不挂载该分区；保留兼容 subtype 仅用于构建工具识别，不会引入文件系统代码。
 - `scripts/build-secure.sh`、`.github/workflows/ci.yml`：安全生产配置要求外部 RSA-3072 密钥，启用 Secure Boot V2、AES-256 Flash Encryption release 模式、NVS Encryption，并使用独立 target；CI 只生成一次性密钥验证配置可构建，不持有量产私钥。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
 - 以上状态通过 fmt、clippy、420 项单元测试、release 交叉构建和授权真机启动日志验证；RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
@@ -221,7 +221,6 @@
 
 ### 长期
 
-- 实现远程 OTA 下载、版本策略和服务端发布协议；双槽、签名验证、首启确认和自动回滚基础已具备。
 - 在独立量产样机和工装上验证 Secure Boot V2、Flash Encryption、NVS Encryption 与 eFuse 流程。
 - 建立启动失败计数和安全模式，避免 panic 重启循环。
 - 将功耗策略演进为 DFS、Light Sleep、Deep Sleep 和 PM lock 的场景化模型。
@@ -231,12 +230,11 @@
 ## 6. 需要确认的信息
 
 1. BLE 配对页面是否被视为“物理在场即授权”，还是必须抵御附近陌生客户端。
-2. 产品是否计划支持远程 OTA；如不支持，现场升级和故障恢复流程是什么。
-3. 量产方如何保管 Secure Boot 私钥，以及是否有独立样机验证不可逆的 eFuse 流程。
-4. 当前保留分区未来是否需要用于本地文件系统；固件目前不挂载它。
-5. 服务端是否只允许 HTTPS，以及使用公共 CA、私有 CA 还是证书固定。
-6. USB 控制接口是否只在受控维修环境开放。
-7. 实机长期运行的 stack high-water mark、内部堆最低值和最大连续块数据。
-8. EPD、音频和 Wi-Fi 同时工作的峰值电流及电源设计余量。
-9. 安全生产配置是否还需要调整量产日志等级和 core dump 提取权限。
-10. 是否存在未纳入仓库的硬件在环、OTA、安全配置或量产脚本。
+2. 量产方如何保管 Secure Boot 私钥，以及是否有独立样机验证不可逆的 eFuse 流程。
+3. 当前保留分区未来是否需要用于本地文件系统；固件目前不挂载它。
+4. 服务端是否只允许 HTTPS，以及使用公共 CA、私有 CA 还是证书固定。
+5. USB 控制接口是否只在受控维修环境开放。
+6. 实机长期运行的 stack high-water mark、内部堆最低值和最大连续块数据。
+7. EPD、音频和 Wi-Fi 同时工作的峰值电流及电源设计余量。
+8. 安全生产配置是否还需要调整量产日志等级和 core dump 提取权限。
+9. 是否存在未纳入仓库的硬件在环、安全配置或量产脚本。

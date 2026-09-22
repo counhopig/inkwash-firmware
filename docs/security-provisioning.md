@@ -38,7 +38,7 @@ CI 使用一次性 RSA 密钥验证安全配置能够完整构建；一次性密
 - Flash 模式为 DIO、频率为 80 MHz
 - 分区表来自当前构建的 `rust-firmware/partitions.csv`
 - 设备身份属于本次量产批次的允许列表
-- bootloader、partition table、OTA metadata 和应用来自同一次安全构建
+- bootloader、partition table 和应用来自同一次安全构建
 
 当前授权开发设备 `20:6E:F1:B4:7D:E4` 不用于首次安全配置验证，不得在该设备上烧写安全 eFuse。
 
@@ -50,6 +50,6 @@ CI 使用一次性 RSA 密钥验证安全配置能够完整构建；一次性密
 2. 签名应用正常启动，NVS 写入和重启读取正常。
 3. 未签名应用无法启动。
 4. 离线读取 Flash 不包含 Wi-Fi 密码或 Bearer Token 明文。
-5. OTA 更新只接受受信任密钥签名的镜像；失败更新回滚到上一槽。
+5. 受信任签名的应用能够启动，篡改或未签名的应用无法启动。
 6. JTAG 和 ROM Basic Console 不可用。
 7. 设备 MAC、固件版本、镜像摘要和工装结果写入量产记录。

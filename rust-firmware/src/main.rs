@@ -476,7 +476,6 @@ fn main() -> Result<()> {
                 inkwash_logic::app::Event::SyncSchedulerConfigured(scheduler_config),
                 &mut ctx,
             )?;
-            confirm_pending_ota()?;
         }
         let now = Instant::now();
 
@@ -1138,27 +1137,6 @@ fn reset_reason_name(reason: esp_idf_svc::sys::esp_reset_reason_t) -> &'static s
         esp_reset_reason_t_ESP_RST_CPU_LOCKUP => "cpu-lockup",
         _ => "unknown",
     }
-}
-
-fn confirm_pending_ota() -> anyhow::Result<()> {
-    let running = unsafe { esp_idf_svc::sys::esp_ota_get_running_partition() };
-    if running.is_null() {
-        anyhow::bail!("OTA self-test could not identify the running partition");
-    }
-
-    let mut state = esp_idf_svc::sys::esp_ota_img_states_t_ESP_OTA_IMG_UNDEFINED;
-    let result = unsafe { esp_idf_svc::sys::esp_ota_get_state_partition(running, &mut state) };
-    if result == esp_idf_svc::sys::ESP_ERR_NOT_FOUND {
-        return Ok(());
-    }
-    esp_idf_svc::sys::esp!(result)?;
-    if state == esp_idf_svc::sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY {
-        esp_idf_svc::sys::esp!(unsafe {
-            esp_idf_svc::sys::esp_ota_mark_app_valid_cancel_rollback()
-        })?;
-        log::info!("OTA image accepted after startup self-test");
-    }
-    Ok(())
 }
 
 fn run_safe_mode(
