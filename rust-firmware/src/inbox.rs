@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 use serde::{Deserialize, Serialize};
 
+use inkwash_logic::boot_store::StoreFault;
+
 use crate::nvs_blob::{read_blob, write_blob};
 
 pub use inkwash_logic::inbox_item::{InboxItem, InboxKind, Priority};
@@ -37,10 +39,14 @@ impl InboxStore {
         Ok(Self { nvs })
     }
 
-    fn load_state(&self) -> Result<InboxState> {
+    fn load_state(&self) -> Result<InboxState, StoreFault> {
         if let Some(state) = read_blob::<STATE_BLOB_BUF_LEN, InboxState>(&self.nvs, KEY_STATE)? {
             if state.version != 1 {
-                return Err(anyhow!("unsupported inbox state version {}", state.version));
+                log::error!(
+                    "stored inbox state version {} is not supported",
+                    state.version
+                );
+                return Err(StoreFault::UnsupportedVersion);
             }
             return Ok(state);
         }
@@ -57,7 +63,7 @@ impl InboxStore {
         write_blob::<STATE_BLOB_BUF_LEN, _>(&self.nvs, KEY_STATE, state)
     }
 
-    pub fn load(&self) -> Result<Vec<InboxItem>> {
+    pub fn load(&self) -> Result<Vec<InboxItem>, StoreFault> {
         Ok(self.load_state()?.items)
     }
 
@@ -105,7 +111,7 @@ impl InboxStore {
         self.save_state(&state)
     }
 
-    pub fn pending_read(&self) -> Result<Vec<u64>> {
+    pub fn pending_read(&self) -> Result<Vec<u64>, StoreFault> {
         Ok(self.load_state()?.pending_read)
     }
 
@@ -128,7 +134,7 @@ impl InboxStore {
         self.save_state(&state)
     }
 
-    pub fn unread_urgent(&self) -> Result<Vec<u64>> {
+    pub fn unread_urgent(&self) -> Result<Vec<u64>, StoreFault> {
         Ok(self
             .load()?
             .iter()

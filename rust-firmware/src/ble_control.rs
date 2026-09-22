@@ -12,6 +12,8 @@ use esp32_nimble::{
     uuid128, BLEAdvertisementData, BLECharacteristic, BLEDevice, NimbleProperties, NotifyTxStatus,
 };
 
+use inkwash_logic::diag::DiagCounter;
+
 use crate::control;
 
 const CHANNEL_CAPACITY: usize = 16;
@@ -480,6 +482,7 @@ impl BleControl {
     ) -> Result<u64, BleReplyError> {
         let json = control::render_reply(reply, id);
         if self.pending_replies.len() >= CHANNEL_CAPACITY {
+            crate::diag::record(DiagCounter::BleWorkerQueueFull);
             return Err(BleReplyError::QueueFull);
         }
         let reply_id = self.next_reply_id;
@@ -523,7 +526,10 @@ impl BleControl {
                 session_id: stop_session_id,
             }) {
                 Ok(()) => self.pending_stop = None,
-                Err(mpsc::TrySendError::Full(_)) => return,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    crate::diag::record(DiagCounter::BleWorkerQueueFull);
+                    return;
+                }
                 Err(mpsc::TrySendError::Disconnected(_)) => self.pending_stop = None,
             }
         }
@@ -542,7 +548,10 @@ impl BleControl {
                 json: reply.json.clone(),
             }) {
                 Ok(()) => reply.queued = true,
-                Err(mpsc::TrySendError::Full(_)) => break,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    crate::diag::record(DiagCounter::BleWorkerQueueFull);
+                    break;
+                }
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
         }

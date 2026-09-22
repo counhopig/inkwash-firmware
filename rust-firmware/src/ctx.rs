@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::mpsc::TryRecvError;
 
+use inkwash_logic::diag::DiagCounter;
+
 use crate::alarms::AlarmStore;
 use crate::ble_control::BleControl;
 use crate::board::Note4Board;
@@ -363,6 +365,7 @@ impl DeviceContext<'_> {
             return Ok(());
         }
         if self.pending_usb_replies.len() >= USB_REPLY_PENDING_CAPACITY {
+            crate::diag::record(DiagCounter::UsbReplyQueueFull);
             if self.pending_usb_reply_latch.is_some() {
                 return Err(format!(
                     "USB reply mailbox and producer latch full (capacity {})",

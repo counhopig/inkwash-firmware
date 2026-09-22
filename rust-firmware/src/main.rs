@@ -4,10 +4,12 @@ mod audio;
 mod audio_task;
 mod ble_control;
 mod board;
+mod boot_ledger;
 mod button;
 mod canvas;
 mod control;
 mod ctx;
+mod diag;
 mod display;
 mod effect_task;
 mod epd_task;
@@ -47,6 +49,10 @@ use button::POLL_INTERVAL_MS;
 use ctx::DeviceContext;
 use epd_task::EpdCompletion;
 use inbox::InboxStore;
+use inkwash_logic::boot_store::{
+    resolve, StoreId, DEFAULT_SYNC_INTERVAL_MINUTES, DEFAULT_TIMEZONE_OFFSET_MINUTES,
+};
+use inkwash_logic::diag::DiagCounter;
 use rtc::DateTime;
 use storage::PersistedCounters;
 use todos::TodoStore;
@@ -63,6 +69,10 @@ const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const ALARM_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 const SAFE_MODE_REPLY_CAPACITY: usize = usb_console::REPLY_WRITER_CAPACITY;
+
+const SAFE_MODE_CORE_HEADLINE: &str = "CORE DATA UNAVAILABLE";
+
+const SAFE_MODE_LOOP_HEADLINE: &str = "BOOT LOOP DETECTED";
 
 const BUILD_EPOCH_SECS: u64 = build_epoch_secs();
 
@@ -86,10 +96,15 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let reset_reason = unsafe { esp_idf_svc::sys::esp_reset_reason() };
-    log::info!(
-        "Reset reason: {} ({reset_reason})",
-        reset_reason_name(reset_reason)
-    );
+    let reset_kind = boot_ledger::reset_kind(reset_reason);
+    let ledger = boot_ledger::note_attempt(reset_kind);
+    log::info!("Reset reason: {} ({reset_reason})", reset_kind.label());
+    if ledger.failures() > 0 {
+        log::warn!(
+            "Boot ledger: {} consecutive failed boots before this attempt",
+            ledger.failures()
+        );
+    }
     log::info!(
         "Inkwash NOTE4 Rust bring-up starting (git {})",
         env!("GIT_REV")
@@ -147,6 +162,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("RTC executor start failed: {err}"),
         ),
     };
@@ -157,6 +173,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("NVS partition init failed: {err}"),
         ),
     };
@@ -166,6 +183,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Counters NVS open failed: {err}"),
         ),
     };
@@ -175,6 +193,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Alarm NVS open failed: {err}"),
         ),
     };
@@ -184,6 +203,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Todo NVS open failed: {err}"),
         ),
     };
@@ -196,6 +216,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Inbox NVS open failed: {err}"),
         ),
     };
@@ -206,8 +227,28 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Synchronized-state recovery failed: {err}"),
         ),
+    }
+    let boot_stores = match read_boot_stores(&counters, &alarm_store, &todo_store, &inbox_store) {
+        Ok(stores) => stores,
+        Err(fault) => run_safe_mode(
+            &mut board,
+            &mut usb_console,
+            &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
+            &fault.reason(),
+        ),
+    };
+    if ledger.exhausted() {
+        run_safe_mode(
+            &mut board,
+            &mut usb_console,
+            &mut usb_reply_writer,
+            SAFE_MODE_LOOP_HEADLINE,
+            &ledger.reason(),
+        );
     }
     let effect_counters = match PersistedCounters::open(effect_partition.clone()) {
         Ok(store) => store,
@@ -215,6 +256,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Effect counters NVS open failed: {err}"),
         ),
     };
@@ -224,6 +266,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Effect alarm NVS open failed: {err}"),
         ),
     };
@@ -233,6 +276,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Effect todo NVS open failed: {err}"),
         ),
     };
@@ -242,6 +286,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             &format!("Effect inbox NVS open failed: {err}"),
         ),
     };
@@ -263,8 +308,8 @@ fn main() -> Result<()> {
             if dt.voltage_low {
                 log::warn!("PCF8563 VL set (RTC battery low/lost); reseeding from build time");
                 needs_wifi_sync = true;
-                let offset = counters.timezone_offset_minutes().unwrap_or(0);
-                let seeded = DateTime::from_unix(BUILD_EPOCH_SECS).shifted_minutes(offset as i32);
+                let seeded = DateTime::from_unix(BUILD_EPOCH_SECS)
+                    .shifted_minutes(boot_stores.timezone_offset_minutes as i32);
                 if let Err(err) = rtc.write_time(&seeded) {
                     log::warn!("PCF8563 reseed failed: {err}");
                     core_failure = Some(format!("PCF8563 reseed failed: {err}"));
@@ -285,10 +330,16 @@ fn main() -> Result<()> {
         }
     };
 
-    let boot_core = match collect_boot_core_facts(&rtc, &alarm_store, clock, core_failure) {
+    let boot_core = match collect_boot_core_facts(&rtc, clock, core_failure) {
         Ok(facts) => facts,
         Err(reason) => {
-            run_safe_mode(&mut board, &mut usb_console, &mut usb_reply_writer, &reason);
+            run_safe_mode(
+                &mut board,
+                &mut usb_console,
+                &mut usb_reply_writer,
+                SAFE_MODE_CORE_HEADLINE,
+                &reason,
+            );
         }
     };
 
@@ -297,6 +348,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE_HEADLINE,
             "forced by INKWASH_FORCE_SAFE_MODE=1 (test hook)",
         );
     }
@@ -325,10 +377,10 @@ fn main() -> Result<()> {
     if !needs_wifi_sync {
         log::info!("RTC is healthy; skipping boot-time Wi-Fi/NTP resync");
     } else {
-        match counters.wifi_creds() {
-            Ok(Some(creds)) => match wifi_mgr.connect(&creds) {
+        match boot_stores.wifi_creds.as_ref() {
+            Some(creds) => match wifi_mgr.connect(creds) {
                 Ok(()) => {
-                    let timezone_offset = counters.timezone_offset_minutes().unwrap_or(0);
+                    let timezone_offset = boot_stores.timezone_offset_minutes;
                     match wifi::ntp_sync_and_set_rtc(&rtc, timezone_offset) {
                         Ok(()) => match rtc.read_time() {
                             Ok(dt) => clock = Some(dt),
@@ -342,22 +394,20 @@ fn main() -> Result<()> {
                 }
                 Err(err) => log::warn!("Wi-Fi connect failed: {err}"),
             },
-            Ok(None) => {
+            None => {
                 log::info!(
                     "No Wi-Fi credentials in NVS; skipping connect (see scripts/gen-nvs-wifi.py)"
                 );
             }
-            Err(err) => log::warn!("Could not read Wi-Fi credentials from NVS: {err}"),
         }
     };
 
-    let boot_result =
-        collect_boot_snapshot(boot_core, &counters, &todo_store, &inbox_store, clock)?;
     let scheduler_config = inkwash_logic::app::SyncSchedulerConfig {
         now_unix: clock.map(|now| now.to_unix()).unwrap_or(0),
-        interval_minutes: counters.sync_interval_minutes().unwrap_or(60),
-        last_sync_epoch: counters.last_sync_epoch().unwrap_or(None),
+        interval_minutes: boot_stores.sync_interval_minutes,
+        last_sync_epoch: boot_stores.last_sync_epoch,
     };
+    let boot_result = collect_boot_snapshot(boot_core, boot_stores, clock);
 
     let sync_task = sync_task::SyncTask::spawn(sync_partition, wifi_mgr)?;
 
@@ -447,6 +497,7 @@ fn main() -> Result<()> {
     let power_ticks_origin = Instant::now();
     let mut last_activity = Instant::now();
     let mut status_last = Instant::now();
+    let mut last_diag = diag::snapshot();
     let mut stack_last = Instant::now();
     let mut clock_last = Instant::now();
     let mut alarm_status_last = Instant::now()
@@ -476,6 +527,8 @@ fn main() -> Result<()> {
                 inkwash_logic::app::Event::SyncSchedulerConfigured(scheduler_config),
                 &mut ctx,
             )?;
+            boot_ledger::clear();
+            log::info!("Boot ledger cleared: core initialization completed");
         }
         let now = Instant::now();
 
@@ -488,6 +541,11 @@ fn main() -> Result<()> {
             if let Err(err) = report_power_state(ctx.board) {
                 log::warn!("Power status probe failed: {err}");
             }
+            let snapshot = diag::snapshot();
+            if let Some(line) = inkwash_logic::diag::render_delta(&last_diag, &snapshot) {
+                log::warn!("Diagnostics: {line}");
+            }
+            last_diag = snapshot;
         }
 
         let clock_interval = if idle {
@@ -676,6 +734,7 @@ fn main() -> Result<()> {
                     conn_handle,
                     reply_id,
                 } => {
+                    diag::record(DiagCounter::BleReplyRetry);
                     log::warn!(
                         "BLE reply {reply_id} notify failed for session {session_id}, generation {generation}, handle {conn_handle}; retry queued"
                     );
@@ -730,6 +789,7 @@ fn main() -> Result<()> {
                     log::warn!(
                         "BLE reply {reply_id} terminated for session {session_id}, generation {generation}, handle {conn_handle}"
                     );
+                    diag::record(DiagCounter::BleReplyDrop);
                     continue;
                 }
             };
@@ -1116,42 +1176,20 @@ fn main() -> Result<()> {
     }
 }
 
-#[allow(non_upper_case_globals)]
-fn reset_reason_name(reason: esp_idf_svc::sys::esp_reset_reason_t) -> &'static str {
-    use esp_idf_svc::sys::*;
-    match reason {
-        esp_reset_reason_t_ESP_RST_POWERON => "power-on",
-        esp_reset_reason_t_ESP_RST_EXT => "external",
-        esp_reset_reason_t_ESP_RST_SW => "software",
-        esp_reset_reason_t_ESP_RST_PANIC => "panic",
-        esp_reset_reason_t_ESP_RST_INT_WDT => "interrupt-watchdog",
-        esp_reset_reason_t_ESP_RST_TASK_WDT => "task-watchdog",
-        esp_reset_reason_t_ESP_RST_WDT => "watchdog",
-        esp_reset_reason_t_ESP_RST_DEEPSLEEP => "deep-sleep",
-        esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
-        esp_reset_reason_t_ESP_RST_SDIO => "sdio",
-        esp_reset_reason_t_ESP_RST_USB => "usb",
-        esp_reset_reason_t_ESP_RST_JTAG => "jtag",
-        esp_reset_reason_t_ESP_RST_EFUSE => "efuse",
-        esp_reset_reason_t_ESP_RST_PWR_GLITCH => "power-glitch",
-        esp_reset_reason_t_ESP_RST_CPU_LOCKUP => "cpu-lockup",
-        _ => "unknown",
-    }
-}
-
 fn run_safe_mode(
     board: &mut Note4Board,
     usb_console: &mut crate::usb_console::UsbConsole,
     usb_reply_writer: &mut UsbReplyWriter,
+    headline: &str,
     reason: &str,
 ) -> ! {
-    log::error!("Entering minimum safe mode (core boot fact unavailable: {reason})");
+    log::error!("Entering minimum safe mode ({headline}: {reason})");
 
     {
         let mut canvas = board.display.canvas_mut();
         canvas.clear();
         crate::ui::header(&mut canvas, "SAFE MODE");
-        canvas.draw_text_prop(8, 60, 1, "CORE DATA UNAVAILABLE");
+        canvas.draw_text_prop(8, 60, 1, headline);
 
         let (r1, r2) = if reason.chars().count() > 40 {
             let mut chars = reason.chars();
@@ -1165,8 +1203,8 @@ fn run_safe_mode(
         if !r2.is_empty() {
             canvas.draw_text_prop(8, 96, 1, &r2);
         }
-        canvas.draw_text_prop(8, 140, 1, "USB DIAGNOSTICS ACTIVE");
-        canvas.draw_text_prop(8, 156, 1, "HOLD ENTER + RESET TO EXIT");
+        canvas.draw_text_prop(8, 140, 1, "STORED DATA UNTOUCHED");
+        canvas.draw_text_prop(8, 156, 1, "USB DIAG; RESET TO RETRY");
         drop(canvas);
         if let Err(err) = board.display.refresh_full() {
             log::error!("Safe-mode error screen refresh failed: {err:#}");
@@ -1308,12 +1346,10 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
 #[derive(Debug)]
 struct BootCoreFacts {
     alarm_status: crate::rtc_executor::AlarmStatus,
-    alarms: Vec<crate::alarms::StoredAlarm>,
 }
 
 fn collect_boot_core_facts(
     rtc: &crate::rtc_executor::RtcExecutor,
-    alarm_store: &AlarmStore,
     clock: Option<DateTime>,
     prior_failure: Option<String>,
 ) -> std::result::Result<BootCoreFacts, String> {
@@ -1326,12 +1362,57 @@ fn collect_boot_core_facts(
     let alarm_status = rtc
         .alarm_status()
         .map_err(|err| format!("RTC alarm status read failed: {err}"))?;
-    let alarms = alarm_store
-        .load()
-        .map_err(|err| format!("Alarm NVS load failed: {err}"))?;
-    Ok(BootCoreFacts {
-        alarm_status,
+    Ok(BootCoreFacts { alarm_status })
+}
+
+/// Everything the boot path reads out of persistent storage, resolved once.
+///
+/// Reads happen here, before anything else touches these stores, so a store
+/// that cannot be read is reported with the store and the failure class instead
+/// of quietly looking like a device that was never configured. Absent keys are
+/// first-time configuration and take their documented default.
+#[derive(Debug)]
+struct BootStores {
+    alarms: Vec<crate::alarms::StoredAlarm>,
+    todos: Vec<crate::todos::Todo>,
+    inbox: Vec<crate::inbox::InboxItem>,
+    config: inkwash_logic::device_config::DeviceConfig,
+    wifi_creds: Option<inkwash_logic::device_config::WifiCreds>,
+    timezone_offset_minutes: i16,
+    sync_interval_minutes: u16,
+    last_sync_epoch: Option<u64>,
+}
+
+fn read_boot_stores(
+    counters: &PersistedCounters,
+    alarm_store: &AlarmStore,
+    todo_store: &TodoStore,
+    inbox_store: &InboxStore,
+) -> std::result::Result<BootStores, inkwash_logic::boot_store::BootFault> {
+    let alarms = resolve(StoreId::Alarms, alarm_store.load())?;
+    let todos = resolve(StoreId::Todos, todo_store.load())?;
+    let inbox = resolve(StoreId::Inbox, inbox_store.load())?;
+    let config = resolve(StoreId::ServerConfig, counters.device_config())?.unwrap_or_else(|| {
+        inkwash_logic::device_config::DeviceConfig {
+            server_url: String::new(),
+            auth_token: String::new(),
+        }
+    });
+    let wifi_creds = resolve(StoreId::WifiCredentials, counters.wifi_creds())?;
+    let timezone_offset_minutes = resolve(StoreId::Timezone, counters.timezone_offset_minutes())?
+        .unwrap_or(DEFAULT_TIMEZONE_OFFSET_MINUTES);
+    let sync_interval_minutes = resolve(StoreId::SyncInterval, counters.sync_interval_minutes())?
+        .unwrap_or(DEFAULT_SYNC_INTERVAL_MINUTES);
+    let last_sync_epoch = resolve(StoreId::LastSyncEpoch, counters.last_sync_epoch())?;
+    Ok(BootStores {
         alarms,
+        todos,
+        inbox,
+        config,
+        wifi_creds,
+        timezone_offset_minutes,
+        sync_interval_minutes,
+        last_sync_epoch,
     })
 }
 
@@ -1342,45 +1423,32 @@ struct BootSnapshotResult {
 
 fn collect_boot_snapshot(
     core: BootCoreFacts,
-    counters: &PersistedCounters,
-    todo_store: &TodoStore,
-    inbox_store: &InboxStore,
+    stores: BootStores,
     clock: Option<DateTime>,
-) -> anyhow::Result<BootSnapshotResult> {
-    let todos = todo_store
-        .load()
-        .map_err(|err| anyhow::anyhow!("Todo NVS load failed: {err}"))?;
-    let inbox = inbox_store
-        .load()
-        .map_err(|err| anyhow::anyhow!("Inbox NVS load failed: {err}"))?;
-    let config =
-        counters
-            .device_config()?
-            .unwrap_or_else(|| inkwash_logic::device_config::DeviceConfig {
-                server_url: String::new(),
-                auth_token: String::new(),
-            });
+) -> BootSnapshotResult {
     let wake_cause = power::wake_cause();
 
-    let wifi = counters.wifi_creds()?;
     let status = inkwash_logic::app::DeviceStatus {
-        wifi_ssid: wifi.as_ref().map(|creds| creds.ssid.clone()),
-        wifi_has_password: wifi.is_some_and(|creds| !creds.password.is_empty()),
-        timezone_offset_minutes: counters.timezone_offset_minutes()?,
+        wifi_ssid: stores.wifi_creds.as_ref().map(|creds| creds.ssid.clone()),
+        wifi_has_password: stores
+            .wifi_creds
+            .as_ref()
+            .is_some_and(|creds| !creds.password.is_empty()),
+        timezone_offset_minutes: stores.timezone_offset_minutes,
     };
-    Ok(BootSnapshotResult {
+    BootSnapshotResult {
         snapshot: inkwash_logic::app::BootSnapshot {
             wake_cause,
             now: clock,
             rtc_alarm_flag: core.alarm_status.alarm_flag,
             rtc_alarm_interrupt_enabled: core.alarm_status.alarm_interrupt_enabled,
-            alarms: core.alarms,
-            todos,
-            inbox,
-            config,
+            alarms: stores.alarms,
+            todos: stores.todos,
+            inbox: stores.inbox,
+            config: stores.config,
             status,
         },
-    })
+    }
 }
 
 fn poll_ble_lifecycle(
@@ -1590,6 +1658,7 @@ fn retain_or_overflow_dispatch_event(
     event: inkwash_logic::app::Event,
 ) -> Result<(), DispatchSaturated> {
     if let Err(event) = retain_pending_app_event(ctx, event) {
+        diag::record(DiagCounter::RuntimeQueueFull);
         if let Err(event) = ctx.pending_dispatch_sources.retain(event) {
             if ctx.pending_dispatch_event.is_none() {
                 ctx.pending_dispatch_event = Some(event);
@@ -1680,6 +1749,7 @@ fn service_effect_task(
                 log::warn!(
                     "effect notice retained: runtime queue full; reducing queued events to make room"
                 );
+                diag::record(DiagCounter::RuntimeQueueFull);
                 return Ok(());
             }
         }
@@ -1697,6 +1767,7 @@ fn service_effect_task(
         match ctx.effect_task.try_submit_batch(batch) {
             Ok(()) => ctx.worker_batch_in_flight = true,
             Err((batch, crate::effect_task::EffectTaskError::QueueFull)) => {
+                diag::record(DiagCounter::EffectQueueFull);
                 ctx.pending_effect_batch = Some(batch)
             }
             Err((_, crate::effect_task::EffectTaskError::Disconnected)) => {
@@ -1740,6 +1811,7 @@ fn reduce_effect_batches(
                         break;
                     }
                     Err((batch, crate::effect_task::EffectTaskError::QueueFull)) => {
+                        diag::record(DiagCounter::EffectQueueFull);
                         ctx.pending_effect_batches.push_front(batch);
                         break;
                     }
@@ -1833,6 +1905,7 @@ fn queue_ble_delivery(
             "BLE reply mailbox and producer latch full (capacity {}); rejecting delivery",
             ctx::BLE_REPLY_PENDING_CAPACITY
         );
+        diag::record(DiagCounter::BleReplyQueueFull);
         return false;
     }
     ctx.pending_ble_deliveries

@@ -125,7 +125,7 @@ pub(crate) fn draw_calendar_grid(
                 };
                 if fires {
                     let slot = &mut marks[day as usize].todo;
-                    if slot.map_or(true, |current| todo.importance > current) {
+                    if slot.is_none_or(|current| todo.importance > current) {
                         *slot = Some(todo.importance);
                     }
                 }

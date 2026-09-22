@@ -5,10 +5,13 @@ pub mod app;
 pub mod audio_command;
 pub mod ble_memory;
 pub mod ble_radio;
+pub mod boot_guard;
+pub mod boot_store;
 pub mod button_event;
 pub mod command_sessions;
 pub mod datetime;
 pub mod device_config;
+pub mod diag;
 pub mod epd_registry;
 pub mod event_queue;
 pub mod harness;
@@ -335,5 +338,71 @@ mod ble_memory_contract {
         );
         assert!(!EP_TASK.contains("#[cfg(test)]"));
         assert!(!USB.contains("#[cfg(test)]"));
+    }
+
+    #[test]
+    fn boot_ledger_lives_in_retained_memory_and_clears_only_after_core_init() {
+        const BOOT_LEDGER: &str = include_str!("../../rust-firmware/src/boot_ledger.rs");
+        const MAIN: &str = include_str!("../../rust-firmware/src/main.rs");
+
+        assert!(
+            BOOT_LEDGER.contains("#[link_section = \".rtc_noinit\"]"),
+            "the boot ledger must live in RTC noinit memory: anywhere else it is either \
+             re-initialized from the flash image on every boot (the loop it counts is \
+             never seen) or cleared by the reset it is meant to count"
+        );
+        assert!(BOOT_LEDGER.contains("write_volatile"));
+        assert!(MAIN.contains("if ledger.exhausted()"));
+
+        let dispatch = MAIN
+            .find("Event::SyncSchedulerConfigured(scheduler_config)")
+            .expect("the boot path must configure the sync scheduler once at startup");
+        let clear = MAIN
+            .find("boot_ledger::clear()")
+            .expect("the boot ledger must be cleared on purpose");
+        assert!(
+            dispatch < clear,
+            "the ledger may only be cleared after core initialization dispatched, so a \
+             run that dies earlier keeps counting"
+        );
+    }
+
+    #[test]
+    fn diagnostic_counters_are_atomic_and_stay_off_the_flash() {
+        const DIAG: &str = include_str!("../../rust-firmware/src/diag.rs");
+
+        assert!(
+            DIAG.contains("AtomicU32"),
+            "counters are written from the main, EPD and BLE workers, so a plain static \
+             would be a data race under -D warnings' shared-mutable-state rules"
+        );
+        assert!(DIAG.contains("fetch_update"));
+        assert!(
+            !DIAG.contains("Nvs") && !DIAG.contains("nvs_blob"),
+            "counters are incremented on hot paths and must never write NVS"
+        );
+        assert!(
+            !DIAG.contains("Mutex"),
+            "an uncontended atomic keeps the queue-full and fallback paths lock-free"
+        );
+    }
+
+    #[test]
+    fn safe_mode_never_touches_stored_data() {
+        const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
+        let safe_mode = MAIN_SOURCE
+            .split("fn run_safe_mode(")
+            .nth(1)
+            .expect("the firmware must keep a minimum safe mode");
+        let body = safe_mode
+            .split("\nfn ")
+            .next()
+            .expect("safe mode must be a self-contained function")
+            .to_lowercase();
+        assert!(
+            !body.contains("nvs") && !body.contains("erase"),
+            "safe mode promises the operator that stored data is untouched: it must not \
+             take a store handle, and it must never erase one"
+        );
     }
 }

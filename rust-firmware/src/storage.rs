@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 use serde::{Deserialize, Serialize};
 
+use inkwash_logic::boot_store::StoreFault;
+
 use crate::nvs_blob;
 
 const NAMESPACE: &str = "inkwash";
@@ -92,15 +94,19 @@ impl PersistedCounters {
         Ok(Self { nvs })
     }
 
-    fn read_num<T: std::str::FromStr>(&self, key: &str, label: &str) -> Result<Option<T>>
+    fn read_num<T: std::str::FromStr>(
+        &self,
+        key: &str,
+        label: &str,
+    ) -> Result<Option<T>, StoreFault>
     where
         T::Err: std::fmt::Display,
     {
         match nvs_blob::read_scalar::<NUM_STR_MAX_LEN>(&self.nvs, key)? {
-            Some(value) => value
-                .parse::<T>()
-                .map(Some)
-                .map_err(|e| anyhow!("invalid stored {label} '{value}': {e}")),
+            Some(value) => value.parse::<T>().map(Some).map_err(|err| {
+                log::error!("stored {label} is not a valid number: {err}");
+                StoreFault::Corrupt
+            }),
             None => Ok(None),
         }
     }
@@ -109,22 +115,26 @@ impl PersistedCounters {
         nvs_blob::write_scalar(&self.nvs, key, &value.to_string())
     }
 
-    pub fn wifi_creds(&self) -> Result<Option<WifiCreds>> {
+    pub fn wifi_creds(&self) -> Result<Option<WifiCreds>, StoreFault> {
         if let Some(stored) = nvs_blob::read_blob::<WIFI_CONFIG_BUF_LEN, StoredWifiConfig>(
             &self.nvs,
             KEY_WIFI_CONFIG,
         )? {
             if stored.version != 1 {
-                return Err(anyhow!(
-                    "unsupported stored Wi-Fi config version {}",
+                log::error!(
+                    "stored Wi-Fi config version {} is not supported",
                     stored.version
-                ));
+                );
+                return Err(StoreFault::UnsupportedVersion);
             }
             let creds = WifiCreds {
                 ssid: stored.ssid,
                 password: stored.password,
             };
-            validate_wifi_creds(&creds)?;
+            validate_wifi_creds(&creds).map_err(|err| {
+                log::error!("stored Wi-Fi config is unusable: {err}");
+                StoreFault::Corrupt
+            })?;
             return Ok(Some(creds));
         }
         let Some(ssid) = nvs_blob::read_scalar::<WIFI_CRED_MAX_LEN>(&self.nvs, KEY_WIFI_SSID)?
@@ -134,7 +144,10 @@ impl PersistedCounters {
         let password = nvs_blob::read_scalar::<WIFI_CRED_MAX_LEN>(&self.nvs, KEY_WIFI_PASS)?
             .unwrap_or_default();
         let creds = WifiCreds { ssid, password };
-        validate_wifi_creds(&creds)?;
+        validate_wifi_creds(&creds).map_err(|err| {
+            log::error!("stored Wi-Fi credentials are unusable: {err}");
+            StoreFault::Corrupt
+        })?;
         Ok(Some(creds))
     }
 
@@ -151,22 +164,26 @@ impl PersistedCounters {
         )
     }
 
-    pub fn device_config(&self) -> Result<Option<DeviceConfig>> {
+    pub fn device_config(&self) -> Result<Option<DeviceConfig>, StoreFault> {
         if let Some(stored) = nvs_blob::read_blob::<SERVER_CONFIG_BLOB_LEN, StoredServerConfig>(
             &self.nvs,
             KEY_SERVER_CONFIG,
         )? {
             if stored.version != 1 {
-                return Err(anyhow!(
-                    "unsupported stored server config version {}",
+                log::error!(
+                    "stored server config version {} is not supported",
                     stored.version
-                ));
+                );
+                return Err(StoreFault::UnsupportedVersion);
             }
             let cfg = DeviceConfig {
                 server_url: stored.server_url,
                 auth_token: stored.auth_token,
             };
-            validate_device_config(&cfg)?;
+            validate_device_config(&cfg).map_err(|err| {
+                log::error!("stored server config is unusable: {err}");
+                StoreFault::Corrupt
+            })?;
             return Ok(Some(cfg));
         }
         let Some(server_url) =
@@ -180,7 +197,10 @@ impl PersistedCounters {
             server_url,
             auth_token,
         };
-        validate_device_config(&cfg)?;
+        validate_device_config(&cfg).map_err(|err| {
+            log::error!("stored server config is unusable: {err}");
+            StoreFault::Corrupt
+        })?;
         Ok(Some(cfg))
     }
 
@@ -205,7 +225,7 @@ impl PersistedCounters {
         )
     }
 
-    pub fn sync_apply_journal(&self) -> Result<Option<inkwash_logic::app::SyncedData>> {
+    pub fn sync_apply_journal(&self) -> Result<Option<inkwash_logic::app::SyncedData>, StoreFault> {
         nvs_blob::read_dynamic_blob(
             &self.nvs,
             KEY_SYNC_APPLY_JOURNAL,
@@ -220,10 +240,8 @@ impl PersistedCounters {
             .map_err(|e| anyhow!("NVS remove({KEY_SYNC_APPLY_JOURNAL}) failed: {e}"))
     }
 
-    pub fn sync_interval_minutes(&self) -> Result<u16> {
-        Ok(self
-            .read_num::<u16>(KEY_SYNC_INTERVAL_MIN, "sync interval")?
-            .unwrap_or(60))
+    pub fn sync_interval_minutes(&self) -> Result<Option<u16>, StoreFault> {
+        self.read_num::<u16>(KEY_SYNC_INTERVAL_MIN, "sync interval")
     }
 
     pub fn set_sync_interval_minutes(&self, minutes: u16) -> Result<()> {
@@ -233,7 +251,7 @@ impl PersistedCounters {
         self.write_num(KEY_SYNC_INTERVAL_MIN, minutes)
     }
 
-    pub fn last_sync_epoch(&self) -> Result<Option<u64>> {
+    pub fn last_sync_epoch(&self) -> Result<Option<u64>, StoreFault> {
         self.read_num::<u64>(KEY_LAST_SYNC_EPOCH, "last-sync epoch")
     }
 
@@ -241,7 +259,7 @@ impl PersistedCounters {
         self.write_num(KEY_LAST_SYNC_EPOCH, epoch)
     }
 
-    pub fn rtc_align_epoch(&self) -> Result<Option<u64>> {
+    pub fn rtc_align_epoch(&self) -> Result<Option<u64>, StoreFault> {
         self.read_num::<u64>(KEY_RTC_ALIGN_EPOCH, "rtc-align epoch")
     }
 
@@ -256,10 +274,8 @@ impl PersistedCounters {
             .map_err(|e| anyhow!("NVS remove({KEY_RTC_ALIGN_EPOCH}) failed: {e}"))
     }
 
-    pub fn timezone_offset_minutes(&self) -> Result<i16> {
-        Ok(self
-            .read_num::<i16>(KEY_TIMEZONE_OFFSET, "timezone offset")?
-            .unwrap_or(0))
+    pub fn timezone_offset_minutes(&self) -> Result<Option<i16>, StoreFault> {
+        self.read_num::<i16>(KEY_TIMEZONE_OFFSET, "timezone offset")
     }
 
     pub fn save_timezone_offset_minutes(&self, offset: i16) -> Result<()> {
@@ -271,7 +287,7 @@ impl PersistedCounters {
         self.write_num(KEY_TIMEZONE_OFFSET, offset)
     }
 
-    pub fn todo_reminded_date(&self) -> Result<Option<String>> {
+    pub fn todo_reminded_date(&self) -> Result<Option<String>, StoreFault> {
         nvs_blob::read_scalar::<NUM_STR_MAX_LEN>(&self.nvs, KEY_TODO_REMINDED_DATE)
     }
 

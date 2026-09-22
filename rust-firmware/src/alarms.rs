@@ -10,6 +10,8 @@ const KEY_DIRTY: &str = "dirty";
 
 const BLOB_BUF_LEN: usize = 1024;
 
+use inkwash_logic::boot_store::StoreFault;
+
 pub use inkwash_logic::alarm_schedule::{
     date_from_days, days_since_epoch, days_until, next_due, next_occurrence_date, Repeat,
     StoredAlarm,
@@ -26,7 +28,7 @@ impl AlarmStore {
         Ok(Self { nvs })
     }
 
-    pub fn load(&self) -> Result<Vec<StoredAlarm>> {
+    pub fn load(&self) -> Result<Vec<StoredAlarm>, StoreFault> {
         let mut alarms: Vec<StoredAlarm> =
             read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_ALARMS)?.unwrap_or_default();
         inkwash_logic::sanitize::sanitize_alarms(&mut alarms);
@@ -45,7 +47,7 @@ impl AlarmStore {
         self.dirty().mark(id)
     }
 
-    pub fn dirty_ids(&self) -> Result<Vec<u8>> {
+    pub fn dirty_ids(&self) -> Result<Vec<u8>, StoreFault> {
         self.dirty().ids()
     }
 

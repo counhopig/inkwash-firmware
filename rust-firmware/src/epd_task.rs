@@ -12,6 +12,8 @@ use esp_idf_svc::sys::zectrix_epd::{
     zectrix_epd_refresh_full_1bpp, zectrix_epd_refresh_partial_1bpp,
 };
 
+use inkwash_logic::diag::DiagCounter;
+
 use crate::canvas::{self, Rect};
 
 const COMPLETION_CAPACITY: usize = 16;
@@ -40,6 +42,7 @@ impl CompletionMailbox {
     fn reserve(&self) -> bool {
         let mut state = self.state.lock();
         if state.queue.len() + state.reserved >= COMPLETION_CAPACITY {
+            crate::diag::record(DiagCounter::EpdQueueFull);
             return false;
         }
         state.reserved += 1;
@@ -325,6 +328,7 @@ fn execute(
                 },
                 Err(err) => {
                     log::warn!("EPD partial refresh failed; trying full refresh: {err}");
+                    crate::diag::record(DiagCounter::EpdFullFallback);
                     let result = refresh_full(handle, &cmd.frame);
                     EpdCompletion {
                         kind: RefreshKind::Partial(rect),

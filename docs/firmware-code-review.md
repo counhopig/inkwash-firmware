@@ -41,13 +41,17 @@
 
 ### 验证结果
 
-- `cargo test --locked`：420 项测试通过
+- `cargo test --locked`：444 项测试通过
 - `cargo fmt --check`：通过
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
-- `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- `scripts/build-secure.sh`：Secure Boot V2、AES-256 Flash Encryption、NVS Encryption 安全生产配置交叉构建成功；未向实机写入或烧写 eFuse
-- 当前 release 应用镜像为 2,662,864 字节，占 4 MiB factory 分区的 63.49%
+- 固件 `cargo clippy --release --locked -- -D warnings`：在 ESP-IDF v5.5.5 + esp 工具链下零告警
+- `scripts/build-rust.sh --release --locked`：ESP32-S3 release 交叉构建成功
+- `scripts/build-rust.sh --diagnostic --release --locked`：diagnostic 目标交叉构建成功
+- `scripts/build-secure.sh`：以一次性 RSA-3072 密钥验证 Secure Boot V2、AES-256 Flash Encryption、NVS Encryption 安全生产配置可完整构建；未向实机写入或烧写 eFuse
+- 当前 release 应用镜像为 2,673,472 字节，占 4 MiB factory 分区的 63.74%
+- `esptool image_info` 显示 release 镜像共 7 段，RTC 段只覆盖 `0x5000_0008`（`.rtc.force_slow`）；启动失败账本所在的 `0x5000_0000` 不属于任何镜像段，因此普通复位触发 bootloader 重新初始化 RTC 段时不会覆写账本
+- 启动失败账本的连续计数需要在真机上制造连续异常复位才能观测（可用 `p06_validate` 功能让每次启动注入一次故障），列为外部验证
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
@@ -64,11 +68,11 @@
 
 1. 整体架构质量较高。业务状态机、Effect 执行层和硬件任务边界清晰，复杂异步操作有显式完成反馈和代际检查。
 2. 并发设计经过了较多压力场景考虑。RTC、EPD、同步、BLE、音频和 USB 均采用独立执行上下文，多数队列具有固定容量和背压处理。
-3. 纯逻辑层具备 420 项主机测试，是本项目最值得保留的工程资产之一。
+3. 纯逻辑层具备 444 项主机测试，是本项目最值得保留的工程资产之一。
 4. BLE 控制通道已要求 LE Secure Connections、MITM、动态六位 passkey，以及加密并认证的读写权限；该边界应通过真实客户端继续做负向互操作验证。
 5. Wi-Fi 密码和服务端 Bearer Token 由安全生产配置的加密 NVS 保护；Secure Boot V2 和 AES-256 Flash Encryption 使用独立构建目录与外部签名密钥。当前开发机配置刻意保持未烧写 eFuse。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
-7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
+7. panic 策略已设为打印后自动重启；连续失败启动计数已加入，连续三次异常启动后进入最小安全模式，避免同类故障无限重启。
 8. 固件面向通过 USB 本地刷写的极客用户，分区布局使用单个 4 MiB factory 应用分区，不引入无需求的 OTA 状态和回滚逻辑。
 9. Light Sleep、tickless idle 与 40–160 MHz 动态调频已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。
 10. 同步应用先持久化完整 journal，再更新各 NVS namespace，全部成功后清除 journal；启动在读取业务状态前强制重放未完成事务，避免掉电后暴露跨数据集混合状态。
@@ -76,7 +80,7 @@
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
 13. 建议优先完成 BLE 安全互操作测试、量产安全配置的工装验证和功耗优化。
 14. 当前 `POST /api/sync` 是带本地变更的合并操作，服务端不会按 ETag 返回 304；固件已移除无效的 ETag 请求状态和 NVS 写入，避免伪缓存机制与额外 Flash 磨损。
-15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
+15. 启动阶段读取 Todo、Inbox、报警、设备配置、Wi-Fi、时区、同步元数据和同步 journal 时，只有键确实不存在才使用默认值；数据损坏、版本不支持与 I/O 错误都会归类为故障并使设备进入最小安全模式，不再静默降级为空值。
 16. 完整 core dump 已从 UART 移至 512 KiB Flash 分区，避免 panic 时直接向 USB 主机输出凭据；默认配置使用 light heap poisoning，独立 diagnostic 配置使用 comprehensive poisoning。
 
 ## 2. 值得肯定的可行设计
@@ -121,7 +125,7 @@
 - 位置：`logic/src/event_queue.rs`、`rust-firmware/src/epd_task.rs`、`sync_task.rs`、`usb_console.rs`
 - 设计：关键通道采用固定容量队列，区分 Full 与 Disconnected；关键事件饱和时由生产者保留并重试。
 - 为什么好：避免慢网络或慢显示导致无界堆增长，也减少静默丢失关键完成事件的风险。
-- 建议：统一增加队列高水位、拒绝和重试计数。
+- 建议：饱和与重试已经有固定计数（`logic/src/diag.rs`），后续只需在新增队列时同步扩展该枚举。
 
 ### 2.7 同步响应有明确的内存和语义边界
 
@@ -153,7 +157,7 @@
 
 ### 2.11 已落实的可靠性与安全边界
 
-- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 420 项主机测试。
+- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 444 项主机测试。
 - `rust-firmware/src/wifi.rs:60`：`connect()` 的所有失败出口都会执行 `disconnect()`，避免连接或 DHCP 超时后遗留驱动状态。
 - `rust-firmware/src/ble_control.rs:961`：BLE 命令解析失败只记录长度和错误，不再输出可能含 Wi-Fi 密码或 Token 的原始 payload。
 - `rust-firmware/src/ble_control.rs:857`、`:944`：BLE 使用动态六位 passkey、LE Secure Connections、MITM 和 bonding；控制特征要求加密且认证后才能读写。
@@ -193,7 +197,13 @@
 - `rust-firmware/partitions.csv`：未使用的 11.3125 MiB 空间标记为 `reserved`，固件不挂载该分区；保留兼容 subtype 仅用于构建工具识别，不会引入文件系统代码。
 - `scripts/build-secure.sh`、`.github/workflows/ci.yml`：安全生产配置要求外部 RSA-3072 密钥，启用 Secure Boot V2、AES-256 Flash Encryption release 模式、NVS Encryption，并使用独立 target；CI 只生成一次性密钥验证配置可构建，不持有量产私钥。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
-- 以上状态通过 fmt、clippy、420 项单元测试、release 交叉构建和授权真机启动日志验证；RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
+- `rust-firmware/src/nvs_blob.rs`：启动期读取失败按类别返回，只有键确实不存在才是 `Ok(None)`；JSON 解码失败只记录 `serde_json` 的分类与行列位置，不输出可能包含 Wi-Fi 密码或 Bearer Token 的原始字节。
+- `rust-firmware/src/storage.rs`、`inbox.rs`、`todos.rs`、`alarms.rs`：报警、Todo、Inbox、设备配置、Wi-Fi、时区、同步周期、同步元数据和同步 journal 的读取统一返回 `StoreFault`（`Corrupt` / `UnsupportedVersion` / `Io`）；版本号不符与内容校验失败不再与“未配置”混为一谈。
+- `logic/src/boot_store.rs`、`rust-firmware/src/main.rs`：启动期每个存储读取都经 `resolve(StoreId, …)` 归类，任一故障都会把设备送入最小安全模式并只报告存储名与故障类别（ASCII、单行、不含任何存储内容）；`read_boot_stores` 在 RTC 初始化之前一次性读全，之后不再出现 `.unwrap_or(default)` 形式的静默降级。
+- `logic/src/boot_guard.rs`、`rust-firmware/src/boot_ledger.rs`：连续失败启动计数保存在 `.rtc_noinit`（NOLOAD，RTC 域供电期间保留、断电即清零）；只有 panic、任务/中断看门狗、brownout、电源毛刺、CPU lockup 与异常软件复位才累加，断电、复位引脚、USB 复位和深睡唤醒都从零计数；计数只在核心初始化 dispatch 完成后清零；连续三次异常启动进入最小安全模式，且不执行任何 NVS 擦除。
+- `logic/src/diag.rs`、`rust-firmware/src/diag.rs`：队列 Full、BLE 回复重试与放弃、EPD 局刷回退全刷共 9 个固定计数槽，使用饱和原子、无锁、不写 NVS；仅在计数变化时输出一条 `Diagnostics:` 日志（名称 + 增量 + 累计），内容是固定枚举名，不含载荷或凭据。
+- `logic/src/lib.rs`：契约测试新增四项——启动账本必须位于 `.rtc_noinit`、只能在核心初始化 dispatch 之后清零、诊断计数必须使用原子且不引用 NVS、安全模式不得接触任何存储。
+- 以上状态通过 fmt、clippy（`logic` 与 `rust-firmware` 均为 `-D warnings` 零告警）、444 项单元测试、release 与 diagnostic 交叉构建，以及 ELF 段表静态核对验证；实机启动日志验证覆盖的是本轮改动之前的固件，本轮改动尚未烧写授权设备。RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
 
 ## 3. 改进建议
 
@@ -201,13 +211,7 @@
 
 仓库内可修复的 P0 已关闭。安全生产配置已经构建验证；首次安全烧录、eFuse、离线读取和拒绝未签名镜像属于不可逆的量产工装验证，不能在当前唯一开发设备上执行。
 
-## 4. 快速收益清单
-
-以下改动通常可在 1–2 小时内完成，且风险较低：
-
-1. 为队列 Full、BLE reply retry 和 EPD fallback 增加累计计数。
-
-## 5. 中期与长期建议
+## 4. 中期与长期建议
 
 ### 中期
 
@@ -222,12 +226,11 @@
 ### 长期
 
 - 在独立量产样机和工装上验证 Secure Boot V2、Flash Encryption、NVS Encryption 与 eFuse 流程。
-- 建立启动失败计数和安全模式，避免 panic 重启循环。
 - 将功耗策略演进为 DFS、Light Sleep、Deep Sleep 和 PM lock 的场景化模型。
 - 为服务端通信增加设备身份、Token 轮换、重放保护和可选证书固定。
 - 建立 SBOM、依赖审计、可复现构建和签名发布流程。
 
-## 6. 需要确认的信息
+## 5. 需要确认的信息
 
 1. BLE 配对页面是否被视为“物理在场即授权”，还是必须抵御附近陌生客户端。
 2. 量产方如何保管 Secure Boot 私钥，以及是否有独立样机验证不可逆的 eFuse 流程。
@@ -237,4 +240,5 @@
 6. 实机长期运行的 stack high-water mark、内部堆最低值和最大连续块数据。
 7. EPD、音频和 Wi-Fi 同时工作的峰值电流及电源设计余量。
 8. 安全生产配置是否还需要调整量产日志等级和 core dump 提取权限。
-9. 是否存在未纳入仓库的硬件在环、安全配置或量产脚本。
+9. 从启动失败安全模式恢复的工装偏好：断电重启、复位引脚，还是后续增加 USB 侧确认指令。
+10. 是否存在未纳入仓库的硬件在环、安全配置或量产脚本。

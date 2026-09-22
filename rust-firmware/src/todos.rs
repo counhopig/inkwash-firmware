@@ -3,6 +3,8 @@ use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 
 use crate::nvs_blob::{read_blob, write_blob, DirtySet};
 
+use inkwash_logic::boot_store::StoreFault;
+
 #[allow(unused_imports)]
 pub use inkwash_logic::todo::{Importance, Todo, TodoDue};
 
@@ -23,7 +25,7 @@ impl TodoStore {
         Ok(Self { nvs })
     }
 
-    pub fn load(&self) -> Result<Vec<Todo>> {
+    pub fn load(&self) -> Result<Vec<Todo>, StoreFault> {
         let mut todos: Vec<Todo> =
             read_blob::<BLOB_BUF_LEN, _>(&self.nvs, KEY_TODOS)?.unwrap_or_default();
         inkwash_logic::sanitize::sanitize_todos(&mut todos);
@@ -42,7 +44,7 @@ impl TodoStore {
         self.dirty().mark(id)
     }
 
-    pub fn dirty_ids(&self) -> Result<Vec<u8>> {
+    pub fn dirty_ids(&self) -> Result<Vec<u8>, StoreFault> {
         self.dirty().ids()
     }
 
