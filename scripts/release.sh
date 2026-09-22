@@ -90,6 +90,7 @@ fi
 espflash save-image --skip-update-check --chip esp32s3 \
     --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
     --bootloader "$BOOTLOADER" --partition-table "$PARTITIONS" \
+    --partition-table-offset 0x10000 \
     --target-app-partition ota_0 \
     "$ELF" "$verify_dir/inkwash-note4.bin" >/dev/null
 
@@ -104,7 +105,7 @@ gh release create "$TAG" "$ELF" "$BOOTLOADER" "$PARTITIONS" \
 \`\`\`bash
 espflash flash --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80mhz \\
   --bootloader bootloader.bin \\
-  --partition-table partitions.csv --non-interactive \\
+  --partition-table partitions.csv --partition-table-offset 0x10000 --non-interactive \\
   inkwash-note4
 \`\`\`
 "

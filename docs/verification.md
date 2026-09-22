@@ -255,7 +255,8 @@ firmware-format:              # 第四轮新增
 ```bash
 espflash flash --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
   --bootloader rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin \
-  --partition-table rust-firmware/partitions.csv --non-interactive inkwash-note4
+  --partition-table rust-firmware/partitions.csv --partition-table-offset 0x10000 \
+  --non-interactive inkwash-note4
 ```
 
 - **DIO 模式，永远不要 QIO**（`sdkconfig.defaults:8` + `# CONFIG_ESPTOOLPY_OCT_FLASH is not set`）

@@ -3,6 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+build_profile="${INKWASH_BUILD_PROFILE:-production}"
+cargo_args=()
+for arg in "$@"; do
+    if [ "$arg" = "--diagnostic" ]; then
+        build_profile="diagnostic"
+    else
+        cargo_args+=("$arg")
+    fi
+done
+
 # Locate ESP-IDF without hardcoding an install path: honor $IDF_PATH when
 # set, else probe the conventional install locations in order.
 if [ -z "${IDF_PATH:-}" ]; then
@@ -46,11 +56,24 @@ if [ -z "${LIBCLANG_PATH:-}" ]; then
 fi
 
 cd rust-firmware
+target_root="target"
+if [ "$build_profile" = "diagnostic" ]; then
+    export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diagnostic.defaults"
+    target_root="target-diagnostic"
+    export CARGO_TARGET_DIR="$PWD/$target_root"
+elif [ "$build_profile" = "secure" ]; then
+    if [ -z "${ESP_IDF_SDKCONFIG_DEFAULTS:-}" ]; then
+        echo "secure profile requires ESP_IDF_SDKCONFIG_DEFAULTS" >&2
+        exit 1
+    fi
+    target_root="target-secure"
+    export CARGO_TARGET_DIR="$PWD/$target_root"
+fi
 partition_hash="v2:$(sha256sum partitions.csv | awk '{print $1}')"
-partition_stamp="target/.inkwash-partitions.sha256"
-if [ -d target ] && { [ ! -f "$partition_stamp" ] || [ "$(cat "$partition_stamp")" != "$partition_hash" ]; }; then
+partition_stamp="$target_root/.inkwash-partitions.sha256"
+if [ -d "$target_root" ] && { [ ! -f "$partition_stamp" ] || [ "$(cat "$partition_stamp")" != "$partition_hash" ]; }; then
     cargo clean
 fi
-cargo build "$@"
-mkdir -p target
+cargo build "${cargo_args[@]}"
+mkdir -p "$target_root"
 printf '%s\n' "$partition_hash" > "$partition_stamp"

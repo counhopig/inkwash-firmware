@@ -87,3 +87,53 @@ jobs:
             rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin
             rust-firmware/target/xtensa-esp32s3-espidf/release/partition-table.bin
             rust-firmware/target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*/out/build/libespidf.map
+
+  firmware-diagnostic-build:
+    name: inkwash-note4 (ESP32-S3 diagnostic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ESP-IDF 5.5.5
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: v5.5.5
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+
+      - name: Build diagnostic firmware
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: ./scripts/build-rust.sh --diagnostic --release --locked
+
+  firmware-secure-build:
+    name: inkwash-note4 (secure production config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ESP-IDF 5.5.5
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: v5.5.5
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+
+      - name: Generate ephemeral CI signing key
+        run: espsecure.py generate_signing_key --version 2 "$RUNNER_TEMP/secure-boot-ci.pem"
+
+      - name: Build secure configuration
+        env:
+          INKWASH_SECURE_BOOT_SIGNING_KEY: ${{ runner.temp }}/secure-boot-ci.pem
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: ./scripts/build-secure.sh

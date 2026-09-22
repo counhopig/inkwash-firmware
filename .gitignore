@@ -12,6 +12,8 @@ sdkconfig.old
 
 # Rust build artifacts
 rust-firmware/target/
+rust-firmware/target-diagnostic/
+rust-firmware/target-secure/
 rust-firmware/.embuild/
 logic/target/
 tools/*/target/

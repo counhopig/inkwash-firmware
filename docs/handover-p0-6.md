@@ -141,7 +141,8 @@ cargo build --release --features p06_validate_core1 # 验证：core 1 V2 人工�
 espflash flash --port /dev/cu.usbmodem1101 --chip esp32s3 --flash-size 16mb \
   --flash-mode dio --flash-freq 80mhz \
   --bootloader rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin \
-  --partition-table rust-firmware/partitions.csv --non-interactive \
+  --partition-table rust-firmware/partitions.csv --partition-table-offset 0x10000 \
+  --non-interactive \
   rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
 
 # 解码器

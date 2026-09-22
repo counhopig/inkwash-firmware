@@ -30,10 +30,10 @@
 | CPU 默认频率 | 160 MHz |
 | BLE | NimBLE Peripheral，最多一个连接 |
 | TLS | mbedTLS 完整证书包 |
-| 分区 | NVS 64 KiB、OTA metadata 8 KiB、双 4 MiB OTA 槽、core dump 512 KiB、LittleFS 7.375 MiB |
+| 分区 | 分区表偏移 64 KiB；NVS 64 KiB、NVS 密钥 4 KiB、OTA metadata 8 KiB、双 4 MiB OTA 槽、core dump 512 KiB、保留区 7.3125 MiB |
 | OTA | 双槽与 bootloader 回滚已启用；远程下载协议尚未实现 |
-| Secure Boot | 未启用 |
-| Flash/NVS 加密 | 未启用 |
+| Secure Boot | 开发配置关闭；独立安全生产配置启用 V2 RSA 签名 |
+| Flash/NVS 加密 | 开发配置关闭；独立安全生产配置启用 AES-256 release 模式和 NVS 加密 |
 
 ### 实机验证条件
 
@@ -46,7 +46,8 @@
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
 - `scripts/build-rust.sh --release`：ESP32-S3 release 交叉构建成功
-- 当前 release 应用镜像为 2,668,368 字节，占 4 MiB OTA 槽的 63.62%
+- `scripts/build-secure.sh`：Secure Boot V2、AES-256 Flash Encryption、NVS Encryption 安全生产配置交叉构建成功；未向实机写入或烧写 eFuse
+- 当前 release 应用镜像为 2,668,720 字节，占 4 MiB OTA 槽的 63.63%
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
 - 重置后按授权配置烧录当前 release 固件：ESP32-S3、16 MB、DIO、80 MHz、`rust-firmware/partitions.csv`；烧录前再次核对 MAC，未擦除 NVS
@@ -65,7 +66,7 @@
 2. 并发设计经过了较多压力场景考虑。RTC、EPD、同步、BLE、音频和 USB 均采用独立执行上下文，多数队列具有固定容量和背压处理。
 3. 纯逻辑层具备 420 项主机测试，是本项目最值得保留的工程资产之一。
 4. BLE 控制通道已要求 LE Secure Connections、MITM、动态六位 passkey，以及加密并认证的读写权限；该边界应通过真实客户端继续做负向互操作验证。
-5. Wi-Fi 密码和服务端 Bearer Token 存储于普通 NVS，而 Secure Boot、Flash Encryption 和 NVS Encryption 均未启用。
+5. Wi-Fi 密码和服务端 Bearer Token 由安全生产配置的加密 NVS 保护；Secure Boot V2 和 AES-256 Flash Encryption 使用独立构建目录与外部签名密钥。当前开发机配置刻意保持未烧写 eFuse。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
 7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
 8. 当前分区布局具备双 OTA 槽和回滚元数据，应用会在核心外设、NVS、任务及状态机启动成功后确认待验证镜像；仓库与服务端尚无远程 OTA 下载协议。
@@ -73,10 +74,10 @@
 10. 同步应用先持久化完整 journal，再更新各 NVS namespace，全部成功后清除 journal；启动在读取业务状态前强制重放未完成事务，避免掉电后暴露跨数据集混合状态。
 11. RTC 高频分配器崩溃路径已经移除，并通过 1,000 次连续持久化门槛；测试器现会检测任意相邻 uptime 回退、应用重启、部分完成和 USB 写超时。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
-13. 建议优先完成 BLE 安全互操作测试和敏感数据保护，再推进 OTA 传输协议与功耗优化。
+13. 建议优先完成 BLE 安全互操作测试和量产安全配置的工装验证，再推进 OTA 传输协议与功耗优化。
 14. 当前 `POST /api/sync` 是带本地变更的合并操作，服务端不会按 ETag 返回 304；固件已移除无效的 ETag 请求状态和 NVS 写入，避免伪缓存机制与额外 Flash 磨损。
 15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
-16. 完整 core dump 已从 UART 移至 512 KiB Flash 分区，避免 panic 时直接向 USB 主机输出凭据；综合堆毒化仍适合当前 P0 定位，不宜直接作为最终量产配置。
+16. 完整 core dump 已从 UART 移至 512 KiB Flash 分区，避免 panic 时直接向 USB 主机输出凭据；默认配置使用 light heap poisoning，独立 diagnostic 配置使用 comprehensive poisoning。
 
 ## 2. 值得肯定的可行设计
 
@@ -188,6 +189,9 @@
 - `rust-firmware/partitions.csv`、`rust-firmware/src/main.rs:1099`：双槽、回滚 metadata 和 512 KiB core dump 分区已经落地；待验证镜像只有在 RTC、NVS、主要工作任务和状态机启动成功后才确认有效。
 - `rust-firmware/src/sync_apply.rs`、`storage.rs`：同步快照采用持久化 redo journal；启动先重放再构造 `BootSnapshot`，写入失败则进入安全模式，不会把部分提交的数据交给业务状态机。NVS 扩至 64 KiB，为最大 12 KiB journal 和现有对象保留整理空间。
 - `rust-firmware/src/tasks.rs`：所有应用 pthread 统一使用 internal RAM 栈、显式优先级和 `CONFIG_FREERTOS_NO_AFFINITY`；RTC 8、音频 7、USB 6、Effect 5、EPD/BLE 4、同步 3，实时告警路径明确高于后台 TLS，同一全局配置锁防止创建线程时策略串扰。
+- `rust-firmware/sdkconfig.defaults`、`sdkconfig.diagnostic.defaults`：默认量产构建使用 light heap poisoning 和 Flash core dump；`--diagnostic` 使用独立 target 并恢复 comprehensive poisoning。Linux、Windows 构建入口和 CI 均覆盖两种配置，不会互相复用 sdkconfig 或产物。
+- `rust-firmware/partitions.csv`：未使用的 7.3125 MiB 空间标记为 `reserved`，固件不挂载该分区；保留兼容 subtype 仅用于构建工具识别，不会引入文件系统代码。
+- `scripts/build-secure.sh`、`.github/workflows/ci.yml`：安全生产配置要求外部 RSA-3072 密钥，启用 Secure Boot V2、AES-256 Flash Encryption release 模式、NVS Encryption，并使用独立 target；CI 只生成一次性密钥验证配置可构建，不持有量产私钥。
 - `scripts/backup-flash.ps1`：读取 Flash 前强制核验 ESP32-S3、授权 MAC `20:6E:F1:B4:7D:E4` 和 16 MB 容量；备份后校验长度并生成包含设备身份和 SHA-256 的 JSON 清单。
 - 以上状态通过 fmt、clippy、420 项单元测试、release 交叉构建和授权真机启动日志验证；RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
 
@@ -195,31 +199,7 @@
 
 ### P0 必须修复
 
-#### P0-1 敏感凭据存入未加密 NVS
-
-- 位置：`rust-firmware/src/storage.rs:55`、`:70`；`rust-firmware/sdkconfig.defaults`
-- 证据：Wi-Fi 密码和 Bearer Token 分别写入 `wifi_pass`、`auth_token`；实际生成配置未启用 Secure Boot、Flash Encryption 或 NVS Encryption。
-- 影响：通过物理读取 Flash、恶意固件或未限制的调试接口可恢复网络凭据和服务端 Token，固件也没有可信启动链。
-- 建议：生产配置启用 Secure Boot V2、Flash Encryption 和加密 NVS；开发与生产配置分离，量产流程单独管理 eFuse。
-- 验证：离线读取 Flash 不应出现密码或 Token 明文；未签名固件应无法启动；验证量产、升级和恢复流程。
-
-### P2 优化项
-
-#### P2-6 7.375 MiB storage 分区当前未被使用
-
-- 位置：`rust-firmware/partitions.csv:5`；全仓库文件系统挂载路径
-- 证据：`storage` 数据分区占 `0x760000`，但固件没有 LittleFS/SPIFFS/FAT 挂载或读写代码；持久化全部位于 64 KiB NVS。
-- 影响：约 46% Flash 空间预留但尚未承担运行功能；这不影响正确性，但分区用途尚未形成产品约定。
-- 建议：确认未来是否存放用户文档或离线资源；不要仅为“利用空间”引入文件系统。
-- 验证：用生成的 partition table 二进制核对偏移、大小和无重叠，并对刷写、升级和数据保留策略做回归。
-
-#### P2-8 量产配置与诊断配置尚未分离
-
-- 位置：`rust-firmware/sdkconfig.defaults:110-116`
-- 证据：默认配置同时启用综合堆毒化、INFO 日志和 Flash core dump。这些设置适合当前 P0 定位，但会增加运行开销和 panic 后恢复时间。
-- 影响：单一 profile 难以同时满足故障定位和量产的性能、安全、恢复时延要求。
-- 建议：保留 diagnostic profile；另建 production defaults，明确日志级别、core dump 去向、堆检查级别和安全启动参数。两种 profile 都应纳入 CI 构建。
-- 验证：比较两种镜像的体积、内部堆、性能和故障输出，并确保生产 profile 不泄露敏感内存。
+仓库内可修复的 P0 已关闭。安全生产配置已经构建验证；首次安全烧录、eFuse、离线读取和拒绝未签名镜像属于不可逆的量产工装验证，不能在当前唯一开发设备上执行。
 
 ## 4. 快速收益清单
 
@@ -241,8 +221,8 @@
 
 ### 长期
 
-- 实现双槽 OTA、签名验证、首启确认和自动回滚。
-- 建立 Secure Boot V2、Flash Encryption、NVS Encryption 和 eFuse 量产流程。
+- 实现远程 OTA 下载、版本策略和服务端发布协议；双槽、签名验证、首启确认和自动回滚基础已具备。
+- 在独立量产样机和工装上验证 Secure Boot V2、Flash Encryption、NVS Encryption 与 eFuse 流程。
 - 建立启动失败计数和安全模式，避免 panic 重启循环。
 - 将功耗策略演进为 DFS、Light Sleep、Deep Sleep 和 PM lock 的场景化模型。
 - 为服务端通信增加设备身份、Token 轮换、重放保护和可选证书固定。
@@ -252,11 +232,11 @@
 
 1. BLE 配对页面是否被视为“物理在场即授权”，还是必须抵御附近陌生客户端。
 2. 产品是否计划支持远程 OTA；如不支持，现场升级和故障恢复流程是什么。
-3. 量产流程是否已规划 Secure Boot、Flash Encryption、NVS Encryption 和 eFuse 烧写。
-4. LittleFS 的实际用途及最低容量要求。
+3. 量产方如何保管 Secure Boot 私钥，以及是否有独立样机验证不可逆的 eFuse 流程。
+4. 当前保留分区未来是否需要用于本地文件系统；固件目前不挂载它。
 5. 服务端是否只允许 HTTPS，以及使用公共 CA、私有 CA 还是证书固定。
 6. USB 控制接口是否只在受控维修环境开放。
 7. 实机长期运行的 stack high-water mark、内部堆最低值和最大连续块数据。
 8. EPD、音频和 Wi-Fi 同时工作的峰值电流及电源设计余量。
-9. 量产是否需要独立 sdkconfig profile，以分离诊断、日志、堆毒化和量产恢复策略。
+9. 安全生产配置是否还需要调整量产日志等级和 core dump 提取权限。
 10. 是否存在未纳入仓库的硬件在环、OTA、安全配置或量产脚本。

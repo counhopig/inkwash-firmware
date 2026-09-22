@@ -1,5 +1,6 @@
 param(
-    [switch]$Release
+    [switch]$Release,
+    [switch]$Diagnostic
 )
 
 $ErrorActionPreference = "Stop"
@@ -93,9 +94,15 @@ if (-not $env:LIBCLANG_PATH) {
 
 Push-Location $projectDir
 try {
+    $targetRoot = "target"
+    if ($Diagnostic) {
+        $env:ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.diagnostic.defaults"
+        $targetRoot = "target-diagnostic"
+        $env:CARGO_TARGET_DIR = Join-Path $projectDir $targetRoot
+    }
     $partitionHash = "v2:" + (Get-FileHash -Algorithm SHA256 "partitions.csv").Hash.ToLowerInvariant()
-    $partitionStamp = "target\.inkwash-partitions.sha256"
-    if ((Test-Path "target") -and
+    $partitionStamp = Join-Path $targetRoot ".inkwash-partitions.sha256"
+    if ((Test-Path $targetRoot) -and
         ((-not (Test-Path $partitionStamp)) -or
          ((Get-Content $partitionStamp -Raw).Trim() -ne $partitionHash))) {
         & cargo clean
@@ -113,7 +120,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
-    New-Item -ItemType Directory -Force "target" | Out-Null
+    New-Item -ItemType Directory -Force $targetRoot | Out-Null
     Set-Content -Path $partitionStamp -Value $partitionHash -Encoding Ascii
 } finally {
     Pop-Location

@@ -83,6 +83,7 @@ espflash flash --port /dev/tty.usbmodem1101 \
   --flash-mode dio --flash-freq 80mhz \
   --bootloader target/xtensa-esp32s3-espidf/release/bootloader.bin \
   --partition-table partitions.csv \
+  --partition-table-offset 0x10000 \
   --non-interactive target/xtensa-esp32s3-espidf/release/inkwash-note4
 ```
 
