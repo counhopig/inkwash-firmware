@@ -86,6 +86,9 @@ if ! cmp -s "$verify_dir/partition-table.bin" "$PARTITIONS_BIN"; then
     echo "generated partition table does not match $PARTITIONS" >&2
     exit 1
 fi
+echo "==> Verifying the boot ledger survives the application image"
+./scripts/check-boot-ledger.sh "$ELF"
+
 espflash save-image --skip-update-check --chip esp32s3 \
     --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
     --bootloader "$BOOTLOADER" --partition-table "$PARTITIONS" \

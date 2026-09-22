@@ -125,6 +125,30 @@ pub const DEFAULT_TIMEZONE_OFFSET_MINUTES: i16 = 0;
 /// Synchronization period assumed when the device has never stored one.
 pub const DEFAULT_SYNC_INTERVAL_MINUTES: u16 = 60;
 
+/// Shortest synchronization period the firmware accepts.
+pub const MIN_SYNC_INTERVAL_MINUTES: u16 = 1;
+
+/// Longest synchronization period the firmware accepts (one day).
+pub const MAX_SYNC_INTERVAL_MINUTES: u16 = 1440;
+
+/// Westernmost timezone offset the firmware accepts (UTC-12:00).
+pub const MIN_TIMEZONE_OFFSET_MINUTES: i16 = -720;
+
+/// Easternmost timezone offset the firmware accepts (UTC+14:00).
+pub const MAX_TIMEZONE_OFFSET_MINUTES: i16 = 840;
+
+/// A stored sync interval is only usable if it is one the device itself would
+/// have written: anything outside the accepted range is corrupt data, not a
+/// value to clamp.
+pub const fn is_valid_sync_interval(minutes: u16) -> bool {
+    minutes >= MIN_SYNC_INTERVAL_MINUTES && minutes <= MAX_SYNC_INTERVAL_MINUTES
+}
+
+/// Same rule for the timezone offset.
+pub const fn is_valid_timezone_offset(offset_minutes: i16) -> bool {
+    offset_minutes >= MIN_TIMEZONE_OFFSET_MINUTES && offset_minutes <= MAX_TIMEZONE_OFFSET_MINUTES
+}
+
 /// Boot-time read policy: a read that succeeded is returned as it came, and a
 /// fault is reported so the caller can stop booting instead of degrading real
 /// data to the default for an absent key.
@@ -183,6 +207,30 @@ mod tests {
             degraded.is_err(),
             "corrupted data must not be readable as an empty list"
         );
+    }
+
+    #[test]
+    fn stored_numbers_must_be_in_the_range_the_device_writes() {
+        assert!(is_valid_sync_interval(MIN_SYNC_INTERVAL_MINUTES));
+        assert!(is_valid_sync_interval(MAX_SYNC_INTERVAL_MINUTES));
+        assert!(is_valid_sync_interval(60));
+        assert!(!is_valid_sync_interval(0));
+        assert!(!is_valid_sync_interval(MAX_SYNC_INTERVAL_MINUTES + 1));
+        assert!(!is_valid_sync_interval(u16::MAX));
+
+        assert!(is_valid_timezone_offset(MIN_TIMEZONE_OFFSET_MINUTES));
+        assert!(is_valid_timezone_offset(MAX_TIMEZONE_OFFSET_MINUTES));
+        assert!(is_valid_timezone_offset(0));
+        assert!(!is_valid_timezone_offset(MIN_TIMEZONE_OFFSET_MINUTES - 1));
+        assert!(!is_valid_timezone_offset(MAX_TIMEZONE_OFFSET_MINUTES + 1));
+        assert!(!is_valid_timezone_offset(i16::MIN));
+        assert!(!is_valid_timezone_offset(i16::MAX));
+    }
+
+    #[test]
+    fn the_documented_defaults_are_themselves_acceptable() {
+        assert!(is_valid_sync_interval(DEFAULT_SYNC_INTERVAL_MINUTES));
+        assert!(is_valid_timezone_offset(DEFAULT_TIMEZONE_OFFSET_MINUTES));
     }
 
     #[test]

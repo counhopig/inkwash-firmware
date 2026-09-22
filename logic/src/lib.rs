@@ -388,6 +388,29 @@ mod ble_memory_contract {
     }
 
     #[test]
+    fn the_boot_ledger_image_gate_is_wired_into_every_build() {
+        const CI: &str = include_str!("../../.github/workflows/ci.yml");
+        const RELEASE: &str = include_str!("../../scripts/release.sh");
+        // Including the gate here also keeps it from disappearing quietly.
+        const GATE: &str = include_str!("../../scripts/check-boot-ledger.sh");
+
+        assert!(GATE.contains("--self-test"), "the gate must be testable");
+        assert!(
+            GATE.contains("image_info"),
+            "the gate must inspect the produced image, not the ELF it came from"
+        );
+        assert_eq!(
+            CI.matches("./scripts/check-boot-ledger.sh").count(),
+            3,
+            "release, diagnostic and secure builds must each run the image gate"
+        );
+        assert!(
+            RELEASE.contains("./scripts/check-boot-ledger.sh"),
+            "a release must not ship an image whose segments cover the boot ledger"
+        );
+    }
+
+    #[test]
     fn safe_mode_never_touches_stored_data() {
         const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
         let safe_mode = MAIN_SOURCE

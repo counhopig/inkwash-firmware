@@ -41,7 +41,7 @@
 
 ### 验证结果
 
-- `cargo test --locked`：444 项测试通过
+- `cargo test --locked`：447 项测试通过
 - `cargo fmt --check`：通过
 - `cargo clippy --all-targets -- -D warnings`：通过
 - 固件 `cargo +stable fmt --check`：通过
@@ -49,8 +49,9 @@
 - `scripts/build-rust.sh --release --locked`：ESP32-S3 release 交叉构建成功
 - `scripts/build-rust.sh --diagnostic --release --locked`：diagnostic 目标交叉构建成功
 - `scripts/build-secure.sh`：以一次性 RSA-3072 密钥验证 Secure Boot V2、AES-256 Flash Encryption、NVS Encryption 安全生产配置可完整构建；未向实机写入或烧写 eFuse
-- 当前 release 应用镜像为 2,673,472 字节，占 4 MiB factory 分区的 63.74%
-- `esptool image_info` 显示 release 镜像共 7 段，RTC 段只覆盖 `0x5000_0008`（`.rtc.force_slow`）；启动失败账本所在的 `0x5000_0000` 不属于任何镜像段，因此普通复位触发 bootloader 重新初始化 RTC 段时不会覆写账本
+- 当前 release 应用镜像为 2,674,192 字节，占 4 MiB factory 分区的 63.76%
+- `scripts/check-boot-ledger.sh`：用 espflash（README/release 的刷写路径）和 esptool 分别把应用 ELF 转成镜像并解析段表，release、diagnostic、secure 三种构建下都确认没有任何可加载段覆盖 `.rtc_noinit`。三种构建的 RTC 段均为 `0x5000_0008..0x5000_0028`（`.rtc.force_slow`），账本所在的 `0x5000_0000..0x5000_0008` 不在任何段内，因此普通复位触发 bootloader 重新初始化 RTC 段时不会覆写账本；`--self-test` 用构造段表验证“覆盖即失败、不覆盖即通过、无法解析即失败”
+- 上述结论只对最终应用产物成立：IDF 侧中间产物 `libespidf.elf`/`libespidf.bin` 的 `.rtc_noinit` 为空且不含 Rust 侧符号，其 RTC 段从 `0x5000_0000` 开始属于该 ELF 自身的 `.rtc.force_slow`；脚本对该文件会直接报“账本未链接”而不是给出通过结论
 - 启动失败账本的连续计数需要在真机上制造连续异常复位才能观测（可用 `p06_validate` 功能让每次启动注入一次故障），列为外部验证
 - USB 只读身份核验确认当前 `/dev/ttyACM0` 的设备序列号/MAC 为 `20:6E:F1:B4:7D:E4`，与授权 Zectrix Note 4 一致
 - 设备曾出现 USB CDC/JTAG 在线但应用无响应；当次没有保存 panic PC，因此根因仍未确认
@@ -68,7 +69,7 @@
 
 1. 整体架构质量较高。业务状态机、Effect 执行层和硬件任务边界清晰，复杂异步操作有显式完成反馈和代际检查。
 2. 并发设计经过了较多压力场景考虑。RTC、EPD、同步、BLE、音频和 USB 均采用独立执行上下文，多数队列具有固定容量和背压处理。
-3. 纯逻辑层具备 444 项主机测试，是本项目最值得保留的工程资产之一。
+3. 纯逻辑层具备 447 项主机测试，是本项目最值得保留的工程资产之一。
 4. BLE 控制通道已要求 LE Secure Connections、MITM、动态六位 passkey，以及加密并认证的读写权限；该边界应通过真实客户端继续做负向互操作验证。
 5. Wi-Fi 密码和服务端 Bearer Token 由安全生产配置的加密 NVS 保护；Secure Boot V2 和 AES-256 Flash Encryption 使用独立构建目录与外部签名密钥。当前开发机配置刻意保持未烧写 eFuse。
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
@@ -157,7 +158,7 @@
 
 ### 2.11 已落实的可靠性与安全边界
 
-- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 444 项主机测试。
+- `logic/src/app.rs:3424`、`:3571`：`SetServer` 在进入持久化前拒绝非 HTTPS、超过 240 字节、空 authority、带 userinfo 或 authority 含空白的 URL；对应的拒绝且不写入测试已纳入 447 项主机测试。
 - `rust-firmware/src/wifi.rs:60`：`connect()` 的所有失败出口都会执行 `disconnect()`，避免连接或 DHCP 超时后遗留驱动状态。
 - `rust-firmware/src/ble_control.rs:961`：BLE 命令解析失败只记录长度和错误，不再输出可能含 Wi-Fi 密码或 Token 的原始 payload。
 - `rust-firmware/src/ble_control.rs:857`、`:944`：BLE 使用动态六位 passkey、LE Secure Connections、MITM 和 bonding；控制特征要求加密且认证后才能读写。
@@ -200,10 +201,12 @@
 - `rust-firmware/src/nvs_blob.rs`：启动期读取失败按类别返回，只有键确实不存在才是 `Ok(None)`；JSON 解码失败只记录 `serde_json` 的分类与行列位置，不输出可能包含 Wi-Fi 密码或 Bearer Token 的原始字节。
 - `rust-firmware/src/storage.rs`、`inbox.rs`、`todos.rs`、`alarms.rs`：报警、Todo、Inbox、设备配置、Wi-Fi、时区、同步周期、同步元数据和同步 journal 的读取统一返回 `StoreFault`（`Corrupt` / `UnsupportedVersion` / `Io`）；版本号不符与内容校验失败不再与“未配置”混为一谈。
 - `logic/src/boot_store.rs`、`rust-firmware/src/main.rs`：启动期每个存储读取都经 `resolve(StoreId, …)` 归类，任一故障都会把设备送入最小安全模式并只报告存储名与故障类别（ASCII、单行、不含任何存储内容）；`read_boot_stores` 在 RTC 初始化之前一次性读全，之后不再出现 `.unwrap_or(default)` 形式的静默降级。
+- `scripts/check-boot-ledger.sh`：镜像段门禁，release、diagnostic、secure 三种构建与 `scripts/release.sh` 都必须在刷写前确认没有可加载段覆盖 `.rtc_noinit`；`--self-test` 覆盖失败与通过两侧，防止门禁本身退化为永远通过。
+- `logic/src/boot_store.rs`、`rust-firmware/src/storage.rs`、`logic/src/app.rs`：同步周期与时区偏移的读取除了解析还做范围校验，界限与写入端共用同一组常量（1–1440 分钟、UTC-12:00–UTC+14:00），越界值归类为 `Corrupt`，不再被截断或夹紧后进入调度与时钟。
 - `logic/src/boot_guard.rs`、`rust-firmware/src/boot_ledger.rs`：连续失败启动计数保存在 `.rtc_noinit`（NOLOAD，RTC 域供电期间保留、断电即清零）；只有 panic、任务/中断看门狗、brownout、电源毛刺、CPU lockup 与异常软件复位才累加，断电、复位引脚、USB 复位和深睡唤醒都从零计数；计数只在核心初始化 dispatch 完成后清零；连续三次异常启动进入最小安全模式，且不执行任何 NVS 擦除。
 - `logic/src/diag.rs`、`rust-firmware/src/diag.rs`：队列 Full、BLE 回复重试与放弃、EPD 局刷回退全刷共 9 个固定计数槽，使用饱和原子、无锁、不写 NVS；仅在计数变化时输出一条 `Diagnostics:` 日志（名称 + 增量 + 累计），内容是固定枚举名，不含载荷或凭据。
 - `logic/src/lib.rs`：契约测试新增四项——启动账本必须位于 `.rtc_noinit`、只能在核心初始化 dispatch 之后清零、诊断计数必须使用原子且不引用 NVS、安全模式不得接触任何存储。
-- 以上状态通过 fmt、clippy（`logic` 与 `rust-firmware` 均为 `-D warnings` 零告警）、444 项单元测试、release 与 diagnostic 交叉构建，以及 ELF 段表静态核对验证；实机启动日志验证覆盖的是本轮改动之前的固件，本轮改动尚未烧写授权设备。RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
+- 以上状态通过 fmt、clippy（`logic` 与 `rust-firmware` 均为 `-D warnings` 零告警）、447 项单元测试、release、diagnostic、secure 交叉构建，以及镜像段表核对验证；实机启动日志验证覆盖的是本轮改动之前的固件，本轮改动尚未烧写授权设备。RTC/NVS 路径另通过 1,000 次连续提交与 60 秒 soak。
 
 ## 3. 改进建议
 

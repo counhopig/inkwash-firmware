@@ -3524,12 +3524,19 @@ fn transition_command(
             vec![reply_batch(state, channel, status)]
         }
         ControlRequest::SetTimezone { offset_minutes } => {
-            if !(-720..=840).contains(&offset_minutes) {
+            // The store rejects any offset outside this range as corrupt, so a
+            // command must not be able to produce one: both sides share the
+            // predicate rather than repeating the numbers.
+            if !crate::boot_store::is_valid_timezone_offset(offset_minutes) {
                 return vec![reply_batch(
                     state,
                     channel,
                     Reply::Error {
-                        message: "Timezone offset must be between -720 and 840 minutes".into(),
+                        message: format!(
+                            "Timezone offset must be between {} and {} minutes",
+                            crate::boot_store::MIN_TIMEZONE_OFFSET_MINUTES,
+                            crate::boot_store::MAX_TIMEZONE_OFFSET_MINUTES
+                        ),
                     },
                 )];
             }

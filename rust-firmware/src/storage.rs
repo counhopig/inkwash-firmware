@@ -111,6 +111,30 @@ impl PersistedCounters {
         }
     }
 
+    /// Reads a stored number and checks it against the range this firmware
+    /// would have written. A value that parses but cannot have come from the
+    /// device is corrupt data: clamping it would hide the damage, and the boot
+    /// path would carry a nonsensical timezone or sync period.
+    fn read_validated_num<T, F>(
+        &self,
+        key: &str,
+        label: &str,
+        is_valid: F,
+    ) -> Result<Option<T>, StoreFault>
+    where
+        T: std::str::FromStr + std::fmt::Display + Copy,
+        T::Err: std::fmt::Display,
+        F: Fn(T) -> bool,
+    {
+        match self.read_num::<T>(key, label)? {
+            Some(value) if !is_valid(value) => {
+                log::error!("stored {label} is out of range: {value}");
+                Err(StoreFault::Corrupt)
+            }
+            other => Ok(other),
+        }
+    }
+
     fn write_num<T: ToString>(&self, key: &str, value: T) -> Result<()> {
         nvs_blob::write_scalar(&self.nvs, key, &value.to_string())
     }
@@ -241,12 +265,20 @@ impl PersistedCounters {
     }
 
     pub fn sync_interval_minutes(&self) -> Result<Option<u16>, StoreFault> {
-        self.read_num::<u16>(KEY_SYNC_INTERVAL_MIN, "sync interval")
+        self.read_validated_num(
+            KEY_SYNC_INTERVAL_MIN,
+            "sync interval",
+            inkwash_logic::boot_store::is_valid_sync_interval,
+        )
     }
 
     pub fn set_sync_interval_minutes(&self, minutes: u16) -> Result<()> {
-        if !(1..=1440).contains(&minutes) {
-            return Err(anyhow!("sync interval must be between 1 and 1440 minutes"));
+        if !inkwash_logic::boot_store::is_valid_sync_interval(minutes) {
+            return Err(anyhow!(
+                "sync interval must be between {} and {} minutes",
+                inkwash_logic::boot_store::MIN_SYNC_INTERVAL_MINUTES,
+                inkwash_logic::boot_store::MAX_SYNC_INTERVAL_MINUTES
+            ));
         }
         self.write_num(KEY_SYNC_INTERVAL_MIN, minutes)
     }
@@ -275,13 +307,19 @@ impl PersistedCounters {
     }
 
     pub fn timezone_offset_minutes(&self) -> Result<Option<i16>, StoreFault> {
-        self.read_num::<i16>(KEY_TIMEZONE_OFFSET, "timezone offset")
+        self.read_validated_num(
+            KEY_TIMEZONE_OFFSET,
+            "timezone offset",
+            inkwash_logic::boot_store::is_valid_timezone_offset,
+        )
     }
 
     pub fn save_timezone_offset_minutes(&self, offset: i16) -> Result<()> {
-        if !(-720..=840).contains(&offset) {
+        if !inkwash_logic::boot_store::is_valid_timezone_offset(offset) {
             return Err(anyhow!(
-                "timezone offset must be between -720 and 840 minutes"
+                "timezone offset must be between {} and {} minutes",
+                inkwash_logic::boot_store::MIN_TIMEZONE_OFFSET_MINUTES,
+                inkwash_logic::boot_store::MAX_TIMEZONE_OFFSET_MINUTES
             ));
         }
         self.write_num(KEY_TIMEZONE_OFFSET, offset)

@@ -77,6 +77,9 @@ jobs:
           SOURCE_DATE_EPOCH: "1700000000"
         run: ./scripts/build-rust.sh --release --locked
 
+      - name: Verify the boot ledger stays outside every loadable segment
+        run: ./scripts/check-boot-ledger.sh
+
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -111,6 +114,9 @@ jobs:
           SOURCE_DATE_EPOCH: "1700000000"
         run: ./scripts/build-rust.sh --diagnostic --release --locked
 
+      - name: Verify the boot ledger stays outside every loadable segment
+        run: ./scripts/check-boot-ledger.sh rust-firmware/target-diagnostic/xtensa-esp32s3-espidf/release/inkwash-note4
+
   firmware-secure-build:
     name: inkwash-note4 (secure production config)
     runs-on: ubuntu-latest
@@ -137,3 +143,6 @@ jobs:
           INKWASH_SECURE_BOOT_SIGNING_KEY: ${{ runner.temp }}/secure-boot-ci.pem
           SOURCE_DATE_EPOCH: "1700000000"
         run: ./scripts/build-secure.sh
+
+      - name: Verify the boot ledger stays outside every loadable segment
+        run: ./scripts/check-boot-ledger.sh rust-firmware/target-secure/xtensa-esp32s3-espidf/release/inkwash-note4
