@@ -105,30 +105,44 @@ struct NotifyAttempt {
 
 struct NotifyAttemptMailbox {
     armed: Option<NotifyAttempt>,
-
-    retired_handles: [u64; 1024],
+    retired_handles: VecDeque<(u16, std::time::Instant)>,
 }
+
+const RETIRED_HANDLE_GRACE: Duration = Duration::from_secs(3);
+const RETIRED_HANDLE_CAPACITY: usize = 4;
 
 impl Default for NotifyAttemptMailbox {
     fn default() -> Self {
         Self {
             armed: None,
-            retired_handles: [0; 1024],
+            retired_handles: VecDeque::with_capacity(RETIRED_HANDLE_CAPACITY),
         }
     }
 }
 
 impl NotifyAttemptMailbox {
-    fn is_retired(&self, conn_handle: u16) -> bool {
-        let word = usize::from(conn_handle) / 64;
-        let bit = usize::from(conn_handle) % 64;
-        self.retired_handles[word] & (1u64 << bit) != 0
+    fn discard_expired_handles(&mut self) {
+        let now = std::time::Instant::now();
+        self.retired_handles
+            .retain(|(_, retired_at)| now.duration_since(*retired_at) < RETIRED_HANDLE_GRACE);
+    }
+
+    fn is_retired(&mut self, conn_handle: u16) -> bool {
+        self.discard_expired_handles();
+        self.retired_handles
+            .iter()
+            .any(|(handle, _)| *handle == conn_handle)
     }
 
     fn retire_handle(&mut self, conn_handle: u16) {
-        let word = usize::from(conn_handle) / 64;
-        let bit = usize::from(conn_handle) % 64;
-        self.retired_handles[word] |= 1u64 << bit;
+        self.discard_expired_handles();
+        self.retired_handles
+            .retain(|(handle, _)| *handle != conn_handle);
+        if self.retired_handles.len() == RETIRED_HANDLE_CAPACITY {
+            self.retired_handles.pop_front();
+        }
+        self.retired_handles
+            .push_back((conn_handle, std::time::Instant::now()));
     }
 
     fn arm(&mut self, attempt: NotifyAttempt) -> bool {
@@ -158,7 +172,11 @@ impl NotifyAttemptMailbox {
     }
 
     fn take_for_callback(&mut self, conn_handle: u16) -> Option<NotifyAttempt> {
-        let attempt = self.armed?;
+        let Some(attempt) = self.armed else {
+            self.retired_handles
+                .retain(|(handle, _)| *handle != conn_handle);
+            return None;
+        };
         if attempt.conn_handle != conn_handle {
             return None;
         }

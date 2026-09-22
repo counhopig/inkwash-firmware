@@ -175,6 +175,7 @@
 - `scripts/release.sh`：发布前要求干净工作区，校验 GitHub 登录、仓库、标签和 Release 冲突；构建验证完成后先创建带完整附件的 draft Release，最后发布并同步次要远端标签，中途失败不会产生公开但附件不完整的 Release。
 - `rust-firmware/src/board.rs`：GPIO4 与 ADC1 channel 3 在 `Note4Board::take()` 中一次取得，channel 连同 ADC driver 由 Board 全生命周期持有；周期采样不再通过 `Peripherals::steal()` 绕过 HAL 所有权。
 - `rust-firmware/src/main.rs`、`heap_probe.rs`：每秒电源采样和正常栈水位降为 DEBUG；任一任务剩余栈低于 2 KiB 时仍以 WARN 输出，默认 INFO 量产运行不再持续打印正常周期状态。
+- `rust-firmware/src/ble_control.rs`：notify 完成关联继续使用 session、generation、conn_handle 与 attempt_id 四元组；断连 handle 改为容量 4、3 秒安全窗口的退休队列，迟到回调可主动排空退休项，窗口到期后允许 NimBLE 复用 handle，不再永久拒绝新连接回复，同时省去原 8 KiB 位图。
 - `rust-firmware/src/tasks.rs`：pthread 默认配置在修改前保存，创建 internal-stack worker 后恢复，避免全局线程栈策略泄漏到后续线程。
 - `rust-firmware/sdkconfig.defaults`：15,000 字节显示帧优先进入 PSRAM；Wi-Fi RX/TX 缓冲数量按本设备短连接负载下调，减轻 DMA/internal heap 压力。
 - `README.md`、`scripts/release.sh`、`docs/verification.md`：刷写流程显式指定同次构建的 bootloader；冷启动已确认 bootloader 和应用均为 ESP-IDF v5.5.5。发布附件包含 ELF、bootloader 和分区表。
@@ -224,14 +225,6 @@
 - 影响：任务调度依赖 pthread 默认值，无法明确保证 RTC、告警音频、UI 和后台同步的响应顺序。
 - 建议：先记录实际 task priority/core，再以最小调整保证 RTC 和告警控制高于后台同步；不要在缺少测量时大范围提高优先级。
 - 验证：Wi-Fi TLS、EPD 全刷和音频同时运行时测量按键和告警响应延迟。
-
-#### P1-6 BLE 断开重连后可能永久拒绝回复
-
-- 位置：`rust-firmware/src/ble_control.rs:104`、`:126`、`:147`
-- 证据：`NotifyAttemptMailbox` 使用 8 KiB 的 `retired_handles: [u64; 1024]`；`quarantine()` 和 `release_generation()` 会置位，但当前实现没有任何清位路径。`arm()` 会永久拒绝退休 handle。
-- 影响：若 NimBLE 在同一 `BleSession` 内重连时复用 `conn_handle`，新连接的所有 notify 回复都会被拒绝。简单清位又可能让旧连接的迟到回调错误消费新 attempt，因此不能直接删除退休机制。
-- 建议：先建立可靠的旧 notify 回调排空边界，或更换不依赖仅有 `conn_handle` 的完成关联模型；在确认回调归属前不要采用“连接时清位”的表面修复。
-- 验证：在同一配对会话中反复断开/重连，记录每代 `conn_handle`、generation、attempt_id 和 notify 回调。如果 handle 被复用，应确认新请求仍能收到回复且旧回调不能完成新请求。
 
 #### P1-7 同步数据应用存在跨 key 部分提交
 

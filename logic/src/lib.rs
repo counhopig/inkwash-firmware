@@ -156,7 +156,9 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("attempt_id: u64"));
         assert!(BLE_SOURCE.contains("const BLE_REPLY_MAX_RETRIES: u8 = 3"));
         assert!(BLE_SOURCE.contains("ReplyTerminated"));
-        assert!(BLE_SOURCE.contains("retired_handles: [u64; 1024]"));
+        assert!(BLE_SOURCE.contains("retired_handles: VecDeque<(u16, std::time::Instant)>"));
+        assert!(BLE_SOURCE.contains("const RETIRED_HANDLE_GRACE: Duration"));
+        assert!(BLE_SOURCE.contains("fn discard_expired_handles"));
         assert!(BLE_SOURCE.contains("fn release_generation"));
         assert!(BLE_SOURCE.contains("self.is_retired(attempt.conn_handle)"));
         assert!(BLE_SOURCE.contains("self.retire_handle(conn_handle)"));
