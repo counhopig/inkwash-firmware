@@ -214,7 +214,7 @@ AppState ──ViewModel::from_state()──▶ ViewModel { generation, view, cl
 - **单向拉取 + 脏标记上传**：`POST /api/sync`，请求体只带 *locally dirty* 的
   `{alarms:[{id,enabled}], todos:[{id,done}], inbox_read:[]}`（`sync.rs:68-86,201-221`），
   dirty 集合持久化在 NVS（`nvs_blob.rs:52-85`），服务端合并后回权威列表。
-  ETag/304 保留但**只读取不发送**（`sync.rs:177` 形参 `_etag` 未使用）——legacy 路径半退役。
+  当前 POST 是带本地变更的合并操作，不使用 ETag/304；服务端只在 legacy GET 路径保留条件请求。
 - **响应缓冲在 PSRAM**：16 KiB `PsramBuffer`（`sync.rs:19-45`），读满时做 1 字节溢出探测
   （`sync.rs:101-112`），避免在截断数据上做 JSON 解析。
 - **校验在 logic**：`validate_sync_response`（`sync_validate.rs:41-95`）做 id 去重、
@@ -224,7 +224,7 @@ AppState ──ViewModel::from_state()──▶ ViewModel { generation, view, cl
 
 | namespace | 内容 | 上限 |
 |---|---|---|
-| `inkwash` | wifi/server/tz/etag/sync 元数据/提醒日期 | 标量 64 或 256 字节 |
+| `inkwash` | wifi/server/tz/sync 元数据/提醒日期 | 标量 64 或 256 字节 |
 | `inkwash_alrm` | `alarms` blob + `dirty` 集合 | 1024 |
 | `inkwash_todo` | `todos` blob + `dirty` 集合 | 2048 |
 | `inkwash_inbox` | `items` + `pending`（待 ACK 的已读） | 4096（截到 32 条、300 字符/条） |

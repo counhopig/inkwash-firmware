@@ -109,9 +109,6 @@ impl EffectExecutor for TaskExecutor {
                     d.inbox_store.ack_read(&data.inbox_read_acked)?;
                     d.alarm_store.clear_dirty_ids(&data.uploaded_alarm_ids)?;
                     d.todo_store.clear_dirty_ids(&data.uploaded_todo_ids)?;
-                    if let Some(etag) = data.etag.as_deref() {
-                        d.counters.save_sync_etag(etag)?;
-                    }
                     Ok(())
                 })();
                 match result {
@@ -125,9 +122,6 @@ impl EffectExecutor for TaskExecutor {
             }
             Effect::PersistSyncMetadata(meta) => {
                 let result = (|| -> Result<()> {
-                    if let Some(etag) = meta.etag.as_deref() {
-                        d.counters.save_sync_etag(etag)?;
-                    }
                     if let Some(epoch) = meta.last_sync_epoch {
                         d.counters.set_last_sync_epoch(epoch)?;
                     }
@@ -145,14 +139,6 @@ impl EffectExecutor for TaskExecutor {
                     Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
             }
-            Effect::ClearSyncEtag => match d.counters.clear_sync_etag() {
-                Ok(()) => Ok(EffectOutcome::Completed(
-                    inkwash_logic::app::EffectOutput::Persisted(
-                        inkwash_logic::app::PersistTarget::SyncMetadata,
-                    ),
-                )),
-                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
-            },
             Effect::ClearRtcAlignEpoch => match d.counters.clear_rtc_align_epoch() {
                 Ok(()) => Ok(EffectOutcome::Completed(
                     inkwash_logic::app::EffectOutput::Persisted(

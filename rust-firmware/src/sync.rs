@@ -58,8 +58,6 @@ pub enum SyncOutcome {
 
         inbox_read_acked: Vec<u64>,
         inbox_truncated: bool,
-        etag: Option<String>,
-
         uploaded_alarm_ids: Vec<u8>,
 
         uploaded_todo_ids: Vec<u8>,
@@ -121,7 +119,7 @@ fn https_post(
     body: &[u8],
     buf: &mut [u8],
     err_label: &str,
-) -> Result<(usize, Option<String>)> {
+) -> Result<usize> {
     let config = HttpConfiguration {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         timeout: Some(HTTP_TIMEOUT),
@@ -171,15 +169,13 @@ fn https_post(
         return Err(anyhow!("{err_label}: HTTP {}", response.status()));
     }
 
-    let etag = response.header("etag").map(|s| s.to_string());
     let bytes_read = read_body_fully(&mut response, buf)?;
-    Ok((bytes_read, etag))
+    Ok(bytes_read)
 }
 
 pub fn fetch_and_apply(
     server_url: &str,
     token: &str,
-    _etag: Option<&str>,
     alarm_store: &AlarmStore,
     todo_store: &TodoStore,
     inbox_store: &InboxStore,
@@ -229,7 +225,7 @@ pub fn fetch_and_apply(
 
     let mut buf = PsramBuffer::new(RESPONSE_BUF_LEN)?;
     heap_probe::snapshot("fetch_and_apply:after-psram-buf");
-    let (bytes_read, new_etag) = https_post(
+    let bytes_read = https_post(
         server_url,
         token,
         &[],
@@ -259,8 +255,6 @@ pub fn fetch_and_apply(
         inbox: parsed.inbox,
         inbox_read_acked: parsed.inbox_read_acked,
         inbox_truncated: parsed.inbox_truncated,
-        etag: new_etag,
-
         uploaded_alarm_ids: dirty_alarms,
         uploaded_todo_ids: dirty_todos,
     })
@@ -291,8 +285,6 @@ pub fn sync_now(
             .device_config()
             .map_err(|e| anyhow!("failed to load server config: {e}"))?
             .ok_or_else(|| anyhow!("Server not configured; use SetServer first"))?;
-        let etag = counters.sync_etag().ok().flatten();
-
         if wifi_mgr.used() {
             log::warn!(
                 "Wi-Fi already used this boot session; attempting a second connect (scan-free)"
@@ -306,7 +298,6 @@ pub fn sync_now(
         let outcome = fetch_and_apply(
             &cfg.server_url,
             &cfg.auth_token,
-            etag.as_deref(),
             alarm_store,
             todo_store,
             inbox_store,
@@ -365,7 +356,7 @@ pub fn poll_urgent(counters: &PersistedCounters, wifi_mgr: &mut wifi::WifiManage
 
     let result = (|| -> Result<bool> {
         let mut buf = [0u8; 256];
-        let (bytes_read, _) = https_post(
+        let bytes_read = https_post(
             &cfg.server_url,
             &cfg.auth_token,
             &[("x-inkwash-poll", "1")],

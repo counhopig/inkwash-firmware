@@ -119,9 +119,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     self.ctx
                         .todo_store
                         .clear_dirty_ids(&data.uploaded_todo_ids)?;
-                    if let Some(etag) = data.etag.as_deref() {
-                        self.ctx.counters.save_sync_etag(etag)?;
-                    }
                     Ok(())
                 })();
                 match result {
@@ -137,9 +134,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
             },
             Effect::PersistSyncMetadata(meta) => {
                 let result = (|| -> Result<()> {
-                    if let Some(etag) = meta.etag.as_deref() {
-                        self.ctx.counters.save_sync_etag(etag)?;
-                    }
                     if let Some(epoch) = meta.last_sync_epoch {
                         self.ctx.counters.set_last_sync_epoch(epoch)?;
                     }
@@ -155,12 +149,6 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
             }
-            Effect::ClearSyncEtag => match self.ctx.counters.clear_sync_etag() {
-                Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
-                    inkwash_logic::app::PersistTarget::SyncMetadata,
-                ))),
-                Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
-            },
             Effect::ClearRtcAlignEpoch => match self.ctx.counters.clear_rtc_align_epoch() {
                 Ok(()) => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
                 Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),

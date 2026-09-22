@@ -93,7 +93,6 @@ pub fn effect_name(effect: &Effect) -> &'static str {
         Effect::PersistWifiCredentials(_) => "PersistWifiCredentials",
         Effect::PersistSyncMetadata(_) => "PersistSyncMetadata",
         Effect::ApplySyncedData(_) => "ApplySyncedData",
-        Effect::ClearSyncEtag => "ClearSyncEtag",
         Effect::ClearRtcAlignEpoch => "ClearRtcAlignEpoch",
         Effect::PersistTimezone(_) => "PersistTimezone",
         Effect::WriteRtcTime(_) => "WriteRtcTime",
@@ -135,7 +134,6 @@ impl EffectExecutor for FakeExecutor {
             | Effect::PersistSyncMetadata(_)
             | Effect::ApplySyncedData(_)
             | Effect::ClearRtcAlignEpoch
-            | Effect::ClearSyncEtag
             | Effect::PersistTimezone(_) => EffectCategory::Persist,
             Effect::CollectReminderFacts(_) => EffectCategory::Persist,
             Effect::ProgramRtcAlarm(_) | Effect::DisableRtcAlarm | Effect::WriteRtcTime(_) => {
@@ -184,9 +182,6 @@ impl EffectExecutor for FakeExecutor {
             Effect::PersistSyncMetadata(_) => Ok(EffectOutcome::Completed(
                 EffectOutput::Persisted(crate::app::PersistTarget::SyncMetadata),
             )),
-            Effect::ClearSyncEtag => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
-                crate::app::PersistTarget::SyncMetadata,
-            ))),
             Effect::ClearRtcAlignEpoch => Ok(EffectOutcome::Completed(EffectOutput::RenderDone)),
             Effect::ApplySyncedData(_) => Ok(EffectOutcome::Completed(EffectOutput::Persisted(
                 crate::app::PersistTarget::SyncApply,

@@ -11,7 +11,6 @@ const KEY_WIFI_CONFIG: &str = "wifi_cfg_v1";
 const KEY_SERVER_URL: &str = "server_url";
 const KEY_AUTH_TOKEN: &str = "auth_token";
 const KEY_SERVER_CONFIG: &str = "server_cfg_v1";
-const KEY_SYNC_ETAG: &str = "sync_etag";
 const KEY_TIMEZONE_OFFSET: &str = "timezone_min";
 const KEY_SYNC_INTERVAL_MIN: &str = "sync_interval_min";
 const KEY_LAST_SYNC_EPOCH: &str = "last_sync_epoch";
@@ -194,21 +193,6 @@ impl PersistedCounters {
                 auth_token: cfg.auth_token.clone(),
             },
         )
-    }
-
-    pub fn sync_etag(&self) -> Result<Option<String>> {
-        nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_SYNC_ETAG)
-    }
-
-    pub fn save_sync_etag(&self, etag: &str) -> Result<()> {
-        nvs_blob::write_scalar(&self.nvs, KEY_SYNC_ETAG, etag)
-    }
-
-    pub fn clear_sync_etag(&self) -> Result<()> {
-        self.nvs
-            .remove(KEY_SYNC_ETAG)
-            .map(|_| ())
-            .map_err(|e| anyhow!("NVS remove({KEY_SYNC_ETAG}) failed: {e}"))
     }
 
     pub fn sync_interval_minutes(&self) -> Result<u16> {

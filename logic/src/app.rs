@@ -343,8 +343,6 @@ pub enum Effect {
 
     ApplySyncedData(SyncedData),
 
-    ClearSyncEtag,
-
     ClearRtcAlignEpoch,
 
     PersistTimezone(i16),
@@ -485,7 +483,6 @@ pub struct SyncRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncMetadata {
-    pub etag: Option<String>,
     pub last_sync_epoch: Option<u64>,
     pub rtc_align_epoch: Option<u64>,
 }
@@ -559,8 +556,6 @@ pub struct SyncedData {
 
     pub inbox_read_acked: Vec<u64>,
     pub inbox_truncated: bool,
-    pub etag: Option<String>,
-
     pub uploaded_alarm_ids: Vec<u8>,
 
     pub uploaded_todo_ids: Vec<u8>,
@@ -2998,7 +2993,6 @@ fn transition_effect_completed(
                         metadata_op,
                         FailurePolicy::AbortBatch,
                         vec![Effect::PersistSyncMetadata(SyncMetadata {
-                            etag: None,
                             last_sync_epoch: Some(metadata.last_sync_epoch),
                             rtc_align_epoch: metadata.ntp_epoch,
                         })],
@@ -3455,33 +3449,18 @@ fn transition_command(
                 )];
             }
             let cfg_op = state.next_operation_id();
-            let clear_op = state.next_operation_id();
             let cfg = DeviceConfig {
                 server_url: url.clone(),
                 auth_token: token.clone(),
             };
             let pending_request = ControlRequest::SetServer { url, token };
-            set_pending_reply(
+            set_pending_reply(state, channel, cfg_op, pending_request, vec![cfg_op]);
+            vec![batch(
                 state,
-                channel,
                 cfg_op,
-                pending_request,
-                vec![cfg_op, clear_op],
-            );
-            vec![
-                batch(
-                    state,
-                    cfg_op,
-                    FailurePolicy::AbortBatch,
-                    vec![Effect::PersistConfig(cfg)],
-                ),
-                batch(
-                    state,
-                    clear_op,
-                    FailurePolicy::AbortBatch,
-                    vec![Effect::ClearSyncEtag],
-                ),
-            ]
+                FailurePolicy::AbortBatch,
+                vec![Effect::PersistConfig(cfg)],
+            )]
         }
         ControlRequest::ClearAlarms => {
             let persist_op = state.next_operation_id();
@@ -3914,7 +3893,6 @@ mod tests {
             inbox: vec![],
             inbox_read_acked: vec![],
             inbox_truncated: false,
-            etag: None,
             uploaded_alarm_ids: vec![],
             uploaded_todo_ids: vec![],
         }
@@ -4434,7 +4412,7 @@ mod tests {
     }
 
     #[test]
-    fn set_server_persists_config_and_clears_etag_then_replies_ok() {
+    fn set_server_persists_config_then_replies_ok() {
         let mut state = AppState::default();
         let batches = update(
             &mut state,
@@ -4454,17 +4432,11 @@ mod tests {
                     .any(|e| matches!(e, Effect::PersistConfig(_)))
             })
             .expect("SetServer must persist the config");
-        let clear_batch = batches
-            .iter()
-            .find(|b| b.effects.iter().any(|e| matches!(e, Effect::ClearSyncEtag)))
-            .expect("SetServer must clear the stale ETag");
         let cfg_op = cfg_batch.operation_id;
-        let clear_op = clear_batch.operation_id;
-        assert_ne!(cfg_op, clear_op);
 
         assert!(state.config.server_url.is_none(), "facts apply on confirm");
 
-        let mid = update(
+        let done = update(
             &mut state,
             Event::EffectCompleted(EffectCompletion {
                 batch_id: EffectBatchId(0),
@@ -4479,20 +4451,6 @@ mod tests {
             Some("https://sync.example")
         );
         assert!(state.config.server_has_token);
-        assert!(!mid
-            .iter()
-            .any(|b| b.effects.iter().any(|e| matches!(e, Effect::Reply { .. }))));
-
-        let done = update(
-            &mut state,
-            Event::EffectCompleted(EffectCompletion {
-                batch_id: EffectBatchId(0),
-                effect_id: EffectId(0),
-                operation_id: clear_op,
-                render_generation: None,
-                output: EffectOutput::Persisted(PersistTarget::SyncMetadata),
-            }),
-        );
         assert!(done.iter().any(|b| {
             b.effects.iter().any(|e| {
                 matches!(

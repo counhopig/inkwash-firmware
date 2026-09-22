@@ -15,7 +15,6 @@ pub fn batch_is_worker_safe(batch: &EffectBatch) -> bool {
                 | Effect::PersistTimezone(_)
                 | Effect::ApplySyncedData(_)
                 | Effect::PersistSyncMetadata(_)
-                | Effect::ClearSyncEtag
                 | Effect::ClearRtcAlignEpoch
                 | Effect::MarkInboxRead { .. }
                 | Effect::PersistReminder(_)

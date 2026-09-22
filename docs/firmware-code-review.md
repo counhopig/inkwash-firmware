@@ -67,12 +67,12 @@
 6. 服务端 URL 现已在状态机入口强制 HTTPS、长度上限和无 userinfo；这项安全边界有单元测试覆盖。
 7. panic 策略已设为打印后自动重启，可避免同类故障永久停机；尚需补充重启循环识别。
 8. 当前分区布局不支持 OTA、升级失败回滚或远程安全维护。
-9. Light Sleep 与 tickless idle 已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。运行态最低频率仍为 160 MHz。
+9. Light Sleep、tickless idle 与 40–160 MHz 动态调频已启用；ESP-IDF 5.5.5 会忽略 CPU retention 内存申请失败，当前配置已显式关闭未实际生效的 CPU-domain power-down，保留自动 Light Sleep 和唤醒源。
 10. 同步应用会连续更新多个 NVS 对象而没有事务或 generation 标记；掉电或写入失败可能留下跨数据集的部分提交状态。
 11. 真机 core dump 已把最新 Double exception 收敛到 RTC 高频轮询创建一次性回复通道时的分配器路径；改为复用通道后 400 秒 soak 通过，但尚未达到 1,000 次压力发布门槛，因此仍作为发布阻断项跟踪。
 12. 现有刷写文档和发布脚本已显式携带同一次构建生成的 v5.5.5 bootloader，消除了 `espflash` 内置 v6.1 beta bootloader 与应用版本混用。
 13. 建议优先完成长期压力验证、BLE 安全互操作测试和敏感数据保护，再推进 OTA、原子持久化与功耗优化。
-14. 同步层虽然保存了 ETag，却没有发送 `If-None-Match`，且只接受 HTTP 200；当前 ETag 机制实际上没有形成条件请求闭环。
+14. 当前 `POST /api/sync` 是带本地变更的合并操作，服务端不会按 ETag 返回 304；固件已移除无效的 ETag 请求状态和 NVS 写入，避免伪缓存机制与额外 Flash 磨损。
 15. 启动阶段对 Todo、Inbox、设备配置、Wi-Fi 和时区的部分 NVS 读取错误会静默降级为空值，存在把“数据损坏”误判成“尚未配置”的风险。
 16. 生产配置仍启用 UART core dump 和综合堆毒化：前者可能经 USB 暴露内存中的密码与 Token，后者适合定位当前 P0，但不宜直接作为最终量产配置。
 
@@ -229,18 +229,10 @@
 #### P1-7 同步数据应用存在跨 key 部分提交
 
 - 位置：`rust-firmware/src/effect_task.rs:104`
-- 证据：`ApplySyncedData` 依次写 alarms、todos、inbox、pending-read ack、alarm dirty set、todo dirty set 和 ETag。任一步失败只会返回错误，不会回滚前面已成功的 NVS 写入。
-- 影响：掉电、NVS 空间不足或单次写失败可能形成“新 alarms + 旧 todos”“内容已覆盖但 dirty 标记未清”或“数据已写但 ETag 未推进”等跨集合不一致。状态机当次不会确认成功，但重启后会读到部分新数据。
+- 证据：`ApplySyncedData` 依次写 alarms、todos、inbox、pending-read ack、alarm dirty set 和 todo dirty set。任一步失败只会返回错误，不会回滚前面已成功的 NVS 写入。
+- 影响：掉电、NVS 空间不足或单次写失败可能形成“新 alarms + 旧 todos”或“内容已覆盖但 dirty 标记未清”等跨集合不一致。状态机当次不会确认成功，但重启后会读到部分新数据。
 - 建议：为同步快照增加 generation/commit marker。先写带同一 generation 的 staging 数据，全部成功后原子切换 active generation；最小方案至少应最后写 commit marker，并在启动时只接纳完整 generation。
 - 验证：在每个写入步骤后注入复位和错误，重启后必须得到完整旧快照或完整新快照，不能出现混合状态。
-
-#### P1-9 ETag 被保存但没有用于条件请求
-
-- 位置：`rust-firmware/src/sync.rs:179-239`、`:294`
-- 证据：`fetch_and_apply()` 的参数名为 `_etag` 且未使用；调用 `https_post()` 时额外 header 为空。HTTP 层只接受状态码 200，标准条件请求的 304 会被当作错误。
-- 影响：每次同步都会下载完整数据，浪费流量、功耗和 Flash 写入次数；代码和持久化状态会让维护者误以为已经支持增量缓存。
-- 建议：发送 `If-None-Match`，显式把 304 映射为 `NotModified`，且 304 时不重写业务数据；若服务端协议并不支持 ETag，则删除该状态，避免伪机制。
-- 验证：服务端依次返回 200+ETag、304、更新后的 200，确认请求头、状态机、NVS 写入次数和同步时间符合预期。
 
 #### P1-10 UART core dump 会暴露运行内存中的凭据
 
