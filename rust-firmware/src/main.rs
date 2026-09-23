@@ -412,7 +412,7 @@ fn main() -> Result<()> {
             },
             None => {
                 log::info!(
-                    "No Wi-Fi credentials in NVS; skipping connect (see scripts/gen-nvs-wifi.py)"
+                    "No Wi-Fi credentials in NVS; skipping connect (provision with set_wifi over USB or BLE)"
                 );
             }
         }

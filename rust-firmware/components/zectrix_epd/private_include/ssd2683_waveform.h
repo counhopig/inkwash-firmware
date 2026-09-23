@@ -24,8 +24,9 @@ struct ProgrammedByte {
     uint8_t value;
 };
 
-// Exact reconstruction of docs/0.3s.h. The original file contains 479 bytes
-// of 0xFF, so storing only programmed bytes keeps this header reviewable.
+// Exact reconstruction of the vendor waveform capture 0.3s.h. The original
+// contains 479 bytes of 0xFF, so storing only programmed bytes keeps this
+// header reviewable.
 // SHA-256 of the expanded 535-byte payload:
 // 62aa8a14381c62a78c60ef34ab323c1fda3f96472bee44971fa84b9bd0a925ee
 constexpr std::array<ProgrammedByte, 56> kFastBwProgrammedBytes = {{

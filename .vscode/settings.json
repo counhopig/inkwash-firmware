@@ -1,6 +1,6 @@
 // Machine-independent rust-analyzer setup for the Xtensa esp toolchain.
 //
-// One-time per-machine prerequisites (see docs/development-guide.md):
+// One-time per-machine prerequisites (see README.md, "Quick start"):
 //   1. `espup install`, then `rustup toolchain link esp-ra ~/esp/esp-ra`
 //      (re-link after every espup reinstall).
 //   2. An ESP-IDF installation must be available under a conventional path,
