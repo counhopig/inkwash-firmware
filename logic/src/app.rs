@@ -1176,6 +1176,8 @@ fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> 
 }
 
 fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
+    let released_manual_request =
+        state.requested_sleep == Some(SleepKind::ManualDeep) && poll.input_latch_clear;
     if poll.activity_observed {
         state.last_activity_ticks = Some(poll.now_ticks);
         state.idle_since_ticks = None;
@@ -1188,11 +1190,12 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
             state.pending_sleep_page_allows = false;
             state.pending_sleep_maintenance = None;
         }
-        return if disable {
-            disable_light_sleep_batch(state)
-        } else {
-            vec![]
-        };
+        if disable {
+            return disable_light_sleep_batch(state);
+        }
+        if !released_manual_request {
+            return vec![];
+        }
     }
     if state.sleep.committed_kind().is_some() {
         return vec![];
@@ -6622,7 +6625,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_sleep_row_requests_tokenized_sleep() {
+    fn settings_sleep_short_press_survives_same_cycle_activity_poll() {
         let mut state = AppState::default();
         let _ = update(
             &mut state,
@@ -6662,7 +6665,7 @@ mod tests {
         );
         let poll = |now_ticks| PowerPoll {
             now_ticks,
-            activity_observed: false,
+            activity_observed: true,
             final_display_pending: false,
             final_persist_pending: false,
             usb_connected: true,
