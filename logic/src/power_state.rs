@@ -2,6 +2,7 @@
 pub enum SleepKind {
     Light,
     Deep,
+    ManualDeep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +104,8 @@ impl SleepState {
         }
         match token.kind {
             SleepKind::Light => light_blocker(inputs).is_none(),
-            SleepKind::Deep => deep_blocker(inputs, true).is_none(),
+            SleepKind::Deep => deep_blocker(inputs, true, false).is_none(),
+            SleepKind::ManualDeep => deep_blocker(inputs, true, true).is_none(),
         }
     }
 
@@ -115,8 +117,8 @@ impl SleepState {
     ) -> Result<SleepToken, SleepBlocker> {
         let blocker = match kind {
             SleepKind::Light => light_blocker(inputs),
-
-            SleepKind::Deep => deep_blocker(inputs, false),
+            SleepKind::Deep => deep_blocker(inputs, false, false),
+            SleepKind::ManualDeep => deep_blocker(inputs, false, true),
         };
         if let Some(blocker) = blocker {
             self.phase = None;
@@ -147,7 +149,8 @@ impl SleepState {
         }
         let blocker = match token.kind {
             SleepKind::Light => light_blocker(inputs),
-            SleepKind::Deep => deep_blocker(inputs, true),
+            SleepKind::Deep => deep_blocker(inputs, true, false),
+            SleepKind::ManualDeep => deep_blocker(inputs, true, true),
         };
         if let Some(blocker) = blocker {
             self.phase = None;
@@ -174,7 +177,11 @@ fn light_blocker(inputs: SleepInputs) -> Option<SleepBlocker> {
     }
 }
 
-fn deep_blocker(inputs: SleepInputs, require_wake_plan: bool) -> Option<SleepBlocker> {
+fn deep_blocker(
+    inputs: SleepInputs,
+    require_wake_plan: bool,
+    allow_usb_connected: bool,
+) -> Option<SleepBlocker> {
     light_blocker(inputs)
         .or_else(|| {
             inputs
@@ -196,7 +203,9 @@ fn deep_blocker(inputs: SleepInputs, require_wake_plan: bool) -> Option<SleepBlo
             (require_wake_plan && !inputs.wake_plan_confirmed)
                 .then_some(SleepBlocker::WakePlanUnconfirmed)
         })
-        .or_else(|| inputs.usb_connected.then_some(SleepBlocker::UsbConnected))
+        .or_else(|| {
+            (inputs.usb_connected && !allow_usb_connected).then_some(SleepBlocker::UsbConnected)
+        })
         .or_else(|| (!inputs.event_queue_empty).then_some(SleepBlocker::EventQueueNotEmpty))
         .or_else(|| (!inputs.input_latch_clear).then_some(SleepBlocker::InputLatchSet))
 }
@@ -350,5 +359,21 @@ mod tests {
             state.prepare(SleepKind::Deep, 5, inputs),
             Err(SleepBlocker::PageDisallowsSleep)
         );
+    }
+
+    #[test]
+    fn manual_deep_sleep_allows_an_attached_usb_host() {
+        let mut inputs = ready();
+        inputs.usb_connected = true;
+        assert_eq!(
+            SleepState::new().prepare(SleepKind::Deep, 5, inputs),
+            Err(SleepBlocker::UsbConnected)
+        );
+        let mut state = SleepState::new();
+        let token = state
+            .prepare(SleepKind::ManualDeep, 5, inputs)
+            .expect("manual sleep prepare");
+        state.commit(token, inputs).expect("manual sleep commit");
+        assert!(state.final_check(token, inputs));
     }
 }

@@ -370,6 +370,9 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 inkwash_logic::power_state::SleepKind::Deep => {
                     crate::power::prepare_deep_sleep_wakeups(*maintenance)
                 }
+                inkwash_logic::power_state::SleepKind::ManualDeep => {
+                    crate::power::prepare_deep_sleep_wakeups(*maintenance)
+                }
             }
             .map(|()| EffectOutcome::Async)
             .map_err(|err| {
