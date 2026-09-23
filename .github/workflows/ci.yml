@@ -60,17 +60,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ESP-IDF 5.5.5
-        uses: espressif/install-esp-idf-action@v1
-        with:
-          version: v5.5.5
-
       - name: Install Xtensa Rust toolchain
         uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
           buildtargets: esp32s3
           ldproxy: true
+
+      - name: Install ESP-IDF 5.5.5
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: v5.5.5
 
       - name: Build release firmware
         env:
@@ -97,17 +97,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ESP-IDF 5.5.5
-        uses: espressif/install-esp-idf-action@v1
-        with:
-          version: v5.5.5
-
       - name: Install Xtensa Rust toolchain
         uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
           buildtargets: esp32s3
           ldproxy: true
+
+      - name: Install ESP-IDF 5.5.5
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: v5.5.5
 
       - name: Build diagnostic firmware
         env:
@@ -123,17 +123,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ESP-IDF 5.5.5
-        uses: espressif/install-esp-idf-action@v1
-        with:
-          version: v5.5.5
-
       - name: Install Xtensa Rust toolchain
         uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
           buildtargets: esp32s3
           ldproxy: true
+
+      - name: Install ESP-IDF 5.5.5
+        uses: espressif/install-esp-idf-action@v1
+        with:
+          version: v5.5.5
 
       - name: Generate ephemeral CI signing key
         run: espsecure.py generate_signing_key --version 2 "$RUNNER_TEMP/secure-boot-ci.pem"
