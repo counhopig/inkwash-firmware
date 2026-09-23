@@ -42,6 +42,7 @@ pub enum Screen {
         selected: usize,
     },
     About,
+    SleepPending,
 
     SyncIntervalPick {
         selected: usize,
@@ -117,6 +118,7 @@ impl Screen {
                 selected: *selected,
             },
             Screen::About => RenderView::About,
+            Screen::SleepPending => RenderView::SleepPending,
             Screen::SyncIntervalPick { selected } => RenderView::SyncInterval {
                 selected: *selected,
             },
@@ -422,6 +424,7 @@ pub enum RenderView {
     },
 
     About,
+    SleepPending,
 
     AlarmList {
         selected: usize,
@@ -995,7 +998,15 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
     } else {
         Vec::new()
     };
-    if sleep_activity_event(&event) || tick_cancels_prepared || tick_wakes_light_sleep {
+    let keep_manual_request = state.requested_sleep == Some(SleepKind::ManualDeep)
+        && !matches!(
+            event,
+            Event::Button(_) | Event::UsbCommand(_) | Event::BleCommand(_)
+        );
+    if (sleep_activity_event(&event) && !keep_manual_request)
+        || tick_cancels_prepared
+        || tick_wakes_light_sleep
+    {
         state.sleep.activity();
         state.pending_sleep_operation = None;
 
@@ -1987,6 +1998,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::Navigation { .. }
             | Screen::Settings { .. }
             | Screen::About
+            | Screen::SleepPending
             | Screen::SyncIntervalPick { .. }
             | Screen::AlarmList { .. }
             | Screen::AlarmAdd(_)
@@ -2183,6 +2195,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_SLEEP_ROW {
                         state.requested_sleep = Some(SleepKind::ManualDeep);
+                        state.screen = Screen::SleepPending;
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_BLE_PAIRING_ROW {
@@ -2230,6 +2243,19 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
             }
             _ => vec![],
         },
+        Screen::SleepPending => {
+            state.requested_sleep = None;
+            state.sleep.activity();
+            state.pending_sleep_operation = None;
+            state.pending_sleep_inputs = None;
+            state.pending_sleep_page_allows = false;
+            state.pending_sleep_maintenance = None;
+            state.screen = Screen::Settings {
+                selected: SETTINGS_SLEEP_ROW,
+            };
+            state.render_generation = state.render_generation.next();
+            vec![render_batch(state)]
+        }
         Screen::SyncIntervalPick { selected } => {
             transition_sync_interval_pick_button(state, *selected, button)
         }

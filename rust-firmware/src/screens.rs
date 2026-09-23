@@ -99,6 +99,14 @@ pub(crate) fn draw_about(canvas: &mut Canvas) {
     footer(canvas, "ENTER BACK");
 }
 
+pub(crate) fn draw_sleep_pending(canvas: &mut Canvas) {
+    canvas.clear();
+    header(canvas, "SLEEP");
+    canvas.draw_text_prop(24, 80, 2, "GOING TO SLEEP");
+    canvas.draw_text_prop(24, 128, 1, "FINISHING ACTIVE WORK...");
+    footer(canvas, "PRESS ANY KEY TO CANCEL");
+}
+
 const SYNC_INTERVAL_OPTIONS: [&str; 5] = ["1 MIN", "5 MIN", "10 MIN", "30 MIN", "60 MIN"];
 
 pub(crate) fn draw_sync_interval(canvas: &mut Canvas, selected: usize) {

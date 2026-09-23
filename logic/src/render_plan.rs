@@ -240,6 +240,7 @@ fn surface_kind(view: &RenderView) -> SurfaceKind {
         RenderView::Calendar { .. } => SurfaceKind::CalendarGrid,
         RenderView::WeekView { .. }
         | RenderView::About
+        | RenderView::SleepPending
         | RenderView::InboxItem { .. }
         | RenderView::NumberPick { .. }
         | RenderView::BlePairing { .. }
