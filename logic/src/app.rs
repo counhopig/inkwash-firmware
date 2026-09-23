@@ -1059,7 +1059,9 @@ fn sleep_activity_event(event: &Event) -> bool {
         Event::EffectCompleted(completion)
             if matches!(
                 completion.output,
-                EffectOutput::LightSleepEntered | EffectOutput::LightSleepDisabled
+                EffectOutput::RenderDone
+                    | EffectOutput::LightSleepEntered
+                    | EffectOutput::LightSleepDisabled
             ) =>
         {
             false
@@ -6663,10 +6665,10 @@ mod tests {
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
         );
-        let poll = |now_ticks| PowerPoll {
+        let poll = |now_ticks, final_display_pending| PowerPoll {
             now_ticks,
             activity_observed: true,
-            final_display_pending: false,
+            final_display_pending,
             final_persist_pending: false,
             usb_connected: true,
             event_queue_empty: true,
@@ -6675,7 +6677,23 @@ mod tests {
             network_resumable: false,
             light_wake_after_ms: 1_000,
         };
-        let batches = update(&mut state, Event::PowerPoll(poll(0)));
+        let blocked = update(&mut state, Event::PowerPoll(poll(0, true)));
+        assert!(blocked.is_empty());
+        assert_eq!(state.requested_sleep, Some(SleepKind::ManualDeep));
+
+        let _ = update(
+            &mut state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(99),
+                effect_id: EffectId(99),
+                operation_id: OperationId(99),
+                render_generation: None,
+                output: EffectOutput::RenderDone,
+            }),
+        );
+        assert_eq!(state.requested_sleep, Some(SleepKind::ManualDeep));
+
+        let batches = update(&mut state, Event::PowerPoll(poll(1, false)));
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
