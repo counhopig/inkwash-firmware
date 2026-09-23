@@ -82,7 +82,7 @@ pub(crate) fn draw_navigation_bar(canvas: &mut Canvas, selected: usize) {
     );
 }
 
-pub const SETTINGS_ROWS: [&str; 5] = ["SYNC NOW", "SYNC INTERVAL", "BLE PAIRING", "SLEEP", "ABOUT"];
+pub const SETTINGS_ROWS: [&str; 4] = ["SYNC NOW", "SYNC INTERVAL", "BLE PAIRING", "ABOUT"];
 
 pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {
     let items: Vec<String> = SETTINGS_ROWS.iter().map(|s| s.to_string()).collect();

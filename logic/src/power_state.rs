@@ -2,7 +2,6 @@
 pub enum SleepKind {
     Light,
     Deep,
-    ManualDeep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,7 +104,6 @@ impl SleepState {
         match token.kind {
             SleepKind::Light => light_blocker(inputs).is_none(),
             SleepKind::Deep => deep_blocker(inputs, true, false).is_none(),
-            SleepKind::ManualDeep => deep_blocker(inputs, true, true).is_none(),
         }
     }
 
@@ -118,7 +116,6 @@ impl SleepState {
         let blocker = match kind {
             SleepKind::Light => light_blocker(inputs),
             SleepKind::Deep => deep_blocker(inputs, false, false),
-            SleepKind::ManualDeep => deep_blocker(inputs, false, true),
         };
         if let Some(blocker) = blocker {
             self.phase = None;
@@ -150,7 +147,6 @@ impl SleepState {
         let blocker = match token.kind {
             SleepKind::Light => light_blocker(inputs),
             SleepKind::Deep => deep_blocker(inputs, true, false),
-            SleepKind::ManualDeep => deep_blocker(inputs, true, true),
         };
         if let Some(blocker) = blocker {
             self.phase = None;
@@ -359,21 +355,5 @@ mod tests {
             state.prepare(SleepKind::Deep, 5, inputs),
             Err(SleepBlocker::PageDisallowsSleep)
         );
-    }
-
-    #[test]
-    fn manual_deep_sleep_allows_an_attached_usb_host() {
-        let mut inputs = ready();
-        inputs.usb_connected = true;
-        assert_eq!(
-            SleepState::new().prepare(SleepKind::Deep, 5, inputs),
-            Err(SleepBlocker::UsbConnected)
-        );
-        let mut state = SleepState::new();
-        let token = state
-            .prepare(SleepKind::ManualDeep, 5, inputs)
-            .expect("manual sleep prepare");
-        state.commit(token, inputs).expect("manual sleep commit");
-        assert!(state.final_check(token, inputs));
     }
 }
