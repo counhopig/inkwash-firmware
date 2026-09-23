@@ -37,6 +37,8 @@ if [ -z "${IDF_PYTHON_ENV_PATH:-}" ] \
     || ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     . "$IDF_PATH/export.sh"
+else
+    export PATH="$IDF_PATH/tools:$PATH"
 fi
 
 # esp-idf-sys's bindgen step needs espup's esp-clang, which clang-sys does not

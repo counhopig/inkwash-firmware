@@ -73,6 +73,8 @@ if [ -z "${IDF_PYTHON_ENV_PATH:-}" ] \
     || ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     . "$IDF_PATH/export.sh" >/dev/null 2>&1
+else
+    export PATH="$IDF_PATH/tools:$PATH"
 fi
 if ! python3 -c 'import esptool' >/dev/null 2>&1; then
     echo "esptool is required to read the produced images (ESP-IDF python environment)" >&2
