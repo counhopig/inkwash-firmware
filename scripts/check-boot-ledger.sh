@@ -67,8 +67,13 @@ if [ -z "${IDF_PATH:-}" ] || [ ! -f "$IDF_PATH/export.sh" ]; then
     exit 1
 fi
 export IDF_PATH
-# shellcheck disable=SC1091
-. "$IDF_PATH/export.sh" >/dev/null 2>&1
+if [ -z "${IDF_PYTHON_ENV_PATH:-}" ] \
+    || [ ! -x "$IDF_PYTHON_ENV_PATH/bin/python" ] \
+    || ! command -v idf.py >/dev/null 2>&1 \
+    || ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$IDF_PATH/export.sh" >/dev/null 2>&1
+fi
 if ! python3 -c 'import esptool' >/dev/null 2>&1; then
     echo "esptool is required to read the produced images (ESP-IDF python environment)" >&2
     exit 1

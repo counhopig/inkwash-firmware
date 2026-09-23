@@ -31,8 +31,13 @@ if [ -z "${IDF_PATH:-}" ] || [ ! -f "$IDF_PATH/export.sh" ]; then
 fi
 export IDF_PATH
 
-# shellcheck disable=SC1091
-. "$IDF_PATH/export.sh"
+if [ -z "${IDF_PYTHON_ENV_PATH:-}" ] \
+    || [ ! -x "$IDF_PYTHON_ENV_PATH/bin/python" ] \
+    || ! command -v idf.py >/dev/null 2>&1 \
+    || ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$IDF_PATH/export.sh"
+fi
 
 # esp-idf-sys's bindgen step needs espup's esp-clang, which clang-sys does not
 # find on its own. Locate it under the active `esp` rustup toolchain instead
