@@ -1390,7 +1390,7 @@ pub fn ble_pairing_session_matches(screen: &Screen, session_id: u64) -> bool {
 }
 
 fn transition_sync_boundary_due(state: &mut AppState) -> Vec<EffectBatch> {
-    if state.sync != SyncState::Idle {
+    if state.requested_sleep == Some(SleepKind::ManualDeep) || state.sync != SyncState::Idle {
         return vec![];
     }
     if !state.connectivity.wifi_configured || !state.connectivity.server_configured {
@@ -1414,6 +1414,9 @@ fn transition_urgent_poll_completed(state: &mut AppState, available: bool) -> Ve
         return vec![];
     };
     let _ = op;
+    if state.requested_sleep == Some(SleepKind::ManualDeep) {
+        return vec![];
+    }
     if !available {
         state.sync_scheduler.clear_urgent_synced();
         return vec![];
@@ -1444,7 +1447,8 @@ fn transition_urgent_poll_failed(state: &mut AppState) -> Vec<EffectBatch> {
 }
 
 fn schedule_sync_from_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBatch> {
-    if state.sync != SyncState::Idle
+    if state.requested_sleep == Some(SleepKind::ManualDeep)
+        || state.sync != SyncState::Idle
         || state.pending_urgent_poll.is_some()
         || !state.connectivity.wifi_configured
         || !state.connectivity.server_configured
