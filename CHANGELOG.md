@@ -6,6 +6,82 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Single event loop** — the application state machine in `inkwash-logic`
+  (events in, effect batches out) drives the firmware. Batches travel through
+  bounded queues, a failing batch no longer discards the rest of its event,
+  queued batches count toward the sleep admission gates, and a saturated queue
+  is counted instead of silently dropping work.
+- **Boot-failure guard and minimum safe mode** — a ledger in RTC noinit memory
+  counts consecutive attributable resets (panic, task or interrupt watchdog,
+  brownout, power glitch, CPU lockup, unexpected software reset). Three in a
+  row park the device in a minimum safe mode that keeps USB diagnostics and all
+  stored data intact, and both the panel and the boot log state which recovery
+  that mode needs. Power-on, the reset pin, a USB reset, a deep-sleep wake and
+  any power cycle start a fresh count; store read faults are classified
+  (corrupt / unsupported version / I/O) and never degraded to a default.
+- **Runtime diagnostics** — saturating counters for conditions that are handled
+  quietly (saturation of each queue and mailbox, BLE reply retries and drops,
+  EPD partial-to-full fallback), logged as deltas.
+- **Build profiles** — `--diagnostic` (comprehensive heap poisoning plus INFO
+  logging) and `scripts/build-secure.sh` (Secure Boot V2, AES-256 flash
+  encryption in release mode, NVS encryption, JTAG and basic-ROM download
+  disabled), each building into its own target directory.
+- **Device tooling** — `scripts/smoke-note4.py` (soak and command stress over
+  the USB protocol), `scripts/capture-serial.py` (reconnecting capture with
+  required-pattern assertions), `scripts/check-git-rev.sh` (fails a build whose
+  embedded revision is stale), `scripts/check-boot-ledger.sh` (fails when the
+  flashed image would cover the boot ledger) and `scripts/backup-flash.ps1`
+  (identity-checked 16 MB dump).
+- **About screen** — firmware version and embedded git revision, reached from
+  Settings.
+- **P0-6 first-exception recorder** — extended to both cores, with a host-side
+  decoder in `tools/p06_accept.py`; it stays out of the default image behind
+  the `p06_diag` / `p06_validate` / `p06_validate_core1` features.
+
+### Changed
+- **Storage and partitions** — the partition table now carries a 64 KiB NVS,
+  an encrypted `nvs_keys` partition, a 512 KiB coredump partition for panic
+  capture, and a single 4 MiB `factory` application partition. Grouped state
+  updates are written atomically, an interrupted sync apply is recovered from a
+  journal, and stored settings are validated on read against the ranges the
+  device itself writes rather than clamped into range.
+- **BLE** — pairing requires authentication; the worker is created on demand
+  instead of at boot, connection handles are reused safely, and replies are
+  retried through bounded mailboxes.
+- **Control protocol** — command nesting is bounded before parsing, and the
+  realtime-clock reply channel is reused under load instead of being dropped.
+- **Scheduling** — task priorities and stack allocation policy are defined in
+  one place, and the watchdog covers the blocking worker windows.
+- **Sync** — cron boundaries re-align after the wall clock moves backwards
+  (`set_rtc`, the daily NTP alignment, a PCF8563 reseed) instead of suspending
+  automatic sync until the clock passes the stale cursor.
+- **Settings** — the manual sleep entry is gone; sleeping is decided by the
+  power state machine alone.
+- **Build** — ESP-IDF discovery reuses an active environment and prefers the
+  tools of the selected IDF, native component sources are tracked for rebuilds,
+  and the embedded CJK font blobs are validated at build time. The release
+  script verifies the target artifacts and the partition table against
+  espflash's own output, and runs the boot-ledger gate, before it publishes.
+- **Source comments** — the accumulated comment layer was stripped from both
+  crates; comments now exist only where a non-obvious constraint needs
+  recording.
+
+### Removed
+- The `docs/` set (architecture map, development guide, control protocol, sync
+  API, hardware assessment, verification, review notes). The control protocol
+  is specified by `logic/src/protocol.rs` plus the framing in
+  `rust-firmware/src/usb_console.rs` / `ble_control.rs`, and the sync contract
+  by `logic/src/sync_validate.rs` and its tests.
+- The obsolete ETag sync state.
+
+### Known limitations
+- Input stays poll-based: there is no dedicated button task or bounded event
+  queue, and `wake.rs` only wakes the main loop rather than emitting semantic
+  key events.
+- Not yet verified on device: idle power and response latency measurements, the
+  full alarm-ringing flow, and BLE end-to-end pairing.
+
 ## [0.6.0] - 2026-09-08
 
 ### Added
@@ -105,8 +181,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   page header (brand + title + rule); the number-picker value is
   vertically centered; the inbox detail page fits long titles by scaling
   down or wrapping.
-- `docs/sync-api.md` documents the lightweight poll and the dirty-set
-  upload semantics.
 
 ### Fixed
 - Inbox detail body text overflowed the right edge (wrapped with the
