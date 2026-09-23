@@ -82,12 +82,21 @@ pub(crate) fn draw_navigation_bar(canvas: &mut Canvas, selected: usize) {
     );
 }
 
-pub const SETTINGS_ROWS: [&str; 4] = ["SYNC NOW", "SYNC INTERVAL", "BLE PAIRING", "SLEEP"];
+pub const SETTINGS_ROWS: [&str; 5] = ["SYNC NOW", "SYNC INTERVAL", "BLE PAIRING", "SLEEP", "ABOUT"];
 
 pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {
     let items: Vec<String> = SETTINGS_ROWS.iter().map(|s| s.to_string()).collect();
     draw_rows(canvas, "SETTINGS", &items, selected);
     footer(canvas, "UP/DOWN MOVE   ENTER OK   HOLD ENTER BACK");
+}
+
+pub(crate) fn draw_about(canvas: &mut Canvas) {
+    canvas.clear();
+    header(canvas, "ABOUT");
+    canvas.draw_text_prop(24, 64, 2, "INKWASH NOTE 4");
+    canvas.draw_text_prop(24, 112, 1, concat!("FIRMWARE ", env!("CARGO_PKG_VERSION")));
+    canvas.draw_text_prop(24, 144, 1, env!("GIT_REV"));
+    footer(canvas, "ENTER BACK");
 }
 
 const SYNC_INTERVAL_OPTIONS: [&str; 5] = ["1 MIN", "5 MIN", "10 MIN", "30 MIN", "60 MIN"];

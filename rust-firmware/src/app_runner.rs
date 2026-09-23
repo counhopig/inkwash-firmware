@@ -370,6 +370,9 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                 inkwash_logic::power_state::SleepKind::Deep => {
                     crate::power::prepare_deep_sleep_wakeups(*maintenance)
                 }
+                inkwash_logic::power_state::SleepKind::ManualDeep => {
+                    crate::power::prepare_deep_sleep_wakeups(*maintenance)
+                }
             }
             .map(|()| EffectOutcome::Async)
             .map_err(|err| {
@@ -452,6 +455,10 @@ fn draw_sm_surface(
         RenderView::Settings { selected } => {
             let mut canvas = ctx.board.display.canvas_mut();
             crate::screens::draw_settings(&mut canvas, selected);
+        }
+        RenderView::About => {
+            let mut canvas = ctx.board.display.canvas_mut();
+            crate::screens::draw_about(&mut canvas);
         }
         RenderView::SyncInterval { selected } => {
             let mut canvas = ctx.board.display.canvas_mut();

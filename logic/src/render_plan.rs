@@ -239,6 +239,7 @@ fn surface_kind(view: &RenderView) -> SurfaceKind {
         | RenderView::Inbox { .. } => SurfaceKind::List,
         RenderView::Calendar { .. } => SurfaceKind::CalendarGrid,
         RenderView::WeekView { .. }
+        | RenderView::About
         | RenderView::InboxItem { .. }
         | RenderView::NumberPick { .. }
         | RenderView::BlePairing { .. }

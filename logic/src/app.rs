@@ -41,6 +41,7 @@ pub enum Screen {
     Settings {
         selected: usize,
     },
+    About,
 
     SyncIntervalPick {
         selected: usize,
@@ -115,6 +116,7 @@ impl Screen {
             Screen::Settings { selected } => RenderView::Settings {
                 selected: *selected,
             },
+            Screen::About => RenderView::About,
             Screen::SyncIntervalPick { selected } => RenderView::SyncInterval {
                 selected: *selected,
             },
@@ -418,6 +420,8 @@ pub enum RenderView {
     Settings {
         selected: usize,
     },
+
+    About,
 
     AlarmList {
         selected: usize,
@@ -1196,22 +1200,26 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     if state.pending_sleep_inputs.is_some() {
         return vec![];
     }
-    let last = *state.last_activity_ticks.get_or_insert(poll.now_ticks);
-    let idle_for = poll.now_ticks.saturating_sub(last);
-    let idle_since = if idle_for >= 2_000 {
-        *state.idle_since_ticks.get_or_insert(last + 2_000)
+    let kind = if state.requested_sleep == Some(SleepKind::ManualDeep) {
+        SleepKind::ManualDeep
     } else {
-        return vec![];
-    };
-    let automatic_kind = (poll.now_ticks.saturating_sub(idle_since) >= 300_000)
-        .then_some(SleepKind::Deep)
-        .or(Some(SleepKind::Light));
-    let kind = state.requested_sleep.or(automatic_kind);
-    let Some(kind) = kind else {
-        return vec![];
+        let last = *state.last_activity_ticks.get_or_insert(poll.now_ticks);
+        let idle_for = poll.now_ticks.saturating_sub(last);
+        let idle_since = if idle_for >= 2_000 {
+            *state.idle_since_ticks.get_or_insert(last + 2_000)
+        } else {
+            return vec![];
+        };
+        state.requested_sleep.unwrap_or_else(|| {
+            if poll.now_ticks.saturating_sub(idle_since) >= 300_000 {
+                SleepKind::Deep
+            } else {
+                SleepKind::Light
+            }
+        })
     };
     let inputs = app_sleep_inputs(state, poll);
-    let maintenance = (kind == SleepKind::Deep)
+    let maintenance = matches!(kind, SleepKind::Deep | SleepKind::ManualDeep)
         .then(|| {
             state
                 .clock
@@ -1317,7 +1325,9 @@ fn transition_sleep_committed(state: &mut AppState, token: SleepToken) -> Vec<Ef
         SleepKind::Light => Effect::EnterLightSleep(LightSleepPlan {
             wake_after_ms: state.pending_sleep_light_wake_after_ms,
         }),
-        SleepKind::Deep => Effect::EnterDeepSleep(WakeupPlan { maintenance }),
+        SleepKind::Deep | SleepKind::ManualDeep => {
+            Effect::EnterDeepSleep(WakeupPlan { maintenance })
+        }
     };
     let operation_id = state.next_operation_id();
     state.pending_sleep_operation = Some(operation_id);
@@ -1971,6 +1981,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
         Screen::Home
             | Screen::Navigation { .. }
             | Screen::Settings { .. }
+            | Screen::About
             | Screen::SyncIntervalPick { .. }
             | Screen::AlarmList { .. }
             | Screen::AlarmAdd(_)
@@ -2166,7 +2177,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_SLEEP_ROW {
-                        state.requested_sleep = Some(SleepKind::Deep);
+                        state.requested_sleep = Some(SleepKind::ManualDeep);
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_BLE_PAIRING_ROW {
@@ -2193,6 +2204,10 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                             ),
                             render_batch(state),
                         ]
+                    } else if cur == SETTINGS_ABOUT_ROW {
+                        state.screen = Screen::About;
+                        state.render_generation = state.render_generation.next();
+                        vec![render_batch(state)]
                     } else {
                         vec![]
                     }
@@ -2200,6 +2215,16 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 _ => vec![],
             }
         }
+        Screen::About => match button {
+            ButtonEvent::Pressed(ButtonId::Enter) | ButtonEvent::LongPressed(ButtonId::Enter) => {
+                state.screen = Screen::Settings {
+                    selected: SETTINGS_ABOUT_ROW,
+                };
+                state.render_generation = state.render_generation.next();
+                vec![render_batch(state)]
+            }
+            _ => vec![],
+        },
         Screen::SyncIntervalPick { selected } => {
             transition_sync_interval_pick_button(state, *selected, button)
         }
@@ -2225,7 +2250,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
     }
 }
 
-pub const SETTINGS_ROW_COUNT: usize = 4;
+pub const SETTINGS_ROW_COUNT: usize = 5;
+
+pub const SETTINGS_ABOUT_ROW: usize = 4;
 
 pub const SETTINGS_SLEEP_ROW: usize = 3;
 
@@ -6468,25 +6495,40 @@ mod tests {
         );
         assert_eq!(state.screen, Screen::Settings { selected: 0 });
 
-        for _ in 0..3 {
+        for _ in 0..SETTINGS_ABOUT_ROW {
             let _ = update(
                 &mut state,
                 Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
             );
         }
-        assert_eq!(state.screen, Screen::Settings { selected: 3 });
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_ABOUT_ROW
+            }
+        );
 
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
         );
-        assert_eq!(state.screen, Screen::Settings { selected: 3 });
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_ABOUT_ROW
+            }
+        );
 
         let _ = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Up)),
         );
-        assert_eq!(state.screen, Screen::Settings { selected: 2 });
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_ABOUT_ROW - 1
+            }
+        );
 
         for _ in 0..5 {
             let _ = update(
@@ -6623,20 +6665,58 @@ mod tests {
             activity_observed: false,
             final_display_pending: false,
             final_persist_pending: false,
-            usb_connected: false,
+            usb_connected: true,
             event_queue_empty: true,
             input_latch_clear: true,
             wake_plan_confirmed: true,
             network_resumable: false,
             light_wake_after_ms: 1_000,
         };
-        let _ = update(&mut state, Event::PowerPoll(poll(0)));
-        let batches = update(&mut state, Event::PowerPoll(poll(2_000)));
+        let batches = update(&mut state, Event::PowerPoll(poll(0)));
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::PrepareSleep { .. })));
+            .any(|e| matches!(e, Effect::PrepareSleep { token, .. } if token.kind == SleepKind::ManualDeep)));
         assert!(state.sleep.prepared_token().is_some());
+    }
+
+    #[test]
+    fn settings_about_row_opens_and_returns_to_settings() {
+        let mut state = AppState {
+            screen: Screen::Settings {
+                selected: SETTINGS_ABOUT_ROW,
+            },
+            ..AppState::default()
+        };
+
+        let opened = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(state.screen, Screen::About);
+        assert!(opened.iter().flat_map(|batch| &batch.effects).any(
+            |effect| matches!(effect, Effect::Render(request) if request.view == RenderView::About)
+        ));
+
+        assert!(update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        )
+        .is_empty());
+        let returned = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_ABOUT_ROW
+            }
+        );
+        assert!(returned
+            .iter()
+            .flat_map(|batch| &batch.effects)
+            .any(|effect| matches!(effect, Effect::Render(_))));
     }
 
     #[test]
@@ -7080,15 +7160,14 @@ mod tests {
             activity_observed: false,
             final_display_pending: false,
             final_persist_pending: false,
-            usb_connected: false,
+            usb_connected: true,
             event_queue_empty: true,
             input_latch_clear: true,
             wake_plan_confirmed: true,
             network_resumable: false,
             light_wake_after_ms: 1_000,
         };
-        let _ = update(&mut state, Event::PowerPoll(poll(0)));
-        let batches = update(&mut state, Event::PowerPoll(poll(2_000)));
+        let batches = update(&mut state, Event::PowerPoll(poll(0)));
         assert!(batches
             .iter()
             .flat_map(|b| &b.effects)
