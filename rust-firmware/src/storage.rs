@@ -1,101 +1,215 @@
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
+use serde::{Deserialize, Serialize};
+
+use inkwash_logic::boot_store::StoreFault;
 
 use crate::nvs_blob;
 
 const NAMESPACE: &str = "inkwash";
 const KEY_WIFI_SSID: &str = "wifi_ssid";
 const KEY_WIFI_PASS: &str = "wifi_pass";
+const KEY_WIFI_CONFIG: &str = "wifi_cfg_v1";
 const KEY_SERVER_URL: &str = "server_url";
 const KEY_AUTH_TOKEN: &str = "auth_token";
-const KEY_SYNC_ETAG: &str = "sync_etag";
+const KEY_SERVER_CONFIG: &str = "server_cfg_v1";
 const KEY_TIMEZONE_OFFSET: &str = "timezone_min";
 const KEY_SYNC_INTERVAL_MIN: &str = "sync_interval_min";
 const KEY_LAST_SYNC_EPOCH: &str = "last_sync_epoch";
 const KEY_RTC_ALIGN_EPOCH: &str = "rtc_align_epoch";
-/// ESP-IDF NVS keys are limited to 15 characters; `todo_reminded_date` (18
-/// chars) silently failed every write with `ESP_ERR_NVS_KEY_TOO_LONG`.
+const KEY_SYNC_APPLY_JOURNAL: &str = "sync_jrn_v1";
+const SYNC_APPLY_JOURNAL_MAX_LEN: usize = 12 * 1024;
+
 const KEY_TODO_REMINDED_DATE: &str = "todo_rem_date";
 
-/// Maximum length of the NVS strings used for Wi-Fi credentials.
-/// ESP32-S3 NVS limits a single string item to ~4000 bytes; 64 chars is
-/// plenty for an SSID and WPA2 passphrase.
-const WIFI_CRED_MAX_LEN: usize = 64;
+const WIFI_CRED_MAX_LEN: usize = 65;
+const WIFI_CONFIG_BUF_LEN: usize = 768;
 
-/// Maximum length of the NVS strings used for server URL, auth token, and ETag.
-/// Server URLs typically fit in ~256 chars, tokens often 128-256 chars, and
-/// ETags vary but are rarely over 128 chars.
 const SERVER_CONFIG_MAX_LEN: usize = 256;
+const SERVER_CONFIG_BLOB_LEN: usize = 2304;
+const MAX_SERVER_URL_LEN: usize = 240;
+const MAX_AUTH_TOKEN_LEN: usize = SERVER_CONFIG_MAX_LEN - 1;
 
-/// Read-buffer size for every numeric/date scalar (stored as its decimal
-/// string): a `u64` needs at most 20 digits and the `YYYYMMDD` reminder
-/// marker 8, so one shared size covers them all.
 const NUM_STR_MAX_LEN: usize = 20;
 
-/// Pure config data shapes (`WifiCreds`, `DeviceConfig`) live in
-/// `inkwash-logic` so the host-testable application state machine shares
-/// the single source of truth; re-exported here so every existing
-/// `storage::WifiCreds` / `storage::DeviceConfig` call site keeps working.
 pub use inkwash_logic::device_config::{DeviceConfig, WifiCreds};
+
+#[derive(Serialize, Deserialize)]
+struct StoredWifiConfig {
+    version: u8,
+    ssid: String,
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredServerConfig {
+    version: u8,
+    server_url: String,
+    auth_token: String,
+}
+
+fn validate_wifi_creds(creds: &WifiCreds) -> Result<()> {
+    let valid_password = creds.password.is_empty()
+        || (8..=63).contains(&creds.password.len())
+        || (creds.password.len() == 64
+            && creds.password.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if creds.ssid.is_empty() || creds.ssid.len() > 32 || !valid_password {
+        return Err(anyhow!("Wi-Fi credentials exceed 802.11 limits"));
+    }
+    Ok(())
+}
+
+fn validate_device_config(cfg: &DeviceConfig) -> Result<()> {
+    if cfg.server_url.len() > MAX_SERVER_URL_LEN {
+        return Err(anyhow!(
+            "server URL is {} bytes (max {MAX_SERVER_URL_LEN})",
+            cfg.server_url.len()
+        ));
+    }
+    let Some(rest) = cfg.server_url.strip_prefix("https://") else {
+        return Err(anyhow!("server URL must use HTTPS"));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    {
+        return Err(anyhow!("server URL contains an invalid authority"));
+    }
+    if cfg.auth_token.len() > MAX_AUTH_TOKEN_LEN {
+        return Err(anyhow!(
+            "authentication token is {} bytes (max {MAX_AUTH_TOKEN_LEN})",
+            cfg.auth_token.len()
+        ));
+    }
+    Ok(())
+}
 
 pub struct PersistedCounters {
     nvs: EspDefaultNvs,
 }
 
 impl PersistedCounters {
-    /// `partition` is a clone of the one shared `EspDefaultNvsPartition`
-    /// handle `main.rs` takes once - `EspDefaultNvsPartition::take()` is a
-    /// true singleton (guarded by a global taken-flag, not a ref-counted
-    /// "take a new handle" call) and errors with `ESP_ERR_INVALID_STATE` if
-    /// called again while an earlier handle is still alive, so every NVS
-    /// namespace opener in this codebase (`AlarmStore`, `TodoStore`, this
-    /// one) must share a single taken partition rather than each calling
-    /// `take()` independently.
     pub fn open(partition: EspDefaultNvsPartition) -> Result<Self> {
         let nvs = EspDefaultNvs::new(partition, NAMESPACE, true)
             .map_err(|e| anyhow!("failed to open NVS namespace '{NAMESPACE}': {e}"))?;
         Ok(Self { nvs })
     }
 
-    /// Parses a decimal-string scalar into `T`; `label` only feeds the error
-    /// message (mirroring each former hand-written getter's wording).
-    fn read_num<T: std::str::FromStr>(&self, key: &str, label: &str) -> Result<Option<T>>
+    fn read_num<T: std::str::FromStr>(
+        &self,
+        key: &str,
+        label: &str,
+    ) -> Result<Option<T>, StoreFault>
     where
         T::Err: std::fmt::Display,
     {
         match nvs_blob::read_scalar::<NUM_STR_MAX_LEN>(&self.nvs, key)? {
-            Some(value) => value
-                .parse::<T>()
-                .map(Some)
-                .map_err(|e| anyhow!("invalid stored {label} '{value}': {e}")),
+            Some(value) => value.parse::<T>().map(Some).map_err(|err| {
+                log::error!("stored {label} is not a valid number: {err}");
+                StoreFault::Corrupt
+            }),
             None => Ok(None),
         }
     }
 
-    /// Stores a numeric scalar as its decimal string.
+    /// Reads a stored number and checks it against the range this firmware
+    /// would have written. A value that parses but cannot have come from the
+    /// device is corrupt data: clamping it would hide the damage, and the boot
+    /// path would carry a nonsensical timezone or sync period.
+    fn read_validated_num<T, F>(
+        &self,
+        key: &str,
+        label: &str,
+        is_valid: F,
+    ) -> Result<Option<T>, StoreFault>
+    where
+        T: std::str::FromStr + std::fmt::Display + Copy,
+        T::Err: std::fmt::Display,
+        F: Fn(T) -> bool,
+    {
+        match self.read_num::<T>(key, label)? {
+            Some(value) if !is_valid(value) => {
+                log::error!("stored {label} is out of range: {value}");
+                Err(StoreFault::Corrupt)
+            }
+            other => Ok(other),
+        }
+    }
+
     fn write_num<T: ToString>(&self, key: &str, value: T) -> Result<()> {
         nvs_blob::write_scalar(&self.nvs, key, &value.to_string())
     }
 
-    /// Reads the Wi-Fi credentials stored in NVS, if any.
-    pub fn wifi_creds(&self) -> Result<Option<WifiCreds>> {
+    pub fn wifi_creds(&self) -> Result<Option<WifiCreds>, StoreFault> {
+        if let Some(stored) = nvs_blob::read_blob::<WIFI_CONFIG_BUF_LEN, StoredWifiConfig>(
+            &self.nvs,
+            KEY_WIFI_CONFIG,
+        )? {
+            if stored.version != 1 {
+                log::error!(
+                    "stored Wi-Fi config version {} is not supported",
+                    stored.version
+                );
+                return Err(StoreFault::UnsupportedVersion);
+            }
+            let creds = WifiCreds {
+                ssid: stored.ssid,
+                password: stored.password,
+            };
+            validate_wifi_creds(&creds).map_err(|err| {
+                log::error!("stored Wi-Fi config is unusable: {err}");
+                StoreFault::Corrupt
+            })?;
+            return Ok(Some(creds));
+        }
         let Some(ssid) = nvs_blob::read_scalar::<WIFI_CRED_MAX_LEN>(&self.nvs, KEY_WIFI_SSID)?
         else {
             return Ok(None);
         };
         let password = nvs_blob::read_scalar::<WIFI_CRED_MAX_LEN>(&self.nvs, KEY_WIFI_PASS)?
             .unwrap_or_default();
-        Ok(Some(WifiCreds { ssid, password }))
+        let creds = WifiCreds { ssid, password };
+        validate_wifi_creds(&creds).map_err(|err| {
+            log::error!("stored Wi-Fi credentials are unusable: {err}");
+            StoreFault::Corrupt
+        })?;
+        Ok(Some(creds))
     }
 
-    /// Stores the Wi-Fi credentials in NVS for later connections.
     pub fn save_wifi_creds(&self, creds: &WifiCreds) -> Result<()> {
-        nvs_blob::write_scalar(&self.nvs, KEY_WIFI_SSID, &creds.ssid)?;
-        nvs_blob::write_scalar(&self.nvs, KEY_WIFI_PASS, &creds.password)
+        validate_wifi_creds(creds)?;
+        nvs_blob::write_blob::<WIFI_CONFIG_BUF_LEN, _>(
+            &self.nvs,
+            KEY_WIFI_CONFIG,
+            &StoredWifiConfig {
+                version: 1,
+                ssid: creds.ssid.clone(),
+                password: creds.password.clone(),
+            },
+        )
     }
 
-    /// Reads the server configuration (URL and auth token) from NVS, if any.
-    pub fn device_config(&self) -> Result<Option<DeviceConfig>> {
+    pub fn device_config(&self) -> Result<Option<DeviceConfig>, StoreFault> {
+        if let Some(stored) = nvs_blob::read_blob::<SERVER_CONFIG_BLOB_LEN, StoredServerConfig>(
+            &self.nvs,
+            KEY_SERVER_CONFIG,
+        )? {
+            if stored.version != 1 {
+                log::error!(
+                    "stored server config version {} is not supported",
+                    stored.version
+                );
+                return Err(StoreFault::UnsupportedVersion);
+            }
+            let cfg = DeviceConfig {
+                server_url: stored.server_url,
+                auth_token: stored.auth_token,
+            };
+            validate_device_config(&cfg).map_err(|err| {
+                log::error!("stored server config is unusable: {err}");
+                StoreFault::Corrupt
+            })?;
+            return Ok(Some(cfg));
+        }
         let Some(server_url) =
             nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_SERVER_URL)?
         else {
@@ -103,85 +217,88 @@ impl PersistedCounters {
         };
         let auth_token = nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_AUTH_TOKEN)?
             .unwrap_or_default();
-        Ok(Some(DeviceConfig {
+        let cfg = DeviceConfig {
             server_url,
             auth_token,
-        }))
+        };
+        validate_device_config(&cfg).map_err(|err| {
+            log::error!("stored server config is unusable: {err}");
+            StoreFault::Corrupt
+        })?;
+        Ok(Some(cfg))
     }
 
-    /// Stores the server configuration (URL and auth token) in NVS.
     pub fn save_device_config(&self, cfg: &DeviceConfig) -> Result<()> {
-        nvs_blob::write_scalar(&self.nvs, KEY_SERVER_URL, &cfg.server_url)?;
-        nvs_blob::write_scalar(&self.nvs, KEY_AUTH_TOKEN, &cfg.auth_token)
+        validate_device_config(cfg)?;
+        nvs_blob::write_blob::<SERVER_CONFIG_BLOB_LEN, _>(
+            &self.nvs,
+            KEY_SERVER_CONFIG,
+            &StoredServerConfig {
+                version: 1,
+                server_url: cfg.server_url.clone(),
+                auth_token: cfg.auth_token.clone(),
+            },
+        )
     }
 
-    /// Reads the last-seen sync ETag from NVS for conditional requests, if any.
-    pub fn sync_etag(&self) -> Result<Option<String>> {
-        nvs_blob::read_scalar::<SERVER_CONFIG_MAX_LEN>(&self.nvs, KEY_SYNC_ETAG)
+    pub fn save_sync_apply_journal(&self, data: &inkwash_logic::app::SyncedData) -> Result<()> {
+        nvs_blob::write_blob::<SYNC_APPLY_JOURNAL_MAX_LEN, _>(
+            &self.nvs,
+            KEY_SYNC_APPLY_JOURNAL,
+            data,
+        )
     }
 
-    /// Stores the sync ETag in NVS for future conditional requests.
-    pub fn save_sync_etag(&self, etag: &str) -> Result<()> {
-        nvs_blob::write_scalar(&self.nvs, KEY_SYNC_ETAG, etag)
+    pub fn sync_apply_journal(&self) -> Result<Option<inkwash_logic::app::SyncedData>, StoreFault> {
+        nvs_blob::read_dynamic_blob(
+            &self.nvs,
+            KEY_SYNC_APPLY_JOURNAL,
+            SYNC_APPLY_JOURNAL_MAX_LEN,
+        )
     }
 
-    /// Invalidates conditional-sync state after changing server identity.
-    pub fn clear_sync_etag(&self) -> Result<()> {
+    pub fn clear_sync_apply_journal(&self) -> Result<()> {
         self.nvs
-            .remove(KEY_SYNC_ETAG)
+            .remove(KEY_SYNC_APPLY_JOURNAL)
             .map(|_| ())
-            .map_err(|e| anyhow!("NVS remove({KEY_SYNC_ETAG}) failed: {e}"))
+            .map_err(|e| anyhow!("NVS remove({KEY_SYNC_APPLY_JOURNAL}) failed: {e}"))
     }
 
-    /// Automatic-sync interval in minutes. The device re-syncs with the
-    /// configured server every this many minutes while running on Home (see
-    /// `main.rs`'s periodic sync check). Defaults to 60 (1 hour).
-    pub fn sync_interval_minutes(&self) -> Result<u16> {
-        Ok(self
-            .read_num::<u16>(KEY_SYNC_INTERVAL_MIN, "sync interval")?
-            .unwrap_or(60))
+    pub fn sync_interval_minutes(&self) -> Result<Option<u16>, StoreFault> {
+        self.read_validated_num(
+            KEY_SYNC_INTERVAL_MIN,
+            "sync interval",
+            inkwash_logic::boot_store::is_valid_sync_interval,
+        )
     }
 
-    /// Sets the automatic-sync interval in minutes.
     pub fn set_sync_interval_minutes(&self, minutes: u16) -> Result<()> {
-        if !(1..=1440).contains(&minutes) {
-            return Err(anyhow!("sync interval must be between 1 and 1440 minutes"));
+        if !inkwash_logic::boot_store::is_valid_sync_interval(minutes) {
+            return Err(anyhow!(
+                "sync interval must be between {} and {} minutes",
+                inkwash_logic::boot_store::MIN_SYNC_INTERVAL_MINUTES,
+                inkwash_logic::boot_store::MAX_SYNC_INTERVAL_MINUTES
+            ));
         }
         self.write_num(KEY_SYNC_INTERVAL_MIN, minutes)
     }
 
-    /// Unix seconds of the last successful sync, if any. `main.rs` uses this
-    /// with `sync_interval_minutes` to decide when to trigger the next
-    /// automatic sync.
-    pub fn last_sync_epoch(&self) -> Result<Option<u64>> {
+    pub fn last_sync_epoch(&self) -> Result<Option<u64>, StoreFault> {
         self.read_num::<u64>(KEY_LAST_SYNC_EPOCH, "last-sync epoch")
     }
 
-    /// Records the time of a successful sync so the periodic checker knows
-    /// how long it has been since the last one.
     pub fn set_last_sync_epoch(&self, epoch: u64) -> Result<()> {
         self.write_num(KEY_LAST_SYNC_EPOCH, epoch)
     }
 
-    /// Unix seconds of the last successful periodic NTP RTC alignment, if
-    /// any. `main.rs` uses this to resync the PCF8563 roughly once a day,
-    /// keeping the wall-clock boundaries the cron sync aligns to accurate.
-    pub fn rtc_align_epoch(&self) -> Result<Option<u64>> {
+    pub fn rtc_align_epoch(&self) -> Result<Option<u64>, StoreFault> {
         self.read_num::<u64>(KEY_RTC_ALIGN_EPOCH, "rtc-align epoch")
     }
 
-    /// Records when the RTC was last aligned via NTP.
     pub fn set_rtc_align_epoch(&self, epoch: u64) -> Result<()> {
         self.write_num(KEY_RTC_ALIGN_EPOCH, epoch)
     }
 
-    /// Drops the last-alignment marker. Call whenever the RTC clock is set
-    /// from a source other than a confirmed-successful NTP sync (the
-    /// boot-time VL reseed in `main.rs`, from a stale build-time constant) -
-    /// leaving a stale marker in place can leave it *later* than the
-    /// now-reseeded clock, which would otherwise block every future
-    /// alignment attempt indefinitely (see `sync.rs::maybe_align_rtc`'s doc
-    /// comment).
     pub fn clear_rtc_align_epoch(&self) -> Result<()> {
         self.nvs
             .remove(KEY_RTC_ALIGN_EPOCH)
@@ -189,29 +306,29 @@ impl PersistedCounters {
             .map_err(|e| anyhow!("NVS remove({KEY_RTC_ALIGN_EPOCH}) failed: {e}"))
     }
 
-    pub fn timezone_offset_minutes(&self) -> Result<i16> {
-        Ok(self
-            .read_num::<i16>(KEY_TIMEZONE_OFFSET, "timezone offset")?
-            .unwrap_or(0))
+    pub fn timezone_offset_minutes(&self) -> Result<Option<i16>, StoreFault> {
+        self.read_validated_num(
+            KEY_TIMEZONE_OFFSET,
+            "timezone offset",
+            inkwash_logic::boot_store::is_valid_timezone_offset,
+        )
     }
 
     pub fn save_timezone_offset_minutes(&self, offset: i16) -> Result<()> {
-        if !(-720..=840).contains(&offset) {
+        if !inkwash_logic::boot_store::is_valid_timezone_offset(offset) {
             return Err(anyhow!(
-                "timezone offset must be between -720 and 840 minutes"
+                "timezone offset must be between {} and {} minutes",
+                inkwash_logic::boot_store::MIN_TIMEZONE_OFFSET_MINUTES,
+                inkwash_logic::boot_store::MAX_TIMEZONE_OFFSET_MINUTES
             ));
         }
         self.write_num(KEY_TIMEZONE_OFFSET, offset)
     }
 
-    /// The last calendar date (as `YYYYMMDD`) on which the due-todo
-    /// reminder fired, if ever. `main.rs` compares it against today so a
-    /// due `High` todo rings once per day, not every poll.
-    pub fn todo_reminded_date(&self) -> Result<Option<String>> {
+    pub fn todo_reminded_date(&self) -> Result<Option<String>, StoreFault> {
         nvs_blob::read_scalar::<NUM_STR_MAX_LEN>(&self.nvs, KEY_TODO_REMINDED_DATE)
     }
 
-    /// Records that the due-todo reminder fired on `date` (`YYYYMMDD`).
     pub fn set_todo_reminded_date(&self, date: &str) -> Result<()> {
         nvs_blob::write_scalar(&self.nvs, KEY_TODO_REMINDED_DATE, date)
     }

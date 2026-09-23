@@ -23,6 +23,7 @@ esp-idf-hal = { path = "../vendor/esp-idf-hal" }
 anyhow = "1"
 inkwash-logic = { path = "../logic" }
 embedded-svc = "0.29"
+enumset = "1"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section"] }
 esp32-nimble = "0.12"
 heapless = "0.9"
@@ -35,6 +36,11 @@ serde_json = "1"
 embuild = "0.33"
 
 [[package.metadata.esp-idf-sys.extra_components]]
-component_dirs = ["components/zectrix_epd"]
+component_dirs = ["components/zectrix_epd", "components/p06_recorder"]
 bindings_header = "components/zectrix_epd/include/zectrix_epd.h"
 bindings_module = "zectrix_epd"
+
+[features]
+p06_validate = []
+p06_validate_core1 = []
+p06_diag = []

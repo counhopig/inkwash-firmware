@@ -1,30 +1,15 @@
-//! Reminder de-duplication rules, factored out of `rust-firmware/src/
-//! reminders.rs` and `rust-firmware/src/inbox.rs` (both call into this
-//! instead of inlining the logic) so the "don't remind twice"/"don't lose a
-//! pending-read ack across a resync" invariants are covered by host tests
-//! instead of only ever being exercised on a physical device.
-
 use crate::datetime::DateTime;
 use crate::inbox_item::InboxItem;
 use crate::todo::{Importance, Todo};
 
-/// The per-day key `reminders.rs` stores in NVS (`todo_reminded_date`) to
-/// track whether today's due-todo reminder has already fired.
 pub fn reminder_date_key(now: &DateTime) -> String {
     format!("{:04}{:02}{:02}", now.year, now.month, now.day)
 }
 
-/// Whether today's due-todo reminder has already been shown, given the
-/// date key persisted after the last time it fired (`None` if it has never
-/// fired).
 pub fn already_reminded_today(prev: Option<&str>, now: &DateTime) -> bool {
     prev == Some(reminder_date_key(now).as_str())
 }
 
-/// High-importance, not-yet-done todos due today - either by an explicit
-/// `due_date` match, or because a recurrence `repeat` covers today. This is
-/// the "what would remind" half of the due-todo reminder; `reminders.rs`
-/// pairs it with `already_reminded_today` before actually showing anything.
 pub fn due_high_importance_todos<'a>(todos: &'a [Todo], now: &DateTime) -> Vec<&'a Todo> {
     todos
         .iter()
@@ -42,12 +27,6 @@ pub fn due_high_importance_todos<'a>(todos: &'a [Todo], now: &DateTime) -> Vec<&
         .collect()
 }
 
-/// Recomputes the locally-pending-read set after replacing the inbox with a
-/// fresh server list (`InboxStore::save`): a `seq` stays pending only if the
-/// server still lists it and still shows it as unread - if the server has
-/// already applied the ack (item now `read`, or dropped entirely), the
-/// pending entry has served its purpose and is dropped so it isn't
-/// re-uploaded forever.
 pub fn merge_pending_read(pending: &[u64], new_items: &[InboxItem]) -> Vec<u64> {
     pending
         .iter()
@@ -56,9 +35,6 @@ pub fn merge_pending_read(pending: &[u64], new_items: &[InboxItem]) -> Vec<u64> 
         .collect()
 }
 
-/// Marks every item in `pending` as locally read, so a full replace
-/// (`InboxStore::save`) doesn't un-read something the user already opened
-/// this session, just because the server hasn't caught up to the ack yet.
 pub fn apply_pending_read(items: &mut [InboxItem], pending: &[u64]) {
     for item in items.iter_mut() {
         if pending.contains(&item.id) {
@@ -67,8 +43,6 @@ pub fn apply_pending_read(items: &mut [InboxItem], pending: &[u64]) {
     }
 }
 
-/// Drops every `seq` the server has now acknowledged (`inbox_read_acked`)
-/// from the locally-pending-read set.
 pub fn ack_pending_read(pending: &[u64], acked: &[u64]) -> Vec<u64> {
     pending
         .iter()
@@ -138,10 +112,10 @@ mod tests {
             day: 22,
         };
         let todos = vec![
-            todo(1, Importance::High, false, Some(due)), // due today, matches
-            todo(2, Importance::High, true, Some(due)),  // done - excluded
-            todo(3, Importance::Medium, false, Some(due)), // not High - excluded
-            todo(4, Importance::High, false, None),      // no due date - excluded
+            todo(1, Importance::High, false, Some(due)),
+            todo(2, Importance::High, true, Some(due)),
+            todo(3, Importance::Medium, false, Some(due)),
+            todo(4, Importance::High, false, None),
         ];
         let result = due_high_importance_todos(&todos, &now);
         assert_eq!(result.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1]);
@@ -150,25 +124,21 @@ mod tests {
     #[test]
     fn due_high_importance_todos_honors_recurrence_over_due_date() {
         use crate::alarm_schedule::Repeat;
-        let now = dt(2026, 8, 22, 6); // Saturday
+        let now = dt(2026, 8, 22, 6);
         let mut recurring = todo(1, Importance::High, false, None);
         recurring.repeat = Some(Repeat::Weekly { days: vec![6] });
         assert_eq!(
             due_high_importance_todos(&[recurring.clone()], &now).len(),
             1
         );
-        recurring.repeat = Some(Repeat::Weekly { days: vec![1] }); // Monday only
+        recurring.repeat = Some(Repeat::Weekly { days: vec![1] });
         assert!(due_high_importance_todos(&[recurring], &now).is_empty());
     }
 
     #[test]
     fn merge_pending_read_keeps_only_still_unread_items() {
         let pending = vec![1, 2, 3];
-        let new_items = vec![
-            item(1, false), // still unread - kept
-            item(2, true),  // server applied the ack - dropped
-                            // 3 no longer present at all - dropped
-        ];
+        let new_items = vec![item(1, false), item(2, true)];
         let mut result = merge_pending_read(&pending, &new_items);
         result.sort();
         assert_eq!(result, vec![1]);

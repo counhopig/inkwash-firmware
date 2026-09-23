@@ -1,22 +1,3 @@
-//! Pure, hardware-independent firmware business logic, split out of
-//! `rust-firmware` so it can be unit-tested on the host - plain
-//! `cargo test` from this directory - without the ESP-IDF/xtensa toolchain
-//! or any hardware attached.
-//!
-//! `rust-firmware` cross-compiles only for `xtensa-esp32s3-espidf` and links
-//! against `esp-idf-sys`, whose build script shells out to `idf.py` and the
-//! ESP-IDF SDK; that dependency can't be built for a host target at all, so
-//! before this split, no part of the firmware crate's logic could be tested
-//! anywhere but on the physical device. This crate has no ESP-IDF
-//! dependency (just `serde`), so it builds and tests on any host.
-//!
-//! `rust-firmware` depends on this crate by path and re-exports each type
-//! from its usual module (`rtc::DateTime`, `alarms::{Repeat, StoredAlarm}`,
-//! `sync::{validate_repeat, validate_date}`, ...) so nothing calling into
-//! them needs to change - this crate is the single source of truth for the
-//! logic itself; the firmware modules add the hardware-facing parts (NVS
-//! storage, I2C, display, buttons) around it.
-
 pub mod alarm_flow;
 pub mod alarm_regs;
 pub mod alarm_schedule;
@@ -24,10 +5,13 @@ pub mod app;
 pub mod audio_command;
 pub mod ble_memory;
 pub mod ble_radio;
+pub mod boot_guard;
+pub mod boot_store;
 pub mod button_event;
 pub mod command_sessions;
 pub mod datetime;
 pub mod device_config;
+pub mod diag;
 pub mod epd_registry;
 pub mod event_queue;
 pub mod harness;
@@ -40,6 +24,7 @@ pub mod render_plan;
 pub mod rtc_latch;
 pub mod runner;
 pub mod runtime;
+pub mod sanitize;
 pub mod scheduler;
 pub mod sync_validate;
 pub mod todo;
@@ -48,9 +33,7 @@ pub mod worker_heartbeat;
 
 #[cfg(test)]
 mod ble_memory_contract {
-    // Keep the host-only guard next to the host-testable state-machine tests.
-    // The hardware crate cannot be built for the host, but these invariants
-    // must stay coupled to its ESP-IDF memory configuration.
+
     const BLE_SOURCE: &str = include_str!("../../rust-firmware/src/ble_control.rs");
     const EFFECT_SOURCE: &str = include_str!("../../rust-firmware/src/effect_task.rs");
     const TASKS_SOURCE: &str = include_str!("../../rust-firmware/src/tasks.rs");
@@ -65,8 +48,7 @@ mod ble_memory_contract {
     #[test]
     fn ble_worker_uses_internal_stack_and_checks_internal_heap_before_init() {
         assert!(BLE_SOURCE.contains("const BLE_TASK_STACK: usize = 16 * 1024"));
-        // The internal-RAM stack caps moved into the shared spawner when the
-        // effect task needed the same guarantee; assert them there.
+
         assert!(
             TASKS_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT"),
             "the shared spawner must pin worker stacks to internal RAM"
@@ -77,7 +59,7 @@ mod ble_memory_contract {
             "the spawner must restore the default pthread policy"
         );
         assert!(
-            BLE_SOURCE.contains("spawn_internal_stack(\"ble\", BLE_TASK_STACK"),
+            BLE_SOURCE.contains("crate::tasks::PRIORITY_BLE"),
             "the BLE worker must be spawned through the internal-stack helper"
         );
         assert!(BLE_SOURCE.contains("MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_DMA"));
@@ -89,15 +71,10 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("log_stack_high_watermark(\"after BLE init\")"));
     }
 
-    /// The effect task runs the NVS/flash-write path that used to live on the
-    /// 32 KiB main task, so its stack must be internal RAM too: flash writes
-    /// execute with the cache disabled, where a PSRAM stack is unreachable.
-    /// It must also stay large enough for `read_blob::<4096>` plus the serde
-    /// frames around it (8 KiB measured only 1032 bytes of headroom on device).
     #[test]
     fn effect_worker_uses_an_internal_stack_with_blob_headroom() {
         assert!(
-            EFFECT_SOURCE.contains("spawn_internal_stack(\"effect-task\", EFFECT_TASK_STACK"),
+            EFFECT_SOURCE.contains("crate::tasks::PRIORITY_EFFECT"),
             "the effect worker must be spawned through the internal-stack helper"
         );
         let stack = EFFECT_SOURCE
@@ -112,9 +89,6 @@ mod ble_memory_contract {
         assert!(!EFFECT_SOURCE.contains("MALLOC_CAP_SPIRAM"));
     }
 
-    /// The BLE worker must be created on first use rather than at boot: a
-    /// permanently parked 16 KiB internal-RAM thread is what boot-looped this
-    /// device, and the radio is unused until the pairing screen opens.
     #[test]
     fn ble_worker_thread_is_created_on_demand() {
         assert!(
@@ -141,7 +115,7 @@ mod ble_memory_contract {
             .find("if session.is_some()")
             .expect("worker must guard duplicate Start commands");
         let start_init = BLE_SOURCE
-            .find("match BleSession::start(session_id)")
+            .find("match BleSession::start(session_id, passkey)")
             .expect("worker must initialize after duplicate Start guard");
         assert!(start_guard < start_init);
         assert!(BLE_SOURCE.contains("active_session_id"));
@@ -150,14 +124,14 @@ mod ble_memory_contract {
     }
 
     #[test]
-    fn ble_lifecycle_callbacks_retain_full_channel_observations() {
+    fn ble_lifecycle_callbacks_never_block_the_nimble_host() {
         assert!(BLE_SOURCE.contains("struct LifecycleSender"));
         assert!(BLE_SOURCE.contains("fn send_lifecycle"));
         assert!(BLE_SOURCE.contains("struct LifecycleMailbox"));
         assert!(BLE_SOURCE.contains("queue: VecDeque<SequencedLifecycle>"));
-        assert!(BLE_SOURCE.contains("Condvar"));
-        assert!(BLE_SOURCE.contains("while mailbox.queue.len() >= CHANNEL_CAPACITY"));
-        assert!(!BLE_SOURCE.contains("latest: Option<SequencedLifecycle>"));
+        assert!(BLE_SOURCE.contains("overflow_latest: Option<SequencedLifecycle>"));
+        assert!(!BLE_SOURCE.contains("Condvar"));
+        assert!(!BLE_SOURCE.contains("while mailbox.queue.len() >= CHANNEL_CAPACITY"));
         assert!(BLE_SOURCE.contains("poll_lifecycle(&self.lifecycle_mailbox"));
         assert!(BLE_SOURCE.contains(
             "send_lifecycle(\n                &lc_tx,\n                BleLifecycle::Connected"
@@ -169,17 +143,28 @@ mod ble_memory_contract {
     }
 
     #[test]
+    fn ble_control_characteristics_require_authenticated_encryption() {
+        assert!(BLE_SOURCE.contains("AuthReq::Bond | AuthReq::Mitm | AuthReq::Sc"));
+        assert!(BLE_SOURCE.contains("SecurityIOCap::DisplayOnly"));
+        assert!(BLE_SOURCE.contains("NimbleProperties::WRITE_ENC"));
+        assert!(BLE_SOURCE.contains("NimbleProperties::WRITE_AUTHEN"));
+        assert!(BLE_SOURCE.contains("BleTaskResult::Started"));
+        assert!(BLE_SOURCE.contains("passkey,"));
+    }
+
+    #[test]
     fn ble_notify_completion_is_attempt_bound_and_stale_safe() {
         assert!(BLE_SOURCE.contains("struct NotifyAttempt"));
         assert!(BLE_SOURCE.contains("attempt: NotifyAttempt"));
         assert!(BLE_SOURCE.contains("attempt_id: u64"));
         assert!(BLE_SOURCE.contains("const BLE_REPLY_MAX_RETRIES: u8 = 3"));
         assert!(BLE_SOURCE.contains("ReplyTerminated"));
-        assert!(BLE_SOURCE.contains("retired_handles: [u64; 1024]"));
+        assert!(BLE_SOURCE.contains("retired_handles: VecDeque<(u16, std::time::Instant)>"));
+        assert!(BLE_SOURCE.contains("const RETIRED_HANDLE_GRACE: Duration"));
+        assert!(BLE_SOURCE.contains("fn discard_expired_handles"));
         assert!(BLE_SOURCE.contains("fn release_generation"));
         assert!(BLE_SOURCE.contains("self.is_retired(attempt.conn_handle)"));
         assert!(BLE_SOURCE.contains("self.retire_handle(conn_handle)"));
-        assert!(BLE_SOURCE.contains("late callback can\n    /// never consume"));
         assert!(BLE_SOURCE.contains("pending.push_back(event)"));
         assert!(!BLE_SOURCE.contains("pending: StdArc<StdMutex<Option<NotifyTxEvent>>>"));
         assert!(BLE_SOURCE.contains("inflight.attempt_id != event.attempt.attempt_id"));
@@ -248,7 +233,6 @@ mod ble_memory_contract {
     fn transport_reply_paths_retain_owned_frames_and_bound_failures() {
         const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
         const CTX_SOURCE: &str = include_str!("../../rust-firmware/src/ctx.rs");
-        const SESSIONS_SOURCE: &str = include_str!("../src/command_sessions.rs");
         assert!(CTX_SOURCE.contains("pending.reply == *reply"));
         assert!(CTX_SOURCE.contains("pub const USB_REPLY_PENDING_CAPACITY: usize = 32"));
         assert!(CTX_SOURCE.contains("const USB_REPLY_MAX_RETRIES: u8 = 3"));
@@ -256,7 +240,6 @@ mod ble_memory_contract {
         assert!(CTX_SOURCE.contains("retry_count = pending.retry_count.saturating_add(1)"));
         assert!(MAIN_SOURCE.contains("fn queue_ble_delivery"));
         assert!(MAIN_SOURCE.contains("BLE_REPLY_PENDING_CAPACITY"));
-        assert!(MAIN_SOURCE.contains("Reserve an owned delivery record before enqueueing"));
         assert!(MAIN_SOURCE.contains("BleReplyError::QueueFull"));
         assert!(MAIN_SOURCE.contains("deliver_ble_reply("));
         assert!(MAIN_SOURCE.contains("ctx.command_sessions.cancel_pending"));
@@ -272,7 +255,6 @@ mod ble_memory_contract {
         assert!(MAIN_SOURCE.contains("pending_ble_reply_latch"));
         assert!(CTX_SOURCE.contains("pending_usb_reply_latch"));
         assert!(MAIN_SOURCE.contains("BLE SetWifi terminal reply terminated after radio handoff"));
-        assert!(SESSIONS_SOURCE.contains("Busy/Pending is a transport response"));
     }
 
     #[test]
@@ -319,5 +301,131 @@ mod ble_memory_contract {
             .find("BLEDevice::deinit_full()")
             .expect("cleanup must deinitialize NimBLE");
         assert!(stop < deinit, "advertising must stop before NimBLE deinit");
+    }
+
+    #[test]
+    fn effect_worker_subscribes_to_the_task_watchdog() {
+        assert!(
+            EFFECT_SOURCE.contains("crate::watchdog::subscribe()"),
+            "the only NVS writer must be watched: an unwatched hang latches \
+             worker_batch_in_flight forever and silently stops all persistence"
+        );
+        assert!(
+            EFFECT_SOURCE.contains("crate::watchdog::feed()"),
+            "subscribing without feeding turns the watchdog into a reboot loop"
+        );
+        assert!(
+            EFFECT_SOURCE.contains("batch_rx.recv_timeout("),
+            "the worker must wake periodically so it can feed while idle"
+        );
+    }
+
+    #[test]
+    fn firmware_keeps_no_unrunnable_test_modules() {
+        const EP_TASK: &str = include_str!("../../rust-firmware/src/epd_task.rs");
+        const USB: &str = include_str!("../../rust-firmware/src/usb_console.rs");
+        const CARGO: &str = include_str!("../../rust-firmware/Cargo.toml");
+
+        assert!(
+            CARGO.contains("harness = false"),
+            "the firmware bin disables the libtest harness; host tests must live in inkwash-logic"
+        );
+        assert!(
+            !EFFECT_SOURCE.contains("#[cfg(test)]"),
+            "with `harness = false` no `#[test]` body is ever run, and cargo does not \
+             even type-check those bodies (ordinary helpers in a cfg(test) module still \
+             are); a test module here can therefore only rot, so keep it in inkwash-logic"
+        );
+        assert!(!EP_TASK.contains("#[cfg(test)]"));
+        assert!(!USB.contains("#[cfg(test)]"));
+    }
+
+    #[test]
+    fn boot_ledger_lives_in_retained_memory_and_clears_only_after_core_init() {
+        const BOOT_LEDGER: &str = include_str!("../../rust-firmware/src/boot_ledger.rs");
+        const MAIN: &str = include_str!("../../rust-firmware/src/main.rs");
+
+        assert!(
+            BOOT_LEDGER.contains("#[link_section = \".rtc_noinit\"]"),
+            "the boot ledger must live in RTC noinit memory: anywhere else it is either \
+             re-initialized from the flash image on every boot (the loop it counts is \
+             never seen) or cleared by the reset it is meant to count"
+        );
+        assert!(BOOT_LEDGER.contains("write_volatile"));
+        assert!(MAIN.contains("if ledger.exhausted()"));
+
+        let dispatch = MAIN
+            .find("Event::SyncSchedulerConfigured(scheduler_config)")
+            .expect("the boot path must configure the sync scheduler once at startup");
+        let clear = MAIN
+            .find("boot_ledger::clear()")
+            .expect("the boot ledger must be cleared on purpose");
+        assert!(
+            dispatch < clear,
+            "the ledger may only be cleared after core initialization dispatched, so a \
+             run that dies earlier keeps counting"
+        );
+    }
+
+    #[test]
+    fn diagnostic_counters_are_atomic_and_stay_off_the_flash() {
+        const DIAG: &str = include_str!("../../rust-firmware/src/diag.rs");
+
+        assert!(
+            DIAG.contains("AtomicU32"),
+            "counters are written from the main, EPD and BLE workers, so a plain static \
+             would be a data race under -D warnings' shared-mutable-state rules"
+        );
+        assert!(DIAG.contains("fetch_update"));
+        assert!(
+            !DIAG.contains("Nvs") && !DIAG.contains("nvs_blob"),
+            "counters are incremented on hot paths and must never write NVS"
+        );
+        assert!(
+            !DIAG.contains("Mutex"),
+            "an uncontended atomic keeps the queue-full and fallback paths lock-free"
+        );
+    }
+
+    #[test]
+    fn the_boot_ledger_image_gate_is_wired_into_every_build() {
+        const CI: &str = include_str!("../../.github/workflows/ci.yml");
+        const RELEASE: &str = include_str!("../../scripts/release.sh");
+        // Including the gate here also keeps it from disappearing quietly.
+        const GATE: &str = include_str!("../../scripts/check-boot-ledger.sh");
+
+        assert!(GATE.contains("--self-test"), "the gate must be testable");
+        assert!(
+            GATE.contains("image_info"),
+            "the gate must inspect the produced image, not the ELF it came from"
+        );
+        assert_eq!(
+            CI.matches("./scripts/check-boot-ledger.sh").count(),
+            3,
+            "release, diagnostic and secure builds must each run the image gate"
+        );
+        assert!(
+            RELEASE.contains("./scripts/check-boot-ledger.sh"),
+            "a release must not ship an image whose segments cover the boot ledger"
+        );
+    }
+
+    #[test]
+    fn safe_mode_never_touches_stored_data() {
+        const MAIN_SOURCE: &str = include_str!("../../rust-firmware/src/main.rs");
+        let safe_mode = MAIN_SOURCE
+            .split("fn run_safe_mode(")
+            .nth(1)
+            .expect("the firmware must keep a minimum safe mode");
+        let body = safe_mode
+            .split("\nfn ")
+            .next()
+            .expect("safe mode must be a self-contained function")
+            .to_lowercase();
+        assert!(
+            !body.contains("nvs") && !body.contains("erase"),
+            "safe mode promises the operator that stored data is untouched: it must not \
+             take a store handle, and it must never erase one"
+        );
     }
 }

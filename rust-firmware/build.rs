@@ -1,53 +1,34 @@
 fn main() {
     embuild::espidf::sysenv::output();
 
-    // Test-only safe-mode injection: when the build environment sets
-    // INKWASH_FORCE_SAFE_MODE=1, the compiled binary forces the minimum
-    // safe-mode entry on a healthy boot (see main.rs run_safe_mode) so the
-    // safe path is device-verifiable without destroying NVS/RTC. The normal
-    // build (unset) is unaffected. Implemented as a build-time env ->
-    // rustc-env so only the final crate rebuilds (a --cfg via RUSTFLAGS
-    // would invalidate every dependency).
-    // Cargo reruns build.rs when this env toggles, so a normal build (env
-    // unset) reliably drops the flag after a force-safe-mode test build.
     println!("cargo:rerun-if-env-changed=INKWASH_FORCE_SAFE_MODE");
     if std::env::var("INKWASH_FORCE_SAFE_MODE").is_ok_and(|v| v == "1") {
         println!("cargo:rustc-env=INKWASH_FORCE_SAFE_MODE=1");
     }
+    println!("cargo:rerun-if-env-changed=INKWASH_P06_VALIDATE");
+    if std::env::var("INKWASH_P06_VALIDATE").is_ok_and(|v| v == "1") {
+        println!("cargo:rustc-env=INKWASH_P06_VALIDATE=1");
+    }
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    emit_tree_rerun_if_changed(std::path::Path::new("components/zectrix_epd"));
+    emit_tree_rerun_if_changed(std::path::Path::new("components/p06_recorder"));
+    validate_cjk_assets(std::path::Path::new("assets"));
 
-    // Capture build-time epoch seconds so the firmware can seed PCF8563 on
-    // first boot (when the coin cell is missing or drained and the VL bit is
-    // asserted). The build script reruns whenever source files change, so a
-    // rebuild will refresh this value automatically.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    println!("cargo:rustc-env=BUILD_EPOCH_SECS={now}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let build_epoch = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value
+            .parse::<u64>()
+            .unwrap_or_else(|err| panic!("invalid SOURCE_DATE_EPOCH '{value}': {err}")),
+        Err(std::env::VarError::NotPresent) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+        Err(err) => panic!("failed to read SOURCE_DATE_EPOCH: {err}"),
+    };
+    println!("cargo:rustc-env=BUILD_EPOCH_SECS={build_epoch}");
 
-    // Emit rerun-if-changed for the git ref this build's GIT_REV derives
-    // from, so committing on the current branch (which rewrites the branch
-    // file under .git/refs/heads/...) reliably triggers a rebuild of the
-    // crate and a fresh embedded revision. `cargo:rerun-if-changed` on the
-    // whole .git/refs directory is NOT reliable: Cargo does not recursively
-    // watch directory contents, so the build script does not rerun when the
-    // checked-out branch advances and only the branch file changes.
-    //
-    // Resolution order:
-    //   1. .git/HEAD is usually the symbolic ref `ref: refs/heads/<branch>`.
-    //      Emit rerun-if-changed on .git/<ref-path> (the branch file) plus
-    //      .git/HEAD itself.
-    //   2. Detached HEAD: HEAD holds a raw object id; emitting rerun on
-    //      .git/HEAD alone is correct (any checkout rewrites it).
-    //   3. packed-refs: when the resolved ref is not a loose file (e.g. it
-    //      lives in .git/packed-refs), watch .git/packed-refs too.
     emit_git_ref_rerun_if_changed();
 
-    // The ESP-IDF app descriptor's `App version`/`Compile time` (visible in
-    // the boot log) come from a `git describe` cached in esp-idf-sys's CMake
-    // build directory at its first configure and are NOT recomputed on later
-    // `cargo build`s, so this firmware-level GIT_REV is always current:
-    // printed once at boot instead of trusting that field.
     let git_rev = std::process::Command::new("git")
         .args(["describe", "--always", "--dirty", "--tags"])
         .output()
@@ -61,45 +42,118 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-/// Emit `cargo:rerun-if-changed` lines for the git ref(s) that determine
-/// `git describe` output. Paths are relative to the crate directory (where
-/// build.rs runs), hence the leading `../`.
+fn validate_cjk_assets(root: &std::path::Path) {
+    const GRID_CELLS: usize = 94 * 94;
+    const CELL_BYTES_16: usize = 32;
+    const CELL_BYTES_12: usize = 24;
+
+    let index_path = root.join("cjk_index.bin");
+    let font16_path = root.join("hzk16.bin");
+    let font12_path = root.join("hzk12.bin");
+    for path in [&index_path, &font16_path, &font12_path] {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let index = std::fs::read(&index_path)
+        .unwrap_or_else(|err| panic!("failed to read '{}': {err}", index_path.display()));
+    let font16 = std::fs::read(&font16_path)
+        .unwrap_or_else(|err| panic!("failed to read '{}': {err}", font16_path.display()));
+    let font12 = std::fs::read(&font12_path)
+        .unwrap_or_else(|err| panic!("failed to read '{}': {err}", font12_path.display()));
+
+    assert_eq!(
+        index.len() % 4,
+        0,
+        "CJK index length must be a multiple of four bytes"
+    );
+    assert_eq!(
+        font16.len(),
+        GRID_CELLS * CELL_BYTES_16,
+        "16px CJK font has an unexpected length"
+    );
+    assert_eq!(
+        font12.len(),
+        GRID_CELLS * CELL_BYTES_12,
+        "12px CJK font has an unexpected length"
+    );
+
+    let mut previous_codepoint = None;
+    let mut cells = std::collections::HashSet::with_capacity(index.len() / 4);
+    for entry in index.chunks_exact(4) {
+        let codepoint = u16::from_le_bytes([entry[0], entry[1]]);
+        let cell = usize::from(u16::from_le_bytes([entry[2], entry[3]]));
+        if let Some(previous) = previous_codepoint {
+            assert!(
+                codepoint > previous,
+                "CJK index codepoints must be strictly increasing"
+            );
+        }
+        assert!(cell < GRID_CELLS, "CJK index cell {cell} is out of range");
+        assert!(cells.insert(cell), "CJK index cell {cell} is duplicated");
+        previous_codepoint = Some(codepoint);
+    }
+}
+
+fn emit_tree_rerun_if_changed(root: &std::path::Path) {
+    let mut entries = std::fs::read_dir(root)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read native component '{}': {err}",
+                root.display()
+            )
+        })
+        .map(|entry| {
+            entry.unwrap_or_else(|err| {
+                panic!(
+                    "failed to inspect native component '{}': {err}",
+                    root.display()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type().unwrap_or_else(|err| {
+            panic!(
+                "failed to inspect native component '{}': {err}",
+                path.display()
+            )
+        });
+        if file_type.is_dir() {
+            emit_tree_rerun_if_changed(&path);
+        } else if file_type.is_file() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 fn emit_git_ref_rerun_if_changed() {
     let git_dir = std::path::Path::new("../.git");
     let watch = |p: &std::path::Path| {
-        // Cargo only treats existing paths as watchable; missing paths are
-        // ignored silently, so always also watch the directory-less HEAD.
         if p.exists() {
             println!("cargo:rerun-if-changed={}", p.display());
         }
     };
 
-    // HEAD is always watched: detached checkouts and branch switches rewrite
-    // it, and `git describe --dirty` output depends on which commit HEAD
-    // points at even when the ref file is unchanged (e.g. `git reset`).
     watch(&git_dir.join("HEAD"));
 
-    // Resolve the symbolic ref, if HEAD is one.
     if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
         let head = head.trim();
         if let Some(ref_path) = head.strip_prefix("ref: ") {
             let resolved = git_dir.join(ref_path);
             watch(&resolved);
-            // A ref whose loose file is absent lives in packed-refs; watch it
-            // so `git pack-refs` / ref updates that only rewrite the pack
-            // still rerun the build.
+
             if !resolved.exists() {
                 watch(&git_dir.join("packed-refs"));
             }
-            // refs/remotes/*/HEAD can be a symref to another ref; handle one
-            // level of indirection for robustness (rare on the device repo).
+
             if let Ok(content) = std::fs::read_to_string(&resolved) {
                 if let Some(inner) = content.trim().strip_prefix("ref: ") {
                     watch(&git_dir.join(inner));
                 }
             }
-        } else {
-            // Detached HEAD: HEAD itself is the whole story (already watched).
         }
     }
 }

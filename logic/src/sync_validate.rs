@@ -1,10 +1,3 @@
-//! Sync response merge/validation rules, moved out of
-//! `rust-firmware/src/sync.rs` (which re-exports them) so they can be unit
-//! tested on the host: this is the one place a malformed or internally
-//! inconsistent server response is rejected before any NVS blob is
-//! replaced, so its edge cases are worth locking down independently of a
-//! live server.
-
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -14,9 +7,6 @@ use crate::datetime::is_leap;
 use crate::inbox_item::InboxItem;
 use crate::todo::Todo;
 
-/// Sync response body shape, deserialized directly from the server's JSON -
-/// `StoredAlarm`/`Todo` already derive `Deserialize`, so no separate wire
-/// DTO is needed. See `docs/sync-api.md` for the exact contract.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct SyncResponse {
     #[serde(default)]
@@ -31,12 +21,6 @@ pub struct SyncResponse {
     pub inbox_truncated: bool,
 }
 
-/// The dedup-then-validate loop shared by all three sync stores (alarms,
-/// todos, inbox), so a fix to one store's loop can't silently miss the other
-/// two. Rejects the first duplicate id (error names it as `{kind}`) and runs
-/// every item through `validate`, which the caller wraps with per-item
-/// context (e.g. "alarm 7 has invalid repeat: ..."). Items whose only rule
-/// is uniqueness pass `|_| Ok(())`.
 pub fn dedup_validate<T>(
     items: &[T],
     kind: &str,
@@ -54,10 +38,6 @@ pub fn dedup_validate<T>(
     Ok(())
 }
 
-/// Rejects malformed or internally inconsistent server state before any NVS
-/// blob is replaced. Wire DTOs deliberately use plain integers for protocol
-/// compatibility; the firmware must establish their invariants at this
-/// boundary instead of letting invalid dates become array indices or RTC BCD.
 pub fn validate_sync_response(response: &SyncResponse) -> Result<(), String> {
     dedup_validate(
         &response.alarms,
@@ -97,9 +77,6 @@ pub fn validate_sync_response(response: &SyncResponse) -> Result<(), String> {
 
     dedup_validate(&response.inbox, "inbox", |item| item.id, |_| Ok(()))?;
 
-    // Preflight the two fixed-size stores before writing either one. Without
-    // this, an oversized todo response could replace alarms and then fail,
-    // leaving a mixed-generation snapshot behind.
     if serde_json::to_vec(&response.alarms)
         .map_err(|e| e.to_string())?
         .len()
@@ -257,11 +234,11 @@ mod tests {
 
     #[test]
     fn validate_date_rejects_feb_29_on_non_leap_years() {
-        assert!(validate_date(2000, 2, 29).is_ok()); // leap
-        assert!(validate_date(2001, 2, 29).is_err()); // not leap
-        assert!(validate_date(1999, 1, 1).is_err()); // year out of range
-        assert!(validate_date(2100, 1, 1).is_err()); // year out of range
-        assert!(validate_date(2026, 4, 31).is_err()); // April has 30 days
+        assert!(validate_date(2000, 2, 29).is_ok());
+        assert!(validate_date(2001, 2, 29).is_err());
+        assert!(validate_date(1999, 1, 1).is_err());
+        assert!(validate_date(2100, 1, 1).is_err());
+        assert!(validate_date(2026, 4, 31).is_err());
     }
 
     #[test]
@@ -273,7 +250,7 @@ mod tests {
         ];
         let err = dedup_validate(&alarms, "alarm", |a| a.id as u64, |_| Ok(())).unwrap_err();
         assert_eq!(err, "duplicate alarm id 1");
-        // Validation still runs on every item, including after a dup-free prefix.
+
         let err = dedup_validate(
             &[alarm(1, 24, 0, Repeat::Daily)],
             "alarm",
@@ -312,7 +289,7 @@ mod tests {
         ];
         let err = dedup_validate(&todos, "todo", |t| t.id as u64, |_| Ok(())).unwrap_err();
         assert_eq!(err, "duplicate todo id 5");
-        // Per-item validation is reached for items that pass dedup.
+
         let err = dedup_validate(
             &[Todo {
                 id: 7,

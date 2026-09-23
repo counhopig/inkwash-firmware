@@ -4,16 +4,19 @@ mod audio;
 mod audio_task;
 mod ble_control;
 mod board;
+mod boot_ledger;
 mod button;
 mod canvas;
 mod control;
 mod ctx;
+mod diag;
 mod display;
 mod effect_task;
 mod epd_task;
 mod font5x7;
 mod font8x16;
 mod font_cjk;
+mod heap_probe;
 mod home;
 mod icons;
 mod inbox;
@@ -26,6 +29,7 @@ mod rtc_executor;
 mod screens;
 mod storage;
 mod sync;
+mod sync_apply;
 mod sync_task;
 mod tasks;
 mod todos;
@@ -45,32 +49,47 @@ use button::POLL_INTERVAL_MS;
 use ctx::DeviceContext;
 use epd_task::EpdCompletion;
 use inbox::InboxStore;
+use inkwash_logic::boot_store::{
+    resolve, StoreId, DEFAULT_SYNC_INTERVAL_MINUTES, DEFAULT_TIMEZONE_OFFSET_MINUTES,
+};
+use inkwash_logic::diag::DiagCounter;
 use rtc::DateTime;
 use storage::PersistedCounters;
 use todos::TodoStore;
 use usb_console::UsbReplyWriter;
 
-/// Idle-mode poll period: 1 s. Exceeds `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`
-/// (200 ticks = 200 ms at FREERTOS_HZ=1000), so each idle sleep is ~0.8 s of
-/// real light sleep per second.
 const IDLE_POLL_INTERVAL_MS: u64 = 1000;
-/// Quiet time before Home drops from the 20 ms cadence to the idle cadence.
+
 const IDLE_ENTER_AFTER: Duration = Duration::from_millis(2000);
-/// Active-mode PCF8563 re-read period (was 60 × 20 ms).
+
 const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(1200);
-/// Idle-mode PCF8563 re-read period. The visible clock shows HH:MM only
-/// (home.rs), so a 10 s staleness window costs nothing on screen; minute
-/// changes still trigger the clock-region refresh, up to 10 s late. Sync
-/// scheduling, alarm re-arming, and due-todo reminders ride the same read -
-/// 10 s boundary-detection granularity is fine for the :00/:30-aligned
-/// scheduler.
+
 const IDLE_CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+const ALARM_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 const SAFE_MODE_REPLY_CAPACITY: usize = usb_console::REPLY_WRITER_CAPACITY;
 
-/// Epoch seconds captured at firmware build time. Used as the fallback RTC
-/// seed when PCF8563 reports `voltage_low = true` (battery was disconnected
-/// or drained). Captured by `build.rs` so a rebuild refreshes the value;
-/// once the RTC keeps time on its coin cell we stop consulting this.
+/// What the minimum safe mode tells the operator. The recovery hint differs by
+/// cause because the causes do: a boot loop ends with any plain reset, while an
+/// unreadable store stays unreadable until the stored data is replaced, so
+/// telling that operator to "reset to retry" would send them in circles.
+#[derive(Clone, Copy)]
+struct SafeModePanel {
+    headline: &'static str,
+    recovery: &'static str,
+}
+
+const SAFE_MODE_CORE: SafeModePanel = SafeModePanel {
+    headline: "CORE DATA UNAVAILABLE",
+    recovery: "ERASE NVS VIA USB TO RECOVER",
+};
+
+const SAFE_MODE_LOOP: SafeModePanel = SafeModePanel {
+    headline: "BOOT LOOP DETECTED",
+    recovery: "RESET OR POWER CYCLE TO RETRY",
+};
+
 const BUILD_EPOCH_SECS: u64 = build_epoch_secs();
 
 const fn build_epoch_secs() -> u64 {
@@ -92,47 +111,85 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    let reset_reason = unsafe { esp_idf_svc::sys::esp_reset_reason() };
+    let reset_kind = boot_ledger::reset_kind(reset_reason);
+    let ledger = boot_ledger::note_attempt(reset_kind);
+    log::info!("Reset reason: {} ({reset_reason})", reset_kind.label());
+    if ledger.failures() > 0 {
+        log::warn!(
+            "Boot ledger: {} consecutive failed boots before this attempt",
+            ledger.failures()
+        );
+    }
     log::info!(
         "Inkwash NOTE4 Rust bring-up starting (git {})",
         env!("GIT_REV")
     );
+    #[cfg(all(
+        feature = "p06_diag",
+        not(feature = "p06_validate"),
+        not(feature = "p06_validate_core1")
+    ))]
+    unsafe {
+        unsafe extern "C" {
+            fn p06_arm() -> u32;
+        }
+        let mask = p06_arm();
+        log::warn!("p06 diag: recorder arm mask={mask:#x} (no artificial trigger)");
+    }
+    #[cfg(feature = "p06_validate")]
+    unsafe {
+        unsafe extern "C" {
+            fn p06_arm() -> u32;
+            fn p06_v2_trigger();
+            fn p06_v3_trigger2();
+        }
+        let mask = p06_arm();
+        assert_eq!(mask, 0x3, "p06 recorder did not arm and verify both cores");
+        log::warn!("p06 validation: recorder armed; triggering V2 fault now");
+        p06_v2_trigger();
+        p06_v3_trigger2(); /* V3：首录 DONE 之后的第二次故障（仅一次） */
+    }
+    #[cfg(all(feature = "p06_validate_core1", not(feature = "p06_validate")))]
+    unsafe {
+        unsafe extern "C" {
+            fn p06_arm() -> u32;
+            fn p06_v2_trigger_core1();
+        }
+        let mask = p06_arm();
+        assert_eq!(mask, 0x3, "p06 recorder did not arm and verify both cores");
+        log::warn!("p06 validation: recorder armed; triggering core 1 V2 fault now");
+        p06_v2_trigger_core1();
+    }
+    heap_probe::register_current_task(heap_probe::SLOT_MAIN);
     if let Err(err) = watchdog::subscribe() {
         log::warn!("Task watchdog subscribe failed: {err}");
     }
     power::log_wakeup_cause();
     let mut board = Note4Board::take()?;
     log::info!("Power latch is high; rendering home screen");
-    // Start USB diagnostics before core RTC/NVS probes so failures can enter
-    // the existing safe-mode loop.
+
     let mut usb_console = usb_console::UsbConsole::start();
     let mut usb_reply_writer = UsbReplyWriter::start()?;
-    // The RTC executor owns the sole Pcf8563 driver (see rtc_executor.rs).
-    // Spawned right after board bring-up from the shared I2C bus; every RTC
-    // read/write below goes through this client handle, never `board.rtc`
-    // (which no longer exists).
+
     let rtc = match rtc_executor::RtcExecutor::spawn(board.i2c_bus.clone()) {
         Ok(rtc) => rtc,
         Err(err) => run_safe_mode(
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("RTC executor start failed: {err}"),
         ),
     };
 
-    // Taken once and cloned into each store: `EspDefaultNvsPartition::take()`
-    // is a true singleton (a global taken-flag, not a ref-counted "take a
-    // new handle" call) and errors with `ESP_ERR_INVALID_STATE` if called
-    // again while an earlier handle is still alive - three independent
-    // `open()`s each calling `take()` themselves made every boot fail here
-    // once `alarms.rs`/`todos.rs` were added, since `counters`'s handle was
-    // still alive when `AlarmStore::open()` tried to take its own.
     let nvs_partition = match esp_idf_svc::nvs::EspDefaultNvsPartition::take() {
         Ok(partition) => partition,
         Err(err) => run_safe_mode(
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("NVS partition init failed: {err}"),
         ),
     };
@@ -142,6 +199,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Counters NVS open failed: {err}"),
         ),
     };
@@ -151,6 +209,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Alarm NVS open failed: {err}"),
         ),
     };
@@ -160,11 +219,11 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Todo NVS open failed: {err}"),
         ),
     };
-    // The sync task gets its own clone and opens its own store handles on
-    // the same partition (`EspNvs` is Send but not Sync - see sync_task.rs).
+
     let sync_partition = nvs_partition.clone();
     let effect_partition = nvs_partition.clone();
     let inbox_store = match InboxStore::open(nvs_partition) {
@@ -173,15 +232,47 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Inbox NVS open failed: {err}"),
         ),
     };
+    match sync_apply::recover(&counters, &alarm_store, &todo_store, &inbox_store) {
+        Ok(true) => log::warn!("Recovered an interrupted synchronized-state commit"),
+        Ok(false) => {}
+        Err(err) => run_safe_mode(
+            &mut board,
+            &mut usb_console,
+            &mut usb_reply_writer,
+            SAFE_MODE_CORE,
+            &format!("Synchronized-state recovery failed: {err}"),
+        ),
+    }
+    let boot_stores = match read_boot_stores(&counters, &alarm_store, &todo_store, &inbox_store) {
+        Ok(stores) => stores,
+        Err(fault) => run_safe_mode(
+            &mut board,
+            &mut usb_console,
+            &mut usb_reply_writer,
+            SAFE_MODE_CORE,
+            &fault.reason(),
+        ),
+    };
+    if ledger.exhausted() {
+        run_safe_mode(
+            &mut board,
+            &mut usb_console,
+            &mut usb_reply_writer,
+            SAFE_MODE_LOOP,
+            &ledger.reason(),
+        );
+    }
     let effect_counters = match PersistedCounters::open(effect_partition.clone()) {
         Ok(store) => store,
         Err(err) => run_safe_mode(
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Effect counters NVS open failed: {err}"),
         ),
     };
@@ -191,6 +282,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Effect alarm NVS open failed: {err}"),
         ),
     };
@@ -200,6 +292,7 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Effect todo NVS open failed: {err}"),
         ),
     };
@@ -209,14 +302,11 @@ fn main() -> Result<()> {
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             &format!("Effect inbox NVS open failed: {err}"),
         ),
     };
 
-    // Wi-Fi/NTP resync is needed only when the battery-backed RTC cannot be
-    // trusted. A firmware flash or ordinary reset does not erase PCF8563
-    // time, so connecting on every reset merely consumes the one safe Wi-Fi
-    // session and forces the first user-triggered Sync Now to reboot.
     let mut needs_wifi_sync = false;
     let mut core_failure: Option<String> = None;
     let mut clock = match rtc.read_time() {
@@ -234,21 +324,14 @@ fn main() -> Result<()> {
             if dt.voltage_low {
                 log::warn!("PCF8563 VL set (RTC battery low/lost); reseeding from build time");
                 needs_wifi_sync = true;
-                let offset = counters.timezone_offset_minutes().unwrap_or(0);
-                let seeded = DateTime::from_unix(BUILD_EPOCH_SECS).shifted_minutes(offset as i32);
+                let seeded = DateTime::from_unix(BUILD_EPOCH_SECS)
+                    .shifted_minutes(boot_stores.timezone_offset_minutes as i32);
                 if let Err(err) = rtc.write_time(&seeded) {
                     log::warn!("PCF8563 reseed failed: {err}");
                     core_failure = Some(format!("PCF8563 reseed failed: {err}"));
                 } else {
                     dt = seeded;
-                    // The clock just jumped to an approximate build-time
-                    // value, not a confirmed-correct one - drop any stale
-                    // "last aligned" marker from before this reseed so
-                    // `sync::maybe_align_rtc` doesn't see a marker that's
-                    // now later than the reseeded clock and (before this
-                    // fix, permanently) skip every future NTP alignment
-                    // attempt. See its doc comment for the hardware case
-                    // this was found from.
+
                     if let Err(err) = counters.clear_rtc_align_epoch() {
                         log::warn!("Failed to clear stale RTC alignment marker: {err}");
                     }
@@ -263,59 +346,33 @@ fn main() -> Result<()> {
         }
     };
 
-    // Probe the core BootSnapshot facts before any network, BLE, or effect
-    // task exists. A failure enters safe mode while only the diagnostic
-    // resources are alive; the successful facts are reused below so the
-    // normal boot path never performs a second core read after task startup.
-    let boot_core = match collect_boot_core_facts(&rtc, &alarm_store, clock, core_failure) {
+    let boot_core = match collect_boot_core_facts(&rtc, clock, core_failure) {
         Ok(facts) => facts,
         Err(reason) => {
-            run_safe_mode(&mut board, &mut usb_console, &mut usb_reply_writer, &reason);
+            run_safe_mode(
+                &mut board,
+                &mut usb_console,
+                &mut usb_reply_writer,
+                SAFE_MODE_CORE,
+                &reason,
+            );
         }
     };
-    // Injectable test hook (see build.rs): a binary built with
-    // INKWASH_FORCE_SAFE_MODE=1 forces the safe-mode entry on a healthy boot
-    // without destroying NVS/RTC. The normal build never sets it.
+
     if option_env!("INKWASH_FORCE_SAFE_MODE").is_some_and(|v| v == "1") {
         run_safe_mode(
             &mut board,
             &mut usb_console,
             &mut usb_reply_writer,
+            SAFE_MODE_CORE,
             "forced by INKWASH_FORCE_SAFE_MODE=1 (test hook)",
         );
     }
-
-    // Ring before the normal boot render, if this boot is the RTC alarm
-    // firing: latency to sound matters more than latency to the home
-    // screen. `power::wake_cause()` reads `esp_sleep_get_wakeup_cause`
-    // again (harmless, not a consuming read); unlike the raw cause logged
-    // above, this distinguishes ENTER-wake from alarm-wake.
-    // AppRunner is the sole alarm owner from step 2 onwards. The previous
-    // `alarms::handle_fired_alarm` boot ring and `ring_screen` are gone:
-    // AppRunner dispatches the BootSnapshot (with the raw AF/AIE facts
-    // captured after `Note4Board::take`, which no longer pre-clears them),
-    // the state machine decides whether to ring (Screen::AlarmRinging), and
-    // the executor renders the ring frame + starts the tone through the
-    // audio task. The wake-cause flag is captured for the deep-sleep wake
-    // path; the ringing comes entirely from the state machine.
-    // Keep the PCF8563's single hardware alarm slot pointed at whichever
-    // stored alarm is nearest, every boot: after arming/editing an alarm,
-    // The RTC alarm register is *not* reprogrammed here: doing so would
-    // touch AF/AIE before AppRunner gets to see them and break the
-    // state-machine-only alarm ownership. AppRunner's first dispatch
-    // (Event::Boot) consumes the alarm list collected in the boot snapshot,
-    // decides whether to arm the RTC and emits ProgramRtcAlarm /
-    // DisableRtcAlarm. Once that batch runs the RTC register matches the
-    // stored list.
 
     if board.nfc.is_none() {
         log::warn!("NFC not available");
     }
 
-    // The audio task owns the process's one ES8311 codec; every tone (alarm
-    // ring, reminders) goes through its command channel so the main loop
-    // never blocks on a tone. A missing codec degrades to silence; the
-    // state machine's StartTone effect reports the failure cleanly.
     let audio_handle = match audio_task::AudioTask::spawn(board.take_audio())? {
         audio_task::AudioSpawn::Running(handle) => {
             log::info!("Audio task spawned");
@@ -329,35 +386,17 @@ fn main() -> Result<()> {
 
     report_power_state(&mut board)?;
 
-    // Taken once up front (it's a singleton) so both the boot-time Wi-Fi
-    // bring-up below and the on-device Wi-Fi setup wizard (triggered from
-    // the main loop by holding UP, or from the menu) can use it.
     let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
 
-    // Also created exactly once and reused for the rest of the program -
-    // see `wifi::WifiManager`'s doc comment for why: a second
-    // `EspWifi::new()` anywhere in the process reliably crashes
-    // (`Guru Meditation Error: InstrFetchProhibited`), confirmed on real
-    // hardware, so every Wi-Fi user (boot-time sync below, the setup
-    // wizard, `sync::sync_now`) shares this one instance instead of each
-    // creating and dropping its own.
     let mut wifi_mgr = wifi::WifiManager::new(&sysloop)?;
 
-    // Optional Wi-Fi bring-up: connect with credentials stored in NVS
-    // (`wifi_ssid` / `wifi_pass`), then sync the clock over NTP and push the
-    // time into the PCF8563 so it keeps ticking while the device sleeps.
-    // Failure to connect or sync only logs a warning; the rest of the UI
-    // keeps working regardless. A healthy battery-backed RTC needs no boot
-    // network traffic; periodic auto-sync (see the main loop below) brings
-    // Wi-Fi up on its own schedule, and multiple connects per boot are safe
-    // (see `wifi::WifiManager`).
     if !needs_wifi_sync {
         log::info!("RTC is healthy; skipping boot-time Wi-Fi/NTP resync");
     } else {
-        match counters.wifi_creds() {
-            Ok(Some(creds)) => match wifi_mgr.connect(&creds) {
+        match boot_stores.wifi_creds.as_ref() {
+            Some(creds) => match wifi_mgr.connect(creds) {
                 Ok(()) => {
-                    let timezone_offset = counters.timezone_offset_minutes().unwrap_or(0);
+                    let timezone_offset = boot_stores.timezone_offset_minutes;
                     match wifi::ntp_sync_and_set_rtc(&rtc, timezone_offset) {
                         Ok(()) => match rtc.read_time() {
                             Ok(dt) => clock = Some(dt),
@@ -371,31 +410,21 @@ fn main() -> Result<()> {
                 }
                 Err(err) => log::warn!("Wi-Fi connect failed: {err}"),
             },
-            Ok(None) => {
+            None => {
                 log::info!(
                     "No Wi-Fi credentials in NVS; skipping connect (see scripts/gen-nvs-wifi.py)"
                 );
             }
-            Err(err) => log::warn!("Could not read Wi-Fi credentials from NVS: {err}"),
         }
     };
 
-    // All BootSnapshot facts are collected before runtime tasks are created.
-    // The core RTC/alarm facts were probed above; this pass only gathers the
-    // remaining local state and never repeats the core reads.
-    let boot_result = collect_boot_snapshot(boot_core, &counters, &todo_store, &inbox_store, clock);
     let scheduler_config = inkwash_logic::app::SyncSchedulerConfig {
         now_unix: clock.map(|now| now.to_unix()).unwrap_or(0),
-        interval_minutes: counters.sync_interval_minutes().unwrap_or(60),
-        last_sync_epoch: counters.last_sync_epoch().unwrap_or(None),
+        interval_minutes: boot_stores.sync_interval_minutes,
+        last_sync_epoch: boot_stores.last_sync_epoch,
     };
+    let boot_result = collect_boot_snapshot(boot_core, boot_stores, clock);
 
-    // Move the process's one WifiManager into the dedicated sync task:
-    // every Wi-Fi operation from here on - scheduled
-    // syncs, the Sync Now menu, USB/BLE SetWifi/SyncNow - runs off the
-    // main loop, so a slow HTTPS round-trip never blocks buttons, USB, or
-    // the display. The main loop talks to it through the command/reply
-    // channels in `DeviceContext`.
     let sync_task = sync_task::SyncTask::spawn(sync_partition, wifi_mgr)?;
 
     let effect_task = effect_task::EffectTask::spawn(effect_task::EffectDrivers {
@@ -406,19 +435,10 @@ fn main() -> Result<()> {
         rtc: rtc.clone(),
     })?;
 
-    // The BLE worker owns NimBLE and is idle until the state machine enters
-    // pairing. Its handle stays in the main context so callbacks and replies
-    // remain serviceable while start/stop run asynchronously off-thread.
     let mut ble_control = ble_control::BleControl::spawn()?;
 
-    // AppRunner shared handle: the state machine is the sole alarm
-    // business owner. Wrapped in Rc<RefCell<>> so collection paths (which
-    // run via DeviceContext::poll_background)
-    // can dispatch RtcAlarmSnapshotReady through the same instance.
     let app_runner = std::rc::Rc::new(std::cell::RefCell::new(app_runner::AppRunner::new()));
 
-    // Bundle the long-lived state into one context, then run the main loop
-    // through it instead of threading board/stores/wifi individually.
     let mut ctx = DeviceContext {
         board: &mut board,
         rtc: &rtc,
@@ -460,9 +480,6 @@ fn main() -> Result<()> {
         pending_sleep_kick: None,
         prepared_wake_plan: None,
         alarm_poll: inkwash_logic::alarm_flow::AlarmPoll::new(),
-        pending_alarm_status: None,
-        pending_alarm_snapshot: None,
-        pending_clock_read: None,
         effect_task: &effect_task,
         pending_effect_batch: None,
         pending_effect_batches: std::collections::VecDeque::new(),
@@ -477,65 +494,34 @@ fn main() -> Result<()> {
             ctx::USB_REPLY_PENDING_CAPACITY,
         ),
         pending_usb_reply_latch: None,
-        // Runtime collection is enabled only after the pre-task boot facts
-        // pass their core checks; keep this defensive guard in lockstep.
+
         app_runner_enabled: true,
     };
-    // Keep USB command handling usable on boards where the connection probe
-    // is conservative and reports false even though a frame arrives.
+
     ctx.command_sessions
         .begin(control::Channel::Usb, ctx.usb_session_id);
 
-    // AppRunner: bridge between the host-testable state machine in
-    // inkwash_logic::app and the existing drivers. The boot snapshot is
-    // dispatched as the first event in the loop (boot_dispatched flag);
-    // the runner receives boot, minute-tick, and RTC AF facts from the
-    // collection loop and owns their business transitions.
     app_runner.borrow_mut().set_last_clock(clock);
     let mut boot_dispatched = false;
     let mut boot_result = Some(boot_result);
     let mut scheduler_config = Some(scheduler_config);
-    // True when AppRunner may process runtime events. Set false when the
-    // BootSnapshot reports a core fact failure, meaning the state machine
-    // has no trustworthy alarm/NVS/config data and must NOT interpret any
-    // AF / Tick event. This prevents dispatch on a default AppState that
-    // would otherwise treat a real alarm as residue and ACK it off.
-    // Always true on the surviving path: a core boot-fact failure diverges
-    // into `run_safe_mode` (which never returns) before this is consulted.
+
     let app_runner_enabled = true;
 
-    // Two-level polling cadence: while the user
-    // interacts - a key is raw-low, a command arrived, a refresh is
-    // pending - the loop runs at POLL_INTERVAL_MS so the poll-based
-    // debounce/long-press timing stays exactly as before. Once the device
-    // has been quiet for IDLE_ENTER_AFTER, the loop drops to the idle
-    // cadence: the 1 s sleep exceeds CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP
-    // (200 ticks), so automatic light sleep engages for ~0.8 s of every
-    // idle second. Keys wake light sleep directly (GPIO wakeup, power.rs);
-    // a raw-low key flips the loop back to the 20 ms cadence so the
-    // debounce keeps its 4-sample timing, and the RTC alarm line
-    // (`board.rtc_int`) runs the alarm path immediately after an ext1 wake.
-    //
-    // Cron-style wall-clock alignment: sync decisions fire when the
-    // boundary index *advances*, not when a boot-relative timer elapses -
-    // so "every 30s" means at :00/:30 of each minute and "every 1h" means
-    // at the top of the hour. Initialized to the boot-time boundary so the
-    // first aligned boundary after boot fires (and a never-synced device
-    // syncs on its first urgent-poll boundary).
     let mut idle = false;
     let mut light_sleep_enabled = false;
     let power_ticks_origin = Instant::now();
     let mut last_activity = Instant::now();
     let mut status_last = Instant::now();
+    let mut last_diag = diag::snapshot();
+    let mut stack_last = Instant::now();
     let mut clock_last = Instant::now();
-    let mut usb_host_was_connected = false;
-    // In-flight AppRunner renders, tracked in FIFO order so the next
-    // EPD completion matches the next in-flight render. The state
-    // machine ignores out-of-order generations so a stale completion
-    // is harmless.
-    // Unified in-flight render registry, shared with DeviceContext so all
-    // collection paths register their kicks for the EPD completion match.
-    // (ctx.pending_renders owns it; we clone the Rc handle.)
+    let mut alarm_status_last = Instant::now()
+        .checked_sub(ALARM_STATUS_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut usb_host_was_connected = true;
+    let mut usb_disconnect_since: Option<Instant> = None;
+
     loop {
         watchdog::feed();
         service_effect_task(&app_runner, &mut ctx)?;
@@ -556,44 +542,37 @@ fn main() -> Result<()> {
                 &app_runner,
                 inkwash_logic::app::Event::SyncSchedulerConfigured(scheduler_config),
                 &mut ctx,
-            )?
-            // Boot alarm needs no special casing: the SM entered
-            // Screen::AlarmRinging from the Boot dispatch (same transition
-            // as a runtime RtcAlarmSnapshotReady), the executor rendered the
-            // ring frame and started the tone through the audio task; ENTER
-            // presses flow through the normal button poll below and dismiss
-            // via the SM's dismiss_ringing.
+            )?;
+            boot_ledger::clear();
+            log::info!("Boot ledger cleared: core initialization completed");
         }
         let now = Instant::now();
 
-        // Power status once per second, unchanged cadence (it gates the
-        // charge-status debounce tick).
+        if now.duration_since(stack_last) >= Duration::from_secs(10) {
+            stack_last = now;
+            heap_probe::log_registered_stacks("periodic");
+        }
         if now.duration_since(status_last) >= Duration::from_secs(1) {
             status_last = now;
             if let Err(err) = report_power_state(ctx.board) {
                 log::warn!("Power status probe failed: {err}");
             }
+            let snapshot = diag::snapshot();
+            if let Some(line) = inkwash_logic::diag::render_delta(&last_diag, &snapshot) {
+                log::warn!("Diagnostics: {line}");
+            }
+            last_diag = snapshot;
         }
 
-        // PCF8563 re-read: 1.2 s active, 10 s idle (see
-        // IDLE_CLOCK_POLL_INTERVAL). Minute changes drive the clock-region
-        // refresh; sync scheduling, alarm re-arming, and due-todo
-        // reminders ride the same read.
         let clock_interval = if idle {
             IDLE_CLOCK_POLL_INTERVAL
         } else {
             CLOCK_POLL_INTERVAL
         };
-        if ctx.pending_clock_read.is_none() && now.duration_since(clock_last) >= clock_interval {
+        if now.duration_since(clock_last) >= clock_interval {
             clock_last = now;
-            match ctx.rtc.request_read_time() {
-                Ok(reply) => ctx.pending_clock_read = Some(reply),
-                Err(err) => log::warn!("RTC read_time request failed: {err}"),
-            }
-        }
-        if let Some(reply) = ctx.pending_clock_read.take() {
-            match reply.try_recv() {
-                Ok(Ok(dt)) => {
+            match ctx.rtc.read_time() {
+                Ok(dt) => {
                     let changed = clock
                         .as_ref()
                         .map(|prev| {
@@ -608,76 +587,45 @@ fn main() -> Result<()> {
                         clock = Some(dt);
                         app_runner.borrow_mut().set_last_clock(clock);
                     }
-                    // Runtime Tick is fed on every RTC sample so the state
-                    // machine can observe the 30-second urgent boundary;
-                    // its render path still refreshes only on visible minute
-                    // changes.
+
                     dispatch_or_retain(&app_runner, inkwash_logic::app::Event::Tick(dt), &mut ctx)
                         .map(|_| ())?
                 }
-                Ok(Err(err)) => log::warn!("PCF8563 read_time failed: {err}"),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.pending_clock_read = Some(reply);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    log::warn!("RTC read_time executor disconnected");
-                }
+                Err(err) => log::warn!("PCF8563 read_time failed: {err}"),
             }
         }
 
-        // AppRunner is the sole alarm owner from step 2 onwards. The
-        // low -> high AF edge is resolved by the *shared* `AlarmPoll`
-        // orchestration (the same code `DeviceContext::poll_alarm_snapshot`
-        // runs for every collection path): AF edge -> consistent snapshot ->
-        // dispatch `RtcAlarmSnapshotReady`. The SM enters
-        // Screen::AlarmRinging (non-blocking), the executor renders the
-        // ring + starts the audio-task tone; ENTER / the ring-deadline Tick
-        // dismiss through the SM. `main` consumes the exit flag below; the
-        // edge / retry / firing semantics are identical at boot and runtime.
-        if ctx.poll_alarm_snapshot()? {
-            // The SM owns the ring's Full renders (enter + dismiss); nothing
-            // here needs a caller-side dirty-path suppression anymore.
-            // Home is the root page: the sticky exit flag exists to let
-            // *nested* pages unwind layer by layer. Here we are already
-            // at Home, so the flag must be consumed immediately -
-            // otherwise the next Navigation/Settings entry would see a
-            // historical alarm as its own exit reason and return at once
-            // (round-22 P1). Blocking-page / reminder paths keep the
-            // flag set for their caller chains and main consumes it when
-            // they return (see the open_navigation handlers). The
-            // consume-for-source policy is the shared production code the
-            // host harness drives.
-            let _ = ctx
-                .alarm_poll
-                .consume_for(inkwash_logic::alarm_flow::AlarmSource::Home);
+        if now.duration_since(alarm_status_last) >= ALARM_STATUS_POLL_INTERVAL {
+            alarm_status_last = now;
+            if ctx.poll_alarm_snapshot()? {
+                let _ = ctx
+                    .alarm_poll
+                    .consume_for(inkwash_logic::alarm_flow::AlarmSource::Home);
+            }
         }
-        // USB command deduplication is scoped to a host connection. The
-        // Serial/JTAG connection probe is the platform's available
-        // connection fact; use its edges to create/end command sessions.
+
         let usb_host_connected = power::usb_host_connected();
-        if usb_host_connected && !usb_host_was_connected {
-            ctx.command_sessions
-                .end(control::Channel::Usb, ctx.usb_session_id);
-            ctx.usb_session_id = ctx.usb_session_id.wrapping_add(1).max(1);
-            ctx.command_sessions
-                .begin(control::Channel::Usb, ctx.usb_session_id);
-            ctx.drop_stale_usb_replies();
-        } else if !usb_host_connected && usb_host_was_connected {
-            ctx.command_sessions
-                .end(control::Channel::Usb, ctx.usb_session_id);
-            ctx.usb_session_id = ctx.usb_session_id.wrapping_add(1).max(1);
-            ctx.drop_stale_usb_replies();
+        if usb_host_connected {
+            usb_disconnect_since = None;
+            if !usb_host_was_connected {
+                ctx.command_sessions
+                    .begin(control::Channel::Usb, ctx.usb_session_id);
+                usb_host_was_connected = true;
+            }
+        } else if usb_host_was_connected {
+            let disconnected_at = usb_disconnect_since.get_or_insert(now);
+            if now.duration_since(*disconnected_at) >= Duration::from_secs(10) {
+                ctx.command_sessions
+                    .end(control::Channel::Usb, ctx.usb_session_id);
+                ctx.usb_session_id = ctx.usb_session_id.wrapping_add(1).max(1);
+                ctx.drop_stale_usb_replies();
+                usb_host_was_connected = false;
+                usb_disconnect_since = None;
+            }
         }
-        usb_host_was_connected = usb_host_connected;
-        // Poll USB console for incoming commands, dispatch them, and send replies.
-        // Stage 5: the redraw is NOT pushed here - state-changing commands
-        // (ClearAlarms / SetWifi / SetTimezone / SyncNow) emit their own
-        // render from the state machine at the point the visible state
-        // changes; the renderer diff decides Noop vs refresh.
+
         let (_usb_changed, usb_activity) = ctx.poll_usb_control(clock.as_ref())?;
 
-        // Poll BLE worker results, lifecycle facts, and incoming commands;
-        // every operation is non-blocking on the main loop.
         while let Some((session_id, message)) = ctx.take_ble_start_failure() {
             let current_session = inkwash_logic::app::ble_pairing_session_matches(
                 &app_runner.borrow().state().screen,
@@ -690,12 +638,9 @@ fn main() -> Result<()> {
                 dispatch_or_retain(&app_runner, event, &mut ctx)?;
             }
         }
-        // Lifecycle is reduced before worker results so a disconnect cannot
-        // turn a late notify callback into a delivery for the old connection.
+
         let mut ble_changed = poll_ble_lifecycle(&app_runner, &mut ctx)?;
         if let Some((_reply_id, result)) = ctx.pending_ble_pairing_success.take() {
-            // The dispatcher owns the event even when servicing the effect
-            // worker fails. Do not put a second copy back into the BLE slot.
             ctx.pending_ble_set_wifi_ack = None;
             match dispatch_or_retain(
                 &app_runner,
@@ -708,9 +653,13 @@ fn main() -> Result<()> {
         }
         while let Some(result) = ctx.ble_control.poll_result() {
             let (session_id, event) = match result {
-                ble_control::BleTaskResult::Started { session_id } => {
-                    (session_id, inkwash_logic::app::Event::BlePairingStarted)
-                }
+                ble_control::BleTaskResult::Started {
+                    session_id,
+                    passkey,
+                } => (
+                    session_id,
+                    inkwash_logic::app::Event::BlePairingStarted { passkey },
+                ),
                 ble_control::BleTaskResult::Failed {
                     session_id,
                     message,
@@ -781,9 +730,7 @@ fn main() -> Result<()> {
                                 let pairing_result = inkwash_logic::app::BlePairingResult {
                                     name: "Inkwash".into(),
                                 };
-                                // The notify completion has already been
-                                // consumed; the state-machine event below is
-                                // now the sole retry owner.
+
                                 ctx.pending_ble_set_wifi_ack = None;
                                 dispatch_or_retain(
                                     &app_runner,
@@ -803,6 +750,7 @@ fn main() -> Result<()> {
                     conn_handle,
                     reply_id,
                 } => {
+                    diag::record(DiagCounter::BleReplyRetry);
                     log::warn!(
                         "BLE reply {reply_id} notify failed for session {session_id}, generation {generation}, handle {conn_handle}; retry queued"
                     );
@@ -857,6 +805,7 @@ fn main() -> Result<()> {
                     log::warn!(
                         "BLE reply {reply_id} terminated for session {session_id}, generation {generation}, handle {conn_handle}"
                     );
+                    diag::record(DiagCounter::BleReplyDrop);
                     continue;
                 }
             };
@@ -889,9 +838,7 @@ fn main() -> Result<()> {
                 );
                 continue;
             }
-            // A valid frame is activity even when it is a cached replay or a
-            // transport-level Busy response. Those fast paths continue before
-            // the normal command dispatcher, but must still cancel idle sleep.
+
             ble_changed = true;
             if let Some(id_value) = id.as_deref() {
                 let ble_session_id = command_generation;
@@ -916,8 +863,7 @@ fn main() -> Result<()> {
                     continue;
                 }
             }
-            // SetRtc falls through to dispatch_migrated_command (Phase 5:
-            // routed through Effect::WriteRtcTime, not handled directly).
+
             if matches!(cmd, control::Command::SyncNow) && ctx.pending_wifi_op.is_some() {
                 let generation = ctx.ble_connection_generation.unwrap_or(0);
                 deliver_ble_reply(
@@ -991,17 +937,11 @@ fn main() -> Result<()> {
                     reply.clone(),
                 );
                 if is_time_write && matches!(reply, control::Reply::Ok) {
-                    ctx.pending_alarm_status = None;
-                    ctx.pending_alarm_snapshot = None;
-                    ctx.pending_clock_read = None;
-                    ctx.alarm_poll.observe_alarm_flag(false);
+                    ctx.invalidate_rtc_reads_after_time_write();
                 }
             }
         }
 
-        // Retry a previously observed EPD terminal fact before consuming a
-        // newer completion. The registry entry was removed only when the
-        // source fact was matched; this retained envelope owns the retry.
         if let Some(pending) = ctx.pending_render_completion.take() {
             let current_generation = app_runner.borrow().state().render_generation;
             let failed = pending.failure.is_some();
@@ -1028,83 +968,54 @@ fn main() -> Result<()> {
             }
         }
 
-        // EPD completion events: feed each one back to the state machine
-        // as `EffectCompleted(RenderDone)` / `EffectFailed(Render)`. The
-        // shared `pending_renders` registry (reachable from the main loop
-        // and every collection path) pairs each `EpdCompletion` with the
-        // next in-flight render. Out-of-order or extra completions are
-        // absorbed by the state machine, which drops effects whose
-        // render_generation is older than the current visible state.
         while let Some(completion) = ctx.board.display.poll_completion() {
-            // Match by request_id (echoed by the EPD task) instead of
-            // FIFO: the single EPD slot can merge or overwrite requests,
-            // so only the completion whose id matches an in-flight
-            // AppRunner render is fed back. Unregistered dirty-rect / ring /
-            // boot refreshes carry ids with no matching kick and are
-            // observed but not fed back.
-            // The shared `RenderRegistry` implements the per-request
-            // terminal rule; this loop drives it and feeds Completed /
-            // Failed back through the returned kick.
             let outcome = {
                 let mut reg = ctx.pending_renders.borrow_mut();
                 reg.feed(completion.request_id, completion.ok, completion.superseded)
             };
             match outcome {
-                inkwash_logic::epd_registry::FeedOutcome::Matched(kick, terminal) => {
-                    match terminal {
-                        inkwash_logic::epd_registry::RenderTerminal::Superseded => {
-                            // The request was replaced before its command
-                            // ran (EPD latest-wins). It must NOT be
-                            // reported as RenderDone - its pixels never
-                            // reached the panel. The replacement request
-                            // carries its own request_id and will complete
-                            // (or fail) on its own; we simply terminate
-                            // this in-flight entry here.
-                            log::warn!(
-                                "AppRunner render (op {:?}) superseded before panel display",
-                                kick.operation_id
+                inkwash_logic::epd_registry::FeedOutcome::Matched(kick, terminal) => match terminal
+                {
+                    inkwash_logic::epd_registry::RenderTerminal::Superseded => {
+                        log::warn!(
+                            "AppRunner render (op {:?}) superseded before panel display",
+                            kick.operation_id
+                        );
+                    }
+                    terminal => {
+                        let failed =
+                            terminal == inkwash_logic::epd_registry::RenderTerminal::Failed;
+                        let output = inkwash_logic::app::EffectOutput::RenderDone;
+                        let failure = if failed {
+                            Some(inkwash_logic::app::EffectError::Render(format!(
+                                "epd refresh failed: {:?}",
+                                completion.kind
+                            )))
+                        } else {
+                            None
+                        };
+                        let retry = ctx::PendingRenderCompletion {
+                            kick: kick.clone(),
+                            output: output.clone(),
+                            failure: failure.clone(),
+                        };
+                        if let Err(err) =
+                            feed_completion_back(&app_runner, &mut ctx, kick, output, failure)
+                        {
+                            log::warn!("AppRunner EPD completion feed failed: {err}");
+                            break;
+                        } else {
+                            let current_generation = app_runner.borrow().state().render_generation;
+                            app_runner::apply_render_cache_terminal(
+                                &ctx.pending_renders,
+                                &retry.kick,
+                                failed,
+                                current_generation,
                             );
                         }
-                        terminal => {
-                            let failed =
-                                terminal == inkwash_logic::epd_registry::RenderTerminal::Failed;
-                            let output = inkwash_logic::app::EffectOutput::RenderDone;
-                            let failure = if failed {
-                                Some(inkwash_logic::app::EffectError::Render(format!(
-                                    "epd refresh failed: {:?}",
-                                    completion.kind
-                                )))
-                            } else {
-                                None
-                            };
-                            let retry = ctx::PendingRenderCompletion {
-                                kick: kick.clone(),
-                                output: output.clone(),
-                                failure: failure.clone(),
-                            };
-                            if let Err(err) =
-                                feed_completion_back(&app_runner, &mut ctx, kick, output, failure)
-                            {
-                                log::warn!("AppRunner EPD completion feed failed: {err}");
-                                break;
-                            } else {
-                                let current_generation =
-                                    app_runner.borrow().state().render_generation;
-                                app_runner::apply_render_cache_terminal(
-                                    &ctx.pending_renders,
-                                    &retry.kick,
-                                    failed,
-                                    current_generation,
-                                );
-                            }
-                        }
                     }
-                }
-                inkwash_logic::epd_registry::FeedOutcome::Ignored => {
-                    // No matching kick: unregistered dirty-rect / ring / boot
-                    // refresh, or a duplicate for an already-terminated
-                    // request. Observed but not fed back.
-                }
+                },
+                inkwash_logic::epd_registry::FeedOutcome::Ignored => {}
             }
             match completion {
                 EpdCompletion {
@@ -1137,23 +1048,8 @@ fn main() -> Result<()> {
             }
         }
 
-        // Receipts from the sync task (scheduled syncs, deferred
-        // USB/BLE SyncNow/SetWifi replies): applies the RTC re-arm, NTP
-        // alignment, and transport replies. Stage 5: the redraw is NOT
-        // decided here - poll_wifi_ops feeds the completion into the state
-        // machine (which owns the merged-data apply + transport reply and
-        // emits a render whose ViewModel diff decides Noop vs refresh), so
-        // an unchanged sync costs no panel refresh and a changed list
-        // repaints exactly what shows it.
         ctx.poll_wifi_ops()?;
 
-        // The main loop hosts the state-machine screens: every screen (Home,
-        // Navigation drawer, Settings, AlarmList, ... ) owns the buttons, and
-        // every debounced button event is fed to the state machine as
-        // Event::Button through the single dispatch_app_runner pump. The SM
-        // owns what the keys mean there and renders its own screen changes as
-        // Effect::Render kicks. No parallel render wedges remain (the SM-disabled nav
-        // loop and the blocking BLE-pairing wedge were deleted in P1#3/P1#4).
         let mut key_changed = false;
         {
             let enter_event = ctx.board.key_enter.poll();
@@ -1169,24 +1065,13 @@ fn main() -> Result<()> {
             }
         }
 
-        // Idle/active selection: input, a dispatched command, or a display
-        // refresh counts as activity; a raw-low key forces the 20 ms
-        // cadence so the polled debounce keeps its 4-sample timing after a
-        // GPIO wake (the wake resumes the loop mid-idle-sleep).
         let any_key_pressed = ctx.board.key_enter.is_raw_pressed()
             || ctx.board.key_up.is_raw_pressed()
             || ctx.board.key_down.is_raw_pressed();
-        // Any USB frame counts as user activity (idle is "no button, no
-        // USB frame", not just visible
-        // changes): GetStatus polls from the desktop tool must not let the
-        // device drift into deep sleep mid-session.
+
         let user_activity = usb_activity || ble_changed || key_changed || any_key_pressed;
         let interacted = user_activity;
 
-        // Resolve a platform sleep handshake only after this full polling
-        // turn has observed input, transports, EPD completions and worker
-        // receipts. Prepare success is represented by the retained kick;
-        // commit gets a fresh mechanical snapshot and can still cancel.
         if let Some(kick) = ctx.pending_sleep_kick.take() {
             let event = match &kick.effect {
                 inkwash_logic::app::Effect::PrepareSleep { token, .. } => {
@@ -1227,28 +1112,19 @@ fn main() -> Result<()> {
                     return Err(err);
                 }
             };
-            // Only clear the platform wake-plan after the runtime queue has
-            // no pending copy and the fact has therefore reached the reducer.
+
             let fact_reduced = ctx.pending_app_events.is_empty()
                 && ctx.pending_dispatch_event.is_none()
                 && ctx.pending_dispatch_sources.is_empty()
                 && !runner.borrow().has_work();
-            if dispatched && fact_reduced {
-                if committed_or_cancelled {
-                    ctx.prepared_wake_plan = None;
-                } else if prepare_fact && ctx.pending_sleep_kick.is_none() {
-                    // Prepare's business gates rejected the platform fact,
-                    // so do not retain a wake plan for a token that was
-                    // cleared.
-                    ctx.prepared_wake_plan = None;
-                }
+            if dispatched
+                && fact_reduced
+                && (committed_or_cancelled || (prepare_fact && ctx.pending_sleep_kick.is_none()))
+            {
+                ctx.prepared_wake_plan = None;
             }
         }
 
-        // Feed the state machine's sole sleep admission path after all input
-        // and transport facts for this iteration have been collected. The
-        // state machine owns the idle thresholds and page/business gates;
-        // this poll carries only mechanical facts from the platform loop.
         if app_runner_enabled {
             let power_poll = inkwash_logic::app::PowerPoll {
                 now_ticks: now.duration_since(power_ticks_origin).as_millis() as u64,
@@ -1261,6 +1137,7 @@ fn main() -> Result<()> {
                     || ctx.worker_batch_in_flight
                     || ctx.pending_effect_notices.is_some(),
                 usb_connected: usb_host_connected,
+
                 event_queue_empty: !app_runner.borrow().has_work()
                     && ctx.pending_effect_batch.is_none()
                     && ctx.pending_effect_batches.is_empty()
@@ -1273,17 +1150,13 @@ fn main() -> Result<()> {
                     && ctx.pending_ble_replies.is_empty()
                     && ctx.pending_ble_deliveries.is_empty()
                     && ctx.pending_ble_handoff.is_none()
-                    && ctx.pending_alarm_status.is_none()
-                    && ctx.pending_alarm_snapshot.is_none()
-                    && ctx.pending_clock_read.is_none()
                     && ctx.pending_sleep_kick.is_none()
                     && ctx.pending_app_events.is_empty()
                     && ctx.pending_dispatch_event.is_none()
                     && ctx.pending_dispatch_sources.is_empty(),
                 input_latch_clear: !any_key_pressed,
                 wake_plan_confirmed: false,
-                // The current sync worker has no resumable light-sleep
-                // checkpoint; keep this false even while a request exists.
+
                 network_resumable: false,
                 light_wake_after_ms: IDLE_POLL_INTERVAL_MS,
             };
@@ -1297,14 +1170,8 @@ fn main() -> Result<()> {
             && app_runner.borrow().state().sleep.committed_kind()
                 == Some(inkwash_logic::power_state::SleepKind::Light);
         if light_sleep_committed && !light_sleep_enabled {
-            // `EnterLightSleep` is executed by the state-machine effect
-            // runner when SleepCommitted is reduced. The committed token is
-            // therefore the acknowledgement that the single platform path
-            // succeeded; do not configure PM a second time here.
             light_sleep_enabled = true;
         } else if !light_sleep_committed && light_sleep_enabled {
-            // The state machine emits DisableLightSleep for this transition;
-            // the effect runner owns the platform call.
             light_sleep_enabled = false;
         }
         if interacted || any_key_pressed {
@@ -1314,24 +1181,7 @@ fn main() -> Result<()> {
             idle = true;
         }
 
-        // A connected USB host is an active debugging/control session even
-        // when it is only reading logs and sends no command frames. IDF's
-        // CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION lock keeps automatic light
-        // sleep from breaking the USB peripheral; the state machine applies
-        // the matching deep-sleep guard through `SleepBlocker::UsbConnected`
-        // (`PowerPoll.usb_connected`), so no timer bookkeeping is needed here.
-
-        // Sleep entry is emitted only by the application state machine after
-        // PowerPoll -> prepare -> final mechanical commit. The loop below is
-        // only the wakeable idle wait used by the committed light-sleep tier.
-
         if light_sleep_committed {
-            // One-shot wake interrupts armed for the light-sleep window: a
-            // key press or an asserted RTC alarm line returns the wait
-            // immediately, so the loop polls the buttons / probes the
-            // alarm line within milliseconds of the event (see `wake.rs`
-            // for why a plain sleep cannot - the GPIO wakeup resumes the
-            // CPU but not the blocked task).
             ctx.board.wake.arm();
             if ctx.board.wake.wait(IDLE_POLL_INTERVAL_MS as u32) {
                 log::info!("Idle wait woken early (key pressed)");
@@ -1342,41 +1192,30 @@ fn main() -> Result<()> {
     }
 }
 
-/// Architecture minimum safe mode (firmware-architecture.md "启动失败与安全
-/// 模式"). Entered when a *core* boot fact is unavailable (RTC alarm-status
-/// read failed, or the alarm NVS list could not be loaded): there is no
-/// trustworthy local data or time to build a meaningful BootSnapshot, so the
-/// normal App state machine must not run (an empty alarm list would treat a
-/// real AF as residue and ACK it off). This is an independent minimal loop -
-/// NOT the normal Home/product loop with the state machine disabled:
-///
-/// - renders a fixed error screen once;
-/// - services only USB diagnostics (GetStatus -> a Status reply with no
-///   configured/connected facts; every other command -> an explicit Error)
-///   so `inkwash-desktop` can see the device is in safe mode;
-/// - keeps the watchdog fed and watches the reset (ENTER) button;
-/// - never initializes or drives Wi-Fi, BLE, light sleep or deep sleep, and
-///   never opens navigation/content pages;
-/// - never returns: the only way out is a reset / power-cycle, which re-runs
-///   the normal boot detection.
 fn run_safe_mode(
     board: &mut Note4Board,
     usb_console: &mut crate::usb_console::UsbConsole,
     usb_reply_writer: &mut UsbReplyWriter,
+    panel: SafeModePanel,
     reason: &str,
 ) -> ! {
-    log::error!("Entering minimum safe mode (core boot fact unavailable: {reason})");
-    // Fixed error screen. Drawn once; safe mode makes no further display
-    // decisions (no renderer cache, no partials, no clock).
+    log::error!(
+        "Entering minimum safe mode ({}: {reason}); {}",
+        panel.headline,
+        panel.recovery
+    );
+
     {
         let mut canvas = board.display.canvas_mut();
         canvas.clear();
         crate::ui::header(&mut canvas, "SAFE MODE");
-        canvas.draw_text_prop(8, 60, 1, "CORE DATA UNAVAILABLE");
-        // Reason text at scale 1; hard-split at 40 chars onto two lines.
-        let (r1, r2) = if reason.len() > 40 {
-            let (head, rest) = reason.split_at(40);
-            (head.to_string(), rest.chars().take(40).collect::<String>())
+        canvas.draw_text_prop(8, 60, 1, panel.headline);
+
+        let (r1, r2) = if reason.chars().count() > 40 {
+            let mut chars = reason.chars();
+            let head: String = chars.by_ref().take(40).collect();
+            let tail: String = chars.take(40).collect();
+            (head, tail)
         } else {
             (reason.to_string(), String::new())
         };
@@ -1384,8 +1223,8 @@ fn run_safe_mode(
         if !r2.is_empty() {
             canvas.draw_text_prop(8, 96, 1, &r2);
         }
-        canvas.draw_text_prop(8, 140, 1, "USB DIAGNOSTICS ACTIVE");
-        canvas.draw_text_prop(8, 156, 1, "HOLD ENTER + RESET TO EXIT");
+        canvas.draw_text_prop(8, 140, 1, "STORED DATA UNTOUCHED");
+        canvas.draw_text_prop(8, 156, 1, panel.recovery);
         drop(canvas);
         if let Err(err) = board.display.refresh_full() {
             log::error!("Safe-mode error screen refresh failed: {err:#}");
@@ -1393,12 +1232,11 @@ fn run_safe_mode(
     }
     let mut pending_replies: std::collections::VecDeque<(usb_console::QueuedReply, bool)> =
         std::collections::VecDeque::with_capacity(SAFE_MODE_REPLY_CAPACITY);
-    // Minimal service loop.
+
     loop {
         watchdog::feed();
         service_safe_mode_replies(usb_reply_writer, &mut pending_replies);
-        // USB diagnostics: GetStatus reports a device with nothing
-        // configured/connected; everything else returns an explicit error.
+
         if let Some((id, cmd)) = usb_console.poll_command() {
             match cmd {
                 crate::control::Command::GetStatus => {
@@ -1423,7 +1261,8 @@ fn run_safe_mode(
                 other => {
                     let reply = inkwash_logic::protocol::Reply::Error {
                         message: format!(
-                            "device is in safe mode (core data unavailable); command {other:?} rejected"
+                            "device is in safe mode ({}); command {other:?} rejected",
+                            panel.headline
                         ),
                     };
                     queue_safe_mode_reply(
@@ -1435,15 +1274,11 @@ fn run_safe_mode(
                 }
             }
         }
-        // Reset/button detection only (no navigation). ENTER long-press is
-        // polled so a stuck boot never hides the reset affordance; the
-        // action itself is a hardware reset via the watchdog / power latch
-        // on the next power-cycle - here we only observe.
+
         board.key_enter.poll();
         board.key_up.poll();
         board.key_down.poll();
-        // Sane poll cadence. Deliberately NO light-sleep arm and NO
-        // deep-sleep: safe mode stays fully awake (architecture).
+
         std::thread::sleep(std::time::Duration::from_millis(
             crate::button::POLL_INTERVAL_MS as u64,
         ));
@@ -1504,7 +1339,7 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
         log::warn!("Charging LED update failed: {err}");
     }
     match board.battery_millivolts() {
-        Ok(vbat_mv) => log::info!(
+        Ok(vbat_mv) => log::debug!(
             "Power state: power_present={} charging={} full={} fault={} no_battery={} vbat_mV={} ({}%)",
             charge.power_present,
             charge.charging,
@@ -1516,7 +1351,7 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
         ),
         Err(err) => {
             log::warn!("Battery ADC read failed: {err}");
-            log::info!(
+            log::debug!(
                 "Power state: power_present={} charging={} full={} fault={} no_battery={} vbat_mV=<n/a>",
                 charge.power_present,
                 charge.charging,
@@ -1529,18 +1364,13 @@ fn report_power_state(board: &mut Note4Board) -> Result<()> {
     Ok(())
 }
 
-/// The core facts are read once before any runtime task is created. They are
-/// retained as an owned boot fact so the later snapshot construction cannot
-/// re-read RTC/NVS after SyncTask, EffectTask, or BLE has started.
 #[derive(Debug)]
 struct BootCoreFacts {
     alarm_status: crate::rtc_executor::AlarmStatus,
-    alarms: Vec<crate::alarms::StoredAlarm>,
 }
 
 fn collect_boot_core_facts(
     rtc: &crate::rtc_executor::RtcExecutor,
-    alarm_store: &AlarmStore,
     clock: Option<DateTime>,
     prior_failure: Option<String>,
 ) -> std::result::Result<BootCoreFacts, String> {
@@ -1553,19 +1383,60 @@ fn collect_boot_core_facts(
     let alarm_status = rtc
         .alarm_status()
         .map_err(|err| format!("RTC alarm status read failed: {err}"))?;
-    let alarms = alarm_store
-        .load()
-        .map_err(|err| format!("Alarm NVS load failed: {err}"))?;
-    Ok(BootCoreFacts {
-        alarm_status,
+    Ok(BootCoreFacts { alarm_status })
+}
+
+/// Everything the boot path reads out of persistent storage, resolved once.
+///
+/// Reads happen here, before anything else touches these stores, so a store
+/// that cannot be read is reported with the store and the failure class instead
+/// of quietly looking like a device that was never configured. Absent keys are
+/// first-time configuration and take their documented default.
+#[derive(Debug)]
+struct BootStores {
+    alarms: Vec<crate::alarms::StoredAlarm>,
+    todos: Vec<crate::todos::Todo>,
+    inbox: Vec<crate::inbox::InboxItem>,
+    config: inkwash_logic::device_config::DeviceConfig,
+    wifi_creds: Option<inkwash_logic::device_config::WifiCreds>,
+    timezone_offset_minutes: i16,
+    sync_interval_minutes: u16,
+    last_sync_epoch: Option<u64>,
+}
+
+fn read_boot_stores(
+    counters: &PersistedCounters,
+    alarm_store: &AlarmStore,
+    todo_store: &TodoStore,
+    inbox_store: &InboxStore,
+) -> std::result::Result<BootStores, inkwash_logic::boot_store::BootFault> {
+    let alarms = resolve(StoreId::Alarms, alarm_store.load())?;
+    let todos = resolve(StoreId::Todos, todo_store.load())?;
+    let inbox = resolve(StoreId::Inbox, inbox_store.load())?;
+    let config = resolve(StoreId::ServerConfig, counters.device_config())?.unwrap_or_else(|| {
+        inkwash_logic::device_config::DeviceConfig {
+            server_url: String::new(),
+            auth_token: String::new(),
+        }
+    });
+    let wifi_creds = resolve(StoreId::WifiCredentials, counters.wifi_creds())?;
+    let timezone_offset_minutes = resolve(StoreId::Timezone, counters.timezone_offset_minutes())?
+        .unwrap_or(DEFAULT_TIMEZONE_OFFSET_MINUTES);
+    let sync_interval_minutes = resolve(StoreId::SyncInterval, counters.sync_interval_minutes())?
+        .unwrap_or(DEFAULT_SYNC_INTERVAL_MINUTES);
+    let last_sync_epoch = resolve(StoreId::LastSyncEpoch, counters.last_sync_epoch())?;
+    Ok(BootStores {
         alarms,
+        todos,
+        inbox,
+        config,
+        wifi_creds,
+        timezone_offset_minutes,
+        sync_interval_minutes,
+        last_sync_epoch,
     })
 }
 
-/// Build the BootSnapshot the state machine consumes in Event::Boot. Core
-/// RTC/alarm facts come from `BootCoreFacts`; remaining NVS facts are soft
-/// failures and become empty/default values so the snapshot remains owned by
-/// the application state machine.
 #[derive(Debug)]
 struct BootSnapshotResult {
     snapshot: inkwash_logic::app::BootSnapshot,
@@ -1573,33 +1444,18 @@ struct BootSnapshotResult {
 
 fn collect_boot_snapshot(
     core: BootCoreFacts,
-    counters: &PersistedCounters,
-    todo_store: &TodoStore,
-    inbox_store: &InboxStore,
+    stores: BootStores,
     clock: Option<DateTime>,
 ) -> BootSnapshotResult {
-    let todos = todo_store.load().unwrap_or_else(|err| {
-        log::warn!("Todo NVS load failed (using empty list): {err}");
-        Vec::new()
-    });
-    let inbox = inbox_store.load().unwrap_or_else(|err| {
-        log::warn!("Inbox NVS load failed (using empty list): {err}");
-        Vec::new()
-    });
-    let config = counters.device_config().ok().flatten().unwrap_or_else(|| {
-        inkwash_logic::device_config::DeviceConfig {
-            server_url: String::new(),
-            auth_token: String::new(),
-        }
-    });
     let wake_cause = power::wake_cause();
-    // Status-visible facts (no secrets) for GetStatus: the wi-fi SSID /
-    // password-presence, the timezone, and last-known connectivity.
-    let wifi = counters.wifi_creds().ok().flatten();
+
     let status = inkwash_logic::app::DeviceStatus {
-        wifi_ssid: wifi.as_ref().map(|creds| creds.ssid.clone()),
-        wifi_has_password: wifi.is_some_and(|creds| !creds.password.is_empty()),
-        timezone_offset_minutes: counters.timezone_offset_minutes().unwrap_or(0),
+        wifi_ssid: stores.wifi_creds.as_ref().map(|creds| creds.ssid.clone()),
+        wifi_has_password: stores
+            .wifi_creds
+            .as_ref()
+            .is_some_and(|creds| !creds.password.is_empty()),
+        timezone_offset_minutes: stores.timezone_offset_minutes,
     };
     BootSnapshotResult {
         snapshot: inkwash_logic::app::BootSnapshot {
@@ -1607,10 +1463,10 @@ fn collect_boot_snapshot(
             now: clock,
             rtc_alarm_flag: core.alarm_status.alarm_flag,
             rtc_alarm_interrupt_enabled: core.alarm_status.alarm_interrupt_enabled,
-            alarms: core.alarms,
-            todos,
-            inbox,
-            config,
+            alarms: stores.alarms,
+            todos: stores.todos,
+            inbox: stores.inbox,
+            config: stores.config,
             status,
         },
     }
@@ -1650,7 +1506,6 @@ fn poll_ble_lifecycle(
                     ctx.command_sessions
                         .begin(control::Channel::Ble, generation);
                 }
-                dispatch_or_retain(runner, inkwash_logic::app::Event::BlePairingStarted, ctx)?;
                 changed = true;
             }
             ble_control::BleLifecycle::Disconnected {
@@ -1742,22 +1597,14 @@ impl std::fmt::Display for DispatchSaturated {
 
 impl std::error::Error for DispatchSaturated {}
 
-/// Admit one event and service the state machine without waiting for a worker
-/// batch. Events that meet a full runtime queue are returned in a typed error
-/// carrying the event so the actual producer can retain or reject it.
 pub(crate) fn dispatch_app_runner(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
 ) -> anyhow::Result<()> {
-    // Keep the incoming event in DeviceContext before servicing the effect
-    // worker. A disconnected worker can make service_effect_task fail; the
-    // event must remain owned by the producer for a later retry in that case.
     if ctx.pending_dispatch_event.is_none() {
         ctx.pending_dispatch_event = Some(event);
     } else {
-        // A previous service failure already owns one event. Preserve this
-        // newer event in the normal bounded FIFO while retrying the older one.
         retain_or_overflow_dispatch_event(ctx, event).map_err(anyhow::Error::new)?;
     }
     service_effect_task(runner, ctx)?;
@@ -1777,10 +1624,6 @@ pub(crate) fn dispatch_app_runner(
     while let Some(event) = ctx.pending_dispatch_sources.take_next() {
         if let Err(event) = runner.borrow_mut().admit_event(event) {
             if let Err(event) = ctx.pending_dispatch_sources.retain(event) {
-                // The event was removed from its source latch before the
-                // retry attempt, so this is only reachable if another event
-                // of the same source filled it concurrently. Keep one final
-                // producer-owned retry slot rather than consuming the fact.
                 return Err(anyhow::Error::new(DispatchSaturated { event }));
             }
             break;
@@ -1789,14 +1632,17 @@ pub(crate) fn dispatch_app_runner(
     reduce_effect_batches(runner, ctx)
 }
 
-/// Return a saturated event to its source owner. Every producer calls this
-/// immediately after dispatch; if that source is already full, the typed
-/// error is propagated to the producer with the event still owned by it.
 pub(crate) fn dispatch_or_retain(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     event: inkwash_logic::app::Event,
     ctx: &mut DeviceContext<'_>,
 ) -> anyhow::Result<()> {
+    if matches!(
+        event,
+        inkwash_logic::app::Event::UsbCommand(_) | inkwash_logic::app::Event::BleCommand(_)
+    ) {
+        heap_probe::note_control_command();
+    }
     match dispatch_app_runner(runner, event, ctx) {
         Ok(()) => Ok(()),
         Err(error) => match error.downcast::<DispatchSaturated>() {
@@ -1811,10 +1657,6 @@ pub(crate) fn dispatch_or_retain(
 
 const PENDING_APP_EVENT_CAPACITY: usize = inkwash_logic::event_queue::HIGH_CAPACITY;
 
-/// Retains one dispatch event in the bounded FIFO, returning it to its
-/// producer when the FIFO is full. The `Err` variant deliberately carries the
-/// event by value so this saturation path stays allocation-free (same
-/// rationale as `PendingDispatchSources::retain`).
 #[allow(clippy::result_large_err)]
 fn retain_pending_app_event(
     ctx: &mut DeviceContext<'_>,
@@ -1831,21 +1673,14 @@ fn retain_pending_app_event(
     Ok(())
 }
 
-/// Typed dispatch saturation: hands event ownership back to the real producer
-/// instead of buffering it in an unbounded queue. Carried by value for the
-/// same allocation-free reason as `retain_pending_app_event`.
 #[allow(clippy::result_large_err)]
 fn retain_or_overflow_dispatch_event(
     ctx: &mut DeviceContext<'_>,
     event: inkwash_logic::app::Event,
 ) -> Result<(), DispatchSaturated> {
     if let Err(event) = retain_pending_app_event(ctx, event) {
+        diag::record(DiagCounter::RuntimeQueueFull);
         if let Err(event) = ctx.pending_dispatch_sources.retain(event) {
-            // A normal dispatch has already taken the primary slot above;
-            // retain one final source-owned retry there if a fixed latch is
-            // unexpectedly full. The only remaining failure means the
-            // worker itself already owns an earlier retry and the caller
-            // must stop producing until it reconnects.
             if ctx.pending_dispatch_event.is_none() {
                 ctx.pending_dispatch_event = Some(event);
                 return Ok(());
@@ -1931,18 +1766,19 @@ fn service_effect_task(
                 remaining.extend(notices_iter);
                 ctx.effect_task
                     .retain_notice(crate::effect_task::BatchResult { notices: remaining });
+
+                log::warn!(
+                    "effect notice retained: runtime queue full; reducing queued events to make room"
+                );
+                diag::record(DiagCounter::RuntimeQueueFull);
                 return Ok(());
             }
         }
-        // The envelope, rather than the number of effects, marks completion.
-        // In particular, AbortBatch may return a single failure notice.
+
         ctx.worker_batch_in_flight = false;
         worker_completed = true;
     }
 
-    // Worker notices may include async kicks in future executor variants.
-    // Route every kick through the shared production sink before reducing the
-    // completion events; no event source may leave a kick stranded in Runtime.
     if worker_completed || replayed_notices {
         for kick in runner.borrow_mut().take_kicks() {
             track_kick_shared(ctx, kick)?;
@@ -1952,6 +1788,7 @@ fn service_effect_task(
         match ctx.effect_task.try_submit_batch(batch) {
             Ok(()) => ctx.worker_batch_in_flight = true,
             Err((batch, crate::effect_task::EffectTaskError::QueueFull)) => {
+                diag::record(DiagCounter::EffectQueueFull);
                 ctx.pending_effect_batch = Some(batch)
             }
             Err((_, crate::effect_task::EffectTaskError::Disconnected)) => {
@@ -1961,10 +1798,6 @@ fn service_effect_task(
     }
     admit_pending_app_events(runner, ctx);
     if worker_completed {
-        // A worker completion is itself a state-machine input. Reduce its
-        // derived batches in this service pass so no unrelated external event
-        // is required to make progress. This is deliberately one-way:
-        // `reduce_effect_batches` never services the worker recursively.
         reduce_effect_batches(runner, ctx)?;
     }
     Ok(())
@@ -1974,20 +1807,19 @@ fn reduce_effect_batches(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     ctx: &mut DeviceContext<'_>,
 ) -> anyhow::Result<()> {
+    let notice_retained = ctx.effect_task.has_retained_notice();
     loop {
-        if ctx.pending_effect_batch.is_some() || ctx.worker_batch_in_flight {
+        if ctx.pending_effect_batch.is_some() {
+            break;
+        }
+        if ctx.worker_batch_in_flight && !notice_retained {
             break;
         }
         let batches = match runner.borrow_mut().reduce_next() {
             Some(batches) => batches,
             None => break,
         };
-        // Queue the whole event's batches: one event can yield several
-        // ordered batches, and a worker-safe one pauses the chain (the effect
-        // task runs a single batch at a time). Running the rest of them from
-        // a queue - instead of returning out of this loop - is what keeps a
-        // Tick's render batch from being dropped behind its reminder fact
-        // batch, which silently froze the on-screen clock.
+
         ctx.pending_effect_batches.extend(batches);
         while ctx.pending_effect_batch.is_none() && !ctx.worker_batch_in_flight {
             let Some(batch) = ctx.pending_effect_batches.pop_front() else {
@@ -2000,7 +1832,7 @@ fn reduce_effect_batches(
                         break;
                     }
                     Err((batch, crate::effect_task::EffectTaskError::QueueFull)) => {
-                        // Retry the head batch before anything queued after it.
+                        diag::record(DiagCounter::EffectQueueFull);
                         ctx.pending_effect_batches.push_front(batch);
                         break;
                     }
@@ -2094,6 +1926,7 @@ fn queue_ble_delivery(
             "BLE reply mailbox and producer latch full (capacity {}); rejecting delivery",
             ctx::BLE_REPLY_PENDING_CAPACITY
         );
+        diag::record(DiagCounter::BleReplyQueueFull);
         return false;
     }
     ctx.pending_ble_deliveries
@@ -2139,9 +1972,7 @@ fn deliver_ble_reply(
         }
         return None;
     }
-    // Reserve an owned delivery record before enqueueing into the worker.
-    // QueueFull can then leave this exact request in the bounded mailbox,
-    // while a successful enqueue atomically transfers it to notify tracking.
+
     ctx.pending_ble_deliveries
         .push_back(ctx::PendingBleDelivery {
             session_id,
@@ -2339,15 +2170,12 @@ fn deliver_protocol_reply(
                 reply.clone(),
             );
             mark_pairing_set_wifi_reply(ctx, command, reply, reply_id);
-            // BLE completion is reported by ReplyDelivered after the
-            // notify-tx callback, so the command cache must remain pending.
+
             false
         }
     }
 }
 
-/// Render kicks enter the EPD registry; sleep kicks are retained until the
-/// next complete platform polling turn.
 fn track_kick_shared(
     ctx: &mut DeviceContext<'_>,
     kick: app_runner::AsyncKick,
@@ -2363,15 +2191,8 @@ fn track_kick_shared(
                     inkwash_logic::epd_registry::retry_replacement_index(pending, &kick)
                 };
                 if let Some(index) = replacement_index {
-                    // The replaced entry was never submitted to EPD. Its
-                    // screen/generation is rebuildable, so keep the newer
-                    // request and avoid stranding an older retry forever.
                     ctx.pending_render_retries[index] = kick;
                 } else {
-                    // Every retained retry is newer than this request (or an
-                    // equal-generation duplicate). Keeping those entries is
-                    // the safe latest-generation policy; this stale request
-                    // has no hardware completion to await.
                     log::debug!("dropping superseded render retry kick");
                 }
             } else {
@@ -2383,9 +2204,6 @@ fn track_kick_shared(
 
     match &kick.effect {
         inkwash_logic::app::Effect::PrepareSleep { token, .. } => {
-            // The runner emits this kick only after the platform wake-source
-            // preparation returned Ok; retain that fact with its exact token
-            // and prepare operation for the collector.
             ctx.prepared_wake_plan = Some(ctx::PreparedWakePlan {
                 token: *token,
                 prepare_operation_id: kick.operation_id,
@@ -2450,9 +2268,6 @@ fn collect_sleep_inputs(
     let pending_ble_reply = !ctx.pending_ble_replies.is_empty()
         || !ctx.pending_ble_deliveries.is_empty()
         || ctx.pending_ble_reply_latch.is_some();
-    let rtc_read_in_flight = ctx.pending_alarm_status.is_some()
-        || ctx.pending_alarm_snapshot.is_some()
-        || ctx.pending_clock_read.is_some();
     inkwash_logic::power_state::SleepInputs {
         input_pending,
         page_allows_sleep: matches!(state.screen, inkwash_logic::app::Screen::Home)
@@ -2474,7 +2289,6 @@ fn collect_sleep_inputs(
             || !matches!(state.sync, inkwash_logic::app::SyncState::Idle)
             || state.urgent_poll_in_flight()
             || worker_in_flight
-            || rtc_read_in_flight
             || pending_usb_reply
             || pending_usb_reply_latch
             || pending_ble_reply
@@ -2486,13 +2300,13 @@ fn collect_sleep_inputs(
         rtc_plan_confirmed: state.rtc_alarm_plan_confirmed(),
         wake_plan_confirmed,
         usb_connected: power::usb_host_connected(),
+
         event_queue_empty: !runner.has_work()
             && !worker_in_flight
             && !pending_usb_reply
             && !pending_usb_reply_latch
             && !pending_render_retry
             && !pending_ble_reply
-            && !rtc_read_in_flight
             && ctx.pending_sleep_kick.is_none()
             && ctx.pending_app_events.is_empty()
             && ctx.pending_dispatch_event.is_none()
@@ -2501,10 +2315,6 @@ fn collect_sleep_inputs(
     }
 }
 
-/// Translate one EPD completion into the matching `EffectCompleted` /
-/// `EffectFailed` and dispatch it back through the runtime. The kick is
-/// consumed (removed from `pending_renders` by the caller before this is
-/// called) so the generation / op id line up.
 fn feed_completion_back(
     runner: &std::rc::Rc<std::cell::RefCell<app_runner::AppRunner>>,
     ctx: &mut DeviceContext<'_>,

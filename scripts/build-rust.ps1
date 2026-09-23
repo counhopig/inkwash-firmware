@@ -1,5 +1,6 @@
 param(
-    [switch]$Release
+    [switch]$Release,
+    [switch]$Diagnostic
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,7 +9,7 @@ $projectDir = Join-Path $PSScriptRoot "..\rust-firmware"
 # Locate ESP-IDF without hardcoding an install path: honor $env:IDF_PATH
 # when set, else probe the conventional install locations and pick the
 # newest match. (Mirrors scripts/build-rust.sh; Windows side remains
-# unverified on a real toolchain - see docs.)
+# unverified on a real toolchain - see docs/verification.md.)
 $idfRoot = $null
 if ($env:IDF_PATH) {
     $idfRoot = $env:IDF_PATH
@@ -93,6 +94,23 @@ if (-not $env:LIBCLANG_PATH) {
 
 Push-Location $projectDir
 try {
+    $targetRoot = "target"
+    if ($Diagnostic) {
+        $env:ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.diagnostic.defaults"
+        $targetRoot = "target-diagnostic"
+        $env:CARGO_TARGET_DIR = Join-Path $projectDir $targetRoot
+    }
+    $partitionHash = "v2:" + (Get-FileHash -Algorithm SHA256 "partitions.csv").Hash.ToLowerInvariant()
+    $partitionStamp = Join-Path $targetRoot ".inkwash-partitions.sha256"
+    if ((Test-Path $targetRoot) -and
+        ((-not (Test-Path $partitionStamp)) -or
+         ((Get-Content $partitionStamp -Raw).Trim() -ne $partitionHash))) {
+        & cargo clean
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo clean for partition-table rebuild failed with exit code $LASTEXITCODE"
+        }
+    }
+
     $cargoArgs = @("build")
     if ($Release) {
         $cargoArgs += "--release"
@@ -102,6 +120,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
+    New-Item -ItemType Directory -Force $targetRoot | Out-Null
+    Set-Content -Path $partitionStamp -Value $partitionHash -Encoding Ascii
 } finally {
     Pop-Location
 }

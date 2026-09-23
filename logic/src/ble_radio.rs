@@ -1,9 +1,3 @@
-//! Host-testable ordering contract for the shared Wi-Fi/BLE radio.
-//!
-//! The ESP-IDF side performs the same transitions around asynchronous
-//! receipts.  Keeping the ordering model here makes the safety rules
-//! executable without an ESP32 or NimBLE runtime.
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BleRadioState {
     Idle,
@@ -28,9 +22,6 @@ pub enum BleRadioError {
     StaleSession,
 }
 
-/// Minimal radio sequencing state machine.  It deliberately has no timing,
-/// threads, or hardware calls; the firmware maps each action to its owner
-/// task and advances it from the corresponding receipt.
 pub struct BleRadioCoordinator {
     state: BleRadioState,
     session_id: Option<u64>,

@@ -1,18 +1,11 @@
-//! Shared visible-window arithmetic for list renderers.
-
-/// Number of rows that fit in the list area of the NOTE4 display.
 pub const MAX_LISTED_ITEMS: usize = 7;
-/// List geometry shared by the canvas renderer and the EPD partial-refresh
-/// mapping. The region reaches the 300px panel boundary so the last row's
-/// text and selection frame are refreshed together.
+
 pub const LIST_REGION_Y: usize = 34;
 pub const LIST_REGION_HEIGHT: usize = 266;
 pub const LIST_FIRST_ROW_Y: usize = 39;
 pub const LIST_ROW_HEIGHT: usize = 37;
 pub const LIST_DISPLAY_HEIGHT: usize = 300;
 
-/// The slice of a list that the renderer should draw, with `selected` always
-/// inside the slice when the list is non-empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListWindow {
     pub first: usize,
@@ -30,9 +23,6 @@ impl ListWindow {
     }
 }
 
-/// Computes a scrolling window for `item_count` rows. Out-of-range cursors
-/// are conservatively clamped; button navigation is responsible for its
-/// own wrap semantics before projecting a ViewModel.
 pub fn list_window(item_count: usize, selected: usize) -> ListWindow {
     if item_count == 0 {
         return ListWindow {
@@ -110,8 +100,7 @@ mod tests {
     fn large_list_keeps_first_last_and_add_row_visible() {
         assert_window(20, 0, 0, 7, 0);
         assert_window(20, 19, 13, 20, 19);
-        // N alarms plus the trailing ADD row: selecting ADD puts it in the
-        // last visible slot, even when the list is much longer than one page.
+
         assert_window(21, 20, 14, 21, 20);
     }
 

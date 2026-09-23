@@ -1,15 +1,7 @@
-//! Bounded command deduplication and pending-request ownership.
-//!
-//! USB and BLE use the same command/reply types, but their request IDs live in
-//! separate transport sessions. This cache deliberately provides a bounded
-//! replay window rather than permanent exactly-once semantics: a duplicate
-//! older than the retained window may be executed again.
-
 use std::collections::VecDeque;
 
 use crate::protocol::{Channel, Command, Reply};
 
-/// Number of terminal replies retained per transport session by default.
 pub const DEFAULT_CACHE_CAPACITY: usize = 8;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -32,22 +24,13 @@ struct TransportSession {
     pending: Option<PendingRequest>,
 }
 
-/// Result of reserving the one deferred command slot for a transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveError {
-    /// The caller has not opened this transport session, or the result came
-    /// from a previous session.
     StaleSession,
-    /// A deferred command is already associated with this transport session.
+
     AlreadyPending,
 }
 
-/// Per-transport, per-session bounded deduplication state.
-///
-/// A session transition clears both the replay cache and the pending command
-/// association. This prevents an ID reused after USB reconnect or BLE
-/// reconnect from matching an old reply, while allowing USB and BLE to reuse
-/// the same request ID independently.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommandSessions {
     usb: TransportSession,
@@ -72,8 +55,6 @@ impl CommandSessions {
         Self::new(DEFAULT_CACHE_CAPACITY)
     }
 
-    /// Starts or resumes a transport session. Repeating the same session ID
-    /// is idempotent; changing it invalidates all old cache and pending state.
     pub fn begin(&mut self, channel: Channel, session_id: u64) {
         let state = self.state_mut(channel);
         if state.session_id != Some(session_id) {
@@ -83,8 +64,6 @@ impl CommandSessions {
         }
     }
 
-    /// Starts a new transport generation while preserving the one command
-    /// correlation that is already being completed across a BLE handoff.
     pub fn begin_preserving_pending(&mut self, channel: Channel, session_id: u64) {
         let state = self.state_mut(channel);
         if state.session_id == Some(session_id) {
@@ -96,8 +75,6 @@ impl CommandSessions {
         state.pending = pending;
     }
 
-    /// Ends only the currently active session. A late completion from an old
-    /// session cannot clear or populate a newer session.
     pub fn end(&mut self, channel: Channel, session_id: u64) {
         let state = self.state_mut(channel);
         if state.session_id == Some(session_id) {
@@ -109,9 +86,6 @@ impl CommandSessions {
         self.state(channel).session_id
     }
 
-    /// Returns a reply only for an exact `(session, request_id, command)` key.
-    /// A same-ID/different-command request is a miss and remains governed by
-    /// the caller's existing command validation contract.
     pub fn lookup(
         &self,
         channel: Channel,
@@ -130,8 +104,6 @@ impl CommandSessions {
             .map(|entry| entry.reply.clone())
     }
 
-    /// Reserves the one deferred-reply association for a transport. `Busy`
-    /// is returned by the caller when this fails; it is never cached here.
     pub fn reserve_pending(
         &mut self,
         channel: Channel,
@@ -160,8 +132,6 @@ impl CommandSessions {
             .flatten()
     }
 
-    /// Releases a reservation when admitting the command event failed before
-    /// the state machine could produce a reply.
     pub fn cancel_pending(
         &mut self,
         channel: Channel,
@@ -182,10 +152,6 @@ impl CommandSessions {
         false
     }
 
-    /// Returns the correlation key reserved for the current deferred reply.
-    /// The key remains owned by the session until the transport confirms the
-    /// terminal frame, so a failed write can retry without re-executing the
-    /// command.
     pub fn pending_key(
         &self,
         channel: Channel,
@@ -195,8 +161,6 @@ impl CommandSessions {
             .map(|pending| (pending.request_id.as_deref(), &pending.command))
     }
 
-    /// Stores only a final reply and clears its matching pending association.
-    /// `Busy` and `Pending` are intentionally not cached.
     pub fn complete_terminal(
         &mut self,
         channel: Channel,
@@ -215,8 +179,6 @@ impl CommandSessions {
             pending.request_id.as_deref() == Some(request_id.as_str()) && pending.command == command
         });
         if !is_terminal(&reply) {
-            // Busy/Pending is a transport response, not a replayable result,
-            // but it still completes the exact reservation that produced it.
             if matches_pending {
                 state.pending = None;
                 return true;
@@ -247,8 +209,6 @@ impl CommandSessions {
         true
     }
 
-    /// Completes an untagged pending command after its reply was accepted by
-    /// the transport. Untagged commands never enter the replay cache.
     pub fn complete_untagged_terminal(
         &mut self,
         channel: Channel,

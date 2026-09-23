@@ -1,85 +1,81 @@
-//! Inbox store, backed by one NVS blob - same shape as `todos.rs` but for
-//! notifications delivered from external sources (webhook/CalDAV) via the
-//! server. The device only browses, marks read, and uploads read `seq`s back;
-//! it never authors inbox content.
-//!
-//! Two pieces of state are kept separately so a power cut between "user
-//! opened a message" and "server acked the read" can't lose the pending read:
-//! - the authoritative `InboxItem` list (from the server),
-//! - a set of `seq`s locally marked read but not yet acknowledged by the
-//!   server. They are only removed once `inbox_read_acked` echoes them back.
-
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
+use serde::{Deserialize, Serialize};
+
+use inkwash_logic::boot_store::StoreFault;
 
 use crate::nvs_blob::{read_blob, write_blob};
 
-/// `InboxKind`/`Priority`/`InboxItem` live in `inkwash-logic` (re-exported
-/// here), alongside the pending-read merge/dedup rules `save`/`mark_read`/
-/// `ack_read` below call into instead of inlining.
 pub use inkwash_logic::inbox_item::{InboxItem, InboxKind, Priority};
 
 const NAMESPACE: &str = "inkwash_inbox";
 const KEY_ITEMS: &str = "items";
 const KEY_PENDING: &str = "pending";
-const BLOB_BUF_LEN: usize = 4096;
+const KEY_STATE: &str = "state_v1";
+const LEGACY_BLOB_BUF_LEN: usize = 4096;
+const STATE_BLOB_BUF_LEN: usize = 6144;
 
-/// Maximum number of items kept locally; anything beyond this is dropped on
-/// save so a large server inbox can't overflow NVS.
 pub const MAX_ITEMS: usize = 32;
 
-/// Per-item body cap (in chars) applied on save - a single 1000-char
-/// Chinese body serializes to ~3KB and would crowd every other item out of
-/// the NVS blob. The device detail page reads fine with 300 chars.
 const MAX_BODY_CHARS: usize = 300;
 
-/// Headroom left below `BLOB_BUF_LEN` for JSON overhead while trimming
-/// items to the byte budget.
 const BLOB_HEADROOM: usize = 256;
+
+#[derive(Default, Deserialize, Serialize)]
+struct InboxState {
+    version: u8,
+    items: Vec<InboxItem>,
+    pending_read: Vec<u64>,
+}
 
 pub struct InboxStore {
     nvs: EspDefaultNvs,
 }
 
 impl InboxStore {
-    /// `partition` must be a clone of the one shared `EspDefaultNvsPartition`
-    /// handle `main.rs` takes once - see the doc comment on
-    /// `storage::PersistedCounters::open`.
     pub fn open(partition: EspDefaultNvsPartition) -> Result<Self> {
         let nvs = EspDefaultNvs::new(partition, NAMESPACE, true)
             .map_err(|e| anyhow!("failed to open NVS namespace '{NAMESPACE}': {e}"))?;
         Ok(Self { nvs })
     }
 
-    fn read_blob<T: for<'de> serde::Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
-        read_blob::<BLOB_BUF_LEN, _>(&self.nvs, key)
+    fn load_state(&self) -> Result<InboxState, StoreFault> {
+        if let Some(state) = read_blob::<STATE_BLOB_BUF_LEN, InboxState>(&self.nvs, KEY_STATE)? {
+            if state.version != 1 {
+                log::error!(
+                    "stored inbox state version {} is not supported",
+                    state.version
+                );
+                return Err(StoreFault::UnsupportedVersion);
+            }
+            return Ok(state);
+        }
+
+        Ok(InboxState {
+            version: 1,
+            items: read_blob::<LEGACY_BLOB_BUF_LEN, _>(&self.nvs, KEY_ITEMS)?.unwrap_or_default(),
+            pending_read: read_blob::<LEGACY_BLOB_BUF_LEN, _>(&self.nvs, KEY_PENDING)?
+                .unwrap_or_default(),
+        })
     }
 
-    fn write_blob<T: serde::Serialize + ?Sized>(&self, key: &str, value: &T) -> Result<()> {
-        write_blob::<BLOB_BUF_LEN, _>(&self.nvs, key, value)
+    fn save_state(&self, state: &InboxState) -> Result<()> {
+        write_blob::<STATE_BLOB_BUF_LEN, _>(&self.nvs, KEY_STATE, state)
     }
 
-    /// The authoritative inbox list, empty if never synced.
-    pub fn load(&self) -> Result<Vec<InboxItem>> {
-        Ok(self.read_blob(KEY_ITEMS)?.unwrap_or_default())
+    pub fn load(&self) -> Result<Vec<InboxItem>, StoreFault> {
+        Ok(self.load_state()?.items)
     }
 
-    /// Replaces the inbox with the server's authoritative list. Any locally
-    /// pending-read `seq`s that are now `read` (or no longer present) are
-    /// dropped; the rest are preserved so they can still be acked later.
     pub fn save(&self, items: &[InboxItem]) -> Result<()> {
-        let pending = self.pending_read()?;
-        let pending = inkwash_logic::reminder_dedup::merge_pending_read(&pending, items);
+        let current = self.load_state()?;
+        let pending =
+            inkwash_logic::reminder_dedup::merge_pending_read(&current.pending_read, items);
         let mut owned: Vec<InboxItem> = items.to_vec();
         owned.truncate(MAX_ITEMS);
-        // Preserve the locally-read flag for anything the server still sends
-        // back as unread but that we've already opened this session.
+
         inkwash_logic::reminder_dedup::apply_pending_read(&mut owned, &pending);
-        // NVS blobs are capped at `BLOB_BUF_LEN`, so long bodies and many
-        // items must be trimmed to fit: cut each body to `MAX_BODY_CHARS`,
-        // then drop the *oldest* items (the server sends newest-first) until
-        // the serialized blob fits. At least one item always survives.
-        let budget = BLOB_BUF_LEN.saturating_sub(BLOB_HEADROOM);
+
         for item in owned.iter_mut() {
             if item.body.chars().count() > MAX_BODY_CHARS {
                 item.body = format!(
@@ -88,49 +84,57 @@ impl InboxStore {
                 );
             }
         }
-        while owned.len() > 1
-            && serde_json::to_vec(&owned)
-                .map(|v| v.len())
+        let mut state = InboxState {
+            version: 1,
+            items: owned,
+            pending_read: pending,
+        };
+        let budget = STATE_BLOB_BUF_LEN.saturating_sub(BLOB_HEADROOM);
+        while state.items.len() > 1
+            && serde_json::to_vec(&state)
+                .map(|bytes| bytes.len())
                 .unwrap_or(usize::MAX)
                 > budget
         {
-            owned.pop();
+            state.items.pop();
         }
-        self.write_blob(KEY_ITEMS, &owned)?;
-        self.write_blob(KEY_PENDING, &pending)
+        state
+            .pending_read
+            .retain(|seq| state.items.iter().any(|item| item.id == *seq));
+        if serde_json::to_vec(&state)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > budget
+        {
+            return Err(anyhow!("inbox state exceeds storage budget"));
+        }
+        self.save_state(&state)
     }
 
-    /// `seq`s locally read but not yet acked by the server.
-    pub fn pending_read(&self) -> Result<Vec<u64>> {
-        Ok(self.read_blob(KEY_PENDING)?.unwrap_or_default())
+    pub fn pending_read(&self) -> Result<Vec<u64>, StoreFault> {
+        Ok(self.load_state()?.pending_read)
     }
 
-    /// Marks `seq` read locally and adds it to the pending-read set (unless
-    /// already there). Used when the user opens a message on-device.
     pub fn mark_read(&self, seq: u64) -> Result<()> {
-        let mut items = self.load()?;
-        let mut pending = self.pending_read()?;
-        if let Some(item) = items.iter_mut().find(|it| it.id == seq) {
-            item.read = true;
+        let mut state = self.load_state()?;
+        let Some(item) = state.items.iter_mut().find(|item| item.id == seq) else {
+            return Err(anyhow!("inbox item {seq} not found"));
+        };
+        item.read = true;
+        if !state.pending_read.contains(&seq) {
+            state.pending_read.push(seq);
         }
-        if !pending.contains(&seq) {
-            pending.push(seq);
-        }
-        self.write_blob(KEY_ITEMS, &items)?;
-        self.write_blob(KEY_PENDING, &pending)
+        self.save_state(&state)
     }
 
-    /// Removes `seq`s from the pending-read set once the server acknowledges
-    /// them (`inbox_read_acked`).
     pub fn ack_read(&self, acked: &[u64]) -> Result<()> {
-        let pending = self.pending_read()?;
-        let remaining = inkwash_logic::reminder_dedup::ack_pending_read(&pending, acked);
-        self.write_blob(KEY_PENDING, &remaining)
+        let mut state = self.load_state()?;
+        state.pending_read =
+            inkwash_logic::reminder_dedup::ack_pending_read(&state.pending_read, acked);
+        self.save_state(&state)
     }
 
-    /// The `seq`s of unread high-priority `alert` items, in store order. These
-    /// drive the urgent full-screen reminder + tone.
-    pub fn unread_urgent(&self) -> Result<Vec<u64>> {
+    pub fn unread_urgent(&self) -> Result<Vec<u64>, StoreFault> {
         Ok(self
             .load()?
             .iter()

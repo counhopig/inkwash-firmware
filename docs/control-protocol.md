@@ -1,412 +1,188 @@
-# Control Protocol (USB/BLE)
+# 控制协议（USB / BLE）
 
-This document specifies the command protocol for configuring the inkwash firmware
-over USB serial or BLE control channels. Transport-specific details (USB framing,
-BLE characteristics) are handled by the transport layer; this document describes
-the command/reply schema that both transports implement.
+> **由源码复原**。原始 `docs/control-protocol.md` 已被 commit `b30c3af` 删除。
+> 本文件的每条命令与 JSON 形状都**经实际运行验证**（用 `inkwash-logic` 直接
+> 序列化/反序列化确认），不是从代码推断。
 
-## Transport-Agnostic Schema
+## 1. 传输层差异
 
-### Commands
+两条链路共享同一套 JSON 协议，但**成帧方式不同**：
 
-Commands are sent as JSON objects, one per line. Each command has a `cmd` field
-identifying the operation, plus command-specific fields.
+| | USB (USB-Serial-JTAG) | BLE (GATT) |
+|---|---|---|
+| 上行成帧 | `>>IW ` + JSON + `\n` | **裸 JSON**（无前缀、无换行要求） |
+| 下行成帧 | `<<IW ` + JSON + `\n` | **裸 JSON** |
+| 最大长度 | 512 字节/行（`usb_console.rs:10`）超出则丢弃整行并告警（`:88-93`） | 受协商 MTU 限制 |
+| 解析位置 | `usb_console.rs:74-85` | `ble_control.rs:942-970` |
+| 解析失败 | 记 `log::warn` 并丢弃该行 | 记 `log::warn` 并 `args.reject()` |
+| 无前缀的行 | **静默忽略**（`usb_console.rs:74` 的 `strip_prefix` 为 `None` 时不进入解析） | 不适用 |
 
-#### `{"cmd":"set_wifi","ssid":"NETWORK_NAME","password":"PASSWORD"}`
+**前缀字面量**：`COMMAND_PREFIX = ">>IW "`、`REPLY_PREFIX = "<<IW "`
+（`usb_console.rs:7,9`）。注意包含尾随空格。
 
-Configure Wi-Fi credentials and verify the connection before saving.
+**BLE GATT 定义**（`ble_control.rs:24-26`）：
 
-**Fields:**
-- **`cmd`** (string, required): `"set_wifi"`
-- **`ssid`** (string, required): The Wi-Fi network name (SSID), typically 1–32 characters.
-- **`password`** (string, required): The WPA2 passphrase, typically 8–63 characters.
+| 用途 | UUID |
+|---|---|
+| Service | `d2c25e50-5e22-48d8-a8b3-34f2f8e2c7d4` |
+| Write（上位机 → 设备） | `d2c25e51-5e22-48d8-a8b3-34f2f8e2c7d4`（`WRITE`，`ble_control.rs:932-933`） |
+| Notify（设备 → 上位机） | `d2c25e52-5e22-48d8-a8b3-34f2f8e2c7d4`（`READ \| NOTIFY`，`ble_control.rs:934-937`） |
 
-**Behavior:**
-- Attempts to connect to the specified network to verify the credentials work.
-- Saves credentials to persistent storage (NVS) only if the connection succeeds.
-- Disconnects after verification (does not hold a persistent connection).
+设备是 **GATT peripheral，单连接**（`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1`）。
+第二个连接会被主动断开（`ble_control.rs:888-891`）。
 
-**Reply:** `Ok` on success, or `Error { message }` if verification failed.
+## 2. 请求（上位机 → 设备）
 
----
+`Command` 用 `#[serde(tag = "cmd", rename_all = "snake_case")]`
+（`logic/src/protocol.rs:9-25`），即**内部标签**：变体名成为顶层 `cmd` 字段的值。
 
-#### `{"cmd":"set_server","url":"HTTPS_URL","token":"AUTH_TOKEN"}`
+| `cmd` | 参数 | 示例 |
+|---|---|---|
+| `get_status` | — | `{"cmd":"get_status"}` |
+| `sync_now` | — | `{"cmd":"sync_now"}` |
+| `set_wifi` | `ssid`, `password` | `{"cmd":"set_wifi","ssid":"MyAP","password":"secret"}` |
+| `set_server` | `url`, `token` | `{"cmd":"set_server","url":"https://example.com","token":"tok"}` |
+| `set_rtc` | `epoch_secs` (u64) | `{"cmd":"set_rtc","epoch_secs":1770000000}` |
+| `set_timezone` | `offset_minutes` (i16) | `{"cmd":"set_timezone","offset_minutes":480}` |
+| `clear_alarms` | — | `{"cmd":"clear_alarms"}` |
 
-Configure the server URL and authentication token for syncing alarms and todos.
+### 可选 `id`（请求关联）
 
-**Fields:**
-- **`cmd`** (string, required): `"set_server"`
-- **`url`** (string, required): The HTTPS endpoint to fetch alarms/todos from
-  (e.g., `https://example.com/api/sync`).
-- **`token`** (string, required): Bearer token for authenticating to the server
-  (e.g., a 32+ character random string).
-
-**Behavior:**
-- Saves the URL and token to persistent storage immediately.
-- Does NOT verify the server is reachable (would require network activity;
-  validation is deferred to `sync_now`).
-
-**Reply:** `Ok` on success, or `Error { message }` if NVS save fails.
-
----
-
-#### `{"cmd":"sync_now"}`
-
-Fetch alarms and todos from the configured server and apply them to local stores.
-
-**Fields:**
-- **`cmd`** (string, required): `"sync_now"`
-- (No other fields.)
-
-**Behavior:**
-- Loads server config from storage (URL + token). Checks that system time is
-  available (needed to re-arm the RTC alarm after applying synced data).
-- Connects Wi-Fi via the process's shared `WifiManager`, then performs the
-  bidirectional HTTPS POST described in
-  [`sync-api.md`](sync-api.md): uploads the device's local alarm `enabled` /
-  todo `done` flags, and applies the server's merged, authoritative alarm/todo
-  lists from the response body. Text, schedules, additions, and deletions are
-  never uploaded by the device.
-- On HTTP 200, parses the response JSON, saves alarms/todos to local stores,
-  and re-arms the PCF8563 hardware alarm slot. Caches any returned ETag
-  (currently informational only - the POST request does not send
-  `If-None-Match`, so every sync gets a full response).
-- On HTTP error or network failure, returns an error; local data is left
-  unchanged.
-- Disconnects Wi-Fi again once the request completes (success or failure).
-
-**Reply:** `Ok` on success, or `Error { message }` on failure.
-
----
-
-#### `{"cmd":"get_status"}`
-
-Query the device's current configuration state.
-
-**Fields:**
-- **`cmd`** (string, required): `"get_status"`
-- (No other fields.)
-
-**Behavior:**
-- Returns a snapshot of whether Wi-Fi and server credentials are configured,
-  the stored SSID / server URL / timezone, and live Wi-Fi connection state.
-- Secrets (Wi-Fi password, server auth token) are never sent back - only
-  booleans indicating whether one is set.
-
-**Reply:** `Status { wifi_configured, server_configured, wifi_connected,
-wifi_ssid, wifi_has_password, server_url, server_has_token,
-timezone_offset_minutes }` (see Replies below).
-
----
-
-#### `{"cmd":"clear_alarms"}`
-
-Delete every locally stored alarm and disarm the PCF8563 hardware alarm slot.
-Wi-Fi credentials, server configuration, and todos are preserved.
-
-**Reply:** `Ok` on success, or `Error { message }` on failure.
-
----
-
-#### `{"cmd":"set_timezone","offset_minutes":480}`
-
-Persist a fixed local UTC offset and immediately shift the hardware RTC by the
-difference from the previous offset. Valid range: -720 (UTC-12:00) through 840
-(UTC+14:00). NTP synchronization applies the stored offset before writing RTC.
-
-**Reply:** `Ok` on success, or `Error { message }` on failure.
-
----
-
-#### `{"cmd":"set_rtc","epoch_secs":1756000000}`
-
-Write a trusted Unix timestamp to the PCF8563 hardware RTC. The stored local
-UTC offset is applied before writing the local clock. This command is intended
-for host-assisted recovery when the device can reach Wi-Fi but NTP/UDP is not
-available; it does not require server configuration.
-
-**Reply:** `Ok` on success, or `Error { message }` on failure.
-
----
-
-### Request Correlation
-
-Any command may include an optional `id` field (any JSON string), e.g.
-`{"cmd":"get_status","id":"req-42"}`. If present, the device echoes it back
-as a top-level `id` field on the reply: `{"status":"status","id":"req-42",...}`.
-If a command omits `id`, its reply has no `id` field either - existing
-clients that never send one see no wire-format change.
-
-A client sending more than one command without waiting for each reply has no
-other way to tell which reply answers which request (see Limitations below),
-especially once the `busy` reply exists - a reminder screen can make several
-replies arrive close together. Set `id` and match on it rather than assuming
-replies arrive in the order requests were sent.
-
-**Resending is safe and cheap when `id` is set.** If a client resends the
-same command (same `id`, same body) because it hasn't seen a reply yet, the
-device recognizes the exact `(id, command)` pair within the current USB or
-BLE connection session and replays the terminal reply instead of re-running
-the command. A deferred command keeps its correlation key until the terminal
-frame is accepted by its transport. For USB, acceptance means the framed
-bytes were written and flushed. For BLE, acceptance means the NimBLE
-notify-tx callback reports `SuccessNotify` for the same connection
-generation. A notify-tx status failure is retried while that connection
-remains valid. An immediate `notify_with` error, a timeout, or a disconnect
-terminates that transport delivery and clears the pending command; the client
-may resend an id-tagged command in the same connection. `busy` is never cached and
-never replaces an existing deferred command. Reconnecting starts a new
-transport session, so an id reused by a new client is not matched to an old
-reply. Without a matching `id` on both the original and the resend, the
-device has no way to tell a resend apart from a genuinely new,
-identically-shaped command, and will execute it again - this matters for
-anything with a real side effect (`set_wifi`, `sync_now`), not just for
-saving battery.
-
-### Replies
-
-Replies are sent as JSON objects, one per line. Each reply has a `status` field
-indicating success or failure, plus status-specific fields, plus `id` if the
-triggering command included one (see Request Correlation above).
-
-#### `{"status":"ok"}`
-
-Command succeeded. No additional data.
-
----
-
-#### `{"status":"busy"}`
-
-A command arrived over USB while a full-screen due-todo or urgent-inbox
-reminder was actively ringing. The command was **not executed** — it is
-dropped, not queued. Retry after the reminder is dismissed (ENTER) or times
-out (120 s for urgent inbox reminders; due-todo reminders wait for ENTER
-indefinitely). This distinguishes "device is temporarily unavailable" from
-silence, so a client doesn't have to guess whether a request was lost.
-
-Only the due-todo and urgent-inbox reminder screens (`reminders.rs`) return
-this; commands are still silently deferred (no reply at all until the
-command is later drained) while the RTC alarm-ringing screen (`alarms.rs`)
-or a BLE-only menu screen is showing — see Limitations below.
-
-**Fields:**
-- **`status`** (string, required): `"busy"`
-
----
-
-#### `{"status":"error","message":"ERROR_DESCRIPTION"}`
-
-Command failed. The `message` field contains a human-readable description of
-the failure (e.g., "Connection verification failed: timeout").
-
-**Fields:**
-- **`status`** (string, required): `"error"`
-- **`message`** (string, required): Description of the error.
-
----
-
-#### `{"status":"status","wifi_configured":BOOL,"server_configured":BOOL,"wifi_connected":BOOL,"wifi_ssid":STR|NULL,"wifi_has_password":BOOL,"server_url":STR|NULL,"server_has_token":BOOL,"timezone_offset_minutes":INT}`
-
-Current device configuration (in reply to `get_status`).
-
-**Fields:**
-- **`status`** (string, required): `"status"`
-- **`wifi_configured`** (bool, required): `true` if Wi-Fi credentials are stored in NVS.
-- **`server_configured`** (bool, required): `true` if server URL + token are stored in NVS.
-- **`wifi_connected`** (bool, required): `true` if currently connected to a Wi-Fi network
-  (live STA link state).
-- **`wifi_ssid`** (string or null, required): stored SSID, or `null` if not configured.
-- **`wifi_has_password`** (bool, required): whether a password is stored for the SSID.
-  The password itself is never transmitted.
-- **`server_url`** (string or null, required): stored server sync URL, or `null` if not
-  configured.
-- **`server_has_token`** (bool, required): whether an auth token is stored. The token
-  itself is never transmitted.
-- **`timezone_offset_minutes`** (int, required): stored UTC offset in minutes (`0` if unset).
-
----
-
-## USB Serial Framing (Phase 4)
-
-The USB serial channel shares the same physical port as firmware log output
-(`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`). To distinguish control frames from
-ordinary `log::info!`/`log::warn!` messages, each is prefixed with a sentinel:
-
-**Command frame (PC → device):**
-```
->>IW <JSON_COMMAND>\n
-```
-
-**Reply frame (device → PC):**
-```
-<<IW <JSON_REPLY>\n
-```
-
-The `>>IW ` and `<<IW ` prefixes (with trailing space) are literal and required.
-Any line not starting with `>>IW ` is treated as log output and ignored by the
-reader.
-
-### Example USB Session
+任意请求可带顶层字符串字段 `id`，设备会在应答中原样回传
+（`control.rs:15-18` 读取，`control.rs:28-30` 写回）。
 
 ```
-# Device boots and logs
-[INFO] Inkwash NOTE4 Rust bring-up starting
-[INFO] Power latch is high; rendering home screen
-
-# PC sends a command (e.g., set Wi-Fi credentials)
->>IW {"cmd":"set_wifi","ssid":"<ssid>","password":"<password>"}
-
-# Device logs internal operations
-[INFO] USB control: Wi-Fi credentials saved for '<ssid>'
-
-# Device sends reply
-<<IW {"status":"ok"}
-
-# PC sends another command
->>IW {"cmd":"sync_now"}
-
-[INFO] USB control sync completed: 3 alarms, 5 todos
-<<IW {"status":"ok"}
-
-# PC queries device status
->>IW {"cmd":"get_status"}
-<<IW {"status":"status","wifi_configured":true,"server_configured":true,"wifi_connected":false,"wifi_ssid":"MySSID","wifi_has_password":true,"server_url":"http://192.168.1.10:8080/api/sync","server_has_token":true,"timezone_offset_minutes":480}
+>>IW {"cmd":"get_status","id":"req-1"}
+<<IW {"id":"req-1","status":"status", ...}
 ```
 
----
+- `id` **不是** `Command` 的字段；反序列化时作为未知字段被忽略（已实测：
+  `{"cmd":"get_status","extra":1}` 解析成功）。
+- `id` 用于**幂等重放**：设备缓存最近 8 条终态应答（`command_sessions.rs:5`），
+  同 `id` 重发直接回放而不重新执行。**但缓存满会静默淘汰最旧条目**，
+  所以幂等性不是严格的——见 `review-findings.md` P1-4。
+- 不带 `id` 的请求无法去重。
 
-## BLE Framing (Phase 5)
+### 入参约束
 
-BLE control is implemented via a GATT service with two characteristics,
-both carrying plain JSON with no additional framing (GATT writes and
-notifications are already message-delimited at the link layer).
+| 命令 | 约束 | 违例应答 | 来源 |
+|---|---|---|---|
+| `set_rtc` | `epoch_secs ∈ [946684800, 4102444800]`（2000-01-01 ～ 2100-01-01） | `error` | `app.rs:3293-3295` |
+| `set_timezone` | `offset_minutes ∈ [-720, 840]` | `error` | `storage.rs:146-153` |
+| `sync_now` | 时钟必须可用 | `error: "System time not available"` | `app.rs:3334-3342` |
+| `sync_now` | 已有同步在途 | `busy` | `app.rs:3330-3333` |
+| `set_wifi` | `ssid ≤ 32` 字符、`password ≤ 64` 字符 | `error`（在 sync 线程侧） | `wifi.rs:70-73` |
+| 任意 | 该通道已有未完成命令 | `busy` | `app.rs:3283-3289` |
+| 任意 | JSON 嵌套深度 > 4 | 解析失败/丢弃 | `protocol.rs:56`、`control.rs:8-12` |
 
-### Service and Characteristics
+`MAX_COMMAND_NESTING = 4`（`protocol.rs:56`）是为保护解析栈而设
+（`protocol.rs:141-148` 的测试注释提到 "the overflow the 4096-byte worker stack"）。
 
-**Service UUID (UUID128):** `d2c25e50-5e22-48d8-a8b3-34f2f8e2c7d4`
+## 3. 应答（设备 → 上位机）
 
-**Command Characteristic (WRITE):**
-- UUID (UUID128): `d2c25e51-5e22-48d8-a8b3-34f2f8e2c7d4`
-- Properties: `WRITE`
-- Payload: JSON command object (e.g., `{"cmd":"get_status"}`)
-- Max size: 512 bytes
+`Reply` 用 `#[serde(tag = "status", rename_all = "snake_case")]`
+（`logic/src/protocol.rs:27-50`）。
 
-**Reply Characteristic (NOTIFY):**
-- UUID (UUID128): `d2c25e52-5e22-48d8-a8b3-34f2f8e2c7d4`
-- Properties: `READ | NOTIFY`
-- Payload: JSON reply object (e.g., `{"status":"ok"}`)
-- Max size: 512 bytes
+| 变体 | 线上 JSON |
+|---|---|
+| `Ok` | `{"status":"ok"}` |
+| `Busy` | `{"status":"busy"}` |
+| `Pending` | `{"status":"pending"}` |
+| `Error` | `{"status":"error","message":"..."}` |
+| `Status` | `{"status":"status", ...}` |
 
-### Example BLE Session
+带 `id` 时额外插入 `"id"` 字段（实测 `{"id":"a1","status":"ok"}`）。
 
-1. PC tool discovers the Inkwash service (`d2c25e50-5e22-48d8-a8b3-34f2f8e2c7d4`).
-2. PC tool enables notifications on the reply characteristic.
-3. PC tool writes a command to the command characteristic:
-   ```
-   {"cmd":"get_status"}
-   ```
-4. Once the pairing screen has been exited back to Home (see Limitations
-   below - commands aren't dispatched while any menu screen is showing),
-   the device processes the command and sends a reply via notification:
-   ```
-   {"status":"status","wifi_configured":true,"server_configured":true,"wifi_connected":false,"wifi_ssid":"MySSID","wifi_has_password":true,"server_url":"http://192.168.1.10:8080/api/sync","server_has_token":true,"timezone_offset_minutes":480}
-   ```
+### ⚠️ `Status` 应答的标签值就是 `"status"`
 
-### Lifecycle
+变体名 `Status` 经 `snake_case` 后与其标签字段名相同，因此线上是
+**`{"status":"status", ...}`**（已实测）。上位机判别时应匹配
+`status == "status"`，不要误以为 `"status"` 是某种错误。
 
-- BLE is **not** active by default; it costs ~150KB RAM.
-- User enters "BLE PAIRING" menu item from Home to start advertising.
-- GATT service accepts one connected client at a time; a second connection is
-  rejected so command writes, notify-tx callbacks, and retries stay bound to
-  one connection handle.
-- On screen exit (HOLD), advertising stops and the GATT service is torn down.
-- The same `control::dispatch` logic handles both USB and BLE commands,
-  so the command/reply contract is identical between transports.
+完整字段（实测输出）：
 
-The firmware tags each BLE command and reply internally with the pairing
-session, connection generation, connection handle, and a private reply id.
-The private reply id is used for retry bookkeeping even when the command has
-no wire-level `id`; it is never added to the JSON payload. BLE notification
-completion means NimBLE reported `SuccessNotify`. This is a protocol-stack
-transmit result, not an application-level acknowledgement from the client.
-Inbound command and reply queues are bounded: a full command queue rejects the
-write, while a reply already accepted by the worker remains owned by its
-bounded retry buffer until delivery, termination, or disconnect.
+```json
+{
+  "status": "status",
+  "wifi_configured": true,
+  "server_configured": false,
+  "wifi_connected": false,
+  "wifi_ssid": "MyAP",
+  "wifi_has_password": true,
+  "server_url": null,
+  "server_has_token": false,
+  "timezone_offset_minutes": 480
+}
+```
 
-### Limitations (same as USB)
+- `wifi_ssid` / `server_url` 为 `null` 表示未配置。
+- `wifi_has_password` / `server_has_token` 是**布尔标志**——设备从不回传
+  密码或 token 本体。
+- `wifi_connected` 表示当前是否已连接（由状态机的 connectivity 决定）。
 
-- Commands are dispatched from Home, content-page browsing, navigation and
-  settings pickers, numeric alarm entry, inbox detail, and the BLE pairing
-  screen. Deliberately time-critical alarm/reminder screens may defer control
-  traffic until the user dismisses them.
+### 序列化兜底
 
----
+若 `Reply` 序列化失败（理论上不会），`control.rs:24-27` 返回固定串：
+`{"status":"error","message":"Failed to serialize reply"}`。
 
-## Error Handling
+### 终态与在途
 
-- **Malformed JSON:** Logged as a warning; command is dropped; no reply is sent.
-- **Excessive nesting:** A frame nesting JSON containers deeper than 4 is
-  rejected before parsing, logged as a warning, and dropped; no reply is sent.
-  Every command here is a flat object, so no valid frame is affected. The limit
-  exists because deserializer recursion depth follows the frame's *shape* rather
-  than its length, and the parsing worker's stack is small; see
-  `MAX_COMMAND_NESTING` in `logic/src/protocol.rs` for the measurements.
-- **Unknown command field:** JSON parse error; handled as above.
-- **Missing required field:** JSON parse error; handled as above.
-- **Command execution failure:** Command completes but returns `Error { message }`.
+`command_sessions.rs:262-267` 把 `Ok` / `Status` / `Error` 视为**终态**并写入
+幂等缓存；`Pending` 与 `Busy` 不写入。
 
----
+## 4. 典型会话
 
-## Security
+### USB
 
-- Commands traverse the USB serial port or BLE link unencrypted. Assume the
-  device is physically accessible when these channels are used.
-- Wi-Fi and server credentials are stored unencrypted in NVS. An attacker with
-  physical access to the device can extract them.
-- Bearer tokens should be long, random, and kept confidential (treat like a
-  password).
+```
+>>IW {"cmd":"get_status","id":"1"}
+<<IW {"id":"1","status":"status","wifi_configured":true,...}
 
----
+>>IW {"cmd":"set_wifi","ssid":"MyAP","password":"secret","id":"2"}
+<<IW {"id":"2","status":"ok"}
 
-## Timing and Scheduling
+>>IW {"cmd":"sync_now","id":"3"}
+<<IW {"id":"3","status":"ok"}
+```
 
-Commands execute synchronously during the main loop's 20 ms poll cycle. Most
-commands complete within that cycle; `sync_now` may block for several seconds
-(network latency). The main loop feeds the Task Watchdog Timer during and after
-command execution, so a hung sync will eventually reboot the device.
+### BLE（同一命令，无前缀）
 
----
+```
+写 d2c25e51: {"cmd":"get_status","id":"1"}
+收 d2c25e52 通知: {"id":"1","status":"status",...}
+```
 
-## Limitations (Current Implementation)
+> BLE 的 notify 有 **2 秒超时兜底**（`ble_control.rs:758-782`）：若某条应答的
+> notify-tx 回调迟迟不返回或连接已断，设备把它标记为 `ReplyTerminated`
+> 并按 generation + conn_handle 丢弃，不会永久阻塞后续命令。
+> 上位机侧遇到无响应应重发（带同一 `id` 可命中幂等缓存）。
 
-- Six commands are implemented: `set_wifi`, `set_server`, `sync_now`,
-  `get_status`, `clear_alarms`, and `set_timezone`.
-- No rate limiting or command queueing; commands are dispatched as they arrive.
-- The optional `id` (see Request Correlation above) only labels which reply
-  answers which command; it does not make out-of-order replies impossible.
-  The device still processes and replies to commands strictly in arrival
-  order (one at a time, no internal queueing/reordering), so a client that
-  keeps exactly one command in flight never needs `id` to disambiguate. Set
-  it if you might have more than one in flight, or want to treat a reply
-  that arrives after your own timeout as identifiably stale rather than
-  guessing.
-- The `busy` reply (see Replies above) only covers the due-todo and
-  urgent-inbox reminder screens. The RTC alarm-ringing screen and BLE-only
-  menu screens still silently defer USB/BLE commands until dispatch resumes
-  - a client can't yet tell "device busy, will reply soon" apart from
-  "device unreachable" in those cases.
-- `UsbConsole` has no dedicated reader task. Home and the long-lived content
-  pages and interactive pickers poll it non-blockingly. Input lines are capped
-  at 512 bytes so a broken client cannot grow the firmware heap without bound.
-- **Opening the serial port can itself trigger a spurious ENTER press.**
-  This board's USB-Serial-JTAG auto-reset circuitry (the same one `espflash`
-  uses to enter the bootloader) wires the DTR/RTS control lines to GPIO0 -
-  which is also the ENTER button. A serial library that asserts DTR/RTS on
-  open (many do, by default) will physically pull GPIO0 low, which the
-  firmware can't distinguish from a real button press. This was observed
-  directly during Phase 4 hardware testing: opening the port and asserting
-  DTR+RTS caused the device to open its on-device menu, which then (per the
-  point above) stopped responding to further commands until backed out of.
-  A PC tool implementation should either avoid asserting DTR/RTS when
-  opening the port, or account for the device possibly landing on a menu
-  screen immediately after connecting.
+## 5. 设备状态机侧的行为
+
+- **命令槽位**：每条通道（USB / BLE）同时只允许一条未完成命令。
+  槽位被占时新命令立即得 `busy`（`app.rs:3282-3287`）。
+- **任务路由**：`sync_now` / `set_wifi` 走 sync 线程（异步，业务结果通过
+  `Effect::Reply` 回投）；`set_rtc` / `set_timezone` / `set_server` /
+  `clear_alarms` 立即回 `ok` 或 `error`。
+- **USB 会话号**：主机插拔会使会话号自增（`main.rs:480-494`），
+  旧会话的未完成应答被取消。BLE 侧对应 connection generation + conn_handle。
+- **安全模式**：核心启动事实不可用（RTC 读失败、NVS 打开失败等）时设备进入
+  safe mode，**只有 `get_status` 被应答**（返回全 `false`/`0`），
+  其余命令回 `error: "device is in safe mode (core data unavailable); command ... rejected"`
+  （`main.rs:1100-1135`）。
+
+## 6. USB 附加：串口日志
+
+USB-Serial-JTAG 同时承载**日志输出**（`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`）
+与控制协议。上位机解析时应只识别 `<<IW ` 前缀行，其余为 `log` crate 输出。
+
+`scripts/capture-serial.py` 提供了非交互式采集（自动探测
+`/dev/cu.usbmodem*` 与 `/dev/ttyACM*`），可用于抓取上述日志与控制应答。
+
+## 7. 已知未覆盖
+
+- 原始 `docs/control-protocol.md` 可能还记录了**版本协商、错误码表、
+  上位机重试建议**等内容；这些未在源码中体现，本文件无法复原。
+- BLE 配对流程（`Screen::BlePairing`）的交互时序未在协议层定义，
+  属于 UI 状态机（`logic/src/app.rs` 的 `transition_ble_pairing_*`），
+  必要时应单独成文。

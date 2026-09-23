@@ -1,36 +1,14 @@
-//! Wall-clock boundary-alignment math shared by `rust-firmware/src/ctx.rs`'s
-//! sync-scheduler and `main.rs`'s status/clock poll counters. "Cron-style"
-//! alignment means a boundary is due when its index *advances* relative to
-//! the last one observed, not when a boot-relative timer elapses - so
-//! "every 30s" fires at :00/:30 of each minute and "every 1h" fires at the
-//! top of the hour, regardless of what wall-clock time the device happened
 use crate::app::InboxState;
 use crate::inbox_item::{InboxKind, Priority};
 
-/// The boundary index that `unix` falls into for a period of `period_secs`
-/// seconds - e.g. `boundary_index(unix, 30)` for the urgent-poll cadence, or
-/// `boundary_index(unix, interval_minutes * 60)` for the full-sync cadence.
 pub fn boundary_index(unix: u64, period_secs: u64) -> u64 {
     unix / period_secs
 }
 
-/// Whether the boundary `unix` falls into has advanced past `last_seen` (the
-/// index recorded the last time this boundary fired). A caller should
-/// record the new `boundary_index(unix, period_secs)` after acting on
-/// `true`, mirroring `ctx.rs::poll_scheduled_sync`.
-pub fn boundary_advanced(unix: u64, period_secs: u64, last_seen: u64) -> bool {
-    boundary_index(unix, period_secs) > last_seen
+pub fn boundary_changed(unix: u64, period_secs: u64, last_seen: u64) -> bool {
+    boundary_index(unix, period_secs) != last_seen
 }
 
-/// Wall-clock sync cursors + urgent-message tracking, moved out of
-/// `DeviceContext` into the host-testable logic crate so the sync-scheduling
-/// business rules (when to poll, when to skip) can be unit-tested without
-/// ESP-IDF.
-///
-/// The `never_synced` flag disables the "full sync on boot" fast path once
-/// any successful sync has occurred; `urgent_synced` tracks whether the
-/// current urgent message has already been fetched (so the server's
-/// persistent `urgent: true` response is not treated as a new message).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncScheduler {
     last_urgent_boundary: u64,
@@ -43,9 +21,6 @@ pub struct SyncScheduler {
 }
 
 impl SyncScheduler {
-    /// Construct from the current wall clock and persisted counters.
-    /// `last_sync_epoch` is `None` on a fresh device (never synced);
-    /// `sync_interval_minutes` defaults to 60.
     pub fn new(now_unix: u64, sync_interval_minutes: u16, last_sync_epoch: Option<u64>) -> Self {
         let interval = sync_interval_minutes.max(1) as u64;
         Self {
@@ -59,16 +34,10 @@ impl SyncScheduler {
         }
     }
 
-    /// Returns `true` if the device already fetched the current urgent
-    /// message and a further urgent-triggered full sync would be redundant.
-    /// Checks the local unread-set: if non-empty *and* `urgent_synced` is
-    /// true, the last full sync already fetched the message — the server
-    /// is just re-reporting `urgent: true` until the user reads it.
     pub fn already_synced_urgent(&self, inbox: &InboxState) -> bool {
         self.urgent_synced && Self::has_unread_urgent(inbox)
     }
 
-    /// `true` when `inbox` contains at least one unread high-priority alert.
     pub fn has_unread_urgent(inbox: &InboxState) -> bool {
         inbox
             .items
@@ -76,10 +45,9 @@ impl SyncScheduler {
             .any(|it| !it.read && it.priority == Priority::High && it.kind == InboxKind::Alert)
     }
 
-    /// Whether a full sync is due (boundary index advanced since last fire).
     pub fn full_due(&self, unix: u64, sync_interval_minutes: u16) -> bool {
         let period = sync_interval_minutes.max(1) as u64 * 60;
-        boundary_advanced(unix, period, self.last_full_boundary)
+        boundary_changed(unix, period, self.last_full_boundary)
     }
 
     pub fn interval_minutes(&self) -> u16 {
@@ -92,12 +60,10 @@ impl SyncScheduler {
         self.last_full_boundary = boundary_index(unix, interval as u64 * 60);
     }
 
-    /// Whether an urgent poll is due (30s boundary advanced).
     pub fn urgent_due(&self, unix: u64) -> bool {
-        boundary_advanced(unix, 30, self.last_urgent_boundary)
+        boundary_changed(unix, 30, self.last_urgent_boundary)
     }
 
-    /// Record that the full-sync boundary fired at `unix`.
     pub fn advance_full_boundary(&mut self, unix: u64, sync_interval_minutes: u16) {
         let period = sync_interval_minutes.max(1) as u64 * 60;
         self.full_boundary_before_advance = Some(self.last_full_boundary);
@@ -110,7 +76,6 @@ impl SyncScheduler {
         }
     }
 
-    /// Record that the urgent-poll boundary fired at `unix`.
     pub fn advance_urgent_boundary(&mut self, unix: u64) {
         self.urgent_boundary_before_advance = Some(self.last_urgent_boundary);
         self.last_urgent_boundary = boundary_index(unix, 30);
@@ -122,29 +87,22 @@ impl SyncScheduler {
         }
     }
 
-    /// Whether this is the first sync ever (fresh device).
     pub fn is_never_synced(&self) -> bool {
         self.never_synced
     }
 
-    /// Clear the `never_synced` flag after a successful first sync.
     pub fn mark_synced(&mut self) {
         self.never_synced = false;
     }
 
-    /// Mark that the current urgent message has been fetched.
     pub fn mark_urgent_synced(&mut self) {
         self.urgent_synced = true;
     }
 
-    /// Clear the urgent-synced flag when the server says `urgent: false`,
-    /// meaning the message has been read or no longer applies.
     pub fn clear_urgent_synced(&mut self) {
         self.urgent_synced = false;
     }
 
-    /// Mark the scheduler as having completed a full sync. This disables the
-    /// fresh-device urgent fast path after the first successful sync.
     pub fn mark_full_sync_completed(&mut self) {
         self.never_synced = false;
     }
@@ -181,16 +139,22 @@ mod tests {
     }
 
     #[test]
-    fn boundary_advanced_is_false_within_the_same_period() {
+    fn boundary_changed_is_false_within_the_same_period() {
         let last_seen = boundary_index(100, 30);
-        assert!(!boundary_advanced(101, 30, last_seen));
-        assert!(!boundary_advanced(119, 30, last_seen));
+        assert!(!boundary_changed(101, 30, last_seen));
+        assert!(!boundary_changed(119, 30, last_seen));
     }
 
     #[test]
-    fn boundary_advanced_is_true_once_the_index_changes() {
+    fn boundary_changed_is_true_once_the_index_changes() {
         let last_seen = boundary_index(100, 30);
-        assert!(boundary_advanced(130, 30, last_seen));
+        assert!(boundary_changed(130, 30, last_seen));
+    }
+
+    #[test]
+    fn boundary_changed_is_true_when_the_clock_moves_backwards() {
+        let last_seen = boundary_index(300, 30);
+        assert!(boundary_changed(270, 30, last_seen));
     }
 
     #[test]
@@ -201,8 +165,8 @@ mod tests {
 
     #[test]
     fn a_never_seen_boundary_index_of_zero_is_not_special_cased() {
-        assert!(boundary_advanced(3600, 3600, 0));
-        assert!(!boundary_advanced(0, 3600, 0));
+        assert!(boundary_changed(3600, 3600, 0));
+        assert!(!boundary_changed(0, 3600, 0));
     }
 
     #[test]
@@ -228,7 +192,7 @@ mod tests {
     #[test]
     fn already_synced_urgent_falls_through_before_first_sync() {
         let s = SyncScheduler::new(100, 60, Some(50));
-        // urgent_synced starts false
+
         let inbox = make_inbox(vec![urgent_item(1, false)]);
         assert!(
             !s.already_synced_urgent(&inbox),
@@ -289,12 +253,21 @@ mod tests {
         let mut s = SyncScheduler::new(0, 60, None);
         s.advance_full_boundary(3600, 60);
         s.advance_urgent_boundary(30);
-        assert!(!s.full_due(3599, 60));
-        assert!(!s.urgent_due(29));
+        assert!(!s.full_due(7199, 60), "same hour as the advance → not due");
+        assert!(
+            !s.urgent_due(59),
+            "same 30s window as the advance → not due"
+        );
         s.rollback_full_boundary();
         s.rollback_urgent_boundary();
-        assert!(s.full_due(3600, 60));
-        assert!(s.urgent_due(30));
+        assert!(
+            s.full_due(7199, 60),
+            "the rolled-back hour is due for a retry again"
+        );
+        assert!(
+            s.urgent_due(59),
+            "the rolled-back 30s window is due for a retry again"
+        );
     }
 
     #[test]
@@ -305,29 +278,56 @@ mod tests {
     }
 
     #[test]
-    fn clock_rollback_does_not_make_a_boundary_due() {
-        let s = SyncScheduler::new(300, 60, Some(300));
-        assert!(!s.urgent_due(270));
-        assert!(!s.full_due(270, 60));
+    fn clock_rollback_re_aligns_the_urgent_cursor_instead_of_stalling() {
+        let mut s = SyncScheduler::new(300, 60, Some(300));
+
+        assert!(s.urgent_due(270));
+        assert!(
+            !s.full_due(270, 60),
+            "a rollback inside the same hour is not a full-sync boundary"
+        );
+        s.advance_urgent_boundary(270);
+        assert!(
+            !s.urgent_due(275),
+            "same 30s window after the re-align → not due"
+        );
+        assert!(s.urgent_due(300), "the next real boundary → due again");
+    }
+
+    #[test]
+    fn clock_rollback_re_arms_a_full_sync_after_a_long_backward_jump() {
+        let mut s = SyncScheduler::new(7 * 24 * 3600, 60, Some(600));
+        let rolled_back = 6 * 24 * 3600;
+        assert!(
+            s.full_due(rolled_back, 60),
+            "the first sample after the jump re-aligns and syncs"
+        );
+        s.advance_full_boundary(rolled_back, 60);
+        assert!(
+            !s.full_due(rolled_back + 3599, 60),
+            "re-aligned hour → not due"
+        );
+        assert!(
+            s.full_due(rolled_back + 3600, 60),
+            "the next aligned hour → due"
+        );
     }
 
     #[test]
     fn urgent_poll_flow_marks_synced_and_skips_redundant() {
-        // Simulate: urgent poll fires → sync → mark synced → server says
-        // urgent=true again but it's the same unread message → skip.
         let mut s = SyncScheduler::new(0, 60, Some(50));
-        // Time 45: boundary 1 (30..59) advanced from initial boundary 0.
+
         assert!(s.urgent_due(45));
-        // After dispatching sync, mark urgent synced.
+
         s.advance_urgent_boundary(45);
         s.mark_urgent_synced();
-        // Now the inbox still has the same unread urgent message.
+
         let inbox = make_inbox(vec![urgent_item(1, false)]);
         assert!(
             s.already_synced_urgent(&inbox),
             "same unread urgent → redundant sync skipped"
         );
-        // After reading the message, urgent_synced doesn't matter.
+
         let read_inbox = make_inbox(vec![urgent_item(1, true)]);
         assert!(
             !s.already_synced_urgent(&read_inbox),

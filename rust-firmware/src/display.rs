@@ -1,16 +1,3 @@
-//! Client side of the EPD subsystem: the shared 1bpp
-//! canvas and the request slot into the dedicated EPD task, which owns
-//! the FFI driver. Every refresh is asynchronous - drawing into the canvas
-//! is never blocked by a panel update, and the main loop never waits on a
-//! refresh.
-//!
-//! The canvas lives on the app thread only. A refresh request snapshots
-//! the whole frame under the canvas lock at request time, so the EPD task
-//! never reads the canvas and a pending refresh is
-//! immune to later drawing. Requests go through a single latest-wins slot;
-//! the caller decides whether an explicit full refresh is needed, while
-//! partial requests stay partial.
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -25,15 +12,6 @@ use crate::rtc::DateTime;
 
 pub use crate::canvas::Rect;
 
-/// Main-thread handle to the EPD subsystem: a lockable view of the frame
-/// buffer plus the request slot into [`crate::epd_task`].
-/// Main-thread handle to the EPD subsystem: an `Arc`-shared lockable
-/// view of the frame buffer plus the request slot into [`crate::epd_task`].
-/// `Clone` so the effect task can own its own handle; the canvas is behind
-/// `Arc<Mutex<>>` so both threads draw and submit from the same buffer.
-/// The EPD task itself never reads the canvas (it receives an immutable
-/// frame snapshot via `RenderCommand`), so the only contention is between
-/// the main loop and the effect task when drawing.
 #[derive(Clone)]
 pub struct EpdClient {
     canvas: Arc<Mutex<Canvas>>,
@@ -41,29 +19,16 @@ pub struct EpdClient {
 }
 
 impl EpdClient {
-    /// Initializes the EPD driver (hardware faults propagate) and spawns
-    /// the refresh task.
     pub fn new() -> Result<Self> {
         let canvas = Arc::new(Mutex::new(Canvas::new()));
         let handle = epd_task::spawn()?;
         Ok(Self { canvas, handle })
     }
 
-    /// Direct canvas access for screens that don't fit the fixed
-    /// `render_home` layout, e.g. the navigation drawer and `screens.rs`.
-    /// The returned guard is the frame buffer; the refresh request issued
-    /// after drawing snapshots it, so what was just drawn is what the
-    /// panel shows.
     pub fn canvas_mut(&self) -> MutexGuard<'_, Canvas> {
         self.canvas.lock()
     }
 
-    /// The idle/background screen: clock, Wi-Fi/battery status, next-alarm
-    /// summary (time, countdown), and a todos summary (open count,
-    /// due-today count). `main.rs` redraws this after returning from any
-    /// modal screen (the navigation drawer, settings menu, alarm ring).
-    /// Layout lives in `home::render` so the same pixels can be previewed
-    /// on a PC; this only hands it the canvas.
     #[allow(clippy::too_many_arguments)]
     pub fn render_home(
         &self,
@@ -94,28 +59,16 @@ impl EpdClient {
         );
     }
 
-    /// Queues a full-screen refresh of the current canvas contents; the
-    /// frame is snapshotted now, so the panel shows exactly this frame.
     pub fn refresh_full(&self) -> Result<u64> {
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
         self.handle.request_full(frame)
     }
 
-    /// Always refreshes only `rect`, never promotes to a full refresh.
-    /// The RTC is sampled frequently but the visible home clock refreshes
-    /// only when its displayed minute changes; boot and alarm-ring still use
-    /// `refresh_full` explicitly. Callers re-render the whole canvas
-    /// before refreshing, so the partial rect always shows fresh pixels.
-    /// The scheduler merges consecutive partials into one pending request;
-    /// `refresh_full` is reserved for deliberate full refreshes such as boot,
-    /// page transitions, overlays, and recovery.
     pub fn refresh_partial(&self, rect: Rect) -> Result<u64> {
         let frame = self.canvas.lock().frame().to_vec().into_boxed_slice();
         self.handle.request_partial(rect, frame)
     }
 
-    /// Non-blocking drain of completed refreshes: the app
-    /// state machine observes each refresh's success/failure/recovery here.
     pub fn poll_completion(&self) -> Option<EpdCompletion> {
         self.handle.poll_completion()
     }
