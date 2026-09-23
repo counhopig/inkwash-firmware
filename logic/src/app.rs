@@ -4,7 +4,7 @@ use crate::button_event::{ButtonEvent, ButtonId};
 use crate::datetime::{days_in_month, DateTime};
 use crate::device_config::{DeviceConfig, WifiCreds};
 use crate::inbox_item::InboxItem;
-use crate::power_state::{SleepInputs, SleepKind, SleepState, SleepToken};
+use crate::power_state::{SleepBlocker, SleepInputs, SleepKind, SleepState, SleepToken};
 use crate::protocol::{Channel, ControlReply, ControlRequest, Reply};
 use crate::todo::Todo;
 use crate::wake_cause::WakeCause;
@@ -42,7 +42,9 @@ pub enum Screen {
         selected: usize,
     },
     About,
-    SleepPending,
+    SleepPending {
+        blocker: Option<SleepBlocker>,
+    },
 
     SyncIntervalPick {
         selected: usize,
@@ -118,7 +120,7 @@ impl Screen {
                 selected: *selected,
             },
             Screen::About => RenderView::About,
-            Screen::SleepPending => RenderView::SleepPending,
+            Screen::SleepPending { blocker } => RenderView::SleepPending { blocker: *blocker },
             Screen::SyncIntervalPick { selected } => RenderView::SyncInterval {
                 selected: *selected,
             },
@@ -424,7 +426,9 @@ pub enum RenderView {
     },
 
     About,
-    SleepPending,
+    SleepPending {
+        blocker: Option<SleepBlocker>,
+    },
 
     AlarmList {
         selected: usize,
@@ -1247,11 +1251,22 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
         .flatten();
     let manual_request = state.requested_sleep.is_some();
     state.requested_sleep = None;
-    let Ok(token) = state.sleep.prepare(kind, poll.now_ticks, inputs) else {
-        if manual_request {
-            state.requested_sleep = Some(kind);
+    let token = match state.sleep.prepare(kind, poll.now_ticks, inputs) {
+        Ok(token) => token,
+        Err(blocker) => {
+            if manual_request {
+                state.requested_sleep = Some(kind);
+                if matches!(state.screen, Screen::SleepPending { blocker: current } if current != Some(blocker))
+                {
+                    state.screen = Screen::SleepPending {
+                        blocker: Some(blocker),
+                    };
+                    state.render_generation = state.render_generation.next();
+                    return vec![render_batch(state)];
+                }
+            }
+            return vec![];
         }
-        return vec![];
     };
     state.pending_sleep_inputs = Some(inputs);
     state.pending_sleep_operation = Some(state.next_operation_id());
@@ -2002,7 +2017,7 @@ fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBat
             | Screen::Navigation { .. }
             | Screen::Settings { .. }
             | Screen::About
-            | Screen::SleepPending
+            | Screen::SleepPending { .. }
             | Screen::SyncIntervalPick { .. }
             | Screen::AlarmList { .. }
             | Screen::AlarmAdd(_)
@@ -2199,7 +2214,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_SLEEP_ROW {
                         state.requested_sleep = Some(SleepKind::ManualDeep);
-                        state.screen = Screen::SleepPending;
+                        state.screen = Screen::SleepPending { blocker: None };
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_BLE_PAIRING_ROW {
@@ -2247,7 +2262,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
             }
             _ => vec![],
         },
-        Screen::SleepPending => {
+        Screen::SleepPending { .. } => {
             state.requested_sleep = None;
             state.sleep.activity();
             state.pending_sleep_operation = None;
@@ -6708,7 +6723,16 @@ mod tests {
             light_wake_after_ms: 1_000,
         };
         let blocked = update(&mut state, Event::PowerPoll(poll(0, true)));
-        assert!(blocked.is_empty());
+        assert!(blocked
+            .iter()
+            .flat_map(|batch| &batch.effects)
+            .any(|effect| matches!(effect, Effect::Render(_))));
+        assert_eq!(
+            state.screen,
+            Screen::SleepPending {
+                blocker: Some(SleepBlocker::FinalDisplayPending)
+            }
+        );
         assert_eq!(state.requested_sleep, Some(SleepKind::ManualDeep));
 
         let _ = update(

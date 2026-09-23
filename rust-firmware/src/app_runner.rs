@@ -460,9 +460,9 @@ fn draw_sm_surface(
             let mut canvas = ctx.board.display.canvas_mut();
             crate::screens::draw_about(&mut canvas);
         }
-        RenderView::SleepPending => {
+        RenderView::SleepPending { blocker } => {
             let mut canvas = ctx.board.display.canvas_mut();
-            crate::screens::draw_sleep_pending(&mut canvas);
+            crate::screens::draw_sleep_pending(&mut canvas, blocker);
         }
         RenderView::SyncInterval { selected } => {
             let mut canvas = ctx.board.display.canvas_mut();

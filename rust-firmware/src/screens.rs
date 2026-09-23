@@ -99,11 +99,27 @@ pub(crate) fn draw_about(canvas: &mut Canvas) {
     footer(canvas, "ENTER BACK");
 }
 
-pub(crate) fn draw_sleep_pending(canvas: &mut Canvas) {
+pub(crate) fn draw_sleep_pending(
+    canvas: &mut Canvas,
+    blocker: Option<inkwash_logic::power_state::SleepBlocker>,
+) {
     canvas.clear();
     header(canvas, "SLEEP");
     canvas.draw_text_prop(24, 80, 2, "GOING TO SLEEP");
-    canvas.draw_text_prop(24, 128, 1, "FINISHING ACTIVE WORK...");
+    let status = match blocker {
+        None => "FINISHING ACTIVE WORK...",
+        Some(inkwash_logic::power_state::SleepBlocker::NetworkInFlight) => "WAITING FOR SYNC...",
+        Some(inkwash_logic::power_state::SleepBlocker::FinalDisplayPending) => {
+            "WAITING FOR DISPLAY..."
+        }
+        Some(inkwash_logic::power_state::SleepBlocker::FinalPersistPending) => {
+            "WAITING FOR STORAGE..."
+        }
+        Some(inkwash_logic::power_state::SleepBlocker::RtcPlanUnconfirmed) => "WAITING FOR RTC...",
+        Some(inkwash_logic::power_state::SleepBlocker::InputLatchSet) => "RELEASE BUTTON...",
+        Some(_) => "FINISHING ACTIVE WORK...",
+    };
+    canvas.draw_text_prop(24, 128, 1, status);
     footer(canvas, "PRESS ANY KEY TO CANCEL");
 }
 
