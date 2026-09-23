@@ -1176,8 +1176,6 @@ fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> 
 }
 
 fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
-    let released_manual_request =
-        state.requested_sleep == Some(SleepKind::ManualDeep) && poll.input_latch_clear;
     if poll.activity_observed {
         state.last_activity_ticks = Some(poll.now_ticks);
         state.idle_since_ticks = None;
@@ -1190,12 +1188,11 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
             state.pending_sleep_page_allows = false;
             state.pending_sleep_maintenance = None;
         }
-        if disable {
-            return disable_light_sleep_batch(state);
-        }
-        if !released_manual_request {
-            return vec![];
-        }
+        return if disable {
+            disable_light_sleep_batch(state)
+        } else {
+            vec![]
+        };
     }
     if state.sleep.committed_kind().is_some() {
         return vec![];
@@ -1203,9 +1200,7 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     if state.pending_sleep_inputs.is_some() {
         return vec![];
     }
-    let kind = if state.requested_sleep == Some(SleepKind::ManualDeep) {
-        SleepKind::ManualDeep
-    } else {
+    let kind = {
         let last = *state.last_activity_ticks.get_or_insert(poll.now_ticks);
         let idle_for = poll.now_ticks.saturating_sub(last);
         let idle_since = if idle_for >= 2_000 {
@@ -1222,7 +1217,7 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
         })
     };
     let inputs = app_sleep_inputs(state, poll);
-    let maintenance = matches!(kind, SleepKind::Deep | SleepKind::ManualDeep)
+    let maintenance = matches!(kind, SleepKind::Deep)
         .then(|| {
             state
                 .clock
@@ -1328,9 +1323,7 @@ fn transition_sleep_committed(state: &mut AppState, token: SleepToken) -> Vec<Ef
         SleepKind::Light => Effect::EnterLightSleep(LightSleepPlan {
             wake_after_ms: state.pending_sleep_light_wake_after_ms,
         }),
-        SleepKind::Deep | SleepKind::ManualDeep => {
-            Effect::EnterDeepSleep(WakeupPlan { maintenance })
-        }
+        SleepKind::Deep => Effect::EnterDeepSleep(WakeupPlan { maintenance }),
     };
     let operation_id = state.next_operation_id();
     state.pending_sleep_operation = Some(operation_id);
@@ -2179,10 +2172,6 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         state.screen = Screen::SyncIntervalPick { selected: 0 };
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
-                    } else if cur == SETTINGS_SLEEP_ROW {
-                        state.requested_sleep = Some(SleepKind::ManualDeep);
-                        state.render_generation = state.render_generation.next();
-                        vec![render_batch(state)]
                     } else if cur == SETTINGS_BLE_PAIRING_ROW {
                         let session_id = state.next_operation_id().0;
                         let pairing = BlePairingRequest {
@@ -2253,11 +2242,9 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
     }
 }
 
-pub const SETTINGS_ROW_COUNT: usize = 5;
+pub const SETTINGS_ROW_COUNT: usize = 4;
 
-pub const SETTINGS_ABOUT_ROW: usize = 4;
-
-pub const SETTINGS_SLEEP_ROW: usize = 3;
+pub const SETTINGS_ABOUT_ROW: usize = 3;
 
 pub const SETTINGS_BLE_PAIRING_ROW: usize = 2;
 
@@ -6625,65 +6612,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_sleep_short_press_survives_same_cycle_activity_poll() {
-        let mut state = AppState::default();
-        let _ = update(
-            &mut state,
-            Event::Boot(boot_snapshot(vec![], Some(dt(8, 0)), false, true)),
-        );
-
-        state.pending_rtc = None;
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
-        );
-
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
-        );
-        assert_eq!(state.screen, Screen::Settings { selected: 3 });
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
-        );
-        let poll = |now_ticks| PowerPoll {
-            now_ticks,
-            activity_observed: true,
-            final_display_pending: false,
-            final_persist_pending: false,
-            usb_connected: true,
-            event_queue_empty: true,
-            input_latch_clear: true,
-            wake_plan_confirmed: true,
-            network_resumable: false,
-            light_wake_after_ms: 1_000,
-        };
-        let batches = update(&mut state, Event::PowerPoll(poll(0)));
-        assert!(batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::PrepareSleep { token, .. } if token.kind == SleepKind::ManualDeep)));
-        assert!(state.sleep.prepared_token().is_some());
-    }
-
-    #[test]
     fn settings_about_row_opens_and_returns_to_settings() {
         let mut state = AppState {
             screen: Screen::Settings {
@@ -7118,63 +7046,6 @@ mod tests {
             .iter()
             .flat_map(|batch| &batch.effects)
             .any(|effect| matches!(effect, Effect::PrepareSleep { .. })));
-    }
-
-    #[test]
-    fn settings_sleep_with_future_once_alarm_plans_maintenance_wake() {
-        let mut state = AppState::default();
-
-        let mut list = vec![alarm(1, 8, 0)];
-        list[0].repeat = Repeat::Once {
-            year: 2026,
-            month: 10,
-            day: 1,
-        };
-        let _ = update(
-            &mut state,
-            Event::Boot(boot_snapshot(list, Some(dt(8, 1)), false, true)),
-        );
-        state.pending_rtc = None;
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Up)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::LongPressed(ButtonId::Down)),
-        );
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
-        );
-
-        for _ in 0..3 {
-            let _ = update(
-                &mut state,
-                Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
-            );
-        }
-        let _ = update(
-            &mut state,
-            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
-        );
-        let poll = |now_ticks| PowerPoll {
-            now_ticks,
-            activity_observed: false,
-            final_display_pending: false,
-            final_persist_pending: false,
-            usb_connected: true,
-            event_queue_empty: true,
-            input_latch_clear: true,
-            wake_plan_confirmed: true,
-            network_resumable: false,
-            light_wake_after_ms: 1_000,
-        };
-        let batches = update(&mut state, Event::PowerPoll(poll(0)));
-        assert!(batches
-            .iter()
-            .flat_map(|b| &b.effects)
-            .any(|e| matches!(e, Effect::PrepareSleep { .. })));
     }
 
     #[test]
