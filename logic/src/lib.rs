@@ -400,6 +400,67 @@ mod ble_memory_contract {
     }
 
     #[test]
+    fn crash_dumps_and_public_releases_keep_secrets_in_bounds() {
+        const RELEASE: &str = include_str!("../../scripts/release.sh");
+        assert!(
+            config_is("ESP_COREDUMP_CAPTURE_DRAM", "n"),
+            "flash is not encrypted in the production image, so the coredump must hold \
+             task stacks only and never copy the heap that holds the Wi-Fi password and token"
+        );
+        for gate in [
+            "require_config '# CONFIG_ESP_COREDUMP_CAPTURE_DRAM is not set'",
+            "require_config '# CONFIG_SECURE_BOOT is not set'",
+            "require_config '# CONFIG_SECURE_FLASH_ENC_ENABLED is not set'",
+            "./scripts/build-rust.sh --release --locked",
+            "SOURCE_DATE_EPOCH=\"$(git show -s --format=%ct HEAD)\"",
+            "Security boundary",
+        ] {
+            assert!(RELEASE.contains(gate), "release.sh lost `{gate}`");
+        }
+    }
+
+    #[test]
+    fn flashing_goes_through_the_identity_check() {
+        const RUNNER: &str = include_str!("../../rust-firmware/.cargo/config.toml");
+        const FLASH: &str = include_str!("../../scripts/flash-note4.sh");
+        assert!(RUNNER.contains("runner = [\"../scripts/flash-note4.sh\""));
+        assert!(!RUNNER.contains("runner = \"espflash"));
+        for check in [
+            "read_mac",
+            "flash_id",
+            "INKWASH_NOTE4_MAC",
+            "--flash-size 16mb --flash-mode dio --flash-freq 80mhz",
+            "--partition-table \"$partitions\" --partition-table-offset 0x10000",
+        ] {
+            assert!(FLASH.contains(check), "flash-note4.sh lost `{check}`");
+        }
+        let identity = FLASH
+            .find("probe read_mac")
+            .expect("the MAC is read before flashing");
+        let flash = FLASH
+            .find("espflash flash")
+            .expect("the wrapper flashes with espflash");
+        assert!(
+            identity < flash,
+            "identity must be proven before anything is written"
+        );
+    }
+
+    #[test]
+    fn secure_builds_sign_and_verify_the_application() {
+        const BUILD: &str = include_str!("../../scripts/build-rust.sh");
+        for step in [
+            "--secure-pad-v2",
+            "espsecure sign_data --version 2",
+            "espsecure verify_signature --version 2 --keyfile \"$key\" \"$signed\"",
+            "\"$out/bootloader.bin\"",
+            "'# CONFIG_SECURE_BOOT_INSECURE is not set'",
+        ] {
+            assert!(BUILD.contains(step), "secure profile lost `{step}`");
+        }
+    }
+
+    #[test]
     fn firmware_keeps_no_unrunnable_test_modules() {
         const EP_TASK: &str = include_str!("../../rust-firmware/src/epd_task.rs");
         const USB: &str = include_str!("../../rust-firmware/src/usb_console.rs");
