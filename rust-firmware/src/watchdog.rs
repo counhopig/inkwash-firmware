@@ -13,7 +13,7 @@ pub fn subscribe() -> Result<()> {
 pub fn feed() {
     match esp!(unsafe { esp_task_wdt_reset() }) {
         Ok(()) => {}
-        Err(err) if err.code() == ESP_ERR_NOT_FOUND as i32 => {}
+        Err(err) if err.code() == ESP_ERR_NOT_FOUND => {}
         Err(err) => log::warn!("esp_task_wdt_reset failed: {err}"),
     }
 }
