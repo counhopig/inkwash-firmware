@@ -839,11 +839,19 @@ pub struct AppState {
     pending_todo_list_edit: Option<PendingTodoListEdit>,
     pending_sync_metadata: Option<PendingSyncMetadata>,
     pending_sync_data: Option<SyncedData>,
+    sync_edits: Option<SyncEdits>,
     pending_sync_rtc_op: Option<OperationId>,
     pending_sync_apply_op: Option<OperationId>,
     pending_sync_metadata_op: Option<OperationId>,
     pending_urgent_poll: Option<OperationId>,
     retries: Vec<RetryPending>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SyncEdits {
+    request_id: OperationId,
+    alarm_ids: Vec<u8>,
+    todo_ids: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -902,6 +910,7 @@ impl Default for AppState {
             pending_todo_list_edit: None,
             pending_sync_metadata: None,
             pending_sync_data: None,
+            sync_edits: None,
             pending_sync_rtc_op: None,
             pending_sync_apply_op: None,
             pending_sync_metadata_op: None,
@@ -1598,13 +1607,17 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
 
 fn transition_sync_apply(
     state: &mut AppState,
-    data: SyncedData,
+    mut data: SyncedData,
     metadata: Option<PendingSyncMetadata>,
 ) -> Vec<EffectBatch> {
     let SyncState::Running { request_id } = state.sync else {
         return Vec::new();
     };
-    let _request_id = request_id;
+    if let Some(edits) = state.sync_edits.take() {
+        if edits.request_id == request_id {
+            overlay_sync_edits(state, &edits, &mut data);
+        }
+    }
 
     let mut batches = Vec::new();
     let apply_op = state.next_operation_id();
@@ -1632,6 +1645,51 @@ fn transition_sync_apply(
     ));
 
     batches
+}
+
+fn sync_edits_for_running(state: &mut AppState) -> Option<&mut SyncEdits> {
+    let SyncState::Running { request_id } = state.sync else {
+        return None;
+    };
+    if state
+        .sync_edits
+        .as_ref()
+        .is_none_or(|edits| edits.request_id != request_id)
+    {
+        state.sync_edits = Some(SyncEdits {
+            request_id,
+            alarm_ids: Vec::new(),
+            todo_ids: Vec::new(),
+        });
+    }
+    state.sync_edits.as_mut()
+}
+
+fn push_unique(ids: &mut Vec<u8>, id: u8) {
+    if !ids.contains(&id) {
+        ids.push(id);
+    }
+}
+
+fn overlay_sync_edits(state: &AppState, edits: &SyncEdits, data: &mut SyncedData) {
+    for id in &edits.alarm_ids {
+        let local = state.alarms.alarms.iter().find(|a| a.id == *id);
+        let synced = data.alarms.iter_mut().find(|a| a.id == *id);
+        if let (Some(local), Some(synced)) = (local, synced) {
+            synced.enabled = local.enabled;
+        }
+    }
+    data.uploaded_alarm_ids
+        .retain(|id| !edits.alarm_ids.contains(id));
+    for id in &edits.todo_ids {
+        let local = state.todos.todos.iter().find(|t| t.id == *id);
+        let synced = data.todos.iter_mut().find(|t| t.id == *id);
+        if let (Some(local), Some(synced)) = (local, synced) {
+            synced.done = local.done;
+        }
+    }
+    data.uploaded_todo_ids
+        .retain(|id| !edits.todo_ids.contains(id));
 }
 
 fn mark_sync_scheduler_completed(state: &mut AppState) {
@@ -2359,7 +2417,9 @@ fn transition_alarm_list_button(
                 state.screen = Screen::AlarmAdd(AlarmAddState::default());
                 state.render_generation = state.render_generation.next();
                 vec![render_batch(state)]
-            } else if state.pending_alarm_list_edit.is_some() {
+            } else if state.pending_alarm_list_edit.is_some()
+                || state.pending_sync_apply_op.is_some()
+            {
                 vec![]
             } else {
                 let op = state.next_operation_id();
@@ -2368,6 +2428,9 @@ fn transition_alarm_list_button(
                 };
                 alarm.enabled = !alarm.enabled;
                 let toggled_id = alarm.id;
+                if let Some(edits) = sync_edits_for_running(state) {
+                    push_unique(&mut edits.alarm_ids, toggled_id);
+                }
                 state.pending_alarm_list_edit = Some(PendingAlarmListEdit {
                     operation_id: op,
                     index: selected,
@@ -2532,7 +2595,7 @@ fn transition_todo_list_button(
         }
 
         ButtonEvent::Pressed(ButtonId::Enter) => {
-            if state.pending_todo_list_edit.is_some() {
+            if state.pending_todo_list_edit.is_some() || state.pending_sync_apply_op.is_some() {
                 return vec![];
             }
             let op = state.next_operation_id();
@@ -2545,6 +2608,9 @@ fn transition_todo_list_button(
                 todo.done = !todo.done;
                 (previous_done, edited_id)
             };
+            if let Some(edits) = sync_edits_for_running(state) {
+                push_unique(&mut edits.todo_ids, edited_id);
+            }
             state.pending_todo_list_edit = Some(PendingTodoListEdit {
                 operation_id: op,
                 index: selected,
@@ -8447,6 +8513,137 @@ mod tests {
         ));
         let _ = update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)));
         assert_eq!(state.screen, Screen::TodoList { selected: 0 });
+    }
+
+    fn applied_sync_data(batches: &[EffectBatch]) -> (OperationId, SyncedData) {
+        batches
+            .iter()
+            .find_map(|b| {
+                b.effects.iter().find_map(|e| match e {
+                    Effect::ApplySyncedData(data) => Some((b.operation_id, data.clone())),
+                    _ => None,
+                })
+            })
+            .expect("sync result is applied")
+    }
+
+    fn complete_sync_apply(state: &mut AppState, operation_id: OperationId) {
+        let _ = update(
+            state,
+            Event::EffectCompleted(EffectCompletion {
+                batch_id: EffectBatchId(0),
+                effect_id: EffectId(0),
+                operation_id,
+                render_generation: None,
+                output: EffectOutput::Persisted(PersistTarget::SyncApply),
+            }),
+        );
+    }
+
+    #[test]
+    fn alarm_toggled_during_sync_survives_the_sync_result() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0), alarm(2, 22, 30)]);
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(!state.alarms.alarms[0].enabled);
+
+        let mut data = synced_data(vec![alarm(1, 8, 0), alarm(2, 22, 30)]);
+        data.uploaded_alarm_ids = vec![1, 2];
+        let applied = update(&mut state, Event::SyncCompleted(SyncResult::Ok { data }));
+        let (apply_op, applied) = applied_sync_data(&applied);
+        assert!(
+            !applied.alarms[0].enabled,
+            "local toggle overlays the server value"
+        );
+        assert!(applied.alarms[1].enabled);
+        assert_eq!(
+            applied.uploaded_alarm_ids,
+            vec![2],
+            "the edited alarm stays dirty for the next upload"
+        );
+
+        complete_sync_apply(&mut state, apply_op);
+        assert!(!state.alarms.alarms[0].enabled);
+    }
+
+    #[test]
+    fn todo_toggled_during_sync_survives_the_sync_result() {
+        let mut state = AppState::default();
+        open_todo_list(&mut state, vec![todo(1, "a", false), todo(2, "b", false)]);
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        assert!(matches!(state.sync, SyncState::Running { .. }));
+
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(state.todos.todos[0].done);
+
+        let mut data = synced_data(vec![]);
+        data.todos = vec![todo(1, "a", false), todo(2, "b", false)];
+        data.uploaded_todo_ids = vec![1];
+        let applied = update(&mut state, Event::SyncCompleted(SyncResult::Ok { data }));
+        let (apply_op, applied) = applied_sync_data(&applied);
+        assert!(applied.todos[0].done);
+        assert!(!applied.todos[1].done);
+        assert!(applied.uploaded_todo_ids.is_empty());
+
+        complete_sync_apply(&mut state, apply_op);
+        assert!(state.todos.todos[0].done);
+    }
+
+    #[test]
+    fn edits_from_an_earlier_sync_do_not_leak_into_the_next_one() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Failed("offline".into())),
+        );
+        assert_eq!(state.sync, SyncState::Idle);
+
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let mut data = synced_data(vec![alarm(1, 8, 0)]);
+        data.uploaded_alarm_ids = vec![1];
+        let applied = update(&mut state, Event::SyncCompleted(SyncResult::Ok { data }));
+        let (_, applied) = applied_sync_data(&applied);
+        assert!(applied.alarms[0].enabled, "the server now owns the value");
+        assert_eq!(applied.uploaded_alarm_ids, vec![1]);
+    }
+
+    #[test]
+    fn edits_are_ignored_while_a_sync_result_is_being_persisted() {
+        let mut state = AppState::default();
+        open_alarm_list(&mut state, vec![alarm(1, 8, 0)]);
+        let _ = update(&mut state, Event::UsbCommand(ControlRequest::SyncNow));
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Ok {
+                data: synced_data(vec![alarm(1, 8, 0)]),
+            }),
+        );
+        assert!(state.pending_sync_apply_op.is_some());
+
+        let pressed = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(state.alarms.alarms[0].enabled);
+        assert!(!pressed.iter().any(|b| b
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistAlarmToggle { .. }))));
     }
 
     #[test]
