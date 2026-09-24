@@ -185,35 +185,31 @@ impl EffectExecutor for TaskExecutor {
                 }
             }
             Effect::PersistAlarmToggle { alarms, toggled_id } => {
-                let save_result = AlarmStore::save(&d.alarm_store, alarms);
-                let dirty_result = d.alarm_store.mark_dirty(*toggled_id);
-                match (save_result, dirty_result) {
-                    (Ok(()), Ok(())) => Ok(EffectOutcome::Completed(
+                let result = d
+                    .alarm_store
+                    .mark_dirty(*toggled_id)
+                    .and_then(|()| AlarmStore::save(&d.alarm_store, alarms));
+                match result {
+                    Ok(()) => Ok(EffectOutcome::Completed(
                         inkwash_logic::app::EffectOutput::Persisted(
                             inkwash_logic::app::PersistTarget::Alarms,
                         ),
                     )),
-                    (Err(err), _) => Err((EffectCategory::Persist, format!("{err:#}"))),
-                    (Ok(()), Err(err)) => Err((
-                        EffectCategory::Persist,
-                        format!("dirty mark failed: {err:#}"),
-                    )),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
             }
             Effect::PersistTodoEdit { todos, edited_id } => {
-                let save_result = TodoStore::save(&d.todo_store, todos);
-                let dirty_result = d.todo_store.mark_dirty(*edited_id);
-                match (save_result, dirty_result) {
-                    (Ok(()), Ok(())) => Ok(EffectOutcome::Completed(
+                let result = d
+                    .todo_store
+                    .mark_dirty(*edited_id)
+                    .and_then(|()| TodoStore::save(&d.todo_store, todos));
+                match result {
+                    Ok(()) => Ok(EffectOutcome::Completed(
                         inkwash_logic::app::EffectOutput::Persisted(
                             inkwash_logic::app::PersistTarget::Todos,
                         ),
                     )),
-                    (Err(err), _) => Err((EffectCategory::Persist, format!("{err:#}"))),
-                    (Ok(()), Err(err)) => Err((
-                        EffectCategory::Persist,
-                        format!("dirty mark failed: {err:#}"),
-                    )),
+                    Err(err) => Err((EffectCategory::Persist, format!("{err:#}"))),
                 }
             }
 
