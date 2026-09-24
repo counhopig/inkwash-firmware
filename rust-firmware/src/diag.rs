@@ -22,6 +22,16 @@ pub fn record(counter: DiagCounter) {
         });
 }
 
+/// Classifies a failed I2C transaction so a bus that is held (timeouts) can
+/// be told apart from a device that is absent or NACKing.
+pub fn record_i2c(err: &esp_idf_svc::sys::EspError) {
+    if err.code() == esp_idf_svc::sys::ESP_ERR_TIMEOUT {
+        record(DiagCounter::I2cTimeout);
+    } else {
+        record(DiagCounter::I2cError);
+    }
+}
+
 pub fn snapshot() -> [u32; DIAG_COUNTER_COUNT] {
     let mut counts = [0u32; DIAG_COUNTER_COUNT];
     for (index, slot) in COUNTERS.iter().enumerate() {

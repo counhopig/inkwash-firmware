@@ -81,6 +81,7 @@ impl Es8311 {
         self.i2c
             .lock()
             .write_read(self.addr, &[reg], &mut value, I2C_TIMEOUT_TICKS)
+            .inspect_err(crate::diag::record_i2c)
             .map_err(|e| anyhow!("ES8311 read reg 0x{reg:02x} failed: {e}"))?;
         Ok(value[0])
     }
@@ -89,6 +90,7 @@ impl Es8311 {
         self.i2c
             .lock()
             .write(self.addr, &[reg, value], I2C_TIMEOUT_TICKS)
+            .inspect_err(crate::diag::record_i2c)
             .map_err(|e| anyhow!("ES8311 write reg 0x{reg:02x} failed: {e}"))
     }
 
