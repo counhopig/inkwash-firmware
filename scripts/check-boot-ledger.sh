@@ -92,12 +92,14 @@ import sys
 start, end = int(sys.argv[1], 16), int(sys.argv[2], 16)
 with open(sys.argv[3]) as table:
     text = table.read()
-segments = [
-    (int(load, 16), int(length, 16))
-    for length, load in re.findall(
-        r"^Segment \d+: len (0x[0-9a-fA-F]+) load (0x[0-9a-fA-F]+)", text, re.M
-    )
-]
+# esptool 4.x prints "Segment N: len L load A ..."; esptool 5.x prints a
+# table whose rows read "N  L  A  file_offs  types".
+rows = re.findall(
+    r"^Segment \d+: len (0x[0-9a-fA-F]+) load (0x[0-9a-fA-F]+)", text, re.M
+) + re.findall(
+    r"^\s*\d+\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s", text, re.M
+)
+segments = [(int(load, 16), int(length, 16)) for length, load in rows]
 if not segments:
     sys.exit("FAIL: no segments found in the image (converter output changed?)")
 if all(load >= 0x50000000 for load, _ in segments):
@@ -125,11 +127,18 @@ if [ "$mode" = self-test ]; then
         > "$tmp/covering.txt"
     printf 'Segment 1: len 0x00800 load 0x3fc90000 file_offs 0x0 [DRAM]\nSegment 6: len 0x00020 load 0x50000008 file_offs 0x0 [RTC_DATA]\n' \
         > "$tmp/clear.txt"
+    printf '      1  0x00800  0x3fc90000  0x00000018  DRAM\n      6  0x00020  0x50000000  0x0028d904  RTC_DATA\n' \
+        > "$tmp/covering-v5.txt"
     printf 'no segments here\n' > "$tmp/unparsable.txt"
 
     echo "==> self-test: a segment covering the ledger must be rejected"
     if decide "$start" "$end" "$tmp/covering.txt" >/dev/null 2>&1; then
         echo "self-test FAILED: a covering segment was accepted" >&2
+        exit 1
+    fi
+    echo "==> self-test: a covering segment in esptool 5's table must be rejected"
+    if decide "$start" "$end" "$tmp/covering-v5.txt" >/dev/null 2>&1; then
+        echo "self-test FAILED: a covering esptool 5 segment was accepted" >&2
         exit 1
     fi
     echo "==> self-test: a segment that stops short of the ledger must be accepted"
