@@ -515,6 +515,7 @@ fn main() -> Result<()> {
     let mut status_last = Instant::now();
     let mut last_diag = diag::snapshot();
     let mut stack_last = Instant::now();
+    let mut pm_profile_last = Instant::now();
     let mut clock_last = Instant::now();
     let mut alarm_status_last = Instant::now()
         .checked_sub(ALARM_STATUS_POLL_INTERVAL)
@@ -551,6 +552,10 @@ fn main() -> Result<()> {
         if now.duration_since(stack_last) >= Duration::from_secs(10) {
             stack_last = now;
             heap_probe::log_registered_stacks("periodic");
+        }
+        if now.duration_since(pm_profile_last) >= Duration::from_secs(60) {
+            pm_profile_last = now;
+            power::log_pm_profile();
         }
         if now.duration_since(status_last) >= Duration::from_secs(1) {
             status_last = now;
