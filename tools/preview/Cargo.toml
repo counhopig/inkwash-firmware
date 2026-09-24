@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 image = "0.25"
+inkwash-logic = { path = "../../logic" }
 
 # Refer the firmware's render modules in place (they are pure Rust, no EPD
 # FFI), so the preview always draws exactly what the device would.
