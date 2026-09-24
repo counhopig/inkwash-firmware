@@ -122,6 +122,7 @@ impl WifiManager {
             .map_err(|e| anyhow!("esp_wifi_get_config (PMF patch) failed: {e:?}"))?;
             sta_config.sta.pmf_cfg.capable = true;
             sta_config.sta.pmf_cfg.required = false;
+            sta_config.sta.sae_pwe_h2e = esp_idf_svc::sys::wifi_sae_pwe_method_t_WPA3_SAE_PWE_BOTH;
             esp_idf_svc::sys::esp!(esp_idf_svc::sys::esp_wifi_set_config(
                 esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA,
                 &mut sta_config,
