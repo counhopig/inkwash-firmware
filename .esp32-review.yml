@@ -10,22 +10,21 @@
 # the moment the code moves above it.
 
 forbid:
-  # The two sanctioned Peripherals::steal() sites. Both rebuild a peripheral
+  # The one sanctioned Peripherals::steal() site. It rebuilds a peripheral
   # handle outside the central board assembly on purpose:
-  #   board.rs:276 - battery ADC channel, rebuilt per read
-  #   wifi.rs:44   - the lazy one-per-process EspWifi modem
-  # Recorded with their real line numbers; if either moves, the reviewer will
+  #   wifi.rs:52   - the lazy one-per-process EspWifi modem
+  # The battery ADC no longer steals; the board keeps its channel handle.
+  # Recorded with its real line number; if it moves, the reviewer will
   # report the new site rather than silently keeping the exemption.
   - id: forbid.peripherals-steal
     severity: high
     pattern: Peripherals::steal\s*\(
     message: >-
       Peripherals::steal() bypasses the central board assembly and can alias a
-      live driver. Only the two documented sites are allowed; a new one needs a
+      live driver. Only the documented site is allowed; a new one needs a
       rationale, not just a line in this list.
     allow:
-      - rust-firmware/src/board.rs:276
-      - rust-firmware/src/wifi.rs:44
+      - rust-firmware/src/wifi.rs:52
 
 # The review reads `rust-firmware/sdkconfig.defaults` for CONFIG_* values, so a
 # comment that cites a configuration option is checked against what the build
