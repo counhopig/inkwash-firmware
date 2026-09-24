@@ -77,6 +77,12 @@ jobs:
           SOURCE_DATE_EPOCH: "1700000000"
         run: ./scripts/build-rust.sh --release --locked
 
+      - name: Clippy (firmware, target-side)
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+          INKWASH_CARGO_SUBCOMMAND: clippy
+        run: ./scripts/build-rust.sh --release --locked -- -D warnings
+
       - name: Verify the boot ledger stays outside every loadable segment
         run: ./scripts/check-boot-ledger.sh
 
@@ -90,6 +96,7 @@ jobs:
             rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin
             rust-firmware/target/xtensa-esp32s3-espidf/release/partition-table.bin
             rust-firmware/target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*/out/build/libespidf.map
+            rust-firmware/target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*/out/sdkconfig
 
   firmware-diagnostic-build:
     name: inkwash-note4 (ESP32-S3 diagnostic)
