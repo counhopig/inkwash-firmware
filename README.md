@@ -114,6 +114,17 @@ screen; provision it from the desktop tool over USB or BLE (`set_wifi`,
 | diagnostic | `./scripts/build-rust.sh --diagnostic --release` | `rust-firmware/target-diagnostic/` | Adds `sdkconfig.diagnostic.defaults` (comprehensive heap poisoning, INFO logging) for on-device fault hunting. |
 | secure | `INKWASH_SECURE_BOOT_SIGNING_KEY=key.pem ./scripts/build-secure.sh` | `rust-firmware/target-secure/` | Secure Boot V2 + AES-256 flash encryption in release mode + NVS encryption, with JTAG and basic ROM download disabled. |
 
+The production profile, and every GitHub Release built from it, is a
+developer build: Secure Boot, flash encryption and NVS encryption are off.
+Anyone with physical access to a device can read its Wi-Fi password and
+server token from flash and can replace its firmware. Give each device its own
+server token and revoke it if the device is lost. The coredump partition holds
+task stacks only (`CONFIG_ESP_COREDUMP_CAPTURE_DRAM` is off, and
+`release.sh` refuses a build that enables it), so a crash dump does not copy
+those secrets out of the heap. The secure profile burns one-way eFuses on first
+boot and binds the device to your signing key; flash it only onto a device you
+have decided to lock.
+
 ## Repository layout
 
 ```text
