@@ -12,6 +12,7 @@ pub mod command_sessions;
 pub mod datetime;
 pub mod device_config;
 pub mod diag;
+pub mod epd_geometry;
 pub mod epd_registry;
 pub mod event_queue;
 pub mod harness;
