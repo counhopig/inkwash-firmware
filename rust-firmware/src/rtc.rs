@@ -55,6 +55,7 @@ impl Pcf8563 {
         self.bus
             .lock()
             .write_read(self.addr, &[reg], out, I2C_TIMEOUT_TICKS)
+            .inspect_err(crate::diag::record_i2c)
             .map_err(|e| anyhow!("PCF8563 read regs 0x{reg:02x} failed: {e}"))
     }
 
@@ -72,6 +73,7 @@ impl Pcf8563 {
         self.bus
             .lock()
             .write(self.addr, &buf[..=bytes.len()], I2C_TIMEOUT_TICKS)
+            .inspect_err(crate::diag::record_i2c)
             .map_err(|e| anyhow!("PCF8563 write regs 0x{start_reg:02x} failed: {e}"))
     }
 

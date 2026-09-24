@@ -41,10 +41,17 @@ pub enum DiagCounter {
     /// A partial EPD refresh failed and the same frame was pushed as a full
     /// refresh.
     EpdFullFallback,
+
+    /// An I2C transaction on the shared RTC/codec/NFC bus timed out: the bus
+    /// may be held (SDA stuck low) rather than a device merely NACKing.
+    I2cTimeout,
+
+    /// An I2C transaction failed for any other reason (NACK, invalid state).
+    I2cError,
 }
 
 impl DiagCounter {
-    pub const ALL: [DiagCounter; 9] = [
+    pub const ALL: [DiagCounter; 11] = [
         DiagCounter::UsbReplyQueueFull,
         DiagCounter::BleReplyQueueFull,
         DiagCounter::BleWorkerQueueFull,
@@ -54,6 +61,8 @@ impl DiagCounter {
         DiagCounter::BleReplyRetry,
         DiagCounter::BleReplyDrop,
         DiagCounter::EpdFullFallback,
+        DiagCounter::I2cTimeout,
+        DiagCounter::I2cError,
     ];
 
     /// Slot in the firmware's counter array.
@@ -74,6 +83,8 @@ impl DiagCounter {
             DiagCounter::BleReplyRetry => "ble_reply_retry",
             DiagCounter::BleReplyDrop => "ble_reply_drop",
             DiagCounter::EpdFullFallback => "epd_full_fallback",
+            DiagCounter::I2cTimeout => "bus_timeout",
+            DiagCounter::I2cError => "bus_error",
         }
     }
 }

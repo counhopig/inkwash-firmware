@@ -43,7 +43,11 @@ if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1 \
 fi
 
 echo "==> Building release firmware..."
-./scripts/build-rust.sh --release
+# Stamp the build with the commit time so the same tag always rebuilds to
+# the same image, and build only the dependency set CI has checked.
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+export SOURCE_DATE_EPOCH
+./scripts/build-rust.sh --release --locked
 test -f "$ELF" || { echo "expected firmware not found at $ELF" >&2; exit 1; }
 test -f "$BOOTLOADER" || { echo "expected bootloader not found at $BOOTLOADER" >&2; exit 1; }
 test -f "$PARTITIONS" || { echo "expected partition table not found at $PARTITIONS" >&2; exit 1; }
@@ -73,6 +77,12 @@ require_config 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y'
 require_config 'CONFIG_ESPTOOLPY_FLASHMODE_DIO=y'
 require_config 'CONFIG_ESPTOOLPY_FLASHFREQ_80M=y'
 require_config 'CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y'
+require_config '# CONFIG_ESP_COREDUMP_CAPTURE_DRAM is not set'
+# The public release is the developer build: it must never carry Secure Boot
+# or flash encryption, which would burn one-way eFuses on first boot of
+# every device flashed from it.
+require_config '# CONFIG_SECURE_BOOT is not set'
+require_config '# CONFIG_SECURE_FLASH_ENC_ENABLED is not set'
 
 command -v espflash >/dev/null || {
     echo "espflash is required to verify the generated partition table" >&2
@@ -95,6 +105,17 @@ espflash save-image --skip-update-check --chip esp32s3 \
     --partition-table-offset 0x10000 \
     --target-app-partition factory \
     "$ELF" "$verify_dir/inkwash-note4.bin" >/dev/null
+factory_size=$((0x400000))
+if ! grep -Eq '^factory,[[:space:]]*app,[[:space:]]*factory,[[:space:]]*0x30000,[[:space:]]*0x400000,' "$PARTITIONS"; then
+    echo "partitions.csv no longer has the 4 MiB factory slot this size check assumes" >&2
+    exit 1
+fi
+app_size="$(wc -c < "$verify_dir/inkwash-note4.bin")"
+echo "==> Application image: $app_size of $factory_size bytes ($((app_size * 100 / factory_size))%)"
+if [ "$app_size" -gt "$factory_size" ]; then
+    echo "application image does not fit the factory partition" >&2
+    exit 1
+fi
 
 echo "==> Creating draft GitHub Release and uploading firmware"
 gh release create "$TAG" "$ELF" "$BOOTLOADER" "$PARTITIONS" \
@@ -102,7 +123,24 @@ gh release create "$TAG" "$ELF" "$BOOTLOADER" "$PARTITIONS" \
     --target "$HEAD" \
     --draft \
     --title "Inkwash Firmware $TAG" \
-    --notes "Firmware for the Zectrix Note 4 e-paper device. Flash with:
+    --notes "Firmware for the Zectrix Note 4 e-paper device.
+
+**Security boundary:** this is the developer build. Secure Boot, flash
+encryption and NVS encryption are off, so anyone with physical access to the
+device can read the stored Wi-Fi password and server token from flash and can
+replace the firmware. Use a dedicated server token for each device and revoke
+it if the device is lost. Build the secure profile (\`scripts/build-secure.sh\`)
+with your own signing key if that is not acceptable.
+
+Identify the board first; a port name is not an identity. Flash only an
+ESP32-S3 with 16 MB flash whose MAC is your Note 4 (never a Note 4C):
+
+\`\`\`bash
+esptool.py --chip esp32s3 --port <port> read_mac
+esptool.py --chip esp32s3 --port <port> flash_id
+\`\`\`
+
+Then flash with:
 
 \`\`\`bash
 espflash flash --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80mhz \\

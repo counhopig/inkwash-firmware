@@ -36,8 +36,12 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # past the threshold. IDLE_TIME_BEFORE_SLEEP is in ticks: 200 ms at
 # FREERTOS_HZ=1000. The Home main loop drops to a 1 s idle cadence
 # (src/main.rs), so each idle sleep exceeds the threshold and spends
-# ~0.8 s of every second in real light sleep. Keys and the RTC alarm
-# line wake it (src/power.rs `configure_light_sleep`). Note the plan's
+# ~0.8 s of every second in real light sleep. The keys wake it
+# (src/power.rs `configure_light_sleep`); the RTC alarm line does not, so
+# a ringing alarm is noticed by the next 1 s idle poll. Worker tasks must
+# block while idle (src/watchdog.rs `WORKER_IDLE_FEED`): any task that
+# wakes more often than the threshold below keeps the chip out of light
+# sleep entirely. Note the plan's
 # `CONFIG_FREERTOS_IDLE_TIME_BEFORE_ENTERING_LIGHT_SLEEP` is the pre-5.x
 # name; IDF 5.5 calls it `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`.
 CONFIG_PM_ENABLE=y
@@ -86,6 +90,21 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
 CONFIG_BT_NIMBLE_DTM_MODE_TEST=n
 CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# Only the GAP and GATT services are registered (esp32-nimble calls
+# ble_svc_gap_init/ble_svc_gatt_init; the control service is our own), so
+# leave NimBLE's sample profiles out of the image.
+CONFIG_BT_NIMBLE_PROX_SERVICE=n
+CONFIG_BT_NIMBLE_ANS_SERVICE=n
+CONFIG_BT_NIMBLE_CTS_SERVICE=n
+CONFIG_BT_NIMBLE_HTP_SERVICE=n
+CONFIG_BT_NIMBLE_IPSS_SERVICE=n
+CONFIG_BT_NIMBLE_TPS_SERVICE=n
+CONFIG_BT_NIMBLE_IAS_SERVICE=n
+CONFIG_BT_NIMBLE_LLS_SERVICE=n
+CONFIG_BT_NIMBLE_SPS_SERVICE=n
+CONFIG_BT_NIMBLE_HR_SERVICE=n
+CONFIG_BT_NIMBLE_BAS_SERVICE=n
+CONFIG_BT_NIMBLE_DIS_SERVICE=n
 # The ESP32-S3 controller has separate build-time pools from NimBLE's host
 # roles. Keep only one advertising activity plus one connection, and omit
 # controller scan/DTM code. Controller code in flash also returns >20 KiB of
@@ -108,6 +127,11 @@ CONFIG_HEAP_POISONING_LIGHT=y
 
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+# The production image does not encrypt flash, so the coredump partition is
+# readable by anyone holding the device. Capture task stacks and TCBs only:
+# the Wi-Fi password and server token live on the heap and in NVS, never in
+# a live stack frame at rest, and must not be copied into the dump.
+CONFIG_ESP_COREDUMP_CAPTURE_DRAM=n
 
 # Production devices must recover from a panic or TWDT event instead of
 # remaining permanently unresponsive until a manual power cycle.

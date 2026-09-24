@@ -1,2 +1,6 @@
 CONFIG_HEAP_POISONING_COMPREHENSIVE=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+# Time spent in each power mode and per PM lock, dumped by the main loop
+# every 60 s (src/power.rs `log_pm_profile`): the light-sleep residency
+# baseline for power regressions.
+CONFIG_PM_PROFILING=y

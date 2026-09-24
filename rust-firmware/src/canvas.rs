@@ -1,18 +1,8 @@
 use crate::font8x16;
 use crate::font_cjk;
 
-pub const WIDTH: usize = 400;
-pub const HEIGHT: usize = 300;
-const BYTES_PER_ROW: usize = WIDTH / 8;
-const FRAME_SIZE: usize = BYTES_PER_ROW * HEIGHT;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-}
+pub use inkwash_logic::epd_geometry::{pack_rect_from_frame, Rect, HEIGHT, WIDTH};
+use inkwash_logic::epd_geometry::{BYTES_PER_ROW, FRAME_SIZE};
 
 pub struct Canvas {
     frame: Vec<u8>,
@@ -183,20 +173,5 @@ impl Canvas {
             cursor += (width as usize + 1) * scale;
         }
         cursor - x
-    }
-}
-
-pub fn pack_rect_from_frame(frame: &[u8], rect: Rect, out: &mut Vec<u8>) {
-    let row_bytes = (rect.width as usize).div_ceil(8);
-    out.clear();
-    out.resize(row_bytes * rect.height as usize, 0);
-    for (row, y) in (rect.y..rect.y + rect.height).enumerate() {
-        for (column, x) in (rect.x..rect.x + rect.width).enumerate() {
-            let index = y as usize * BYTES_PER_ROW + (x as usize) / 8;
-            let mask = 1 << (7 - ((x as usize) & 7));
-            if frame[index] & mask != 0 {
-                out[row * row_bytes + column / 8] |= 1 << (7 - (column & 7));
-            }
-        }
     }
 }

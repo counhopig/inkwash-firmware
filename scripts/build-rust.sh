@@ -81,6 +81,66 @@ partition_stamp="$target_root/.inkwash-partitions.sha256"
 if [ -d "$target_root" ] && { [ ! -f "$partition_stamp" ] || [ "$(cat "$partition_stamp")" != "$partition_hash" ]; }; then
     cargo clean
 fi
-cargo build "${cargo_args[@]}"
+# INKWASH_CARGO_SUBCOMMAND=clippy runs the target-side lints in the same
+# ESP-IDF environment, e.g. `... ./scripts/build-rust.sh --release --locked -- -D warnings`.
+cargo "${INKWASH_CARGO_SUBCOMMAND:-build}" "${cargo_args[@]}"
+if [ "${INKWASH_CARGO_SUBCOMMAND:-build}" != build ]; then
+    exit 0
+fi
 mkdir -p "$target_root"
 printf '%s\n' "$partition_hash" > "$partition_stamp"
+
+if [ "$build_profile" = "secure" ]; then
+    # Secure Boot V2 only boots images that are padded for, and carry, a
+    # signature block. The cargo build produces an ELF and a signed
+    # bootloader; turn the ELF into the signed factory image here and prove
+    # both signatures and the security settings before anything is flashed.
+    key="${INKWASH_SECURE_BOOT_SIGNING_KEY:?secure profile requires INKWASH_SECURE_BOOT_SIGNING_KEY}"
+    out="$CARGO_TARGET_DIR/xtensa-esp32s3-espidf/release"
+    elf="$out/inkwash-note4"
+    for file in "$elf" "$out/bootloader.bin"; do
+        if [ ! -f "$file" ]; then
+            echo "secure profile: expected $file (build with --release)" >&2
+            exit 1
+        fi
+    done
+
+    sdkconfig=""
+    for candidate in "$out"/build/esp-idf-sys-*/out/sdkconfig; do
+        if [ -f "$candidate" ] && { [ -z "$sdkconfig" ] || [ "$candidate" -nt "$sdkconfig" ]; }; then
+            sdkconfig="$candidate"
+        fi
+    done
+    if [ -z "$sdkconfig" ]; then
+        echo "secure profile: generated sdkconfig not found" >&2
+        exit 1
+    fi
+    for setting in \
+        CONFIG_SECURE_BOOT=y \
+        CONFIG_SECURE_BOOT_V2_ENABLED=y \
+        CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y \
+        CONFIG_SECURE_FLASH_ENC_ENABLED=y \
+        CONFIG_SECURE_FLASH_ENCRYPTION_AES256=y \
+        CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y \
+        CONFIG_NVS_ENCRYPTION=y \
+        CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y \
+        CONFIG_ESPTOOLPY_FLASHMODE_DIO=y \
+        CONFIG_ESPTOOLPY_FLASHFREQ_80M=y \
+        '# CONFIG_SECURE_BOOT_INSECURE is not set'; do
+        if ! grep -Fqx "$setting" "$sdkconfig"; then
+            echo "secure profile: $sdkconfig lacks required setting: $setting" >&2
+            exit 1
+        fi
+    done
+
+    unsigned="$out/inkwash-note4-unsigned.bin"
+    signed="$out/inkwash-note4-signed.bin"
+    python3 -m esptool --chip esp32s3 elf2image \
+        --flash_size 16MB --flash_mode dio --flash_freq 80m \
+        --secure-pad-v2 -o "$unsigned" "$elf" >/dev/null
+    python3 -m espsecure sign_data --version 2 --keyfile "$key" \
+        --output "$signed" "$unsigned" >/dev/null
+    python3 -m espsecure verify_signature --version 2 --keyfile "$key" "$signed" >/dev/null
+    python3 -m espsecure verify_signature --version 2 --keyfile "$key" "$out/bootloader.bin" >/dev/null
+    echo "==> secure profile: signed factory image $signed; bootloader signature verified"
+fi

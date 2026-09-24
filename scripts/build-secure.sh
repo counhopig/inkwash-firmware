@@ -28,5 +28,6 @@ printf '%s\n' \
     > "$secure_defaults"
 
 export INKWASH_BUILD_PROFILE=secure
+export INKWASH_SECURE_BOOT_SIGNING_KEY="$key"
 export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;$secure_defaults"
-exec ./scripts/build-rust.sh --release --locked
+./scripts/build-rust.sh --release --locked

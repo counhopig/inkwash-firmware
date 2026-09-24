@@ -90,17 +90,16 @@ the `esp` toolchain, and rebuilds from scratch when `partitions.csv` changes. Th
 output binary is
 `rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4`.
 
-Flash it, after verifying the board identity:
+Flash it through the identity-checked wrapper, which refuses any port that
+is not an ESP32-S3 with 16 MB flash and the authorized Note 4 MAC
+(`INKWASH_NOTE4_MAC`), then flashes 16 MB DIO 80 MHz with `partitions.csv`:
 
 ```bash
-espflash flash \
-  --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
-  --bootloader rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin \
-  --partition-table rust-firmware/partitions.csv \
-  --partition-table-offset 0x10000 \
-  --non-interactive \
-  rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
+INKWASH_NOTE4_MAC=aa:bb:cc:dd:ee:ff ./scripts/flash-note4.sh --port /dev/ttyACM0
 ```
+
+`cargo run --release` in `rust-firmware/` uses the same wrapper as its
+runner; set `INKWASH_NOTE4_PORT` to the board's port.
 
 A device with no Wi-Fi/server credentials in NVS boots straight to the home
 screen; provision it from the desktop tool over USB or BLE (`set_wifi`,
@@ -113,6 +112,17 @@ screen; provision it from the desktop tool over USB or BLE (`set_wifi`,
 | production (default) | `./scripts/build-rust.sh --release` | `rust-firmware/target/` | The normal firmware. |
 | diagnostic | `./scripts/build-rust.sh --diagnostic --release` | `rust-firmware/target-diagnostic/` | Adds `sdkconfig.diagnostic.defaults` (comprehensive heap poisoning, INFO logging) for on-device fault hunting. |
 | secure | `INKWASH_SECURE_BOOT_SIGNING_KEY=key.pem ./scripts/build-secure.sh` | `rust-firmware/target-secure/` | Secure Boot V2 + AES-256 flash encryption in release mode + NVS encryption, with JTAG and basic ROM download disabled. |
+
+The production profile, and every GitHub Release built from it, is a
+developer build: Secure Boot, flash encryption and NVS encryption are off.
+Anyone with physical access to a device can read its Wi-Fi password and
+server token from flash and can replace its firmware. Give each device its own
+server token and revoke it if the device is lost. The coredump partition holds
+task stacks only (`CONFIG_ESP_COREDUMP_CAPTURE_DRAM` is off, and
+`release.sh` refuses a build that enables it), so a crash dump does not copy
+those secrets out of the heap. The secure profile burns one-way eFuses on first
+boot and binds the device to your signing key; flash it only onto a device you
+have decided to lock.
 
 ## Repository layout
 
@@ -141,6 +151,7 @@ inkwash-firmware/
 | `check-git-rev.sh` | Fails when the ELF's boot banner revision differs from `git describe --always --dirty --tags`. |
 | `smoke-note4.py` | Drives the device over the USB `>>IW ` protocol: soak, command stress, reply-timeout checks. |
 | `capture-serial.py` | Timestamped serial capture that reconnects across USB re-enumeration, with required-pattern assertions. |
+| `flash-note4.sh` | Identity-checked flashing (chip, 16 MB flash, MAC); also the cargo runner. |
 | `backup-flash.ps1` | Identity-checked full 16 MB flash backup plus a manifest. |
 | `release.sh` | Builds, verifies the partition table and boot ledger, tags, and publishes a GitHub Release with `gh`. |
 | `rust-analyzer-cargo.sh` | Wrapper that gives rust-analyzer an ESP-IDF environment. |

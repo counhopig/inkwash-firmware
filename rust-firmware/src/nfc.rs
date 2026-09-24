@@ -54,11 +54,13 @@ impl NfcTag {
         self.i2c
             .lock()
             .write(self.addr, &[block_addr], I2C_TIMEOUT_TICKS)
+            .inspect_err(crate::diag::record_i2c)
             .map_err(|e| anyhow!("NFC write block addr 0x{block_addr:02x} failed: {e}"))?;
         thread::sleep(READ_DELAY);
         self.i2c
             .lock()
             .read(self.addr, out, I2C_TIMEOUT_TICKS)
+            .inspect_err(crate::diag::record_i2c)
             .map_err(|e| anyhow!("NFC read block 0x{block_addr:02x} failed: {e}"))
     }
 

@@ -1,5 +1,6 @@
 fn main() {
     embuild::espidf::sysenv::output();
+    println!("cargo::rustc-check-cfg=cfg(esp_idf_pm_profiling)");
 
     println!("cargo:rerun-if-env-changed=INKWASH_FORCE_SAFE_MODE");
     if std::env::var("INKWASH_FORCE_SAFE_MODE").is_ok_and(|v| v == "1") {

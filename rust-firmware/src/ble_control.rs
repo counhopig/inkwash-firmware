@@ -576,7 +576,14 @@ fn run(
     let mut session = None;
     let mut active_session_id = None;
     loop {
-        match command_rx.recv_timeout(Duration::from_millis(20)) {
+        let received = if session.is_some() {
+            command_rx.recv_timeout(Duration::from_millis(20))
+        } else {
+            command_rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match received {
             Ok(WorkerCommand::Start {
                 name: _name,
                 session_id,
@@ -591,9 +598,8 @@ fn run(
                     continue;
                 }
                 log_stack_high_watermark("before BLE init");
-                let passkey = unsafe { esp_idf_svc::sys::esp_random() } % 1_000_000;
-                match BleSession::start(session_id, passkey) {
-                    Ok(new_session) => {
+                match BleSession::start(session_id) {
+                    Ok((new_session, passkey)) => {
                         session = Some(new_session);
                         active_session_id = Some(session_id);
                         log_stack_high_watermark("after BLE init");
@@ -856,7 +862,7 @@ struct InflightReply {
 }
 
 impl BleSession {
-    fn start(session_id: u64, passkey: u32) -> Result<Self> {
+    fn start(session_id: u64) -> Result<(Self, u32)> {
         let free = unsafe { esp_idf_svc::sys::heap_caps_get_free_size(BLE_INTERNAL_CAPS) };
         let largest =
             unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(BLE_INTERNAL_CAPS) };
@@ -867,11 +873,12 @@ impl BleSession {
             ));
         }
         BLEDevice::init();
+        let passkey = unsafe { esp_idf_svc::sys::esp_random() } % 1_000_000;
         let result = Self::start_initialized(session_id, passkey);
         if result.is_err() {
             Self::shutdown_nimble();
         }
-        result
+        result.map(|session| (session, passkey))
     }
 
     fn shutdown_nimble() {

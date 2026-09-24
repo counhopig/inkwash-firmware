@@ -12,6 +12,7 @@ pub mod command_sessions;
 pub mod datetime;
 pub mod device_config;
 pub mod diag;
+pub mod epd_geometry;
 pub mod epd_registry;
 pub mod event_queue;
 pub mod harness;
@@ -115,7 +116,7 @@ mod ble_memory_contract {
             .find("if session.is_some()")
             .expect("worker must guard duplicate Start commands");
         let start_init = BLE_SOURCE
-            .find("match BleSession::start(session_id, passkey)")
+            .find("match BleSession::start(session_id)")
             .expect("worker must initialize after duplicate Start guard");
         assert!(start_guard < start_init);
         assert!(BLE_SOURCE.contains("active_session_id"));
@@ -150,6 +151,22 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("NimbleProperties::WRITE_AUTHEN"));
         assert!(BLE_SOURCE.contains("BleTaskResult::Started"));
         assert!(BLE_SOURCE.contains("passkey,"));
+    }
+
+    #[test]
+    fn ble_passkey_is_drawn_after_the_radio_is_enabled() {
+        let init = BLE_SOURCE
+            .find("BLEDevice::init();")
+            .expect("the session must initialize NimBLE");
+        let draw = BLE_SOURCE
+            .find("esp_random()")
+            .expect("the passkey must come from the hardware RNG");
+        assert!(
+            init < draw,
+            "esp_random() is only a true RNG once the radio is on; before \
+             BLEDevice::init() the six-digit passkey would be pseudo-random"
+        );
+        assert_eq!(BLE_SOURCE.matches("esp_random()").count(), 1);
     }
 
     #[test]
@@ -267,6 +284,14 @@ mod ble_memory_contract {
         assert!(config_is("BT_CTRL_BLE_SCAN", "n"));
         assert!(config_is("BT_CTRL_DTM_ENABLE", "n"));
         assert!(config_is("BT_CTRL_RUN_IN_FLASH_ONLY", "y"));
+        for service in [
+            "PROX", "ANS", "CTS", "HTP", "IPSS", "TPS", "IAS", "LLS", "SPS", "HR", "BAS", "DIS",
+        ] {
+            assert!(
+                config_is(&format!("BT_NIMBLE_{service}_SERVICE"), "n"),
+                "NimBLE sample service {service} is never registered and must stay out of the image"
+            );
+        }
     }
 
     #[test]
@@ -318,6 +343,121 @@ mod ble_memory_contract {
             EFFECT_SOURCE.contains("batch_rx.recv_timeout("),
             "the worker must wake periodically so it can feed while idle"
         );
+    }
+
+    #[test]
+    fn idle_workers_block_long_enough_for_automatic_light_sleep() {
+        const AUDIO: &str = include_str!("../../rust-firmware/src/audio_task.rs");
+        const USB: &str = include_str!("../../rust-firmware/src/usb_console.rs");
+        const WATCHDOG: &str = include_str!("../../rust-firmware/src/watchdog.rs");
+        const RTC: &str = include_str!("../../rust-firmware/src/rtc_executor.rs");
+        const EPD: &str = include_str!("../../rust-firmware/src/epd_task.rs");
+        const SYNC: &str = include_str!("../../rust-firmware/src/sync_task.rs");
+
+        let threshold_ms: u64 = SDKCONFIG
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=")
+            })
+            .and_then(|value| value.parse().ok())
+            .expect("the light-sleep threshold must stay a literal");
+        let feed_secs: u64 = WATCHDOG
+            .split("WORKER_IDLE_FEED: Duration = Duration::from_secs(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|value| value.parse().ok())
+            .expect("WORKER_IDLE_FEED must stay a literal");
+        assert!(
+            feed_secs * 1000 >= 5 * threshold_ms && feed_secs < 10,
+            "idle workers must sleep well past the light-sleep threshold yet feed the 10 s TWDT"
+        );
+        for (name, source) in [
+            ("rtc", RTC),
+            ("epd", EPD),
+            ("sync", SYNC),
+            ("effect", EFFECT_SOURCE),
+            ("audio", AUDIO),
+        ] {
+            assert!(
+                source.contains("WORKER_IDLE_FEED"),
+                "the {name} worker must idle on the shared watchdog cadence"
+            );
+        }
+        assert!(
+            AUDIO.contains("AudioMode::Idle => wait_for_command(")
+                && AUDIO.contains("ready.wait_timeout("),
+            "an idle audio task must block on its mailbox instead of polling"
+        );
+        assert!(
+            BLE_SOURCE.contains("command_rx\n                .recv()\n"),
+            "the BLE worker must block while it has no session"
+        );
+        assert!(
+            USB.contains("const NO_HOST_POLL: Duration = Duration::from_millis(500)"),
+            "the USB reader must back off while no host is attached"
+        );
+    }
+
+    #[test]
+    fn crash_dumps_and_public_releases_keep_secrets_in_bounds() {
+        const RELEASE: &str = include_str!("../../scripts/release.sh");
+        assert!(
+            config_is("ESP_COREDUMP_CAPTURE_DRAM", "n"),
+            "flash is not encrypted in the production image, so the coredump must hold \
+             task stacks only and never copy the heap that holds the Wi-Fi password and token"
+        );
+        for gate in [
+            "require_config '# CONFIG_ESP_COREDUMP_CAPTURE_DRAM is not set'",
+            "require_config '# CONFIG_SECURE_BOOT is not set'",
+            "require_config '# CONFIG_SECURE_FLASH_ENC_ENABLED is not set'",
+            "./scripts/build-rust.sh --release --locked",
+            "SOURCE_DATE_EPOCH=\"$(git show -s --format=%ct HEAD)\"",
+            "Security boundary",
+        ] {
+            assert!(RELEASE.contains(gate), "release.sh lost `{gate}`");
+        }
+    }
+
+    #[test]
+    fn flashing_goes_through_the_identity_check() {
+        const RUNNER: &str = include_str!("../../rust-firmware/.cargo/config.toml");
+        const FLASH: &str = include_str!("../../scripts/flash-note4.sh");
+        assert!(RUNNER.contains("runner = [\"../scripts/flash-note4.sh\""));
+        assert!(!RUNNER.contains("runner = \"espflash"));
+        for check in [
+            "read_mac",
+            "flash_id",
+            "INKWASH_NOTE4_MAC",
+            "--flash-size 16mb --flash-mode dio --flash-freq 80mhz",
+            "--partition-table \"$partitions\" --partition-table-offset 0x10000",
+        ] {
+            assert!(FLASH.contains(check), "flash-note4.sh lost `{check}`");
+        }
+        let identity = FLASH
+            .find("probe read_mac")
+            .expect("the MAC is read before flashing");
+        let flash = FLASH
+            .find("espflash flash")
+            .expect("the wrapper flashes with espflash");
+        assert!(
+            identity < flash,
+            "identity must be proven before anything is written"
+        );
+    }
+
+    #[test]
+    fn secure_builds_sign_and_verify_the_application() {
+        const BUILD: &str = include_str!("../../scripts/build-rust.sh");
+        for step in [
+            "--secure-pad-v2",
+            "espsecure sign_data --version 2",
+            "espsecure verify_signature --version 2 --keyfile \"$key\" \"$signed\"",
+            "\"$out/bootloader.bin\"",
+            "'# CONFIG_SECURE_BOOT_INSECURE is not set'",
+        ] {
+            assert!(BUILD.contains(step), "secure profile lost `{step}`");
+        }
     }
 
     #[test]

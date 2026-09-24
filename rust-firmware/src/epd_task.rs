@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
@@ -15,6 +14,7 @@ use esp_idf_svc::sys::zectrix_epd::{
 use inkwash_logic::diag::DiagCounter;
 
 use crate::canvas::{self, Rect};
+use inkwash_logic::epd_geometry::union_rect;
 
 const COMPLETION_CAPACITY: usize = 16;
 
@@ -57,10 +57,14 @@ impl CompletionMailbox {
         self.available.notify_one();
     }
 
-    fn send(&self, completion: EpdCompletion) {
+    fn send(&self, completion: EpdCompletion, watchdog_subscribed: bool) {
         let mut state = self.state.lock();
         while state.queue.len() + state.reserved >= COMPLETION_CAPACITY {
-            self.available.wait(&mut state);
+            self.available
+                .wait_for(&mut state, crate::watchdog::WORKER_IDLE_FEED);
+            if watchdog_subscribed {
+                crate::watchdog::feed();
+            }
         }
         state.queue.push_back(completion);
         self.available.notify_one();
@@ -283,9 +287,9 @@ fn run(
                 crate::watchdog::feed();
             }
 
-            completions.send(completion);
+            completions.send(completion, watchdog_subscribed);
         }
-        match notify_rx.recv_timeout(Duration::from_secs(1)) {
+        match notify_rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {
                 if watchdog_subscribed {
                     crate::watchdog::feed();
@@ -365,21 +369,6 @@ fn refresh_partial(handle: zectrix_epd_handle_t, rect: Rect, pixels: &[u8]) -> R
     });
     let power_off = check_epd("power off EPD", unsafe { zectrix_epd_power_off(handle) });
     refresh.and(power_off)
-}
-
-fn union_rect(a: Rect, b: Rect) -> Rect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let right = (a.x + a.width).max(b.x + b.width).min(canvas::WIDTH as u16);
-    let bottom = (a.y + a.height)
-        .max(b.y + b.height)
-        .min(canvas::HEIGHT as u16);
-    Rect {
-        x,
-        y,
-        width: right.saturating_sub(x),
-        height: bottom.saturating_sub(y),
-    }
 }
 
 fn check_epd(operation: &str, result: i32) -> Result<()> {

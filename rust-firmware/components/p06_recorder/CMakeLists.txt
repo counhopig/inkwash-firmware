@@ -1,4 +1,6 @@
 idf_component_register(SRCS "recorder.c" INCLUDE_DIRS "." REQUIRES esp_system WHOLE_ARCHIVE)
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wextra -Wsign-compare -Wunused-parameter -Wshadow -Werror)
 
 # 验证固件闸门：仅当 INKWASH_P06_VALIDATE=1 时启用 V2 故障触发。
 # 默认构建不定义该宏 => 组件内构造函数不做任何触发动作（行为不变）。

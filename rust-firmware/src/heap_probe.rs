@@ -88,6 +88,7 @@ pub fn register_current_task(slot: usize) {
 }
 
 pub fn log_registered_stacks(stage: &str) {
+    let mut summary = String::new();
     for (slot, name) in TASK_SLOTS.iter().enumerate() {
         let handle = TASK_HANDLES[slot].load(Ordering::Relaxed);
         if handle == 0 {
@@ -102,12 +103,12 @@ pub fn log_registered_stacks(stage: &str) {
         let stack_end = stack_start.saturating_add(TASK_STACK_BYTES[slot]);
         if hwm < 2048 {
             log::warn!(
-                "STACKPROBE {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
-            );
-        } else {
-            log::debug!(
-                "STACKPROBE {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
+                "STACKLOW {stage} task={name} tcb={handle:#010x} stack={stack_start:#010x}..{stack_end:#010x} hwm_free={hwm} bytes"
             );
         }
+        summary.push_str(&format!(" {name}={hwm}"));
+    }
+    if !summary.is_empty() {
+        log::info!("STACKPROBE {stage}{summary}");
     }
 }

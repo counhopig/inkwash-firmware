@@ -132,6 +132,14 @@ pub fn prepare_light_sleep_wakeups() -> Result<()> {
     Ok(())
 }
 
+pub fn log_pm_profile() {
+    #[cfg(esp_idf_pm_profiling)]
+    unsafe {
+        log::info!("PMPROFILE: lock and mode residency since boot follows");
+        esp_idf_svc::sys::esp_pm_dump_locks((*esp_idf_svc::sys::__getreent())._stdout);
+    }
+}
+
 pub fn usb_host_connected() -> bool {
     unsafe { esp_idf_svc::sys::usb_serial_jtag_is_connected() }
 }

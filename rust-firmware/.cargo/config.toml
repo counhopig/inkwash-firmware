@@ -3,7 +3,10 @@ target = "xtensa-esp32s3-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+# Never flash by port name alone: the wrapper refuses any board that is not
+# the authorized Note 4 (ESP32-S3, 16 MB, INKWASH_NOTE4_MAC). Set
+# INKWASH_NOTE4_PORT to the board's serial port.
+runner = ["../scripts/flash-note4.sh", "--monitor"]
 rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]
