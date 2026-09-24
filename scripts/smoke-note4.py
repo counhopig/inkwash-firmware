@@ -22,6 +22,8 @@ def parse_args():
     parser.add_argument("--stress", type=int, default=20)
     parser.add_argument("--reply-timeout", type=float, default=20.0)
     parser.add_argument("--log-file", help="write the complete raw serial log to this path")
+    parser.add_argument("--min-stack-free", type=int, default=1024,
+                        help="fail if any task's stack high-water mark leaves fewer free bytes")
     return parser.parse_args()
 
 
@@ -85,6 +87,22 @@ class Link:
                 return reply
             time.sleep(0.1)
         return None
+
+
+STACKPROBE = re.compile(r"STACKPROBE \S+((?: [\w-]+=\d+)+)")
+
+
+def stack_minimums(lines):
+    """Lowest free-stack reading per task across every STACKPROBE line."""
+    minimums = {}
+    for line in lines:
+        match = STACKPROBE.search(line)
+        if not match:
+            continue
+        for pair in match.group(1).split():
+            task, free = pair.rsplit("=", 1)
+            minimums[task] = min(int(free), minimums.get(task, int(free)))
+    return minimums
 
 
 TROUBLE = [
@@ -181,6 +199,17 @@ def main():
         print("uptime first/last: %d / %d ms" % (uptimes[0], uptimes[-1]))
         monotonic = all(later >= earlier for earlier, later in zip(uptimes, uptimes[1:]))
         results.append(("uptime monotonic", monotonic))
+
+    minimums = stack_minimums(lines)
+    if minimums:
+        print("stack free minimum (bytes): " + ", ".join(
+            "%s=%d" % item for item in sorted(minimums.items(), key=lambda item: item[1])))
+    tight = {task: free for task, free in minimums.items() if free < args.min_stack_free}
+    results.append(("stack high-water marks reported", bool(minimums)))
+    results.append(("every task keeps >= %d free stack bytes" % args.min_stack_free
+                    + ("" if not tight else " (%s)" % ", ".join(
+                        "%s=%d" % item for item in sorted(tight.items()))),
+                    bool(minimums) and not tight))
 
     boot_markers = sum("boot: Loaded app from partition" in line for line in lines)
     results.append(("no application reboot", boot_markers <= 1))
