@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use esp_idf_svc::sys::{
@@ -7,6 +8,11 @@ use esp_idf_svc::sys::{
     xTaskGenericNotifyFromISR, xTaskGenericNotifyWait, xTaskGetCurrentTaskHandle, BaseType_t,
     TaskHandle_t, TickType_t,
 };
+
+// Each subscription leaks its WakeCtx on purpose: the ISR may run until reset,
+// and no handler is ever removed. A second subscription for the same GPIO would
+// replace the handler while the first context stays live, so it is refused.
+static SUBSCRIBED: Mutex<u64> = Mutex::new(0);
 
 struct WakeCtx {
     task: TaskHandle_t,
@@ -44,6 +50,22 @@ impl Waker {
     }
 
     pub fn subscribe(&self, gpio_num: i32) -> Result<()> {
+        if !(0..64).contains(&gpio_num) {
+            anyhow::bail!("GPIO{gpio_num} cannot carry a wake interrupt");
+        }
+        let bit = 1u64 << gpio_num;
+        let mut subscribed = SUBSCRIBED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *subscribed & bit != 0 {
+            anyhow::bail!("GPIO{gpio_num} wake interrupt is already subscribed");
+        }
+        self.install(gpio_num)?;
+        *subscribed |= bit;
+        Ok(())
+    }
+
+    fn install(&self, gpio_num: i32) -> Result<()> {
         esp_idf_svc::hal::gpio::enable_isr_service()?;
         let task = unsafe { xTaskGetCurrentTaskHandle() };
         let ctx = Box::into_raw(Box::new(WakeCtx {
