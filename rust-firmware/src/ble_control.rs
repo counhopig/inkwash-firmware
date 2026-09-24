@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use esp32_nimble::utilities::mutex::Mutex;
@@ -12,12 +12,18 @@ use esp32_nimble::{
     uuid128, BLEAdvertisementData, BLECharacteristic, BLEDevice, NimbleProperties, NotifyTxStatus,
 };
 
+use inkwash_logic::ble_notify_fence::{NotifyAttempt, NotifyAttemptMailbox};
 use inkwash_logic::diag::DiagCounter;
 
 use crate::control;
 
 const CHANNEL_CAPACITY: usize = 16;
 const BLE_REPLY_MAX_RETRIES: u8 = 3;
+
+/// Longest a reply may be held back waiting for a notify-tx fence to expire.
+/// Two fence windows: enough for the fence to lapse, short enough that a
+/// flapping link still ends in a reported failure rather than a lost reply.
+const DEFERRED_REPLY_MAX: Duration = Duration::from_secs(6);
 
 const BLE_TASK_STACK: usize = 16 * 1024;
 
@@ -95,95 +101,6 @@ struct NotifyTxEvent {
     attempt: NotifyAttempt,
     conn_handle: u16,
     success: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NotifyAttempt {
-    session_id: u64,
-    generation: u64,
-    conn_handle: u16,
-    attempt_id: u64,
-}
-
-struct NotifyAttemptMailbox {
-    armed: Option<NotifyAttempt>,
-    retired_handles: VecDeque<(u16, std::time::Instant)>,
-}
-
-const RETIRED_HANDLE_GRACE: Duration = Duration::from_secs(3);
-const RETIRED_HANDLE_CAPACITY: usize = 4;
-
-impl Default for NotifyAttemptMailbox {
-    fn default() -> Self {
-        Self {
-            armed: None,
-            retired_handles: VecDeque::with_capacity(RETIRED_HANDLE_CAPACITY),
-        }
-    }
-}
-
-impl NotifyAttemptMailbox {
-    fn discard_expired_handles(&mut self) {
-        let now = std::time::Instant::now();
-        self.retired_handles
-            .retain(|(_, retired_at)| now.duration_since(*retired_at) < RETIRED_HANDLE_GRACE);
-    }
-
-    fn is_retired(&mut self, conn_handle: u16) -> bool {
-        self.discard_expired_handles();
-        self.retired_handles
-            .iter()
-            .any(|(handle, _)| *handle == conn_handle)
-    }
-
-    fn retire_handle(&mut self, conn_handle: u16) {
-        self.discard_expired_handles();
-        self.retired_handles
-            .retain(|(handle, _)| *handle != conn_handle);
-        if self.retired_handles.len() == RETIRED_HANDLE_CAPACITY {
-            self.retired_handles.pop_front();
-        }
-        self.retired_handles
-            .push_back((conn_handle, std::time::Instant::now()));
-    }
-
-    fn arm(&mut self, attempt: NotifyAttempt) -> bool {
-        if self.armed.is_some() || self.is_retired(attempt.conn_handle) {
-            return false;
-        }
-        self.armed = Some(attempt);
-        true
-    }
-
-    fn quarantine(&mut self, attempt: NotifyAttempt) {
-        if self.armed == Some(attempt) {
-            self.armed = None;
-        }
-        self.retire_handle(attempt.conn_handle);
-    }
-
-    fn release_generation(&mut self, session_id: u64, generation: u64, conn_handle: u16) {
-        if self.armed.is_some_and(|attempt| {
-            attempt.session_id == session_id
-                && attempt.generation == generation
-                && attempt.conn_handle == conn_handle
-        }) {
-            self.armed = None;
-        }
-        self.retire_handle(conn_handle);
-    }
-
-    fn take_for_callback(&mut self, conn_handle: u16) -> Option<NotifyAttempt> {
-        let Some(attempt) = self.armed else {
-            self.retired_handles
-                .retain(|(handle, _)| *handle != conn_handle);
-            return None;
-        };
-        if attempt.conn_handle != conn_handle {
-            return None;
-        }
-        self.armed.take()
-    }
 }
 
 #[derive(Clone)]
@@ -577,7 +494,18 @@ fn run(
     let mut active_session_id = None;
     loop {
         let received = if session.is_some() {
-            command_rx.recv_timeout(Duration::from_millis(20))
+            match command_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(command) => Ok(command),
+                // Nothing new arrived: retry the reply that a notify-tx fence
+                // held back, so it goes out as soon as the fence lapses.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    match session.as_mut().and_then(BleSession::take_deferred_reply) {
+                        Some(command) => Ok(command),
+                        None => Err(mpsc::RecvTimeoutError::Timeout),
+                    }
+                }
+                Err(err) => Err(err),
+            }
         } else {
             command_rx
                 .recv()
@@ -652,15 +580,35 @@ fn run(
                 reply_id,
                 json,
             }) => {
+                let mut held = false;
                 let result: Result<NotifyAttempt, (bool, String)> =
                     if let Some(active) = session.as_mut() {
                         if active.inflight.is_some() {
                             Err((true, "another BLE reply is awaiting notify-tx".to_string()))
                         } else if active.matches(session_id, generation, conn_handle) {
-                            let attempt = active.next_attempt(generation, conn_handle);
-                            match active.notify(json.as_bytes(), conn_handle, attempt) {
-                                Ok(()) => Ok(attempt),
-                                Err(err) => Err((false, format!("{err:?}"))),
+                            if active.handle_fenced(conn_handle) {
+                                let command = WorkerCommand::Reply {
+                                    session_id,
+                                    generation,
+                                    conn_handle,
+                                    reply_id,
+                                    json,
+                                };
+                                if active.defer_reply(command) {
+                                    log::info!(
+                                        "BLE reply {reply_id} held until the notify-tx fence on \
+                                         handle {conn_handle} expires"
+                                    );
+                                    held = true;
+                                }
+                                Err((true, "notify-tx fence still active".to_string()))
+                            } else {
+                                active.clear_deferred_reply();
+                                let attempt = active.next_attempt(generation, conn_handle);
+                                match active.notify(json.as_bytes(), conn_handle, attempt) {
+                                    Ok(()) => Ok(attempt),
+                                    Err(err) => Err((false, format!("{err:?}"))),
+                                }
                             }
                         } else {
                             Err((false, "stale BLE session/connection".to_string()))
@@ -681,6 +629,7 @@ fn run(
                             });
                         }
                     }
+                    Err(_) if held => {}
                     Err((retryable, err)) => {
                         log::warn!("BLE reply {reply_id} notify enqueue failed: {err}");
                         if result_tx
@@ -850,6 +799,8 @@ struct BleSession {
     inflight: Option<InflightReply>,
     next_attempt_id: u64,
     pending_command: Option<BleCommand>,
+    deferred_reply: Option<WorkerCommand>,
+    deferred_since: Option<std::time::Instant>,
 }
 
 struct InflightReply {
@@ -1033,7 +984,7 @@ impl BleSession {
                 .attempts
                 .lock()
                 .ok()
-                .and_then(|mut attempts| attempts.take_for_callback(conn_handle))
+                .and_then(|mut attempts| attempts.take_for_callback(conn_handle, Instant::now()))
             else {
                 log::warn!("BLE notify-tx callback has no armed attempt; ignoring");
                 return;
@@ -1077,6 +1028,8 @@ impl BleSession {
             inflight: None,
             next_attempt_id: 1,
             pending_command: None,
+            deferred_reply: None,
+            deferred_since: None,
         })
     }
 
@@ -1107,7 +1060,7 @@ impl BleSession {
             .notify_attempts
             .lock()
             .expect("BLE notify attempt mailbox poisoned")
-            .arm(attempt);
+            .arm(attempt, Instant::now());
         if !armed {
             return Err(esp32_nimble::BLEError::fail().expect_err("BLE notify attempt rejected"));
         }
@@ -1118,7 +1071,7 @@ impl BleSession {
                 self.notify_attempts
                     .lock()
                     .expect("BLE notify attempt mailbox poisoned")
-                    .quarantine(attempt);
+                    .quarantine(attempt, Instant::now());
                 Err(err)
             }
         }
@@ -1139,14 +1092,14 @@ impl BleSession {
         self.notify_attempts
             .lock()
             .expect("BLE notify attempt mailbox poisoned")
-            .quarantine(attempt);
+            .quarantine(attempt, Instant::now());
     }
 
     fn release_notify_generation(&self, session_id: u64, generation: u64, conn_handle: u16) {
         self.notify_attempts
             .lock()
             .expect("BLE notify attempt mailbox poisoned")
-            .release_generation(session_id, generation, conn_handle);
+            .release_generation(session_id, generation, conn_handle, Instant::now());
         while self.notify_tx_rx.try_recv().is_ok() {}
         if let Ok(mut pending) = self.notify_tx_pending.lock() {
             pending.retain(|event| {
@@ -1155,6 +1108,42 @@ impl BleSession {
                     || event.attempt.conn_handle != conn_handle
             });
         }
+    }
+
+    fn handle_fenced(&self, conn_handle: u16) -> bool {
+        self.notify_attempts
+            .lock()
+            .expect("BLE notify attempt mailbox poisoned")
+            .is_fenced(conn_handle, Instant::now())
+    }
+
+    /// Holds a reply back instead of reporting it failed, while a late
+    /// callback could still be mistaken for its completion. Only one reply can
+    /// be held, and only until `DEFERRED_REPLY_MAX` has passed since the first
+    /// hold, so a flapping link cannot hide a reply forever.
+    fn defer_reply(&mut self, command: WorkerCommand) -> bool {
+        if self.deferred_reply.is_some() {
+            return false;
+        }
+        let now = Instant::now();
+        if self
+            .deferred_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= DEFERRED_REPLY_MAX)
+        {
+            return false;
+        }
+        self.deferred_since.get_or_insert(now);
+        self.deferred_reply = Some(command);
+        true
+    }
+
+    fn take_deferred_reply(&mut self) -> Option<WorkerCommand> {
+        self.deferred_reply.take()
+    }
+
+    fn clear_deferred_reply(&mut self) {
+        self.deferred_reply = None;
+        self.deferred_since = None;
     }
 
     fn matches(&self, session_id: u64, generation: u64, conn_handle: u16) -> bool {

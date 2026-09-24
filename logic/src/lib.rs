@@ -4,6 +4,7 @@ pub mod alarm_schedule;
 pub mod app;
 pub mod audio_command;
 pub mod ble_memory;
+pub mod ble_notify_fence;
 pub mod ble_radio;
 pub mod boot_guard;
 pub mod boot_store;
@@ -171,17 +172,20 @@ mod ble_memory_contract {
 
     #[test]
     fn ble_notify_completion_is_attempt_bound_and_stale_safe() {
-        assert!(BLE_SOURCE.contains("struct NotifyAttempt"));
+        const FENCE_SOURCE: &str = include_str!("../src/ble_notify_fence.rs");
         assert!(BLE_SOURCE.contains("attempt: NotifyAttempt"));
         assert!(BLE_SOURCE.contains("attempt_id: u64"));
         assert!(BLE_SOURCE.contains("const BLE_REPLY_MAX_RETRIES: u8 = 3"));
-        assert!(BLE_SOURCE.contains("ReplyTerminated"));
-        assert!(BLE_SOURCE.contains("retired_handles: VecDeque<(u16, std::time::Instant)>"));
-        assert!(BLE_SOURCE.contains("const RETIRED_HANDLE_GRACE: Duration"));
-        assert!(BLE_SOURCE.contains("fn discard_expired_handles"));
-        assert!(BLE_SOURCE.contains("fn release_generation"));
-        assert!(BLE_SOURCE.contains("self.is_retired(attempt.conn_handle)"));
-        assert!(BLE_SOURCE.contains("self.retire_handle(conn_handle)"));
+        assert!(FENCE_SOURCE.contains("pub const RETIRED_HANDLE_GRACE: Duration"));
+        assert!(FENCE_SOURCE.contains("fn release_generation"));
+        assert!(FENCE_SOURCE.contains("if !outstanding {"));
+        assert!(BLE_SOURCE.contains("fn handle_fenced"));
+        assert!(BLE_SOURCE.contains("fn defer_reply"));
+        assert!(BLE_SOURCE.contains("const DEFERRED_REPLY_MAX: Duration"));
+        assert!(
+            BLE_SOURCE.contains("held until the notify-tx fence"),
+            "a fenced reply must be held and retried, never reported as failed"
+        );
         assert!(BLE_SOURCE.contains("pending.push_back(event)"));
         assert!(!BLE_SOURCE.contains("pending: StdArc<StdMutex<Option<NotifyTxEvent>>>"));
         assert!(BLE_SOURCE.contains("inflight.attempt_id != event.attempt.attempt_id"));
@@ -566,6 +570,94 @@ mod ble_memory_contract {
             !body.contains("nvs") && !body.contains("erase"),
             "safe mode promises the operator that stored data is untouched: it must not \
              take a store handle, and it must never erase one"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nvs_contract {
+    const STORAGE_SOURCE: &str = include_str!("../../rust-firmware/src/storage.rs");
+    const ALARMS_SOURCE: &str = include_str!("../../rust-firmware/src/alarms.rs");
+    const TODOS_SOURCE: &str = include_str!("../../rust-firmware/src/todos.rs");
+    const INBOX_SOURCE: &str = include_str!("../../rust-firmware/src/inbox.rs");
+    const NVS_BLOB_SOURCE: &str = include_str!("../../rust-firmware/src/nvs_blob.rs");
+    const SYNC_SOURCE: &str = include_str!("../../rust-firmware/src/sync.rs");
+
+    /// NVS stores at most `NVS_KEY_NAME_MAX_SIZE - 1` characters of a key or a
+    /// namespace name and rejects anything longer. A rejected key is invisible
+    /// here — the write fails while the read returns "never stored" — so a
+    /// setting with a long name silently keeps its default on every boot.
+    const NVS_NAME_MAX_LEN: usize = 15;
+
+    fn nvs_names(source: &str) -> Vec<(&str, &str, usize)> {
+        let mut names = Vec::new();
+        for line in source.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("const ") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": &str = \"") else {
+                continue;
+            };
+            if !name.contains("KEY") && !name.contains("NAMESPACE") {
+                continue;
+            }
+            let Some((value, _)) = value.split_once('"') else {
+                continue;
+            };
+            names.push((name, value, value.len()));
+        }
+        names
+    }
+
+    #[test]
+    fn every_nvs_key_and_namespace_fits_the_nvs_limit() {
+        let mut checked = 0;
+        for source in [
+            STORAGE_SOURCE,
+            ALARMS_SOURCE,
+            TODOS_SOURCE,
+            INBOX_SOURCE,
+            NVS_BLOB_SOURCE,
+        ] {
+            for (name, value, len) in nvs_names(source) {
+                checked += 1;
+                assert!(
+                    len <= NVS_NAME_MAX_LEN,
+                    "{name} is \"{value}\": {len} characters, but NVS accepts at most \
+                     {NVS_NAME_MAX_LEN}. The write would fail and the read would report \
+                     \"never stored\", so the setting could never be persisted"
+                );
+            }
+        }
+        assert!(
+            checked >= 15,
+            "expected to inspect the store's NVS names, found {checked}"
+        );
+    }
+
+    /// The apply journal is written before a synced payload is applied, so it
+    /// must be able to store the re-serialized body of every response the sync
+    /// path accepts. An independent, smaller cap strands every payload in the
+    /// band between the two numbers: the sync retries forever without applying
+    /// anything, and the last successful sync stays on the device.
+    #[test]
+    fn the_apply_journal_is_sized_from_the_response_budget() {
+        assert!(
+            STORAGE_SOURCE.contains(
+                "const SYNC_APPLY_JOURNAL_MAX_LEN: usize = crate::sync::RESPONSE_BUF_LEN;"
+            ),
+            "the apply journal must be sized from the response budget it has to store"
+        );
+        let budget = SYNC_SOURCE
+            .split("RESPONSE_BUF_LEN: usize = ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .expect("the response budget must stay a literal so this contract is checkable");
+        assert!(
+            budget >= 16 * 1024,
+            "the device reads up to the server's response budget; found {budget}"
         );
     }
 }

@@ -7,6 +7,8 @@ use inkwash_logic::boot_store::StoreFault;
 use crate::nvs_blob;
 
 const NAMESPACE: &str = "inkwash";
+// NVS rejects keys of 16 characters or more (`NVS_KEY_NAME_MAX_SIZE` is 16,
+// including the terminator), so every key here stays within 15.
 const KEY_WIFI_SSID: &str = "wifi_ssid";
 const KEY_WIFI_PASS: &str = "wifi_pass";
 const KEY_WIFI_CONFIG: &str = "wifi_cfg_v1";
@@ -14,11 +16,15 @@ const KEY_SERVER_URL: &str = "server_url";
 const KEY_AUTH_TOKEN: &str = "auth_token";
 const KEY_SERVER_CONFIG: &str = "server_cfg_v1";
 const KEY_TIMEZONE_OFFSET: &str = "timezone_min";
-const KEY_SYNC_INTERVAL_MIN: &str = "sync_interval_min";
+const KEY_SYNC_INTERVAL_MIN: &str = "sync_interval";
 const KEY_LAST_SYNC_EPOCH: &str = "last_sync_epoch";
 const KEY_RTC_ALIGN_EPOCH: &str = "rtc_align_epoch";
 const KEY_SYNC_APPLY_JOURNAL: &str = "sync_jrn_v1";
-const SYNC_APPLY_JOURNAL_MAX_LEN: usize = 12 * 1024;
+// The journal is written before the response is applied, so it must hold the
+// re-serialized body of any response the sync path accepts: the same budget,
+// not an independent one. A smaller cap here strands payloads in the band
+// between the two numbers, retrying forever without applying anything.
+const SYNC_APPLY_JOURNAL_MAX_LEN: usize = crate::sync::RESPONSE_BUF_LEN;
 
 const KEY_TODO_REMINDED_DATE: &str = "todo_rem_date";
 

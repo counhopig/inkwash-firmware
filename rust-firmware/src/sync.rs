@@ -17,7 +17,10 @@ use crate::wifi;
 
 use inkwash_logic::sync_validate::{validate_sync_response, SyncResponse};
 
-const RESPONSE_BUF_LEN: usize = 16384;
+// The largest sync response the device reads, parses and applies. The apply
+// journal is sized from this: a response inside the budget must always be
+// journalable, or the device would accept work it can never store.
+pub(crate) const RESPONSE_BUF_LEN: usize = 16384;
 
 struct PsramBuffer {
     ptr: NonNull<u8>,
