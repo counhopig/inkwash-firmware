@@ -56,10 +56,14 @@ impl CompletionMailbox {
         self.available.notify_one();
     }
 
-    fn send(&self, completion: EpdCompletion) {
+    fn send(&self, completion: EpdCompletion, watchdog_subscribed: bool) {
         let mut state = self.state.lock();
         while state.queue.len() + state.reserved >= COMPLETION_CAPACITY {
-            self.available.wait(&mut state);
+            self.available
+                .wait_for(&mut state, crate::watchdog::WORKER_IDLE_FEED);
+            if watchdog_subscribed {
+                crate::watchdog::feed();
+            }
         }
         state.queue.push_back(completion);
         self.available.notify_one();
@@ -282,7 +286,7 @@ fn run(
                 crate::watchdog::feed();
             }
 
-            completions.send(completion);
+            completions.send(completion, watchdog_subscribed);
         }
         match notify_rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {
