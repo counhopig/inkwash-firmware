@@ -1151,7 +1151,7 @@ fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> 
     if !matches!(
         st.phase,
         BlePairingPhase::Waiting | BlePairingPhase::Pairing { .. }
-    ) || !st.pairing_deadline_ticks.is_some_and(|d| now_ticks >= d)
+    ) || st.pairing_deadline_ticks.is_none_or(|d| now_ticks < d)
     {
         return vec![];
     }
