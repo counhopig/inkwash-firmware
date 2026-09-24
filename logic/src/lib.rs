@@ -115,7 +115,7 @@ mod ble_memory_contract {
             .find("if session.is_some()")
             .expect("worker must guard duplicate Start commands");
         let start_init = BLE_SOURCE
-            .find("match BleSession::start(session_id, passkey)")
+            .find("match BleSession::start(session_id)")
             .expect("worker must initialize after duplicate Start guard");
         assert!(start_guard < start_init);
         assert!(BLE_SOURCE.contains("active_session_id"));
@@ -150,6 +150,22 @@ mod ble_memory_contract {
         assert!(BLE_SOURCE.contains("NimbleProperties::WRITE_AUTHEN"));
         assert!(BLE_SOURCE.contains("BleTaskResult::Started"));
         assert!(BLE_SOURCE.contains("passkey,"));
+    }
+
+    #[test]
+    fn ble_passkey_is_drawn_after_the_radio_is_enabled() {
+        let init = BLE_SOURCE
+            .find("BLEDevice::init();")
+            .expect("the session must initialize NimBLE");
+        let draw = BLE_SOURCE
+            .find("esp_random()")
+            .expect("the passkey must come from the hardware RNG");
+        assert!(
+            init < draw,
+            "esp_random() is only a true RNG once the radio is on; before \
+             BLEDevice::init() the six-digit passkey would be pseudo-random"
+        );
+        assert_eq!(BLE_SOURCE.matches("esp_random()").count(), 1);
     }
 
     #[test]
