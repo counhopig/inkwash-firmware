@@ -43,7 +43,11 @@ if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1 \
 fi
 
 echo "==> Building release firmware..."
-./scripts/build-rust.sh --release
+# Stamp the build with the commit time so the same tag always rebuilds to
+# the same image, and build only the dependency set CI has checked.
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+export SOURCE_DATE_EPOCH
+./scripts/build-rust.sh --release --locked
 test -f "$ELF" || { echo "expected firmware not found at $ELF" >&2; exit 1; }
 test -f "$BOOTLOADER" || { echo "expected bootloader not found at $BOOTLOADER" >&2; exit 1; }
 test -f "$PARTITIONS" || { echo "expected partition table not found at $PARTITIONS" >&2; exit 1; }
