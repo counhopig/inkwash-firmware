@@ -3,7 +3,6 @@ use parking_lot::Mutex;
 use std::sync::mpsc::{
     sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
 };
-use std::time::Duration;
 
 use inkwash_logic::app::{Effect, EffectBatch};
 use inkwash_logic::runner::{
@@ -21,8 +20,6 @@ const BATCH_CHANNEL_CAP: usize = 1;
 const NOTICE_CHANNEL_CAP: usize = 8;
 
 const EFFECT_TASK_STACK: usize = 16 * 1024;
-
-const IDLE_DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct BatchResult {
@@ -277,7 +274,7 @@ fn run(
     };
 
     loop {
-        let batch = match batch_rx.recv_timeout(IDLE_DRAIN) {
+        let batch = match batch_rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(batch) => batch,
             Err(RecvTimeoutError::Timeout) => {
                 if watchdog_subscribed {

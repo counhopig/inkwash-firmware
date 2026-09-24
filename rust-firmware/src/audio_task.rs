@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use inkwash_logic::audio_command::{AudioMailbox, AudioMode, AudioReducer};
 
 pub struct AudioTask {
     mailbox: Arc<Mutex<AudioMailbox>>,
+    ready: Arc<Condvar>,
 }
 
 pub enum AudioSpawn {
@@ -42,11 +43,13 @@ impl AudioTask {
         codec.set_mute(false)?;
 
         let mailbox = Arc::new(Mutex::new(AudioMailbox::new()));
+        let ready = Arc::new(Condvar::new());
         let task_mailbox = mailbox.clone();
+        let task_ready = ready.clone();
         crate::tasks::spawn("audio", 8 * 1024, crate::tasks::PRIORITY_AUDIO, move || {
-            run(codec, task_mailbox)
+            run(codec, task_mailbox, task_ready)
         })?;
-        Ok(AudioSpawn::Running(AudioTask { mailbox }))
+        Ok(AudioSpawn::Running(AudioTask { mailbox, ready }))
     }
 
     pub fn start_alarm_tone(&self) -> Result<()> {
@@ -73,11 +76,12 @@ impl AudioTask {
         mailbox.enqueue(command).map_err(|rejected| {
             anyhow!("audio mailbox full; rejected reminder command {rejected:?}")
         })?;
+        self.ready.notify_one();
         Ok(())
     }
 }
 
-fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>) {
+fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>, ready: Arc<Condvar>) {
     crate::heap_probe::register_current_task(crate::heap_probe::SLOT_AUDIO);
     log::info!("Audio task running");
     let watchdog_subscribed = match watchdog::subscribe() {
@@ -94,7 +98,7 @@ fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>) {
         }
         drain_commands(&mailbox, &mut reducer);
         match reducer.mode() {
-            AudioMode::Idle => thread::sleep(Duration::from_millis(5)),
+            AudioMode::Idle => wait_for_command(&mailbox, &ready),
             AudioMode::AlarmRing => {
                 if let Err(err) = codec.play_sine_stereo(ALARM_TONE_HZ, ALARM_TONE_BURST_SECS, 8000)
                 {
@@ -132,6 +136,16 @@ fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>) {
                 }
             }
         }
+    }
+}
+
+fn wait_for_command(mailbox: &Arc<Mutex<AudioMailbox>>, ready: &Condvar) {
+    let Ok(queue) = mailbox.lock() else {
+        thread::sleep(watchdog::WORKER_IDLE_FEED);
+        return;
+    };
+    if queue.is_empty() {
+        let _ = ready.wait_timeout(queue, watchdog::WORKER_IDLE_FEED);
     }
 }
 

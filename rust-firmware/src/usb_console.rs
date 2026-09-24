@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
+use std::time::Duration;
 
 const COMMAND_PREFIX: &str = ">>IW ";
 
@@ -13,6 +14,9 @@ const READER_TASK_STACK_SIZE: usize = 12 * 1024;
 const WRITER_TASK_STACK_SIZE: usize = 8 * 1024;
 
 const PENDING_COMMAND_CAPACITY: usize = 8;
+
+const HOST_POLL: Duration = Duration::from_millis(10);
+const NO_HOST_POLL: Duration = Duration::from_millis(500);
 
 pub const REPLY_WRITER_CAPACITY: usize = 8;
 
@@ -62,7 +66,7 @@ fn read_commands(tx: SyncSender<(Option<String>, control::Command)>) {
 
     loop {
         match stdin.read(&mut byte) {
-            Ok(0) => thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(0) => thread::sleep(idle_poll()),
             Ok(_) => {
                 if byte[0] == b'\n' {
                     if discarding_oversized_line {
@@ -100,13 +104,21 @@ fn read_commands(tx: SyncSender<(Option<String>, control::Command)>) {
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(10));
+                thread::sleep(idle_poll());
             }
             Err(err) => {
                 log::warn!("USB console reader I/O error: {err}");
                 thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+    }
+}
+
+fn idle_poll() -> Duration {
+    if crate::power::usb_host_connected() {
+        HOST_POLL
+    } else {
+        NO_HOST_POLL
     }
 }
 

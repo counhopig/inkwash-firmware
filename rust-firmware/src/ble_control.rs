@@ -576,7 +576,14 @@ fn run(
     let mut session = None;
     let mut active_session_id = None;
     loop {
-        match command_rx.recv_timeout(Duration::from_millis(20)) {
+        let received = if session.is_some() {
+            command_rx.recv_timeout(Duration::from_millis(20))
+        } else {
+            command_rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match received {
             Ok(WorkerCommand::Start {
                 name: _name,
                 session_id,

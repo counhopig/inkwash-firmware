@@ -1,7 +1,6 @@
 use std::sync::mpsc::{
     channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
 };
-use std::time::Duration;
 
 use anyhow::Result;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -145,7 +144,7 @@ fn run(mut wifi: WifiManager, partition: EspDefaultNvsPartition, rx: Receiver<Sy
 
     let mut wifi_suspended = false;
     loop {
-        let cmd = match rx.recv_timeout(Duration::from_secs(1)) {
+        let cmd = match rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(cmd) => cmd,
             Err(RecvTimeoutError::Timeout) => {
                 if watchdog_subscribed {

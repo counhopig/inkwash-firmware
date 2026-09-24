@@ -2,7 +2,6 @@ use std::sync::mpsc::{
     channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{bail, Result};
 use inkwash_logic::alarm_regs::AlarmRegs;
@@ -14,8 +13,6 @@ use crate::rtc::{DateTime, Pcf8563, PCF8563_ADDR};
 const RTC_TASK_STACK: usize = 8 * 1024;
 
 const RTC_COMMAND_CAPACITY: usize = 8;
-
-const IDLE_DRAIN: Duration = Duration::from_secs(1);
 
 enum RtcCommand {
     ReadTime,
@@ -156,7 +153,7 @@ fn run(
     let mut latch = inkwash_logic::rtc_latch::RtcSnapshotLatch::new();
 
     loop {
-        let cmd = match rx.recv_timeout(IDLE_DRAIN) {
+        let cmd = match rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(cmd) => cmd,
             Err(RecvTimeoutError::Timeout) => {
                 if watchdog_subscribed {
