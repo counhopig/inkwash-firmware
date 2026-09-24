@@ -394,3 +394,101 @@ export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 6. 普通 release 是否必须保留 coredump？若需要，如何控制转储的提取权限和敏感信息？
 7. Wi-Fi 目标环境是否要求 WPA3-only 支持？
 8. `reserved` 分区是否有预定的实验用途？如果没有，保持当前整体保留即可，不需要提前切分。
+
+## 7. 复核补充（2026-09-24）
+
+复核基线：`9948383`（与上文基线相比仅新增本报告）。逐条对照源码复核了第 3 节结论，并补充了原报告遗漏的问题。本轮同样未烧录设备、未访问串口。
+
+### 7.1 复核中的实际验证
+
+- `logic/`：`cargo test --locked` 446 个测试全部通过；`cargo fmt --check` 通过；`rust-firmware/`：`cargo +stable fmt --check` 通过。
+- `logic/`：本地 clippy 1.94.1 下 `cargo clippy --all-targets --locked -- -D warnings` **失败**：`logic/src/app.rs:1154` 触发 `clippy::nonminimal_bool`（建议写成 `is_none_or(|d| now_ticks < d)`）。GitHub CI 最近一次运行（run 27）为绿，说明结果取决于 `dtolnay/rust-toolchain@stable` 当时解析到的版本，见 7.3 N7。
+
+### 7.2 对第 3 节已有结论的更正
+
+#### 更正 P1-1（RTC 请求等待无超时）→ 建议降为 P2，且原示例修复会引入新缺陷
+
+- 位置：`rust-firmware/src/rtc_executor.rs:114-121`、`:131-204`
+- 复核：RTC 任务退出（探测失败 `return`、命令通道断开 `break`）时会 drop 回复端 `SyncSender`，调用方的 `recv()` 返回 `Err` 而不是永久阻塞。真正会“卡住”的只有 RTC 任务卡在 I2C 事务中，而 I2C 已有 100 tick 超时，RTC 任务本身也订阅了 TWDT。
+- 风险：原报告建议直接改为 `recv_timeout(500ms)`。当前回复通道是所有调用方共享的 `sync_channel(1)`，回复不带请求序号。超时后迟到的回复会留在通道里，被**下一个**请求取走：类型不同时报 “mismatched reply”；类型相同时（`Acknowledge`/`Disable`/`Program`/`WriteTime` 都返回 `RtcReply::Unit`）会把上一条命令的结果当成本条命令的结果，静默出错。
+- 建议：如果要加超时，必须同时给 `RtcCommand`/`RtcReply` 加单调序号并丢弃不匹配的回复，或者每个请求使用独立的 oneshot 回复通道。
+
+#### 更正 P1-3（EPD 完成邮箱阻塞与 TWDT 冲突）→ 建议降为 P2
+
+- 位置：`rust-firmware/src/epd_task.rs:42-67`、`:113-176`、`:272-286`
+- 复核：邮箱已有预留机制（`reserve()`/`complete_reserved()`），被替换的请求在提交侧预留槽位，队列满时提交侧直接返回错误，不会阻塞。worker 的 `send()` 只有在 16 个完成事件都没被消费时才会阻塞，前提是主循环已经停止调用 `poll_completion()`。主任务本身订阅了 TWDT，这种情况下主任务的 TWDT 会先触发或同时触发，EPD 的 TWDT 只是重复报告同一个故障，不是误报重启。
+- 建议：保留原建议（等待期间带超时并 feed），但优先级低于 7.3 中的新问题。
+
+#### 补充 P1-2（主任务 TWDT 订阅失败后仍 feed）
+
+- 结论成立（`rust-firmware/src/main.rs:164-166`、`:525`）。补充：主循环在非 light sleep 状态下按 `POLL_INTERVAL_MS` 运行，订阅失败后每一轮都会打印一条 `esp_task_wdt_reset failed` warning，日志风暴的频率高于原报告的估计。
+
+### 7.3 新发现
+
+#### N1（P1）多个 worker 的短周期轮询让自动 light sleep 基本无法进入
+
+- 位置：
+  - `rust-firmware/src/audio_task.rs:97`：`AudioMode::Idle => thread::sleep(5ms)`，任务常驻，空闲时每 5 ms 醒一次
+  - `rust-firmware/src/ble_control.rs:579`：BLE worker `recv_timeout(20ms)`，没有 BLE 会话时也一直轮询
+  - `rust-firmware/src/usb_console.rs:65,103`：stdin 无数据时 `sleep(10ms)` 轮询
+  - 另有 `rtc_executor.rs:159`、`epd_task.rs:288`、`sync_task.rs:148`、`effect_task.rs:284` 各自 1 s 超时，相位互不对齐
+- 证据：`sdkconfig.defaults` 设置 `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=200`，tickless idle 只在预计空闲时间 ≥ 200 ms 时才进入 light sleep。只要有任务每 5 ms 或 20 ms 醒一次，预计空闲时间就远低于阈值。`sdkconfig.defaults` 注释里“每秒约 0.8 s 处于 light sleep”的前提因此不成立。主循环的 `wake.wait(1000)`（`main.rs:1185-1187`）本身设计正确，但不能单独决定芯片是否睡眠。
+- 影响：电池续航可能远低于设计预期，而逻辑测试和 CI 都发现不了。这也是原报告 P1-7（缺少功耗基线）背后一个具体的、可以直接修复的原因。
+- 建议：
+  - audio：Idle 时改为阻塞等待（`Condvar` 或 channel `recv()`），只在播放时进入 5 ms 节拍。
+  - BLE worker：无会话时阻塞 `recv()`；会话期间再使用短超时。
+  - USB 读线程：安装 `usb_serial_jtag` 驱动并让 VFS 使用阻塞读，或者只在 `usb_host_connected()` 为真时轮询，否则阻塞在一个事件上。
+  - 1 s 心跳：TWDT 为 10 s，可以把 worker 空闲超时拉长到 3–4 s，减少唤醒次数。
+- 验证：开启 `CONFIG_PM_PROFILING`，用 `esp_pm_dump_locks()` 或 sleep 统计比较修改前后的 light sleep 占比；在 Home 静止页面测平均电流。
+
+#### N2（P1）同步进行中修改闹钟/待办，修改会被静默丢弃
+
+- 位置：`logic/src/app.rs:2362-2386`（闹钟切换没有检查 `state.sync`）、`rust-firmware/src/sync.rs:191-203`（请求发出前快照 dirty 集合）、`logic/src/app.rs:2893`（应用时 `state.alarms.alarms = data.alarms`）、`rust-firmware/src/sync_apply.rs:41-46`
+- 过程：
+  1. 同步任务读取本地闹钟和 dirty 集合，发出 HTTPS 请求。
+  2. 请求进行中，用户在闹钟列表切换闹钟 X。`PersistAlarmToggle` 保存新值并标记 X dirty。
+  3. 服务器响应基于第 1 步上传的状态。`ApplySyncedData` 用服务器列表覆盖 NVS 和内存状态。
+  4. 如果 X 已经在第 1 步的 dirty 集合里，`clear_dirty_ids` 会清掉 X，用户的第二次修改彻底丢失。如果 X 不在集合里，dirty 标记还在，但本地值已被服务器旧值覆盖，下一次同步上传的是旧值，修改同样丢失。
+- 待办的 `PersistTodoEdit`（`app.rs:2560`）是同一条路径。
+- 建议（二选一）：
+  - 简单：`state.sync != SyncState::Idle` 时拒绝或排队本地编辑，并在 UI 上提示“同步中”。
+  - 完整：记录每条记录的本地编辑代数。apply 时对快照之后又被编辑过的 ID 保留本地值、保留 dirty，只清除值与上传内容一致的 dirty ID。
+- 验证：在 `logic/src/harness.rs` 中编写脚本：`SyncStarted` → 切换闹钟 → 注入 `SyncFetched` → 断言闹钟值和 dirty 状态都保留。
+
+#### N3（P2）本地编辑先保存后标记 dirty，中途掉电会丢失上传意图
+
+- 位置：`rust-firmware/src/effect_task.rs:187-217`
+- 证据：先执行 `AlarmStore::save`/`TodoStore::save`，再执行 `mark_dirty`。两次 NVS 写入之间掉电时，新值已经落盘但没有标记 dirty，永远不会上传，下一次同步还会被服务器值覆盖。
+- 建议：先 `mark_dirty` 再 `save`。反过来的失败情况只是多上传一次未变化的值，不会造成数据丢失。
+
+#### N4（P2）light sleep 唤醒源不包含 RTC 中断脚，与配置注释不符
+
+- 位置：`rust-firmware/src/power.rs:24,120-133`、`rust-firmware/src/board.rs:180`、`rust-firmware/sdkconfig.defaults` PM 段注释
+- 证据：`WAKE_PINS = [GPIO0, GPIO18, GPIO39]`，light sleep GPIO 唤醒和 `Waker` ISR 都不包含 PCF8563 INT（GPIO5），但 sdkconfig 注释写的是“Keys and the RTC alarm line wake it”。当前闹钟靠主循环每秒轮询发现，延迟不超过约 1 s，功能上没问题。但如果按 N1 把空闲周期拉长，闹钟响铃延迟会随之变大。
+- 建议：把 GPIO5 加入 light sleep 唤醒源和 `Waker`，或者修正注释并明确“闹钟延迟上限 = 空闲轮询周期”。
+
+#### N5（P2）BLE passkey 在射频启用前生成
+
+- 位置：`rust-firmware/src/ble_control.rs:594`（`esp_random()`）早于 `BLEDevice::init()`（`:869`）
+- 证据：ESP32-S3 上 Wi-Fi/BT 都没有启用、也没有调用 `bootloader_random_enable()` 时，ESP-IDF 文档说明 `esp_random()` 的输出应视为伪随机。
+- 影响：6 位 passkey 是 BLE 配对防 MITM 的唯一秘密，熵不足会削弱认证加密的前提。
+- 建议：在 `BLEDevice::init()` 之后生成 passkey（`set_passkey` 本来就在 init 之后调用），或者在生成前后包裹 `bootloader_random_enable()`/`disable()`。
+
+#### N6（P2）`.esp32-review.yml` 的例外清单已经过期
+
+- 位置：`.esp32-review.yml`
+- 证据：清单允许 `rust-firmware/src/board.rs:276` 和 `rust-firmware/src/wifi.rs:44`。当前 `board.rs` 已经没有 `Peripherals::steal()`（电池 ADC 改为持有句柄），`wifi.rs` 中唯一的调用点在第 52 行。
+- 影响：按该文件的设计，审查工具会把 `wifi.rs:52` 报成新的违规，而已删除的 `board.rs` 例外还留着，削弱了例外清单的可审计性。
+- 建议：删除 `board.rs:276`，把 `wifi.rs:44` 改为 `wifi.rs:52`，并同步修改文件头注释。
+
+#### N7（P2）logic CI 工具链未固定，clippy 结果随 stable 变化
+
+- 位置：`.github/workflows/ci.yml` 的 `logic` job
+- 证据：使用 `dtolnay/rust-toolchain@stable` 且没有版本号，clippy 也没加 `--locked`。本地 clippy 1.94.1 已经在 `logic/src/app.rs:1154` 报错（见 7.1）。
+- 建议：修复该处 lint（一行改动），并在 CI 中固定工具链版本（例如 `@1.94.1` 或 `logic/rust-toolchain.toml`），定期主动升级；clippy 同样加上 `--locked`。
+
+### 7.4 更新后的优先级建议
+
+1. N1（light sleep 被轮询打断）和 N2（同步期间编辑丢失）直接影响续航和用户数据，应排在原 P1 列表前面。
+2. 原 P0-1、P0-2 的结论和前提（第 6 节第 1 问）保持不变。
+3. N3、N5、N6、N7 都是小于 1 小时的改动，可以并入第 4 节的快速收益清单。
