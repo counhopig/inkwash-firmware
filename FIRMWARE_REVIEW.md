@@ -492,3 +492,27 @@ export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 1. N1（light sleep 被轮询打断）和 N2（同步期间编辑丢失）直接影响续航和用户数据，应排在原 P1 列表前面。
 2. 原 P0-1、P0-2 的结论和前提（第 6 节第 1 问）保持不变。
 3. N3、N5、N6、N7 都是小于 1 小时的改动，可以并入第 4 节的快速收益清单。
+
+## 8. 修复状态（2026-09-24）
+
+所有修复都在 `docs/esp32-s3-firmware-review` 分支上。在本地 ESP-IDF 5.5.5 + `esp` 1.98.1 工具链上完成了以下验证：release、diagnostic 和 secure 三种 profile 都构建通过，固件侧 `cargo clippy -D warnings` 通过，boot ledger 镜像检查通过，`logic/` 460 个测试和 clippy 都通过。**未烧录设备，未做实机验证。**
+
+| 条目 | 状态 | 处理方式 |
+|---|---|---|
+| P0-1 发布产物无固件与密钥保护 | 已修复（边界明确化） | 公开 release 仍是 developer 构建：用 secure profile 发布会在每台用户设备首次启动时烧写不可逆 eFuse，并把设备绑定到维护者的签名密钥。`release.sh` 现在强制检查 `CONFIG_SECURE_BOOT` 和 Flash 加密均未开启，release notes 与 README 写明安全边界（每台设备使用独立 token，丢失后吊销）。需要锁定设备的用户可用自己的密钥构建 secure profile。 |
+| P0-2 coredump 可能暴露敏感数据 | 已修复 | 显式设置 `CONFIG_ESP_COREDUMP_CAPTURE_DRAM=n`：转储只包含任务栈和 TCB，不含保存 Wi-Fi 密码和 token 的堆。`release.sh` 与 `logic` 契约测试都会拒绝开启该项的构建。 |
+| P1-1 RTC 请求无超时 | 已修复 | 请求和回复带序号，超时 1 s；迟到的回复按序号丢弃，不会被下一个请求误收。 |
+| P1-2 看门狗未订阅仍 feed | 已修复 | `watchdog::feed()` 遇到 `ESP_ERR_NOT_FOUND` 时不再告警。 |
+| P1-3 EPD 完成邮箱阻塞 | 已修复 | 等待改为每 4 s 超时一次，等待期间喂狗。 |
+| P1-4 NimBLE 标准服务未裁剪 | 已修复 | 关闭 12 个示例服务，并加了契约测试。实测镜像体积不变：这些服务从未被引用，链接器原本就会丢弃它们。 |
+| P1-5 secure 构建只验证可编译 | 已修复 | secure profile 现在生成带 `--secure-pad-v2` 的应用镜像，用 `espsecure` 签名，再校验应用和 bootloader 的签名以及最终安全配置。原流程根本没有签名应用，开启 Secure Boot 的设备会拒绝启动。换用其他密钥或未签名镜像都会被校验拒绝。 |
+| P1-6 烧录只凭串口名 | 已修复 | 新增 `scripts/flash-note4.sh`：先核对芯片为 ESP32-S3、Flash 为 16 MB、MAC 为授权 Note 4，再按 16 MB DIO 80 MHz 和 `partitions.csv` 烧录。cargo runner 与 README 改用该脚本，release notes 增加身份核验步骤。 |
+| P1-7 功耗基线 | 部分完成 | diagnostic profile 开启 `CONFIG_PM_PROFILING`，主循环每 60 s 输出各电源模式和 PM lock 的驻留时间，可作为 light sleep 占比基线。电流与唤醒时延仍需实机测量。 |
+| P2-1 / P2-2 release 可复现性 | 已修复 | release 构建加 `--locked`，并以提交时间设置 `SOURCE_DATE_EPOCH`。 |
+| P2-3 栈水位门禁 | 已修复 | 每 10 s 输出一行 INFO 级 `STACKPROBE <stage> task=free ...`；`smoke-note4.py --min-stack-free` 统计各任务最低余量并据此判定。 |
+| P2-4 Wi-Fi 认证 | 已修复（原结论需更正） | `auth_method` 是可接受的最低认证方式，WPA2 已兼容 WPA2/WPA3 过渡模式和 WPA3-only AP。真正的缺口是 `sae_pwe_h2e` 被零值初始化为 UNSPECIFIED，现已显式设为 `WPA3_SAE_PWE_BOTH`。 |
+| P2-5 I2C 总线恢复 | 先统计 | 遵循原报告的建议，先不盲目复位总线。新增 `bus_timeout` / `bus_error` 两个诊断计数，用来区分总线被占住和设备 NACK；有实机数据后再决定是否加入恢复逻辑。 |
+| P2-6 `Waker` 生命周期 | 已修复 | 同一 GPIO 重复订阅会被拒绝，并在代码中写明 `WakeCtx` 是有意泄漏的。 |
+| P2-7 目标侧静态分析 | 已修复 | CI 增加固件 clippy（`-D warnings`）并上传最终 `sdkconfig`；EPD 与 recorder 两个组件启用 `-Wextra -Wsign-compare -Wunused-parameter -Wshadow -Werror`；矩形合并与打包算法移入 `inkwash_logic::epd_geometry` 并补了主机测试。 |
+| N1–N7 | 已修复 | 见对应提交。N4 只修正注释：GPIO5 为电平唤醒，在闹钟被确认前会反复唤醒芯片。 |
+| 其他 | 已修复 | `check-boot-ledger.sh` 同时兼容 esptool 4 和 5 的 `image_info` 输出（原先在 esptool 5 下会误报失败）；`release.sh` 增加应用镜像是否放得进 factory 分区的检查。 |
