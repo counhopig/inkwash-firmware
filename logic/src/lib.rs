@@ -284,6 +284,14 @@ mod ble_memory_contract {
         assert!(config_is("BT_CTRL_BLE_SCAN", "n"));
         assert!(config_is("BT_CTRL_DTM_ENABLE", "n"));
         assert!(config_is("BT_CTRL_RUN_IN_FLASH_ONLY", "y"));
+        for service in [
+            "PROX", "ANS", "CTS", "HTP", "IPSS", "TPS", "IAS", "LLS", "SPS", "HR", "BAS", "DIS",
+        ] {
+            assert!(
+                config_is(&format!("BT_NIMBLE_{service}_SERVICE"), "n"),
+                "NimBLE sample service {service} is never registered and must stay out of the image"
+            );
+        }
     }
 
     #[test]
