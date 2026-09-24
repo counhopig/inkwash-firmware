@@ -90,17 +90,16 @@ the `esp` toolchain, and rebuilds from scratch when `partitions.csv` changes. Th
 output binary is
 `rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4`.
 
-Flash it, after verifying the board identity:
+Flash it through the identity-checked wrapper, which refuses any port that
+is not an ESP32-S3 with 16 MB flash and the authorized Note 4 MAC
+(`INKWASH_NOTE4_MAC`), then flashes 16 MB DIO 80 MHz with `partitions.csv`:
 
 ```bash
-espflash flash \
-  --chip esp32s3 --flash-size 16mb --flash-mode dio --flash-freq 80mhz \
-  --bootloader rust-firmware/target/xtensa-esp32s3-espidf/release/bootloader.bin \
-  --partition-table rust-firmware/partitions.csv \
-  --partition-table-offset 0x10000 \
-  --non-interactive \
-  rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4
+INKWASH_NOTE4_MAC=aa:bb:cc:dd:ee:ff ./scripts/flash-note4.sh --port /dev/ttyACM0
 ```
+
+`cargo run --release` in `rust-firmware/` uses the same wrapper as its
+runner; set `INKWASH_NOTE4_PORT` to the board's port.
 
 A device with no Wi-Fi/server credentials in NVS boots straight to the home
 screen; provision it from the desktop tool over USB or BLE (`set_wifi`,
@@ -152,6 +151,7 @@ inkwash-firmware/
 | `check-git-rev.sh` | Fails when the ELF's boot banner revision differs from `git describe --always --dirty --tags`. |
 | `smoke-note4.py` | Drives the device over the USB `>>IW ` protocol: soak, command stress, reply-timeout checks. |
 | `capture-serial.py` | Timestamped serial capture that reconnects across USB re-enumeration, with required-pattern assertions. |
+| `flash-note4.sh` | Identity-checked flashing (chip, 16 MB flash, MAC); also the cargo runner. |
 | `backup-flash.ps1` | Identity-checked full 16 MB flash backup plus a manifest. |
 | `release.sh` | Builds, verifies the partition table and boot ledger, tags, and publishes a GitHub Release with `gh`. |
 | `rust-analyzer-cargo.sh` | Wrapper that gives rust-analyzer an ESP-IDF environment. |
