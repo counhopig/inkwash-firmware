@@ -2,6 +2,7 @@ use std::sync::mpsc::{
     channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
 };
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use inkwash_logic::alarm_regs::AlarmRegs;
@@ -13,6 +14,8 @@ use crate::rtc::{DateTime, Pcf8563, PCF8563_ADDR};
 const RTC_TASK_STACK: usize = 8 * 1024;
 
 const RTC_COMMAND_CAPACITY: usize = 8;
+
+const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 enum RtcCommand {
     ReadTime,
@@ -37,10 +40,20 @@ pub struct AlarmStatus {
     pub alarm_interrupt_enabled: bool,
 }
 
+struct Sequenced<T> {
+    sequence: u32,
+    body: T,
+}
+
+struct RequestState {
+    replies: Receiver<Sequenced<RtcReply>>,
+    next_sequence: u32,
+}
+
 #[derive(Clone)]
 pub struct RtcExecutor {
-    tx: SyncSender<RtcCommand>,
-    replies: Arc<Mutex<Receiver<RtcReply>>>,
+    tx: SyncSender<Sequenced<RtcCommand>>,
+    requests: Arc<Mutex<RequestState>>,
 }
 
 impl RtcExecutor {
@@ -57,7 +70,10 @@ impl RtcExecutor {
         match probe_rx.recv()? {
             Ok(()) => Ok(Self {
                 tx,
-                replies: Arc::new(Mutex::new(reply_rx)),
+                requests: Arc::new(Mutex::new(RequestState {
+                    replies: reply_rx,
+                    next_sequence: 0,
+                })),
             }),
             Err(err) => bail!("RTC executor probe failed: {err}"),
         }
@@ -109,15 +125,34 @@ impl RtcExecutor {
     }
 
     fn request(&self, command: RtcCommand) -> Result<RtcReply> {
-        let replies = self
-            .replies
+        let mut requests = self
+            .requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.try_send(command)?;
-        Ok(replies.recv()?)
+        requests.next_sequence = requests.next_sequence.wrapping_add(1);
+        let sequence = requests.next_sequence;
+        self.try_send(Sequenced {
+            sequence,
+            body: command,
+        })?;
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match requests.replies.recv_timeout(remaining) {
+                Ok(reply) if reply.sequence == sequence => return Ok(reply.body),
+                Ok(reply) => log::warn!(
+                    "RTC executor: discarding late reply {} while waiting for {sequence}",
+                    reply.sequence
+                ),
+                Err(RecvTimeoutError::Timeout) => {
+                    bail!("RTC executor did not answer request {sequence} within {REPLY_TIMEOUT:?}")
+                }
+                Err(RecvTimeoutError::Disconnected) => bail!("RTC executor disconnected"),
+            }
+        }
     }
 
-    fn try_send(&self, command: RtcCommand) -> Result<()> {
+    fn try_send(&self, command: Sequenced<RtcCommand>) -> Result<()> {
         self.tx.try_send(command).map_err(|err| match err {
             TrySendError::Full(_) => anyhow::anyhow!("RTC command queue is full"),
             TrySendError::Disconnected(_) => anyhow::anyhow!("RTC executor disconnected"),
@@ -127,8 +162,8 @@ impl RtcExecutor {
 
 fn run(
     bus: SharedI2c,
-    rx: Receiver<RtcCommand>,
-    reply: SyncSender<RtcReply>,
+    rx: Receiver<Sequenced<RtcCommand>>,
+    reply: SyncSender<Sequenced<RtcReply>>,
     probe_tx: Sender<Result<()>>,
 ) {
     crate::heap_probe::register_current_task(crate::heap_probe::SLOT_RTC);
@@ -153,7 +188,10 @@ fn run(
     let mut latch = inkwash_logic::rtc_latch::RtcSnapshotLatch::new();
 
     loop {
-        let cmd = match rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
+        let Sequenced {
+            sequence,
+            body: cmd,
+        } = match rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(cmd) => cmd,
             Err(RecvTimeoutError::Timeout) => {
                 if watchdog_subscribed {
@@ -190,7 +228,13 @@ fn run(
             }
             RtcCommand::Program(regs) => RtcReply::Unit(rtc.set_alarm(&regs)),
         };
-        if reply.send(response).is_err() {
+        if reply
+            .send(Sequenced {
+                sequence,
+                body: response,
+            })
+            .is_err()
+        {
             break;
         }
 
