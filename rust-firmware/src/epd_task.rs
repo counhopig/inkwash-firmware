@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
@@ -285,7 +284,7 @@ fn run(
 
             completions.send(completion);
         }
-        match notify_rx.recv_timeout(Duration::from_secs(1)) {
+        match notify_rx.recv_timeout(crate::watchdog::WORKER_IDLE_FEED) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {
                 if watchdog_subscribed {
                     crate::watchdog::feed();

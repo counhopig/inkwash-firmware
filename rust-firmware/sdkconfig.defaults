@@ -36,8 +36,12 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # past the threshold. IDLE_TIME_BEFORE_SLEEP is in ticks: 200 ms at
 # FREERTOS_HZ=1000. The Home main loop drops to a 1 s idle cadence
 # (src/main.rs), so each idle sleep exceeds the threshold and spends
-# ~0.8 s of every second in real light sleep. Keys and the RTC alarm
-# line wake it (src/power.rs `configure_light_sleep`). Note the plan's
+# ~0.8 s of every second in real light sleep. The keys wake it
+# (src/power.rs `configure_light_sleep`); the RTC alarm line does not, so
+# a ringing alarm is noticed by the next 1 s idle poll. Worker tasks must
+# block while idle (src/watchdog.rs `WORKER_IDLE_FEED`): any task that
+# wakes more often than the threshold below keeps the chip out of light
+# sleep entirely. Note the plan's
 # `CONFIG_FREERTOS_IDLE_TIME_BEFORE_ENTERING_LIGHT_SLEEP` is the pre-5.x
 # name; IDF 5.5 calls it `CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP`.
 CONFIG_PM_ENABLE=y

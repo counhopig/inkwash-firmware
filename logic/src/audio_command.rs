@@ -47,6 +47,10 @@ impl AudioMailbox {
         self.queue.drain(..)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.queue.len()

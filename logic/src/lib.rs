@@ -337,6 +337,60 @@ mod ble_memory_contract {
     }
 
     #[test]
+    fn idle_workers_block_long_enough_for_automatic_light_sleep() {
+        const AUDIO: &str = include_str!("../../rust-firmware/src/audio_task.rs");
+        const USB: &str = include_str!("../../rust-firmware/src/usb_console.rs");
+        const WATCHDOG: &str = include_str!("../../rust-firmware/src/watchdog.rs");
+        const RTC: &str = include_str!("../../rust-firmware/src/rtc_executor.rs");
+        const EPD: &str = include_str!("../../rust-firmware/src/epd_task.rs");
+        const SYNC: &str = include_str!("../../rust-firmware/src/sync_task.rs");
+
+        let threshold_ms: u64 = SDKCONFIG
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=")
+            })
+            .and_then(|value| value.parse().ok())
+            .expect("the light-sleep threshold must stay a literal");
+        let feed_secs: u64 = WATCHDOG
+            .split("WORKER_IDLE_FEED: Duration = Duration::from_secs(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|value| value.parse().ok())
+            .expect("WORKER_IDLE_FEED must stay a literal");
+        assert!(
+            feed_secs * 1000 >= 5 * threshold_ms && feed_secs < 10,
+            "idle workers must sleep well past the light-sleep threshold yet feed the 10 s TWDT"
+        );
+        for (name, source) in [
+            ("rtc", RTC),
+            ("epd", EPD),
+            ("sync", SYNC),
+            ("effect", EFFECT_SOURCE),
+            ("audio", AUDIO),
+        ] {
+            assert!(
+                source.contains("WORKER_IDLE_FEED"),
+                "the {name} worker must idle on the shared watchdog cadence"
+            );
+        }
+        assert!(
+            AUDIO.contains("AudioMode::Idle => wait_for_command(")
+                && AUDIO.contains("ready.wait_timeout("),
+            "an idle audio task must block on its mailbox instead of polling"
+        );
+        assert!(
+            BLE_SOURCE.contains("command_rx\n                .recv()\n"),
+            "the BLE worker must block while it has no session"
+        );
+        assert!(
+            USB.contains("const NO_HOST_POLL: Duration = Duration::from_millis(500)"),
+            "the USB reader must back off while no host is attached"
+        );
+    }
+
+    #[test]
     fn firmware_keeps_no_unrunnable_test_modules() {
         const EP_TASK: &str = include_str!("../../rust-firmware/src/epd_task.rs");
         const USB: &str = include_str!("../../rust-firmware/src/usb_console.rs");
