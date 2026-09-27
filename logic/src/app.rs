@@ -825,6 +825,11 @@ pub struct AppState {
     /// Booted from the deep-sleep timer and nobody has touched the device
     /// since: finish the scheduled work, then go straight back to deep sleep.
     background_wake: bool,
+    /// Transient message in the bottom bar: every key press gets visible
+    /// feedback, and so do the outcomes of the operations it starts.
+    pub notice: Option<Notice>,
+    /// The running sync was started from Settings, so its outcome is shown.
+    manual_sync_feedback: bool,
     last_power_poll_ticks: u64,
     op_counter: u64,
     batch_counter: u64,
@@ -906,6 +911,8 @@ impl Default for AppState {
             last_activity_ticks: None,
             idle_since_ticks: None,
             background_wake: false,
+            notice: None,
+            manual_sync_feedback: false,
             last_power_poll_ticks: 0,
             pending_residue_ack: None,
             pending_residue_time: None,
@@ -1026,7 +1033,7 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
         Event::Boot(snapshot) => transition_boot(state, snapshot),
         Event::RtcAlarmSnapshotReady(snapshot) => transition_rtc_snapshot(state, snapshot),
         Event::Tick(now) => transition_tick(state, now),
-        Event::Button(button) => transition_button(state, button),
+        Event::Button(button) => transition_button_with_feedback(state, button),
         Event::EffectCompleted(completion) => transition_effect_completed(state, completion),
         Event::EffectFailed(failure) => transition_effect_failed(state, failure),
         Event::UsbCommand(request) => transition_command(state, Channel::Usb, request),
@@ -1136,9 +1143,66 @@ fn app_sleep_inputs(state: &AppState, poll: PowerPoll) -> SleepInputs {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub text: String,
+    /// `None` keeps the notice up until an outcome replaces it.
+    expires_at_ticks: Option<u64>,
+}
+
+/// How long a notice stays on screen. Each change costs an e-paper refresh.
+const NOTICE_MS: u64 = 4_000;
+
+fn show_notice(state: &mut AppState, text: impl Into<String>) {
+    state.notice = Some(Notice {
+        text: text.into(),
+        expires_at_ticks: Some(state.last_power_poll_ticks + NOTICE_MS),
+    });
+}
+
+fn show_sticky_notice(state: &mut AppState, text: impl Into<String>) {
+    state.notice = Some(Notice {
+        text: text.into(),
+        expires_at_ticks: None,
+    });
+}
+
+fn expire_notice(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> {
+    let expired = state
+        .notice
+        .as_ref()
+        .and_then(|notice| notice.expires_at_ticks)
+        .is_some_and(|deadline| now_ticks >= deadline);
+    if !expired {
+        return vec![];
+    }
+    state.notice = None;
+    state.render_generation = state.render_generation.next();
+    vec![render_batch(state)]
+}
+
+/// What the keys do on each screen, shown when a press changes nothing.
+fn key_hint(screen: &Screen) -> &'static str {
+    match screen {
+        Screen::Home => "HOLD UP OR DOWN FOR MENU",
+        Screen::BlePairing(_) => "HOLD ENTER TO CANCEL PAIRING",
+        Screen::AlarmRinging => "PRESS ENTER TO STOP",
+        Screen::About => "PRESS ENTER TO GO BACK",
+        Screen::Navigation { .. } => "UP/DOWN MOVE  ENTER OPEN  HOLD ENTER BACK",
+        _ => "UP/DOWN MOVE  ENTER OK  HOLD ENTER BACK",
+    }
+}
+
+/// Everything a press can visibly change.
+fn visible_state(state: &AppState) -> (RenderView, u64, Option<String>) {
+    let model = crate::render_plan::ViewModel::from_state(state);
+    (model.view, model.data_fingerprint, model.notice)
+}
+
 fn transition_power_poll(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     state.last_power_poll_ticks = poll.now_ticks;
-    let mut batches = expire_ble_pairing(state, poll.now_ticks);
+    let mut batches = expire_notice(state, poll.now_ticks);
+    batches.extend(expire_ble_pairing(state, poll.now_ticks));
     batches.extend(expire_ring_auto_silence(state, poll.now_ticks));
     batches.extend(expire_reminder(state, poll.now_ticks));
     batches.extend(power_poll_sleep(state, poll));
@@ -1187,6 +1251,7 @@ fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> 
         st.phase = BlePairingPhase::Failure("pairing timeout".into());
         st.pairing_deadline_ticks = None;
     }
+    show_notice(state, "PAIRING TIMED OUT");
     state.screen = Screen::Settings {
         selected: SETTINGS_BLE_PAIRING_ROW,
     };
@@ -1546,6 +1611,7 @@ fn transition_ble_pairing_succeeded(
         st.phase = BlePairingPhase::Success;
     }
     let _ = result;
+    show_notice(state, "PAIRED");
     state.render_generation = state.render_generation.next();
     vec![
         batch(
@@ -1566,7 +1632,7 @@ fn transition_ble_pairing_failed(
         return vec![];
     }
 
-    let _ = failure;
+    show_notice(state, format!("BLE FAILED: {}", failure.message));
     state.screen = Screen::Settings {
         selected: SETTINGS_BLE_PAIRING_ROW,
     };
@@ -1626,6 +1692,10 @@ fn transition_ble_pairing_button(state: &mut AppState, button: ButtonEvent) -> V
 
 fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<EffectBatch> {
     let mut batches = Vec::new();
+    let failure = match &result {
+        SyncResult::Failed(message) => Some(message.clone()),
+        _ => None,
+    };
     match result {
         SyncResult::Ok { data } => {
             batches.extend(transition_sync_apply(state, data, None));
@@ -1657,6 +1727,10 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
             }
         }
     }
+    batches.extend(finish_manual_sync(
+        state,
+        failure.as_deref().map_or(Ok(()), Err),
+    ));
     batches
 }
 
@@ -2067,6 +2141,30 @@ fn dismiss_reminder(state: &mut AppState) -> Vec<EffectBatch> {
     ]
 }
 
+fn transition_button_with_feedback(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
+    if !matches!(
+        button,
+        ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_)
+    ) {
+        return transition_button(state, button);
+    }
+    // The long press of the same hold that opened pairing is swallowed on
+    // purpose; the user is still holding the key and needs no hint.
+    let hold_from_entry =
+        matches!(&state.screen, Screen::BlePairing(pairing) if !pairing.input_released);
+    let before = visible_state(state);
+    let mut batches = transition_button(state, button);
+    if hold_from_entry {
+        return batches;
+    }
+    if visible_state(state) == before {
+        show_notice(state, key_hint(&state.screen));
+        state.render_generation = state.render_generation.next();
+        batches.push(render_batch(state));
+    }
+    batches
+}
+
 fn transition_button(state: &mut AppState, button: ButtonEvent) -> Vec<EffectBatch> {
     if state.screen == Screen::AlarmRinging {
         if matches!(&state.alarm_runtime, AlarmRuntimeState::Firing { .. }) {
@@ -2263,25 +2361,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                 }
                 ButtonEvent::Pressed(ButtonId::Enter) => {
                     if cur == SETTINGS_SYNC_NOW_ROW {
-                        let mut batches = Vec::new();
-                        if state.sync == SyncState::Idle
-                            && state.connectivity.wifi_configured
-                            && state.connectivity.server_configured
-                        {
-                            if let Some(now) = state.clock.now {
-                                let op = state.next_operation_id();
-                                state.sync = SyncState::Running { request_id: op };
-                                batches.push(batch(
-                                    state,
-                                    op,
-                                    FailurePolicy::Continue,
-                                    vec![Effect::StartSync(SyncRequest { now })],
-                                ));
-                            }
-                        }
-                        state.render_generation = state.render_generation.next();
-                        batches.push(render_batch(state));
-                        batches
+                        start_manual_sync(state)
                     } else if cur == SETTINGS_SYNC_INTERVAL_ROW {
                         state.screen = Screen::SyncIntervalPick { selected: 0 };
                         state.render_generation = state.render_generation.next();
@@ -2366,6 +2446,50 @@ pub const SETTINGS_SYNC_INTERVAL_ROW: usize = 1;
 
 pub const SETTINGS_SYNC_NOW_ROW: usize = 0;
 
+/// SYNC NOW: start a sync, or say why it cannot start.
+fn start_manual_sync(state: &mut AppState) -> Vec<EffectBatch> {
+    let mut batches = Vec::new();
+    let now = state.clock.now;
+    if !state.connectivity.wifi_configured {
+        show_notice(state, "WI-FI NOT SET UP");
+    } else if !state.connectivity.server_configured {
+        show_notice(state, "SERVER NOT SET UP");
+    } else if state.sync != SyncState::Idle {
+        show_notice(state, "SYNC ALREADY RUNNING");
+    } else if state.pending_urgent_poll.is_some() {
+        show_notice(state, "NETWORK BUSY, TRY AGAIN");
+    } else if let Some(now) = now {
+        let op = state.next_operation_id();
+        state.sync = SyncState::Running { request_id: op };
+        state.manual_sync_feedback = true;
+        show_sticky_notice(state, "SYNCING...");
+        batches.push(batch(
+            state,
+            op,
+            FailurePolicy::Continue,
+            vec![Effect::StartSync(SyncRequest { now })],
+        ));
+    } else {
+        show_notice(state, "CLOCK NOT SET");
+    }
+    state.render_generation = state.render_generation.next();
+    batches.push(render_batch(state));
+    batches
+}
+
+/// Replaces the "SYNCING..." notice of a manual sync with its outcome.
+fn finish_manual_sync(state: &mut AppState, outcome: Result<(), &str>) -> Vec<EffectBatch> {
+    if !std::mem::take(&mut state.manual_sync_feedback) {
+        return vec![];
+    }
+    match outcome {
+        Ok(()) => show_notice(state, "SYNC OK"),
+        Err(reason) => show_notice(state, format!("SYNC FAILED: {reason}")),
+    }
+    state.render_generation = state.render_generation.next();
+    vec![render_batch(state)]
+}
+
 fn transition_sync_interval_pick_button(
     state: &mut AppState,
     selected: usize,
@@ -2404,6 +2528,7 @@ fn transition_sync_interval_pick_button(
                     .sync_scheduler
                     .set_interval_minutes(now.to_unix(), minutes);
             }
+            show_notice(state, format!("SYNC EVERY {minutes} MIN"));
             state.screen = Screen::Settings {
                 selected: SETTINGS_SYNC_INTERVAL_ROW,
             };
@@ -3389,8 +3514,8 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
         state.pending_sleep_operation = None;
     }
 
-    if matches!(failure.error, EffectError::Ble(_)) && matches!(state.screen, Screen::BlePairing(_))
-    {
+    if let (EffectError::Ble(message), Screen::BlePairing(_)) = (&failure.error, &state.screen) {
+        show_notice(state, format!("BLE FAILED: {message}"));
         state.screen = Screen::Settings {
             selected: SETTINGS_BLE_PAIRING_ROW,
         };
@@ -3458,6 +3583,14 @@ fn transition_effect_failed(state: &mut AppState, failure: EffectFailure) -> Vec
         && state.pending_ble_reply.is_none()
     {
         state.sync = SyncState::Idle;
+    }
+    if state.sync == SyncState::Idle {
+        let reason = if error_message.is_empty() {
+            "ERROR"
+        } else {
+            error_message.as_str()
+        };
+        batches.extend(finish_manual_sync(state, Err(reason)));
     }
     batches
 }
@@ -6751,11 +6884,10 @@ mod tests {
             |effect| matches!(effect, Effect::Render(request) if request.view == RenderView::About)
         ));
 
-        assert!(update(
+        assert!(only_key_hint(&update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
-        )
-        .is_empty());
+        )));
         let returned = update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
@@ -7643,6 +7775,159 @@ mod tests {
         );
     }
 
+    fn notice_text(state: &AppState) -> Option<&str> {
+        state.notice.as_ref().map(|notice| notice.text.as_str())
+    }
+
+    #[test]
+    fn a_press_that_does_nothing_on_home_shows_the_key_hint() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(only_key_hint(&batches));
+        assert_eq!(notice_text(&state), Some("HOLD UP OR DOWN FOR MENU"));
+    }
+
+    #[test]
+    fn released_keys_never_show_a_hint() {
+        let mut state = AppState::default();
+        let batches = update(
+            &mut state,
+            Event::Button(ButtonEvent::Released(ButtonId::Enter)),
+        );
+        assert!(batches.is_empty());
+        assert_eq!(state.notice, None);
+    }
+
+    #[test]
+    fn notices_clear_themselves_after_a_few_seconds() {
+        let mut state = AppState::default();
+        let _ = update(&mut state, Event::PowerPoll(power_poll_at(1_000)));
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(state.notice.is_some());
+        let _ = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(1_000 + NOTICE_MS - 1)),
+        );
+        assert!(state.notice.is_some());
+        let cleared = update(
+            &mut state,
+            Event::PowerPoll(power_poll_at(1_000 + NOTICE_MS)),
+        );
+        assert_eq!(state.notice, None);
+        assert!(cleared
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::Render(r) if r.view_model.notice.is_none())));
+    }
+
+    fn settings_sync_now(state: &mut AppState) -> Vec<EffectBatch> {
+        state.screen = Screen::Settings {
+            selected: SETTINGS_SYNC_NOW_ROW,
+        };
+        update(state, Event::Button(ButtonEvent::Pressed(ButtonId::Enter)))
+    }
+
+    #[test]
+    fn sync_now_says_why_it_cannot_start() {
+        let mut state = AppState::default();
+        let _ = settings_sync_now(&mut state);
+        assert_eq!(notice_text(&state), Some("WI-FI NOT SET UP"));
+
+        state.connectivity.wifi_configured = true;
+        let _ = settings_sync_now(&mut state);
+        assert_eq!(notice_text(&state), Some("SERVER NOT SET UP"));
+
+        state.connectivity.server_configured = true;
+        let _ = settings_sync_now(&mut state);
+        assert_eq!(notice_text(&state), Some("CLOCK NOT SET"));
+
+        state.sync = SyncState::Running {
+            request_id: OperationId(9),
+        };
+        let _ = settings_sync_now(&mut state);
+        assert_eq!(notice_text(&state), Some("SYNC ALREADY RUNNING"));
+    }
+
+    #[test]
+    fn sync_now_shows_progress_then_the_failure_reason() {
+        let mut state = networked_state_at(dt(9, 0));
+        let started = settings_sync_now(&mut state);
+        assert!(started
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StartSync(_))));
+        assert_eq!(notice_text(&state), Some("SYNCING..."));
+
+        let _ = update(&mut state, Event::PowerPoll(power_poll_at(60_000)));
+        assert_eq!(
+            notice_text(&state),
+            Some("SYNCING..."),
+            "progress stays up until the outcome arrives"
+        );
+
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Failed("server unreachable".into())),
+        );
+        assert_eq!(notice_text(&state), Some("SYNC FAILED: server unreachable"));
+    }
+
+    #[test]
+    fn a_scheduled_sync_failure_shows_no_notice() {
+        let mut state = networked_state_at(dt(9, 0));
+        state.sync = SyncState::Running {
+            request_id: OperationId(5),
+        };
+        let _ = update(
+            &mut state,
+            Event::SyncCompleted(SyncResult::Failed("server unreachable".into())),
+        );
+        assert_eq!(state.notice, None);
+    }
+
+    #[test]
+    fn a_ble_start_failure_names_the_reason_on_settings() {
+        let mut state = AppState {
+            screen: Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW,
+            },
+            ..AppState::default()
+        };
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
+        );
+        assert!(matches!(state.screen, Screen::BlePairing(_)));
+        let _ = update(
+            &mut state,
+            Event::BlePairingFailed(BlePairingFailure {
+                message: "low memory".into(),
+            }),
+        );
+        assert_eq!(
+            state.screen,
+            Screen::Settings {
+                selected: SETTINGS_BLE_PAIRING_ROW
+            }
+        );
+        assert_eq!(notice_text(&state), Some("BLE FAILED: low memory"));
+    }
+
+    /// A press that changes nothing only redraws, to show the key hint.
+    fn only_key_hint(batches: &[EffectBatch]) -> bool {
+        let effects: Vec<_> = batches.iter().flat_map(|b| &b.effects).collect();
+        !effects.is_empty()
+            && effects.iter().all(
+                |e| matches!(e, Effect::Render(request) if request.view_model.notice.is_some()),
+            )
+    }
+
     fn prepared_sleep_kind(
         batches: &[EffectBatch],
     ) -> Option<(SleepKind, Option<std::time::Duration>)> {
@@ -8475,11 +8760,10 @@ mod tests {
                 selected: before + 1
             }
         );
-        assert!(update(
+        assert!(only_key_hint(&update(
             &mut state,
             Event::Button(ButtonEvent::Pressed(ButtonId::Enter)),
-        )
-        .is_empty());
+        )));
         assert_eq!(
             state.screen,
             Screen::AlarmList {

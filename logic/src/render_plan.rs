@@ -14,6 +14,9 @@ pub enum PartialRegion {
     CalendarGrid,
 
     Surface,
+
+    /// The bottom notice bar.
+    Notice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +39,9 @@ pub struct ViewModel {
     pub overlay: Overlay,
 
     pub data_fingerprint: u64,
+
+    /// Bottom-bar notice text, drawn over any screen.
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +61,7 @@ impl ViewModel {
             clock_minute: None,
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         }
     }
 
@@ -75,6 +82,7 @@ impl ViewModel {
             clock_minute,
             overlay,
             data_fingerprint,
+            notice: state.notice.as_ref().map(|notice| notice.text.clone()),
         }
     }
 }
@@ -132,11 +140,24 @@ pub fn plan_render(previous: Option<&ViewModel>, current: &ViewModel) -> RenderP
         return RenderPlan::Full { frame };
     };
 
-    if current.view == prev.view
+    let same_content = current.view == prev.view
         && current.clock_minute == prev.clock_minute
         && current.overlay == prev.overlay
-        && current.data_fingerprint == prev.data_fingerprint
-    {
+        && current.data_fingerprint == prev.data_fingerprint;
+    if current.notice != prev.notice {
+        // Only the notice changed: refresh just its bar. Anything else changing
+        // at the same time needs the whole panel, since no other partial region
+        // covers the bar.
+        return if same_content {
+            RenderPlan::Partial {
+                frame,
+                region: PartialRegion::Notice,
+            }
+        } else {
+            RenderPlan::Full { frame }
+        };
+    }
+    if same_content {
         return RenderPlan::Noop;
     }
 
@@ -306,6 +327,7 @@ mod tests {
             clock_minute: Some(minute),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         }
     }
 
@@ -317,6 +339,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 42,
+            notice: None,
         };
         assert_eq!(plan_render(Some(&vm), &vm), RenderPlan::Noop);
     }
@@ -329,6 +352,7 @@ mod tests {
             clock_minute: None,
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         assert_eq!(plan_render(None, &vm), RenderPlan::Full { frame: Frame(0) });
     }
@@ -372,6 +396,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         let cur = ViewModel {
             generation: crate::app::RenderGeneration(2),
@@ -379,6 +404,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         assert_eq!(
             plan_render(Some(&prev), &cur),
@@ -394,6 +420,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
 
         let mut ringing = base.clone();
@@ -451,6 +478,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         assert_eq!(
             plan_render(None, &cur),
@@ -486,6 +514,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 7,
+            notice: None,
         };
         let mut cur = prev.clone();
         cur.generation = crate::app::RenderGeneration(2);
@@ -507,6 +536,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 7,
+            notice: None,
         };
         let mut cur = prev.clone();
         cur.generation = crate::app::RenderGeneration(2);
@@ -528,6 +558,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 7,
+            notice: None,
         };
         let mut cur = prev.clone();
         cur.generation = crate::app::RenderGeneration(2);
@@ -552,6 +583,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         let mut cur = prev.clone();
         cur.generation = crate::app::RenderGeneration(2);
@@ -586,6 +618,7 @@ mod tests {
                 clock_minute: Some(12 * 60),
                 overlay: Overlay::None,
                 data_fingerprint: 17,
+                notice: None,
             };
             let open_vm = ViewModel {
                 generation: RenderGeneration(2),
@@ -646,6 +679,7 @@ mod tests {
             clock_minute: Some(12 * 60),
             overlay: Overlay::None,
             data_fingerprint: 5,
+            notice: None,
         };
 
         let destination = ViewModel {
@@ -701,6 +735,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         let mut cur = prev.clone();
         cur.generation = crate::app::RenderGeneration(2);
@@ -868,5 +903,44 @@ mod tests {
         state.alarms.alarms[0].label = "wake up".to_string();
         let after_label = ViewModel::from_state(&state).data_fingerprint;
         assert_ne!(after_repeat, after_label, "label is part of the drawn row");
+    }
+
+    #[test]
+    fn a_notice_alone_refreshes_only_its_bar() {
+        let base = ViewModel::home(RenderGeneration(1));
+        let with_notice = ViewModel {
+            generation: RenderGeneration(2),
+            notice: Some("SYNC OK".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            plan_render(Some(&base), &with_notice),
+            RenderPlan::Partial {
+                region: PartialRegion::Notice,
+                ..
+            }
+        ));
+        assert!(matches!(
+            plan_render(Some(&with_notice), &base),
+            RenderPlan::Partial {
+                region: PartialRegion::Notice,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_notice_with_a_screen_change_refreshes_the_whole_panel() {
+        let base = ViewModel::home(RenderGeneration(1));
+        let changed = ViewModel {
+            generation: RenderGeneration(2),
+            view: RenderView::Settings { selected: 0 },
+            notice: Some("BLE FAILED".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            plan_render(Some(&base), &changed),
+            RenderPlan::Full { .. }
+        ));
     }
 }

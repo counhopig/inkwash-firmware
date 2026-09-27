@@ -82,6 +82,25 @@ pub(crate) fn draw_navigation_bar(canvas: &mut Canvas, selected: usize) {
     );
 }
 
+/// Bottom bar for transient notices, drawn over whatever screen is showing.
+pub const NOTICE_RECT: Rect = Rect {
+    x: 0,
+    y: 262,
+    width: 400,
+    height: 38,
+};
+
+pub(crate) fn draw_notice(canvas: &mut Canvas, text: &str) {
+    let x = NOTICE_RECT.x as usize;
+    let y = NOTICE_RECT.y as usize;
+    let width = NOTICE_RECT.width as usize;
+    let height = NOTICE_RECT.height as usize;
+    canvas.fill_rect(x, y, width, height, false);
+    canvas.stroke_rect(x + 8, y + 2, width - 16, height - 4, 2);
+    let text = truncate_prop(text, width - 40);
+    canvas.draw_text_prop(x + 20, y + 11, 1, &text);
+}
+
 pub const SETTINGS_ROWS: [&str; 4] = ["SYNC NOW", "SYNC INTERVAL", "BLE PAIRING", "ABOUT"];
 
 pub(crate) fn draw_settings(canvas: &mut Canvas, selected: usize) {

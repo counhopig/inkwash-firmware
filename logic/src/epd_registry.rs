@@ -297,6 +297,7 @@ mod tests {
             clock_minute: minute,
             overlay: crate::render_plan::Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         }
     }
 
@@ -310,6 +311,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: crate::render_plan::Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         }
     }
 
@@ -463,6 +465,7 @@ mod tests {
             clock_minute: Some(8 * 60),
             overlay: crate::render_plan::Overlay::None,
             data_fingerprint: 0,
+            notice: None,
         };
         let plan = reg.plan_for(&settings);
         assert!(matches!(plan, RenderPlan::Full { .. }));

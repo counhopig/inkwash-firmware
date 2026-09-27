@@ -274,6 +274,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     inkwash_logic::render_plan::RenderPlan::Partial { region, .. } => {
                         let facts = render_facts(self.ctx);
                         draw_sm_surface(self.ctx, self.last_clock, req.view.clone(), &facts);
+                        draw_notice(self.ctx, req.view_model.notice.as_deref());
                         let rect = partial_region_rect(region);
                         match self.ctx.board.display.refresh_partial(rect) {
                             Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
@@ -283,6 +284,7 @@ impl EffectExecutor for EffectRunner<'_, '_> {
                     inkwash_logic::render_plan::RenderPlan::Full { .. } => {
                         let facts = render_facts(self.ctx);
                         draw_sm_surface(self.ctx, self.last_clock, req.view.clone(), &facts);
+                        draw_notice(self.ctx, req.view_model.notice.as_deref());
                         match self.ctx.board.display.refresh_full() {
                             Ok(request_id) => Ok(EffectOutcome::AsyncWithId(request_id)),
                             Err(err) => Err((EffectCategory::Render, format!("{err:#}"))),
@@ -430,6 +432,14 @@ pub(crate) fn partial_region_rect(
             width: 400,
             height: 264,
         },
+        inkwash_logic::render_plan::PartialRegion::Notice => crate::screens::NOTICE_RECT,
+    }
+}
+
+fn draw_notice(ctx: &mut DeviceContext<'_>, notice: Option<&str>) {
+    if let Some(text) = notice {
+        let mut canvas = ctx.board.display.canvas_mut();
+        crate::screens::draw_notice(&mut canvas, text);
     }
 }
 
