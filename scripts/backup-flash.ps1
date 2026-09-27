@@ -21,7 +21,7 @@ function Invoke-EsptoolProbe {
 }
 
 $identity = Invoke-EsptoolProbe -CommandArgs @("--chip", "esp32s3", "--port", $Port, "read_mac")
-if ($identity -notmatch "(?im)^Chip is ESP32-S3\b") {
+if ($identity -notmatch "(?im)^(Chip is|Chip type:)\s*ESP32-S3\b") {
   throw "Refusing backup: $Port is not identified as an ESP32-S3."
 }
 if ($identity -notmatch "(?im)^MAC:\s*20:6e:f1:b4:7d:e4\s*$") {

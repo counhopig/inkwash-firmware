@@ -102,6 +102,13 @@ is not an ESP32-S3 with 16 MB flash and the authorized Note 4 MAC
 INKWASH_NOTE4_MAC=aa:bb:cc:dd:ee:ff ./scripts/flash-note4.sh --port /dev/ttyACM0
 ```
 
+On Windows use the PowerShell wrapper, which runs the same checks:
+
+```powershell
+.\scripts\backup-flash.ps1 -Port COM5          # full 16 MB backup first
+.\scripts\flash-note4.ps1 -Port COM5 -Monitor
+```
+
 `cargo run --release` in `rust-firmware/` uses the same wrapper as its
 runner; set `INKWASH_NOTE4_PORT` to the board's port.
 
