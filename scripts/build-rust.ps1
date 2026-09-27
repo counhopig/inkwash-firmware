@@ -1,6 +1,11 @@
 param(
     [switch]$Release,
-    [switch]$Diagnostic
+    [switch]$Diagnostic,
+    # esp-idf-sys refuses to build on Windows when its output directory path
+    # is too long (it asks for a project path of at most 10 characters, and a
+    # `subst` drive does not help). Build into a short directory instead of
+    # rust-firmware\target. Override with -TargetDir or $env:CARGO_TARGET_DIR.
+    [string]$TargetDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -94,12 +99,17 @@ if (-not $env:LIBCLANG_PATH) {
 
 Push-Location $projectDir
 try {
-    $targetRoot = "target"
+    if (-not $TargetDir) {
+        $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "C:\ikw" }
+    }
     if ($Diagnostic) {
         $env:ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.diagnostic.defaults"
-        $targetRoot = "target-diagnostic"
-        $env:CARGO_TARGET_DIR = Join-Path $projectDir $targetRoot
+        # Keep diagnostic objects apart from production ones, as on Linux.
+        $TargetDir = $TargetDir.TrimEnd('\') + "-d"
     }
+    $targetRoot = $TargetDir
+    $env:CARGO_TARGET_DIR = $targetRoot
+    Write-Host "Cargo target directory: $targetRoot"
     $partitionHash = "v2:" + (Get-FileHash -Algorithm SHA256 "partitions.csv").Hash.ToLowerInvariant()
     $partitionStamp = Join-Path $targetRoot ".inkwash-partitions.sha256"
     if ((Test-Path $targetRoot) -and
@@ -122,6 +132,8 @@ try {
     }
     New-Item -ItemType Directory -Force $targetRoot | Out-Null
     Set-Content -Path $partitionStamp -Value $partitionHash -Encoding Ascii
+    $profileDir = if ($Release) { "release" } else { "debug" }
+    Write-Host "Firmware ELF: $(Join-Path $targetRoot "xtensa-esp32s3-espidf\$profileDir\inkwash-note4")"
 } finally {
     Pop-Location
 }

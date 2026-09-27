@@ -90,6 +90,10 @@ the `esp` toolchain, and rebuilds from scratch when `partitions.csv` changes. Th
 output binary is
 `rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4`.
 
+On Windows, `scripts\build-rust.ps1 -Release` builds into `C:\ikw` instead
+(`C:\ikw-d` with `-Diagnostic`), because esp-idf-sys refuses long output paths
+there. Choose another short directory with `-TargetDir` or `CARGO_TARGET_DIR`.
+
 Flash it through the identity-checked wrapper, which refuses any port that
 is not an ESP32-S3 with 16 MB flash and the authorized Note 4 MAC
 (`INKWASH_NOTE4_MAC`), then flashes 16 MB DIO 80 MHz with `partitions.csv`:
