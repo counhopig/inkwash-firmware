@@ -40,6 +40,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the `p06_diag` / `p06_validate` / `p06_validate_core1` features.
 
 ### Changed
+- **Battery life** — a deep-sleep timer wake is now a background wake: it
+  redraws the clock, runs a sync only if its interval boundary has passed
+  since the last successful sync, and returns to deep sleep as soon as the
+  work is done. Before, every 10-minute timer wake stayed up for the full
+  5-minute idle timeout, polling the server over Wi-Fi every 30 s, so a
+  sleeping device spent about half its time awake. Timer wakes land on
+  10-minute wall-clock boundaries; a button press or USB/BLE command turns
+  one into a normal session. The idle timeout before deep sleep drops from
+  5 to 3 minutes. The ES8311 codec is powered down between tones, the NFC
+  tag is powered only during its boot probe and held off in deep sleep, and
+  deep sleep clears the timer wake source that automatic light sleep leaves
+  armed.
 - **Storage and partitions** — the partition table now carries a 64 KiB NVS,
   an encrypted `nvs_keys` partition, a 512 KiB coredump partition for panic
   capture, and a single 4 MiB `factory` application partition. Grouped state

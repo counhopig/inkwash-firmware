@@ -31,10 +31,14 @@ mod reg {
     pub const SYSTEM_0E: u8 = 0x0E;
     pub const SYSTEM_12: u8 = 0x12;
     pub const SYSTEM_13: u8 = 0x13;
+    pub const SYSTEM_14: u8 = 0x14;
+    pub const ADC_15: u8 = 0x15;
+    pub const ADC_17: u8 = 0x17;
     pub const ADC_1C: u8 = 0x1C;
     pub const DAC_31: u8 = 0x31;
     pub const DAC_32: u8 = 0x32;
     pub const DAC_37: u8 = 0x37;
+    pub const GP_45: u8 = 0x45;
 }
 
 mod coeff {
@@ -57,6 +61,7 @@ pub struct Es8311 {
     addr: u8,
     i2s: I2sDriver<'static, I2sTx>,
     pa_enable: PinDriver<'static, Output>,
+    awake: bool,
 }
 
 impl Es8311 {
@@ -71,8 +76,10 @@ impl Es8311 {
             addr,
             i2s,
             pa_enable,
+            awake: false,
         };
         codec.init()?;
+        codec.standby()?;
         Ok(codec)
     }
 
@@ -94,7 +101,35 @@ impl Es8311 {
             .map_err(|e| anyhow!("ES8311 write reg 0x{reg:02x} failed: {e}"))
     }
 
+    /// Power the codec up for playback. A no-op while it is already awake.
+    pub fn wake(&mut self) -> Result<()> {
+        if self.awake {
+            return Ok(());
+        }
+        self.init()
+    }
+
+    /// Power down the DAC, ADC, references and bias between tones. The analog
+    /// path otherwise draws current around the clock, deep sleep included,
+    /// because the AVDD rail stays up for the RTC alarm line and I2C pull-ups.
+    pub fn standby(&mut self) -> Result<()> {
+        if !self.awake {
+            return Ok(());
+        }
+        self.awake = false;
+        self.write_reg(reg::DAC_32, 0x00)?;
+        self.write_reg(reg::ADC_17, 0x00)?;
+        self.write_reg(reg::SYSTEM_0E, 0xFF)?;
+        self.write_reg(reg::SYSTEM_12, 0x02)?;
+        self.write_reg(reg::SYSTEM_14, 0x00)?;
+        self.write_reg(reg::SYSTEM_0D, 0xFA)?;
+        self.write_reg(reg::ADC_15, 0x00)?;
+        self.write_reg(reg::DAC_37, 0x08)?;
+        self.write_reg(reg::GP_45, 0x01)
+    }
+
     fn init(&mut self) -> Result<()> {
+        self.write_reg(reg::GP_45, 0x00)?;
         self.write_reg(reg::RESET, 0x1F)?;
         thread::sleep(Duration::from_micros(20));
         self.write_reg(reg::RESET, 0x00)?;
@@ -134,6 +169,7 @@ impl Es8311 {
 
         self.set_volume(200)?;
         self.set_mute(false)?;
+        self.awake = true;
         Ok(())
     }
 
@@ -159,6 +195,7 @@ impl Es8311 {
         amplitude: i16,
     ) -> Result<()> {
         let playback = (|| -> Result<()> {
+            self.wake()?;
             self.pa_enable.set_high()?;
             thread::sleep(Duration::from_millis(10));
             self.i2s.tx_enable()?;

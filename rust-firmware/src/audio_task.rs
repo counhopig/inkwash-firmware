@@ -98,7 +98,7 @@ fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>, ready: Arc<Condvar>
         }
         drain_commands(&mailbox, &mut reducer);
         match reducer.mode() {
-            AudioMode::Idle => wait_for_command(&mailbox, &ready),
+            AudioMode::Idle => wait_for_command(&mut codec, &mailbox, &ready),
             AudioMode::AlarmRing => {
                 if let Err(err) = codec.play_sine_stereo(ALARM_TONE_HZ, ALARM_TONE_BURST_SECS, 8000)
                 {
@@ -139,7 +139,11 @@ fn run(mut codec: Es8311, mailbox: Arc<Mutex<AudioMailbox>>, ready: Arc<Condvar>
     }
 }
 
-fn wait_for_command(mailbox: &Arc<Mutex<AudioMailbox>>, ready: &Condvar) {
+fn wait_for_command(codec: &mut Es8311, mailbox: &Arc<Mutex<AudioMailbox>>, ready: &Condvar) {
+    // Silent: keep the codec's analog path powered down until the next tone.
+    if let Err(err) = codec.standby() {
+        log::warn!("ES8311 standby failed: {err}");
+    }
     let Ok(queue) = mailbox.lock() else {
         thread::sleep(watchdog::WORKER_IDLE_FEED);
         return;

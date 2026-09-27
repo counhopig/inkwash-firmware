@@ -23,9 +23,13 @@ pub struct SyncScheduler {
 impl SyncScheduler {
     pub fn new(now_unix: u64, sync_interval_minutes: u16, last_sync_epoch: Option<u64>) -> Self {
         let interval = sync_interval_minutes.max(1) as u64;
+        // Seed the full-sync boundary from the last successful sync, not from
+        // boot time: a device that slept through a boundary syncs on the first
+        // tick after waking instead of staying awake until the next boundary.
+        let last_full_seen = last_sync_epoch.unwrap_or(now_unix);
         Self {
             last_urgent_boundary: boundary_index(now_unix, 30),
-            last_full_boundary: boundary_index(now_unix, interval * 60),
+            last_full_boundary: boundary_index(last_full_seen, interval * 60),
             interval_minutes: interval as u16,
             never_synced: last_sync_epoch.is_none(),
             urgent_synced: false,
@@ -354,5 +358,17 @@ mod tests {
     #[test]
     fn has_unread_urgent_is_empty_for_no_items() {
         assert!(!SyncScheduler::has_unread_urgent(&make_inbox(vec![])));
+    }
+
+    #[test]
+    fn a_boot_after_a_missed_boundary_is_due_at_once() {
+        let sched = SyncScheduler::new(7_205, 60, Some(3_500));
+        assert!(sched.full_due(7_205, 60));
+    }
+
+    #[test]
+    fn a_boot_within_the_last_synced_period_is_not_due() {
+        let sched = SyncScheduler::new(3_700, 60, Some(3_650));
+        assert!(!sched.full_due(3_700, 60));
     }
 }

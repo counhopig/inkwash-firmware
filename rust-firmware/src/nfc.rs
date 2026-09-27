@@ -17,7 +17,7 @@ const READ_DELAY: Duration = Duration::from_millis(10);
 pub struct NfcTag {
     i2c: SharedI2c,
     addr: u8,
-    _power: PinDriver<'static, Output>,
+    power: PinDriver<'static, Output>,
     field_detect: PinDriver<'static, Input>,
 }
 
@@ -25,18 +25,13 @@ impl NfcTag {
     pub fn new(
         i2c: SharedI2c,
         addr: u8,
-        mut power: PinDriver<'static, Output>,
+        power: PinDriver<'static, Output>,
         field_detect: PinDriver<'static, Input>,
     ) -> Result<Self> {
-        power
-            .set_high()
-            .context("failed to power on NFC (GPIO21)")?;
-        thread::sleep(Duration::from_millis(1));
-
         let mut tag = Self {
             i2c,
             addr,
-            _power: power,
+            power,
             field_detect,
         };
         let mut probe_buf = [0u8; BLOCK_SIZE];
@@ -45,12 +40,33 @@ impl NfcTag {
         Ok(tag)
     }
 
+    /// The tag is powered only for the duration of a read; nothing else uses
+    /// it, and an always-on supply is a constant drain on the battery.
+    fn with_power<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.power
+            .set_high()
+            .context("failed to power on NFC (GPIO21)")?;
+        thread::sleep(Duration::from_millis(1));
+        let result = read(self);
+        let off = self
+            .power
+            .set_low()
+            .context("failed to power off NFC (GPIO21)");
+        let value = result?;
+        off?;
+        Ok(value)
+    }
+
     #[allow(dead_code)]
     pub fn field_present(&self) -> bool {
         self.field_detect.is_low()
     }
 
     pub fn read_block(&mut self, block_addr: u8, out: &mut [u8; BLOCK_SIZE]) -> Result<()> {
+        self.with_power(|tag| tag.read_block_powered(block_addr, out))
+    }
+
+    fn read_block_powered(&mut self, block_addr: u8, out: &mut [u8; BLOCK_SIZE]) -> Result<()> {
         self.i2c
             .lock()
             .write(self.addr, &[block_addr], I2C_TIMEOUT_TICKS)

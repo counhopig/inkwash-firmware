@@ -1,18 +1,23 @@
 use anyhow::{bail, Result};
 use core::ffi::c_void;
+use core::ptr::{addr_of, addr_of_mut};
 use esp_idf_svc::sys::{
     esp_deep_sleep_start, esp_pm_config_t, esp_pm_configure, esp_sleep_disable_wakeup_source,
     esp_sleep_enable_ext1_wakeup, esp_sleep_enable_gpio_switch, esp_sleep_enable_gpio_wakeup,
     esp_sleep_enable_timer_wakeup, esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_LOW,
     esp_sleep_get_ext1_wakeup_status, esp_sleep_get_wakeup_cause,
     esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT1, esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO,
-    esp_sleep_source_t_ESP_SLEEP_WAKEUP_UNDEFINED, gpio_hold_dis, gpio_hold_en,
-    gpio_int_type_t_GPIO_INTR_LOW_LEVEL, gpio_wakeup_disable, gpio_wakeup_enable,
+    esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER, esp_sleep_source_t_ESP_SLEEP_WAKEUP_UNDEFINED,
+    gpio_hold_dis, gpio_hold_en, gpio_int_type_t_GPIO_INTR_LOW_LEVEL, gpio_wakeup_disable,
+    gpio_wakeup_enable,
 };
 
 pub use inkwash_logic::wake_cause::WakeCause;
 
 const GPIO_NUM_17: i32 = 17;
+/// GT23SC6699 NFC supply switch. Nothing reads the tag after the boot probe,
+/// so it stays off; the hold keeps the pad low through deep sleep.
+pub const GPIO_NUM_21: i32 = 21;
 pub const GPIO_NUM_0: i32 = 0;
 
 pub const GPIO_NUM_5: i32 = 5;
@@ -23,8 +28,19 @@ pub const GPIO_NUM_39: i32 = 39;
 
 pub const WAKE_PINS: [i32; 3] = [GPIO_NUM_0, GPIO_NUM_18, GPIO_NUM_39];
 
+/// Set just before a controlled restart through deep sleep, whose timer wake
+/// must boot as a normal session rather than a background maintenance wake.
+/// RTC memory survives deep sleep and is initialised on power-on. Accessed
+/// with plain volatile loads and stores: RTC memory does not support the
+/// atomic compare-and-swap an `AtomicBool::swap` compiles to.
+#[link_section = ".rtc.data"]
+static mut CONTROLLED_RESTART: u32 = 0;
+
 pub fn release_power_latch_hold() -> Result<()> {
-    unsafe { gpio_hold_dis(GPIO_NUM_17) };
+    unsafe {
+        gpio_hold_dis(GPIO_NUM_17);
+        gpio_hold_dis(GPIO_NUM_21);
+    }
     Ok(())
 }
 
@@ -39,8 +55,20 @@ pub fn enter_deep_sleep_with_wakeups(resync_interval: Option<std::time::Duration
 
     unsafe { esp_sleep_enable_gpio_switch(false) };
 
-    unsafe { gpio_hold_en(GPIO_NUM_17) };
-    log::info!("Entering deep sleep; wake on ENTER/RTC alarm/DOWN (GPIO0/5/18 low)");
+    unsafe {
+        esp_idf_svc::sys::gpio_set_level(GPIO_NUM_21, 0);
+        gpio_hold_en(GPIO_NUM_21);
+        gpio_hold_en(GPIO_NUM_17);
+    }
+    match resync_interval {
+        Some(interval) => log::info!(
+            "Entering deep sleep; wake on ENTER/RTC alarm/DOWN (GPIO0/5/18 low) or timer in {}s",
+            interval.as_secs()
+        ),
+        None => log::info!(
+            "Entering deep sleep; wake on ENTER/RTC alarm/DOWN (GPIO0/5/18 low), no timer"
+        ),
+    }
     unsafe { esp_deep_sleep_start() };
 }
 
@@ -58,6 +86,11 @@ pub fn prepare_deep_sleep_wakeups(resync_interval: Option<std::time::Duration>) 
         if ret != 0 {
             bail!("esp_sleep_enable_timer_wakeup failed: 0x{ret:x}");
         }
+    } else {
+        // Automatic light sleep leaves a timer wake source armed. Deep sleep
+        // would inherit it and reboot about a second later, so clear it when
+        // nothing is scheduled. ESP_ERR_INVALID_STATE (not armed) is fine.
+        unsafe { esp_sleep_disable_wakeup_source(esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER) };
     }
     Ok(())
 }
@@ -71,12 +104,22 @@ pub fn restart_via_deep_sleep(delay: std::time::Duration) -> ! {
     }
     unsafe { esp_sleep_enable_gpio_switch(false) };
     unsafe { gpio_hold_en(GPIO_NUM_17) };
+    unsafe { core::ptr::write_volatile(addr_of_mut!(CONTROLLED_RESTART), 1) };
     log::info!("Controlled deep-sleep restart; timer wake only");
     unsafe { esp_deep_sleep_start() };
 }
 
 pub fn wake_cause() -> WakeCause {
     let cause = unsafe { esp_sleep_get_wakeup_cause() };
+    if cause == esp_sleep_source_t_ESP_SLEEP_WAKEUP_TIMER {
+        let controlled = unsafe { core::ptr::read_volatile(addr_of!(CONTROLLED_RESTART)) } != 0;
+        unsafe { core::ptr::write_volatile(addr_of_mut!(CONTROLLED_RESTART), 0) };
+        return if controlled {
+            WakeCause::Other
+        } else {
+            WakeCause::Timer
+        };
+    }
     if cause != esp_sleep_source_t_ESP_SLEEP_WAKEUP_EXT1 {
         return WakeCause::Other;
     }

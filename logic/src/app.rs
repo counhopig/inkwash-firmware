@@ -822,6 +822,9 @@ pub struct AppState {
     pending_light_sleep_disable: Option<OperationId>,
     last_activity_ticks: Option<u64>,
     idle_since_ticks: Option<u64>,
+    /// Booted from the deep-sleep timer and nobody has touched the device
+    /// since: finish the scheduled work, then go straight back to deep sleep.
+    background_wake: bool,
     last_power_poll_ticks: u64,
     op_counter: u64,
     batch_counter: u64,
@@ -902,6 +905,7 @@ impl Default for AppState {
             pending_light_sleep_disable: None,
             last_activity_ticks: None,
             idle_since_ticks: None,
+            background_wake: false,
             last_power_poll_ticks: 0,
             pending_residue_ack: None,
             pending_residue_time: None,
@@ -1004,6 +1008,9 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
     } else {
         Vec::new()
     };
+    if user_activity_event(&event) {
+        state.background_wake = false;
+    }
     if sleep_activity_event(&event) || tick_cancels_prepared || tick_wakes_light_sleep {
         state.sleep.activity();
         state.pending_sleep_operation = None;
@@ -1056,6 +1063,17 @@ pub fn update(state: &mut AppState, event: Event) -> Vec<EffectBatch> {
     };
     wake_effects.append(&mut batches);
     wake_effects
+}
+
+fn user_activity_event(event: &Event) -> bool {
+    match event {
+        Event::Button(button) => matches!(
+            button,
+            ButtonEvent::Pressed(_) | ButtonEvent::LongPressed(_)
+        ),
+        Event::UsbCommand(_) | Event::BleCommand(_) => true,
+        _ => false,
+    }
 }
 
 fn sleep_activity_event(event: &Event) -> bool {
@@ -1186,6 +1204,7 @@ fn expire_ble_pairing(state: &mut AppState, now_ticks: u64) -> Vec<EffectBatch> 
 
 fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     if poll.activity_observed {
+        state.background_wake = false;
         state.last_activity_ticks = Some(poll.now_ticks);
         state.idle_since_ticks = None;
 
@@ -1212,13 +1231,17 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     let kind = {
         let last = *state.last_activity_ticks.get_or_insert(poll.now_ticks);
         let idle_for = poll.now_ticks.saturating_sub(last);
-        let idle_since = if idle_for >= 2_000 {
-            *state.idle_since_ticks.get_or_insert(last + 2_000)
+        let idle_since = if idle_for >= LIGHT_SLEEP_IDLE_MS {
+            *state
+                .idle_since_ticks
+                .get_or_insert(last + LIGHT_SLEEP_IDLE_MS)
         } else {
             return vec![];
         };
         state.requested_sleep.unwrap_or_else(|| {
-            if poll.now_ticks.saturating_sub(idle_since) >= 300_000 {
+            if state.background_wake
+                || poll.now_ticks.saturating_sub(idle_since) >= DEEP_SLEEP_IDLE_MS
+            {
                 SleepKind::Deep
             } else {
                 SleepKind::Light
@@ -1227,14 +1250,7 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     };
     let inputs = app_sleep_inputs(state, poll);
     let maintenance = matches!(kind, SleepKind::Deep)
-        .then(|| {
-            state
-                .clock
-                .now
-                .and_then(|now| maintenance_wakeup_delay(&state.alarms.alarms, &now))
-                .map(|delay| delay.min(std::time::Duration::from_secs(600)))
-                .or(Some(std::time::Duration::from_secs(600)))
-        })
+        .then(|| sleep_maintenance_delay(state))
         .flatten();
     let manual_request = state.requested_sleep.is_some();
     state.requested_sleep = None;
@@ -1261,6 +1277,36 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
             light_wake_after_ms: poll.light_wake_after_ms,
         }],
     )]
+}
+
+/// Idle time on a sleep-capable page before automatic light sleep.
+const LIGHT_SLEEP_IDLE_MS: u64 = 2_000;
+/// Idle time in light sleep before the device drops to deep sleep.
+const DEEP_SLEEP_IDLE_MS: u64 = 180_000;
+/// Deep-sleep timer period: the Home clock shows HH:MM, so a sleeping device
+/// wakes on each 10-minute wall-clock boundary to redraw it. With Wi-Fi and a
+/// server configured the same wake runs any sync whose interval boundary has
+/// passed, so sync intervals shorter than this only apply while awake.
+const SLEEP_WAKE_PERIOD_SECS: u64 = 10 * 60;
+/// Lands the wake past the boundary even when the RC slow clock that times
+/// deep sleep runs a little fast.
+const SLEEP_WAKE_MARGIN_SECS: u64 = 15;
+
+/// Deep-sleep timer wake. Each timer wake is a background wake: it redraws
+/// the clock, syncs if due and goes straight back to sleep. The RTC hardware
+/// alarm wakes the device for alarms on its own; the timer also re-arms a
+/// one-shot alarm in a later month, which the PCF8563 cannot hold.
+fn sleep_maintenance_delay(state: &AppState) -> Option<std::time::Duration> {
+    let Some(now) = state.clock.now else {
+        return Some(std::time::Duration::from_secs(SLEEP_WAKE_PERIOD_SECS));
+    };
+    let unix = now.to_unix();
+    let until_boundary = SLEEP_WAKE_PERIOD_SECS - unix % SLEEP_WAKE_PERIOD_SECS;
+    let periodic = std::time::Duration::from_secs(until_boundary + SLEEP_WAKE_MARGIN_SECS);
+    Some(
+        maintenance_wakeup_delay(&state.alarms.alarms, &now)
+            .map_or(periodic, |alarm| alarm.min(periodic)),
+    )
 }
 
 fn transition_sleep_prepared(
@@ -1750,6 +1796,7 @@ fn transition_wifi_config_applied(
 }
 
 fn transition_boot(state: &mut AppState, snapshot: BootSnapshot) -> Vec<EffectBatch> {
+    state.background_wake = snapshot.wake_cause == WakeCause::Timer;
     state.clock.now = snapshot.now;
     state.alarms.alarms = snapshot.alarms;
     state.todos.todos = snapshot.todos;
@@ -7519,6 +7566,88 @@ mod tests {
             st.pairing_deadline_ticks,
             Some(5_000 + BLE_PAIRING_TIMEOUT_MS),
             "entering pairing must arm the timeout against the monotonic poll clock"
+        );
+    }
+
+    fn prepared_sleep_kind(
+        batches: &[EffectBatch],
+    ) -> Option<(SleepKind, Option<std::time::Duration>)> {
+        batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .find_map(|e| match e {
+                Effect::PrepareSleep {
+                    token, maintenance, ..
+                } => Some((token.kind, *maintenance)),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn timer_wake_returns_to_deep_sleep_once_idle() {
+        let mut state = AppState {
+            background_wake: true,
+            ..AppState::default()
+        };
+        let _ = update(&mut state, Event::PowerPoll(power_poll_at(0)));
+        let prepared = update(&mut state, Event::PowerPoll(power_poll_at(2_000)));
+        assert_eq!(
+            prepared_sleep_kind(&prepared).map(|(kind, _)| kind),
+            Some(SleepKind::Deep),
+            "a timer wake must not linger in light sleep for the idle timeout"
+        );
+    }
+
+    #[test]
+    fn a_button_press_turns_a_timer_wake_into_a_normal_session() {
+        let mut state = AppState {
+            background_wake: true,
+            ..AppState::default()
+        };
+        let _ = update(
+            &mut state,
+            Event::Button(ButtonEvent::Pressed(ButtonId::Down)),
+        );
+        state.screen = Screen::Home;
+        let _ = update(&mut state, Event::PowerPoll(power_poll_at(0)));
+        let prepared = update(&mut state, Event::PowerPoll(power_poll_at(2_000)));
+        assert_eq!(
+            prepared_sleep_kind(&prepared).map(|(kind, _)| kind),
+            Some(SleepKind::Light)
+        );
+    }
+
+    #[test]
+    fn deep_sleep_waits_for_the_idle_timeout_after_user_activity() {
+        let mut state = AppState::default();
+        let _ = update(&mut state, Event::PowerPoll(power_poll_at(0)));
+        let light = update(&mut state, Event::PowerPoll(power_poll_at(2_000)));
+        assert_eq!(
+            prepared_sleep_kind(&light).map(|(kind, _)| kind),
+            Some(SleepKind::Light)
+        );
+    }
+
+    #[test]
+    fn deep_sleep_wakes_just_past_the_next_ten_minute_boundary() {
+        let mut state = AppState::default();
+        let now = DateTime {
+            second: 42,
+            ..dt(9, 7)
+        };
+        state.clock.now = Some(now);
+        let delay = sleep_maintenance_delay(&state).expect("timer wake");
+        let wake = now.to_unix() + delay.as_secs();
+        assert_eq!(wake % SLEEP_WAKE_PERIOD_SECS, SLEEP_WAKE_MARGIN_SECS);
+        assert!(delay.as_secs() <= SLEEP_WAKE_PERIOD_SECS + SLEEP_WAKE_MARGIN_SECS);
+    }
+
+    #[test]
+    fn deep_sleep_without_a_clock_still_wakes_to_retry() {
+        let state = AppState::default();
+        assert_eq!(
+            sleep_maintenance_delay(&state),
+            Some(std::time::Duration::from_secs(SLEEP_WAKE_PERIOD_SECS))
         );
     }
 
