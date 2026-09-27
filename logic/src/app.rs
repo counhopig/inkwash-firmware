@@ -1449,6 +1449,7 @@ fn transition_urgent_poll_completed(state: &mut AppState, available: bool) -> Ve
         return vec![];
     };
     let _ = op;
+    state.sync_scheduler.mark_network_ok();
     if !available {
         state.sync_scheduler.clear_urgent_synced();
         return vec![];
@@ -1474,7 +1475,9 @@ fn transition_urgent_poll_completed(state: &mut AppState, available: bool) -> Ve
 }
 
 fn transition_urgent_poll_failed(state: &mut AppState) -> Vec<EffectBatch> {
-    state.pending_urgent_poll.take();
+    if state.pending_urgent_poll.take().is_some() {
+        state.sync_scheduler.mark_network_failed();
+    }
     vec![]
 }
 
@@ -1491,6 +1494,11 @@ fn schedule_sync_from_tick(state: &mut AppState, now: DateTime) -> Vec<EffectBat
     let urgent_due = state.sync_scheduler.urgent_due(unix);
     let full_due = state.sync_scheduler.full_due(unix, interval);
     if !urgent_due && !full_due {
+        return vec![];
+    }
+    if !full_due && state.sync_scheduler.network_failed() {
+        // Back off: no radio until the next full-sync boundary.
+        state.sync_scheduler.advance_urgent_boundary(unix);
         return vec![];
     }
     if full_due || (state.sync_scheduler.is_never_synced() && urgent_due) {
@@ -1638,6 +1646,7 @@ fn transition_sync_completed(state: &mut AppState, result: SyncResult) -> Vec<Ef
         }
         SyncResult::Failed(message) => {
             state.sync = SyncState::Idle;
+            state.sync_scheduler.mark_network_failed();
             let reply = Reply::Error { message };
             for channel in [Channel::Usb, Channel::Ble] {
                 if let Some((found_channel, resolved)) =
@@ -6945,6 +6954,71 @@ mod tests {
         update(&mut state, Event::PowerPoll(poll(3_000, true)));
         assert_eq!(state.sleep.committed_kind(), None);
         assert!(state.pending_sleep_operation.is_none());
+    }
+
+    fn networked_state_at(now: DateTime) -> AppState {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        state.connectivity.server_configured = true;
+        state.clock.now = Some(now);
+        state.sync_scheduler =
+            crate::scheduler::SyncScheduler::new(now.to_unix(), 60, Some(now.to_unix()));
+        state
+    }
+
+    fn starts_network(batches: &[EffectBatch]) -> bool {
+        batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::PollUrgent | Effect::StartSync(_)))
+    }
+
+    #[test]
+    fn a_failed_urgent_poll_stops_polling_until_the_next_full_sync() {
+        let start = dt(9, 0);
+        let mut state = networked_state_at(start);
+        let poll_at = DateTime {
+            second: 30,
+            ..start
+        };
+        assert!(starts_network(&schedule_sync_from_tick(
+            &mut state, poll_at
+        )));
+        let _ = update(&mut state, Event::UrgentPollFailed);
+
+        for minute in 1..59 {
+            let later = DateTime {
+                minute,
+                second: 30,
+                ..start
+            };
+            assert!(
+                !starts_network(&schedule_sync_from_tick(&mut state, later)),
+                "no radio at 09:{minute:02}:30 after a failure"
+            );
+        }
+        assert!(
+            starts_network(&schedule_sync_from_tick(&mut state, dt(10, 0))),
+            "the next full-sync boundary still tries"
+        );
+    }
+
+    #[test]
+    fn a_successful_urgent_poll_keeps_the_30_second_cadence() {
+        let start = dt(9, 0);
+        let mut state = networked_state_at(start);
+        let poll_at = DateTime {
+            second: 30,
+            ..start
+        };
+        assert!(starts_network(&schedule_sync_from_tick(
+            &mut state, poll_at
+        )));
+        let _ = update(&mut state, Event::UrgentPollCompleted { available: false });
+        assert!(starts_network(&schedule_sync_from_tick(
+            &mut state,
+            dt(9, 1)
+        )));
     }
 
     #[test]

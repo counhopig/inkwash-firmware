@@ -16,6 +16,10 @@ pub struct SyncScheduler {
     interval_minutes: u16,
     never_synced: bool,
     urgent_synced: bool,
+    /// The last network attempt failed (no AP, no DHCP, server down). Each
+    /// attempt keeps the radio on for up to ~20 s, so the 30 s urgent poll
+    /// stands down until the next full-sync boundary or a manual sync.
+    network_failed: bool,
     urgent_boundary_before_advance: Option<u64>,
     full_boundary_before_advance: Option<u64>,
 }
@@ -33,6 +37,7 @@ impl SyncScheduler {
             interval_minutes: interval as u16,
             never_synced: last_sync_epoch.is_none(),
             urgent_synced: false,
+            network_failed: false,
             urgent_boundary_before_advance: None,
             full_boundary_before_advance: None,
         }
@@ -109,6 +114,19 @@ impl SyncScheduler {
 
     pub fn mark_full_sync_completed(&mut self) {
         self.never_synced = false;
+        self.network_failed = false;
+    }
+
+    pub fn mark_network_failed(&mut self) {
+        self.network_failed = true;
+    }
+
+    pub fn mark_network_ok(&mut self) {
+        self.network_failed = false;
+    }
+
+    pub fn network_failed(&self) -> bool {
+        self.network_failed
     }
 }
 
