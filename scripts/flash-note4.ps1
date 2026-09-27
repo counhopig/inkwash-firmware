@@ -38,9 +38,9 @@ if ($authorizedMac -notmatch '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$') {
 }
 
 if (Get-Command esptool.py -ErrorAction SilentlyContinue) {
-    $esptool = @("esptool.py")
+    $esptool = "esptool.py"
 } elseif (Get-Command esptool -ErrorAction SilentlyContinue) {
-    $esptool = @("esptool")
+    $esptool = "esptool"
 } else {
     throw "Refusing to flash: esptool is required to identify the board (run from an ESP-IDF shell)."
 }
@@ -50,8 +50,7 @@ if (-not (Get-Command espflash -ErrorAction SilentlyContinue)) {
 
 function Invoke-Probe {
     param([string[]]$ProbeArgs)
-    $exe = $esptool[0]
-    $output = (& $exe @($esptool | Select-Object -Skip 1) --chip esp32s3 --port $Port @ProbeArgs 2>&1 | Out-String)
+    $output = (& $esptool --chip esp32s3 --port $Port @ProbeArgs 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) {
         Write-Host $output
         throw "Refusing to flash: esptool could not probe $Port."
