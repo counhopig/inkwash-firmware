@@ -1227,14 +1227,7 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
     };
     let inputs = app_sleep_inputs(state, poll);
     let maintenance = matches!(kind, SleepKind::Deep)
-        .then(|| {
-            state
-                .clock
-                .now
-                .and_then(|now| maintenance_wakeup_delay(&state.alarms.alarms, &now))
-                .map(|delay| delay.min(std::time::Duration::from_secs(600)))
-                .or(Some(std::time::Duration::from_secs(600)))
-        })
+        .then(|| sleep_maintenance_delay(state))
         .flatten();
     let manual_request = state.requested_sleep.is_some();
     state.requested_sleep = None;
@@ -1261,6 +1254,23 @@ fn power_poll_sleep(state: &mut AppState, poll: PowerPoll) -> Vec<EffectBatch> {
             light_wake_after_ms: poll.light_wake_after_ms,
         }],
     )]
+}
+
+/// RTC alarms have their own wake pin. A periodic timer is only needed when
+/// network work can run, or when a one-shot alarm in a future month needs its
+/// RTC alarm registers reprogrammed.
+fn sleep_maintenance_delay(state: &AppState) -> Option<std::time::Duration> {
+    let alarm_maintenance = state
+        .clock
+        .now
+        .and_then(|now| maintenance_wakeup_delay(&state.alarms.alarms, &now));
+    let network_maintenance = (state.connectivity.wifi_configured
+        && state.connectivity.server_configured)
+        .then_some(std::time::Duration::from_secs(600));
+    alarm_maintenance
+        .into_iter()
+        .chain(network_maintenance)
+        .min()
 }
 
 fn transition_sleep_prepared(
@@ -3943,6 +3953,24 @@ fn program_alarm_for(state: &mut AppState, now: &DateTime) -> Vec<EffectBatch> {
 mod tests {
     use super::*;
     use crate::todo::Importance;
+
+    #[test]
+    fn offline_sleep_has_no_unnecessary_periodic_wake() {
+        let state = AppState::default();
+        assert_eq!(sleep_maintenance_delay(&state), None);
+    }
+
+    #[test]
+    fn configured_network_retains_periodic_maintenance() {
+        let mut state = AppState::default();
+        state.connectivity.wifi_configured = true;
+        assert_eq!(sleep_maintenance_delay(&state), None);
+        state.connectivity.server_configured = true;
+        assert_eq!(
+            sleep_maintenance_delay(&state),
+            Some(std::time::Duration::from_secs(600))
+        );
+    }
 
     fn dt(hour: u8, minute: u8) -> DateTime {
         DateTime {
