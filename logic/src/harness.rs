@@ -469,6 +469,7 @@ pub mod helpers {
     ) -> BootSnapshot {
         BootSnapshot {
             wake_cause: WakeCause::Other,
+            open_ble_pairing: false,
             now,
             rtc_alarm_flag: af,
             rtc_alarm_interrupt_enabled: aie,

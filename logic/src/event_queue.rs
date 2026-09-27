@@ -173,6 +173,7 @@ mod tests {
     fn boot() -> Event {
         Event::Boot(crate::app::BootSnapshot {
             wake_cause: WakeCause::Other,
+            open_ble_pairing: false,
             now: Some(dt(8, 0)),
             rtc_alarm_flag: false,
             rtc_alarm_interrupt_enabled: false,

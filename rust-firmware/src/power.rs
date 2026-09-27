@@ -36,6 +36,28 @@ pub const WAKE_PINS: [i32; 3] = [GPIO_NUM_0, GPIO_NUM_18, GPIO_NUM_39];
 #[link_section = ".rtc.data"]
 static mut CONTROLLED_RESTART: u32 = 0;
 
+/// Set by `restart_into_ble_pairing`: the next boot opens BLE pairing
+/// before anything constructs the Wi-Fi driver.
+#[link_section = ".rtc.data"]
+static mut PAIRING_ON_BOOT: u32 = 0;
+
+/// BLE needs a large contiguous block of internal RAM. Once the Wi-Fi driver
+/// has been built and torn down in a boot, the heap is too fragmented (and
+/// its teardown is not safe to race with a new task), so pairing restarts
+/// the chip and starts from a clean heap instead.
+pub fn restart_into_ble_pairing() -> ! {
+    unsafe { core::ptr::write_volatile(addr_of_mut!(PAIRING_ON_BOOT), 1) };
+    log::info!("Restarting to open BLE pairing on a clean heap");
+    restart_via_deep_sleep(std::time::Duration::from_millis(100))
+}
+
+/// Reads and clears the pairing request left by the previous boot.
+pub fn take_pairing_on_boot() -> bool {
+    let requested = unsafe { core::ptr::read_volatile(addr_of!(PAIRING_ON_BOOT)) } != 0;
+    unsafe { core::ptr::write_volatile(addr_of_mut!(PAIRING_ON_BOOT), 0) };
+    requested
+}
+
 pub fn release_power_latch_hold() -> Result<()> {
     unsafe {
         gpio_hold_dis(GPIO_NUM_17);

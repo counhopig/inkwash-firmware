@@ -425,6 +425,7 @@ fn main() -> Result<()> {
     };
     let boot_result = collect_boot_snapshot(boot_core, boot_stores, clock);
 
+    let wifi_used_at_boot = wifi_mgr.used();
     let sync_task = sync_task::SyncTask::spawn(sync_partition, wifi_mgr)?;
 
     let effect_task = effect_task::EffectTask::spawn(effect_task::EffectDrivers {
@@ -459,6 +460,7 @@ fn main() -> Result<()> {
         ble_set_wifi_after_resume: None,
         ble_start_failure: None,
         ble_start_cancelled: false,
+        wifi_used_this_boot: wifi_used_at_boot,
         pending_ble_replies: Vec::new(),
         pending_ble_deliveries: std::collections::VecDeque::with_capacity(
             ctx::BLE_REPLY_PENDING_CAPACITY,
@@ -1465,6 +1467,7 @@ fn collect_boot_snapshot(
     BootSnapshotResult {
         snapshot: inkwash_logic::app::BootSnapshot {
             wake_cause,
+            open_ble_pairing: power::take_pairing_on_boot(),
             now: clock,
             rtc_alarm_flag: core.alarm_status.alarm_flag,
             rtc_alarm_interrupt_enabled: core.alarm_status.alarm_interrupt_enabled,

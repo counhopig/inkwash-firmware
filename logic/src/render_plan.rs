@@ -306,6 +306,7 @@ mod tests {
     fn boot_snapshot(alarms: Vec<StoredAlarm>, now: Option<DateTime>) -> BootSnapshot {
         BootSnapshot {
             wake_cause: WakeCause::Other,
+            open_ble_pairing: false,
             now,
             rtc_alarm_flag: false,
             rtc_alarm_interrupt_enabled: false,

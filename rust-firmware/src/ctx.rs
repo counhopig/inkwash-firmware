@@ -249,6 +249,8 @@ pub struct DeviceContext<'a> {
     pub ble_set_wifi_after_resume: Option<WifiCreds>,
     pub ble_start_failure: Option<(u64, String)>,
     pub ble_start_cancelled: bool,
+    /// The Wi-Fi driver has been constructed at some point in this boot.
+    pub wifi_used_this_boot: bool,
 
     pub pending_ble_replies: Vec<PendingBleReply>,
 
@@ -673,6 +675,7 @@ impl DeviceContext<'_> {
             return Ok(false);
         }
         let reply = self.sync.sync_now(now)?;
+        self.wifi_used_this_boot = true;
         self.pending_wifi_op = Some(PendingWifiOp::Sync { reply });
         Ok(true)
     }
@@ -682,6 +685,7 @@ impl DeviceContext<'_> {
             anyhow::bail!("another Wi-Fi operation is already in progress");
         }
         let reply = self.sync.poll_urgent()?;
+        self.wifi_used_this_boot = true;
         self.pending_wifi_op = Some(PendingWifiOp::UrgentPoll { reply });
         Ok(())
     }
@@ -702,6 +706,7 @@ impl DeviceContext<'_> {
             return Ok(true);
         }
         let reply = self.sync.set_wifi(creds)?;
+        self.wifi_used_this_boot = true;
         self.pending_wifi_op = Some(PendingWifiOp::SetWifi { reply });
         Ok(true)
     }
@@ -744,6 +749,9 @@ impl DeviceContext<'_> {
             || self.ble_wifi_suspended
         {
             return Ok(false);
+        }
+        if self.wifi_used_this_boot {
+            crate::power::restart_into_ble_pairing();
         }
         let reply = self.sync.suspend_for_ble()?;
         self.ble_session_id = Some(request.session_id);

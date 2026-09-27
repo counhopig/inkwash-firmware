@@ -597,6 +597,8 @@ pub struct RtcAlarmSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootSnapshot {
     pub wake_cause: WakeCause,
+    /// The previous boot restarted to open BLE pairing on a clean heap.
+    pub open_ble_pairing: bool,
     pub now: Option<DateTime>,
     pub rtc_alarm_flag: bool,
     pub rtc_alarm_interrupt_enabled: bool,
@@ -1909,6 +1911,12 @@ fn transition_boot(state: &mut AppState, snapshot: BootSnapshot) -> Vec<EffectBa
         }
     }
 
+    if snapshot.open_ble_pairing && !matches!(state.alarm_runtime, AlarmRuntimeState::Firing { .. })
+    {
+        batches.extend(enter_ble_pairing(state, true));
+        return batches;
+    }
+
     if !matches!(state.alarm_runtime, AlarmRuntimeState::Firing { .. })
         && !batches
             .iter()
@@ -2367,29 +2375,7 @@ fn transition_nav_button(state: &mut AppState, button: ButtonEvent) -> Vec<Effec
                         state.render_generation = state.render_generation.next();
                         vec![render_batch(state)]
                     } else if cur == SETTINGS_BLE_PAIRING_ROW {
-                        let session_id = state.next_operation_id().0;
-                        let pairing = BlePairingRequest {
-                            name: "inkwash-note4".to_string(),
-                            session_id,
-                        };
-                        state.screen = Screen::BlePairing(BlePairingState {
-                            phase: BlePairingPhase::Waiting,
-                            pairing_deadline_ticks: Some(
-                                state.last_power_poll_ticks + BLE_PAIRING_TIMEOUT_MS,
-                            ),
-                            session_id,
-                            input_released: false,
-                        });
-                        state.render_generation = state.render_generation.next();
-                        vec![
-                            batch(
-                                state,
-                                OperationId(0),
-                                FailurePolicy::Continue,
-                                vec![Effect::StartBlePairing(pairing)],
-                            ),
-                            render_batch(state),
-                        ]
+                        enter_ble_pairing(state, false)
                     } else if cur == SETTINGS_ABOUT_ROW {
                         state.screen = Screen::About;
                         state.render_generation = state.render_generation.next();
@@ -2445,6 +2431,33 @@ pub const SETTINGS_BLE_PAIRING_ROW: usize = 2;
 pub const SETTINGS_SYNC_INTERVAL_ROW: usize = 1;
 
 pub const SETTINGS_SYNC_NOW_ROW: usize = 0;
+
+/// Opens the pairing screen and asks the firmware to start advertising.
+/// `input_released` is false when the key that chose the row may still be
+/// held, so its long press is not taken as "cancel".
+fn enter_ble_pairing(state: &mut AppState, input_released: bool) -> Vec<EffectBatch> {
+    let session_id = state.next_operation_id().0;
+    let pairing = BlePairingRequest {
+        name: "inkwash-note4".to_string(),
+        session_id,
+    };
+    state.screen = Screen::BlePairing(BlePairingState {
+        phase: BlePairingPhase::Waiting,
+        pairing_deadline_ticks: Some(state.last_power_poll_ticks + BLE_PAIRING_TIMEOUT_MS),
+        session_id,
+        input_released,
+    });
+    state.render_generation = state.render_generation.next();
+    vec![
+        batch(
+            state,
+            OperationId(0),
+            FailurePolicy::Continue,
+            vec![Effect::StartBlePairing(pairing)],
+        ),
+        render_batch(state),
+    ]
+}
 
 /// SYNC NOW: start a sync, or say why it cannot start.
 fn start_manual_sync(state: &mut AppState) -> Vec<EffectBatch> {
@@ -4189,6 +4202,7 @@ mod tests {
     ) -> BootSnapshot {
         BootSnapshot {
             wake_cause: WakeCause::Other,
+            open_ble_pairing: false,
             now,
             rtc_alarm_flag: af,
             rtc_alarm_interrupt_enabled: aie,
@@ -5159,6 +5173,7 @@ mod tests {
         let mut state = AppState::default();
         let snapshot = BootSnapshot {
             wake_cause: WakeCause::Other,
+            open_ble_pairing: false,
             now: Some(dt(8, 0)),
             rtc_alarm_flag: false,
             rtc_alarm_interrupt_enabled: true,
@@ -7086,6 +7101,24 @@ mod tests {
         update(&mut state, Event::PowerPoll(poll(3_000, true)));
         assert_eq!(state.sleep.committed_kind(), None);
         assert!(state.pending_sleep_operation.is_none());
+    }
+
+    #[test]
+    fn a_pairing_restart_boots_straight_into_ble_pairing() {
+        let mut state = AppState::default();
+        let snapshot = BootSnapshot {
+            open_ble_pairing: true,
+            ..boot_snapshot(vec![], Some(dt(9, 0)), false, false)
+        };
+        let batches = update(&mut state, Event::Boot(snapshot));
+        let Screen::BlePairing(pairing) = &state.screen else {
+            panic!("expected the pairing screen, got {:?}", state.screen);
+        };
+        assert!(pairing.input_released, "no key is held across the restart");
+        assert!(batches
+            .iter()
+            .flat_map(|b| &b.effects)
+            .any(|e| matches!(e, Effect::StartBlePairing(_))));
     }
 
     fn networked_state_at(now: DateTime) -> AppState {
