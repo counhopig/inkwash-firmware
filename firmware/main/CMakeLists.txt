@@ -38,6 +38,7 @@ idf_component_register(
         esp_http_client
         mbedtls
         nvs_flash
+        espcoredump
         json
         bt
         lvgl

@@ -1,15 +1,40 @@
 // Inkwash firmware entry point: bring up the board, read why the chip woke,
 // then hand over to the application task loop.
+#include <cstdio>
+
 #include "app/app.h"
 #include "app/safe_mode.h"
 #include "audio/tones.h"
 #include "board.h"
 #include "display.h"
+#include "esp_core_dump.h"
 #include "esp_log.h"
 #include "fonts.h"
 #include "pcf8563.h"
 #include "power/power.h"
 #include "storage/store.h"
+
+namespace {
+
+// Prints the previous crash (if any) so a serial log is enough to find it,
+// then erases it so the next report is fresh.
+void ReportPreviousCrash() {
+    if (esp_core_dump_image_check() != ESP_OK) return;
+    esp_core_dump_summary_t summary = {};
+    if (esp_core_dump_get_summary(&summary) == ESP_OK) {
+        char bt[16 * 11 + 1] = {};
+        size_t used = 0;
+        for (uint32_t i = 0; i < summary.exc_bt_info.depth && i < 16; ++i) {
+            used += snprintf(bt + used, sizeof(bt) - used, " 0x%08lx",
+                             static_cast<unsigned long>(summary.exc_bt_info.bt[i]));
+        }
+        ESP_LOGE("crash", "previous run crashed in task '%s' at pc 0x%08lx; backtrace:%s",
+                 summary.exc_task, static_cast<unsigned long>(summary.exc_pc), bt);
+    }
+    esp_core_dump_image_erase();
+}
+
+}  // namespace
 
 extern "C" void app_main() {
     boot_guard::ResetKind reset = boot_guard::ResetKind::Other;
@@ -17,6 +42,7 @@ extern "C" void app_main() {
     ESP_LOGI("inkwash", "reset: %s, failed boots in a row: %u", boot_guard::Label(reset),
              unsigned(ledger.failures));
     board::Init();
+    ReportPreviousCrash();
     if (ledger.Exhausted()) {
         safe_mode::Run(ledger, reset);
     }

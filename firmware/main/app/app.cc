@@ -214,6 +214,7 @@ struct State {
     bool network_failed = false;
     bool urgent_synced = false;
     bool boot_ledger_cleared = false;
+    int64_t net_started_ms = 0;
     std::vector<uint8_t> edited_alarms;  // toggled while a sync ran
     std::vector<uint8_t> edited_todos;
     bool need_boot_ntp = false;
@@ -499,6 +500,8 @@ bool StartNet(NetJob job, const store::WifiCreds* creds = nullptr) {
         return false;
     }
     g.net_job = job;
+    g.net_started_ms = NowMs();
+    ESP_LOGI(kTag, "net job %d started", static_cast<int>(job));
     return true;
 }
 
@@ -739,6 +742,9 @@ void ReapplyEdits(const std::vector<Alarm>& local_alarms, const std::vector<Todo
 
 void OnNetDone(const Event& e) {
     const NetJob job = g.net_job;
+    ESP_LOGI(kTag, "net job %d done in %lld ms: %s", static_cast<int>(job),
+             static_cast<long long>(NowMs() - g.net_started_ms),
+             e.result.ok ? "ok" : e.result.error.c_str());
     g.net_job = NetJob::None;
     const netsync::Result& r = e.result;
     switch (job) {
@@ -1269,12 +1275,53 @@ void Boot(power::WakeCause wake) {
     if (g.need_boot_ntp) StartNet(NetJob::Ntp);
 }
 
+// Returns true when the event needs a redraw.
+bool HandleEvent(const Event& e) {
+    switch (e.kind) {
+        case Event::Kind::Key:
+            ESP_LOGI(kTag, "key %d %s on screen %d", static_cast<int>(e.key.key),
+                     e.key.kind == keys::Kind::Pressed       ? "press"
+                     : e.key.kind == keys::Kind::LongPressed ? "hold"
+                                                             : "release",
+                     static_cast<int>(g.screen.kind));
+            g.last_activity_ms = NowMs();
+            g.background = false;
+            HandleKey(e.key);
+            return true;
+        case Event::Kind::Command:
+            HandleCommand(e.channel, e.line);
+            return false;
+        case Event::Kind::BleLink:
+            g.last_activity_ms = NowMs();
+            if (e.ble_event == ble::Event::Connected || e.ble_event == ble::Event::Encrypted) {
+                g.ble_deadline_ms = NowMs() + kBlePairingTimeoutMs;
+            }
+            return false;
+        case Event::Kind::NetDone:
+            OnNetDone(e);
+            return true;
+    }
+    return false;
+}
+
+// Logs why deep sleep is being held off, at most every 30 s.
+void LogSleepBlock() {
+    static int64_t last_ms = -30000;
+    const int64_t now = NowMs();
+    if (now - last_ms < 30000) return;
+    last_ms = now;
+    ESP_LOGI(kTag, "deep sleep held: usb=%d net=%d ring=%d screen=%d ble=%d replies=%d/%d",
+             usb_console::HostConnected(), static_cast<int>(g.net_job), g.ringing,
+             static_cast<int>(g.screen.kind), ble::Active(), g.usb_reply.active, g.ble_reply.active);
+}
+
 }  // namespace
 
 void Run(power::WakeCause wake) {
     g_events = xQueueCreate(16, sizeof(Event*));
     g_net = xQueueCreate(2, sizeof(NetRequest*));
-    xTaskCreate(NetTask, "net", 8192, nullptr, 4, nullptr);
+    // TLS handshakes need a deep stack (the Rust sync task used 16 KiB).
+    xTaskCreate(NetTask, "net", 16384, nullptr, 4, nullptr);
 
     Boot(wake);
 
@@ -1295,35 +1342,20 @@ void Run(power::WakeCause wake) {
         Event* e = nullptr;
         bool redraw = false;
         if (xQueueReceive(g_events, &e, pdMS_TO_TICKS(NextWaitMs())) == pdTRUE) {
-            std::unique_ptr<Event> owned(e);
-            switch (e->kind) {
-                case Event::Kind::Key:
-                    g.last_activity_ms = NowMs();
-                    g.background = false;
-                    HandleKey(e->key);
-                    redraw = true;
-                    break;
-                case Event::Kind::Command:
-                    HandleCommand(e->channel, e->line);
-                    break;
-                case Event::Kind::BleLink:
-                    g.last_activity_ms = NowMs();
-                    if (e->ble_event == ble::Event::Connected || e->ble_event == ble::Event::Encrypted) {
-                        g.ble_deadline_ms = NowMs() + kBlePairingTimeoutMs;
-                    }
-                    break;
-                case Event::Kind::NetDone:
-                    OnNetDone(*e);
-                    redraw = true;
-                    break;
-            }
+            // Handle everything already queued (keys pressed during the last
+            // panel refresh) before drawing, so one refresh covers them all.
+            do {
+                std::unique_ptr<Event> owned(e);
+                if (HandleEvent(*e)) redraw = true;
+            } while (xQueueReceive(g_events, &e, 0) == pdTRUE);
         }
         if (Housekeeping()) redraw = true;
         if (redraw) Render();
 
         const int64_t idle_limit = g.background ? kBackgroundIdleMs : kDeepSleepIdleMs;
-        if (NowMs() - g.last_activity_ms >= idle_limit && !SleepBlocked()) {
-            GoToDeepSleep();
+        if (NowMs() - g.last_activity_ms >= idle_limit) {
+            if (!SleepBlocked()) GoToDeepSleep();
+            LogSleepBlock();
         }
     }
 }
