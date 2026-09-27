@@ -102,14 +102,16 @@ try {
     if (-not $TargetDir) {
         $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "C:\ikw" }
     }
+    $defaults = @("sdkconfig.defaults")
     if ($Diagnostic) {
-        $env:ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.diagnostic.defaults"
+        $defaults += "sdkconfig.diagnostic.defaults"
         # Keep diagnostic objects apart from production ones, as on Linux.
         $TargetDir = $TargetDir.TrimEnd('\') + "-d"
     }
     $targetRoot = $TargetDir
     $env:CARGO_TARGET_DIR = $targetRoot
     Write-Host "Cargo target directory: $targetRoot"
+
     $partitionHash = "v2:" + (Get-FileHash -Algorithm SHA256 "partitions.csv").Hash.ToLowerInvariant()
     $partitionStamp = Join-Path $targetRoot ".inkwash-partitions.sha256"
     if ((Test-Path $targetRoot) -and
@@ -120,6 +122,20 @@ try {
             throw "cargo clean for partition-table rebuild failed with exit code $LASTEXITCODE"
         }
     }
+
+    # sdkconfig.defaults reaches partitions.csv by a path relative to
+    # rust-firmware\target, which is wrong for any other target directory.
+    # Override it with the absolute path in a generated defaults file, loaded
+    # last so it wins. Written after any `cargo clean`, which would delete it.
+    New-Item -ItemType Directory -Force $targetRoot | Out-Null
+    $partitionsCsv = (Resolve-Path "partitions.csv").Path -replace '\\', '/'
+    $partitionDefaults = Join-Path (Resolve-Path $targetRoot).Path "partitions.sdkconfig.defaults"
+    Set-Content -Path $partitionDefaults -Encoding Ascii -Value @(
+        "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=`"$partitionsCsv`"",
+        "CONFIG_PARTITION_TABLE_FILENAME=`"$partitionsCsv`""
+    )
+    $defaults += $partitionDefaults
+    $env:ESP_IDF_SDKCONFIG_DEFAULTS = $defaults -join ";"
 
     $cargoArgs = @("build")
     if ($Release) {
