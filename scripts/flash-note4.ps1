@@ -3,6 +3,10 @@
 #
 # Usage:
 #   .\scripts\flash-note4.ps1 -Port COM5 [-Monitor] [-Elf D:\espbuild\...\inkwash-note4]
+#   .\scripts\flash-note4.ps1 -Port COM5 -Cpp [-Monitor] [-BuildDir C:\ikc]
+#
+# -Cpp flashes the C++ firmware built by scripts\build-cpp.ps1 instead of the
+# Rust one. The identity checks are the same for both.
 #
 # A serial-port name is not an identity: another ESP32, or a Note 4C with a
 # different panel, may enumerate on the same COM port. Before writing anything
@@ -13,22 +17,39 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Port,
     [string]$Elf,
-    [switch]$Monitor
+    [switch]$Monitor,
+    [switch]$Cpp,
+    [string]$BuildDir
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $authorizedMac = if ($env:INKWASH_NOTE4_MAC) { $env:INKWASH_NOTE4_MAC } else { "20:6E:F1:B4:7D:E4" }
 
-if (-not $Elf) {
+if ($Cpp) {
+    if (-not $BuildDir) {
+        $BuildDir = if ($env:INKWASH_CPP_BUILD_DIR) { $env:INKWASH_CPP_BUILD_DIR } else { "C:\ikc" }
+    }
+    $cppFiles = @("flash_args", "bootloader\bootloader.bin", "partition_table\partition-table.bin", "inkwash.bin")
+    foreach ($file in $cppFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $BuildDir $file) -PathType Leaf)) {
+            throw "Refusing to flash: $(Join-Path $BuildDir $file) not found (build with scripts\build-cpp.ps1)."
+        }
+    }
+    $flashArgs = Get-Content (Join-Path $BuildDir "flash_args") -Raw
+    if ($flashArgs -notmatch '--flash_mode dio' -or $flashArgs -notmatch '--flash_freq 80m' -or $flashArgs -notmatch '--flash_size 16MB') {
+        throw "Refusing to flash: $BuildDir\flash_args is not DIO / 80 MHz / 16 MB."
+    }
+} elseif (-not $Elf) {
     # Same default as scripts\build-rust.ps1.
     $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "C:\ikw" }
     $Elf = Join-Path $targetRoot "xtensa-esp32s3-espidf\release\inkwash-note4"
 }
-$bootloader = Join-Path (Split-Path -Parent $Elf) "bootloader.bin"
+$bootloader = if ($Cpp) { $null } else { Join-Path (Split-Path -Parent $Elf) "bootloader.bin" }
 $partitions = Join-Path $repo "rust-firmware\partitions.csv"
 
-foreach ($file in @($Elf, $bootloader, $partitions)) {
+$required = if ($Cpp) { @($partitions) } else { @($Elf, $bootloader, $partitions) }
+foreach ($file in $required) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Refusing to flash: $file not found (build with scripts\build-rust.ps1 -Release)."
     }
@@ -44,7 +65,7 @@ if (Get-Command esptool.py -ErrorAction SilentlyContinue) {
 } else {
     throw "Refusing to flash: esptool is required to identify the board (run from an ESP-IDF shell)."
 }
-if (-not (Get-Command espflash -ErrorAction SilentlyContinue)) {
+if (-not $Cpp -and -not (Get-Command espflash -ErrorAction SilentlyContinue)) {
     throw "Refusing to flash: espflash is required (cargo install espflash)."
 }
 
@@ -71,6 +92,22 @@ if ($mac.ToLowerInvariant() -ne $authorizedMac.ToLowerInvariant()) {
 $flash = Invoke-Probe @("flash_id")
 if ($flash -notmatch '(?im)^Detected flash size:\s*16MB\s*$') {
     throw "Refusing to flash: $Port is not identified as a 16 MB flash device."
+}
+
+if ($Cpp) {
+    Write-Host "==> $Port is the authorized Note 4 ($mac); flashing the C++ firmware from $BuildDir"
+    Push-Location $BuildDir
+    try {
+        & $esptool --chip esp32s3 --port $Port --baud 921600 --before default_reset --after hard_reset write_flash '@flash_args'
+        if ($LASTEXITCODE -ne 0) { throw "esptool write_flash failed with exit code $LASTEXITCODE" }
+    } finally {
+        Pop-Location
+    }
+    if ($Monitor) {
+        # DTR/RTS stay low: on the USB Serial/JTAG port they reset the chip.
+        & python -m serial.tools.miniterm --raw --dtr 0 --rts 0 $Port 115200
+    }
+    return
 }
 
 Write-Host "==> $Port is the authorized Note 4 ($mac); flashing $Elf"
