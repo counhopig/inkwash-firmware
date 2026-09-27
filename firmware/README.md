@@ -27,20 +27,21 @@ wrapper (see `AGENTS.md`): ESP32-S3, 16 MB, DIO, 80 MHz, the Rust firmware's
 
 | Path | Role |
 |---|---|
-| `main/board.*` | Power latch, rails, keys, charger, battery ADC, I2C bus |
-| `main/pcf8563.*` | RTC |
-| `main/display.*` | EPD driver behind LVGL: RGB565 strips to the 1 bpp frame, partial/full refresh |
-| `main/fonts.*` | The 8x16 bitmap font as LVGL fonts at scales 1/2/3/5, icons as images |
-| `main/ui/` | Screens |
+| `main/main.cc` | Entry: board, wake cause, NVS, RTC, display, fonts, audio, then `app::Run` |
+| `main/app/` | The application task: screens, key handling, notices, commands, sync scheduling, alarms, reminders, sleep |
+| `main/core/` | Hardware-free logic (dates, model, JSON codec, schedule, protocol, sync payload); host-tested by `test/run.sh` |
+| `main/storage/` | NVS, with the Rust firmware's namespaces, keys and JSON |
+| `main/net/` | Wi-Fi, NTP, HTTPS, the sync protocol and urgent poll |
+| `main/control/` | USB `>>IW` console and the BLE control service |
+| `main/audio/` | ES8311 + I2S tones (alarm, siren, todo beep) |
+| `main/power/` | Wake cause, light sleep, deep sleep, RTC-retained Home frame |
+| `main/board.*`, `main/keys.*`, `main/pcf8563.*` | Board rails, charger, battery, keys, RTC |
+| `main/display.*` | EPD behind LVGL: frame diff picks partial or full refresh |
+| `main/fonts.*`, `main/ui/` | Bitmap fonts (ASCII + HZK CJK), icons, every screen |
 | `main/assets/` | Generated from the Rust sources by `tools/gen_assets.py` |
 
-## Phases
+## Status
 
-1. **Done** — board bring-up, RTC, LVGL on the EPD, Home screen, minute clock.
-2. Keys and navigation: key events, GO TO bar, Settings, About, notice bar.
-3. Storage (NVS, compatible keys) and the USB control protocol.
-4. Wi-Fi, HTTPS sync, alarms/todos/inbox data, Calendar, lists, ringing.
-5. PCF8563 alarms, ES8311 tones, reminders.
-6. Sleep manager: timer/alarm/key wakes, rails off, deep sleep.
-7. BLE control channel.
-8. Retire `rust-firmware/`.
+Feature parity with the Rust firmware; awaiting the on-device check. The
+Rust firmware in `rust-firmware/` stays in the tree as the fallback image
+until the C++ one is confirmed on hardware.

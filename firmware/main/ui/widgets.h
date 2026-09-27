@@ -1,6 +1,8 @@
 // Pixel-positioned primitives matching the Rust Canvas API, as LVGL objects.
 #pragma once
 
+#include <string>
+
 #include "fonts.h"
 #include "lvgl.h"
 
@@ -36,33 +38,26 @@ inline lv_obj_t* StrokeRect(lv_obj_t* parent, int x, int y, int w, int h, int th
     return obj;
 }
 
-// Canvas::draw_text_prop(x, y, scale, text): glyph tops at y.
-inline lv_obj_t* Text(lv_obj_t* parent, int x, int y, int scale, const char* text) {
+inline lv_obj_t* Label(lv_obj_t* parent, int x, int y, const lv_font_t* font, const std::string& text) {
     lv_obj_t* label = lv_label_create(parent);
     lv_obj_remove_style_all(label);
-    lv_obj_set_style_text_font(label, fonts::Prop(scale), 0);
+    lv_obj_set_style_text_font(label, font, 0);
     lv_obj_set_style_text_color(label, lv_color_black(), 0);
     lv_obj_set_style_text_letter_space(label, 0, 0);
-    lv_label_set_text(label, text);
+    lv_obj_set_style_text_line_space(label, 0, 0);
+    lv_label_set_text(label, text.c_str());
     lv_obj_set_pos(label, x, y);
     return label;
 }
 
-// Replaces a label's text and scale, keeping its top-left corner at (x, y).
-inline void SetText(lv_obj_t* label, int x, int y, int scale, const char* text) {
-    lv_obj_set_style_text_font(label, fonts::Prop(scale), 0);
-    lv_label_set_text(label, text);
-    lv_obj_set_pos(label, x, y);
+// Canvas::draw_text_prop(x, y, scale, text): glyph tops at y.
+inline lv_obj_t* Text(lv_obj_t* parent, int x, int y, int scale, const std::string& text) {
+    return Label(parent, x, y, fonts::Prop(scale), text);
 }
 
-// A white screen to build a page on.
-inline lv_obj_t* Page() {
-    lv_obj_t* screen = lv_obj_create(nullptr);
-    lv_obj_remove_style_all(screen);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
-    lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    return screen;
+// Canvas::draw_text_small(x, y, text)
+inline lv_obj_t* SmallText(lv_obj_t* parent, int x, int y, const std::string& text) {
+    return Label(parent, x, y, fonts::Small(), text);
 }
 
 }  // namespace ui

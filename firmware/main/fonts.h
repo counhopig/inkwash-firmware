@@ -1,25 +1,34 @@
-// The Rust firmware's 8x16 proportional bitmap font, exposed as LVGL fonts
-// at the integer scales the UI uses (1, 2, 3, 5), plus the status icons.
+// The Rust firmware's bitmap fonts as LVGL fonts (rust-firmware/src/
+// {canvas,font8x16,font5x7,font_cjk}.rs), so text renders pixel for pixel
+// the same:
+//  - Prop(scale): 8x16 proportional ASCII plus 16x16 CJK, integer-scaled.
+//  - Small(): 5x7 ASCII plus 12x12 CJK.
+// Glyph tops sit at the label's y, like Canvas::draw_text_*.
 #pragma once
+
+#include <string>
+#include <vector>
 
 #include "assets/icons.h"
 #include "lvgl.h"
 
 namespace fonts {
 
-// Registers the fonts; call once after lv_init().
 void Init();
 
-// The font at `scale` (1, 2, 3 or 5; other values fall back to 1).
-const lv_font_t* Prop(int scale);
+const lv_font_t* Prop(int scale);  // 1 to 5
+const lv_font_t* Small();
 
-// Rendered width of `text` in pixels, matching Canvas::text_prop_width.
-int PropWidth(const char* text, int scale);
+int PropWidth(const std::string& text, int scale);  // Canvas::text_prop_width
+int SmallWidth(const std::string& text);            // Canvas::text_small_width
+int FitScale(const std::string& text, int max_width, int max_scale);
 
-// Largest scale <= max_scale whose width fits max_width (at least 1).
-int FitScale(const char* text, int max_width, int max_scale);
+// screens.rs truncate_prop: cut to max_width with a trailing ellipsis.
+std::string TruncateProp(const std::string& text, int max_width);
+// screens.rs wrap_text_prop / wrap_text_small.
+std::vector<std::string> WrapProp(const std::string& text, int max_width);
+std::vector<std::string> WrapSmall(const std::string& text, int max_width);
 
-// Places `icon` with its top-left corner at (x, y), drawn in black.
 lv_obj_t* CreateIcon(lv_obj_t* parent, const assets::Icon& icon, int x, int y);
 
 }  // namespace fonts

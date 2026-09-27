@@ -25,6 +25,9 @@ bool KeyDown(Key key);
 
 Charge ReadCharge();
 
+// Green LED (GPIO3, low = on).
+void SetChargeLed(bool on);
+
 // Battery in percent from the ADC, or -1 when the read fails.
 int BatteryPercent();
 

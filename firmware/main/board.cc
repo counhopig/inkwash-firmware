@@ -121,6 +121,10 @@ Charge ReadCharge() {
     return charge;
 }
 
+void SetChargeLed(bool on) {
+    gpio_set_level(kLed, on ? 0 : 1);
+}
+
 int BatteryPercent() {
     constexpr int kSamples = 10;
     int sum_mv = 0;
