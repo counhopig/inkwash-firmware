@@ -34,7 +34,8 @@ wrapper (see `AGENTS.md`): ESP32-S3, 16 MB, DIO, 80 MHz, the Rust firmware's
 | `main/net/` | Wi-Fi, NTP, HTTPS, the sync protocol and urgent poll |
 | `main/control/` | USB `>>IW` console and the BLE control service |
 | `main/audio/` | ES8311 + I2S tones (alarm, siren, todo beep) |
-| `main/power/` | Wake cause, light sleep, deep sleep, RTC-retained Home frame |
+| `main/power/` | Wake cause, light sleep, deep sleep, RTC-retained Home frame and boot ledger |
+| `main/app/safe_mode.*` | Safe mode after 3 failed boots in a row: USB console only, Enter retries, sleeps after 5 min without USB |
 | `main/board.*`, `main/keys.*`, `main/pcf8563.*` | Board rails, charger, battery, keys, RTC |
 | `main/display.*` | EPD behind LVGL: frame diff picks partial or full refresh |
 | `main/fonts.*`, `main/ui/` | Bitmap fonts (ASCII + HZK CJK), icons, every screen |

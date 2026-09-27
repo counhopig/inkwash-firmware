@@ -67,4 +67,7 @@ constexpr size_t kSettingsAbout = 3;
 constexpr uint16_t kSyncIntervals[5] = {1, 5, 10, 30, 60};
 constexpr size_t kNavDestinations = 6;
 
+// Minimum safe mode after repeated failed boots.
+void DrawSafeMode(lv_obj_t* s, const std::string& reason);
+
 }  // namespace ui

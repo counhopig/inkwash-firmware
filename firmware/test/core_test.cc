@@ -1,9 +1,11 @@
 // Host tests for firmware/main/core. Build and run with ./run.sh.
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 #include "cJSON.h"
+#include "core/boot_guard.h"
 #include "core/codec.h"
 #include "core/datetime.h"
 #include "core/protocol.h"
@@ -179,12 +181,44 @@ static void TestSyncPayload() {
     CHECK(back.data.alarms.size() == 1 && back.uploaded_todo_ids == std::vector<uint8_t>{4});
 }
 
+void TestBootGuard() {
+    using boot_guard::Ledger;
+    using boot_guard::ResetKind;
+    // Cold memory starts a fresh run.
+    for (Ledger raw : {Ledger{0, 0}, Ledger{0xDEADBEEF, 2}, Ledger{boot_guard::kMagic, 4},
+                       Ledger{boot_guard::kMagic + 1, 1}}) {
+        CHECK(!raw.Recorded());
+        CHECK(raw.NoteAttempt(ResetKind::Panic).failures == 1);
+        CHECK(!raw.Exhausted());
+    }
+    // Consecutive failures reach the limit and saturate.
+    Ledger l = Ledger{}.NoteAttempt(ResetKind::PowerOn);
+    CHECK(l.failures == 0 && !l.Exhausted());
+    l = l.NoteAttempt(ResetKind::Panic);
+    CHECK(l.failures == 1 && !l.Exhausted());
+    l = l.NoteAttempt(ResetKind::TaskWatchdog);
+    CHECK(l.failures == 2 && !l.Exhausted());
+    l = l.NoteAttempt(ResetKind::Brownout);
+    CHECK(l.failures == 3 && l.Exhausted());
+    l = l.NoteAttempt(ResetKind::Panic);
+    CHECK(l.failures == 3 && l.Exhausted());
+    // An operator action or a deep-sleep wake starts over.
+    for (ResetKind k : {ResetKind::PowerOn, ResetKind::ExternalReset, ResetKind::DeepSleep,
+                        ResetKind::Usb, ResetKind::Jtag, ResetKind::Other}) {
+        CHECK(!l.NoteAttempt(k).Exhausted());
+        CHECK(l.NoteAttempt(k).failures == 0);
+    }
+    // A finished boot clears the count but keeps the marker.
+    CHECK(l.Cleared().Recorded() && l.Cleared().failures == 0);
+}
+
 int main() {
     TestDatetime();
     TestCodecMatchesSerde();
     TestSchedule();
     TestProtocol();
     TestSyncPayload();
+    TestBootGuard();
     if (g_failures == 0) {
         std::printf("all core tests passed\n");
     }

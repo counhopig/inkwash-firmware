@@ -555,6 +555,17 @@ void DrawBlePairing(lv_obj_t* s, bool have_passkey, uint32_t passkey) {
     Text(s, 8, 112, 1, "5e22-48d8...");
 }
 
+void DrawSafeMode(lv_obj_t* s, const std::string& reason) {
+    Header(s, "SAFE MODE");
+    Text(s, 8, 60, 1, "BOOT LOOP DETECTED");
+    const std::vector<std::string> lines = fonts::WrapProp(reason, 368);
+    int y = 80;
+    for (size_t i = 0; i < lines.size() && i < 2; ++i, y += 16) Text(s, 8, y, 1, lines[i]);
+    Text(s, 8, 140, 1, "STORED DATA UNTOUCHED");
+    Text(s, 8, 156, 1, "PRESS ENTER TO RETRY");
+    Text(s, 8, 172, 1, "USB CONSOLE STAYS AVAILABLE");
+}
+
 void DrawNavigationBar(lv_obj_t* s, size_t selected) {
     constexpr int kX = 16, kY = 34, kW = 176, kH = 266, kRowH = 33;
     FillRect(s, kX, kY, kW, kH, false);

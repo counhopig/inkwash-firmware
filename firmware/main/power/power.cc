@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -26,6 +27,31 @@ constexpr uint32_t kMagic = 0x494B5731;  // "IKW1"
 
 RTC_NOINIT_ATTR Retained g_retained;
 RTC_NOINIT_ATTR uint32_t g_controlled_restart;
+// Separate from g_retained: that one is wiped on every non-deep-sleep reset,
+// the ledger must survive a panic reset. Plain words, not boot_guard::Ledger:
+// its member initializers would make a static constructor zero it at boot.
+RTC_NOINIT_ATTR uint32_t g_boot_magic;
+RTC_NOINIT_ATTR uint32_t g_boot_failures;
+
+boot_guard::ResetKind ResetKindOf(esp_reset_reason_t reason) {
+    using boot_guard::ResetKind;
+    switch (reason) {
+        case ESP_RST_POWERON: return ResetKind::PowerOn;
+        case ESP_RST_EXT: return ResetKind::ExternalReset;
+        case ESP_RST_SW: return ResetKind::SoftwareReset;
+        case ESP_RST_PANIC: return ResetKind::Panic;
+        case ESP_RST_INT_WDT: return ResetKind::InterruptWatchdog;
+        case ESP_RST_TASK_WDT: return ResetKind::TaskWatchdog;
+        case ESP_RST_WDT: return ResetKind::Watchdog;
+        case ESP_RST_DEEPSLEEP: return ResetKind::DeepSleep;
+        case ESP_RST_BROWNOUT: return ResetKind::Brownout;
+        case ESP_RST_USB: return ResetKind::Usb;
+        case ESP_RST_JTAG: return ResetKind::Jtag;
+        case ESP_RST_PWR_GLITCH: return ResetKind::PowerGlitch;
+        case ESP_RST_CPU_LOCKUP: return ResetKind::CpuLockup;
+        default: return ResetKind::Other;
+    }
+}
 
 void PrepareCommon() {
     // Keep the NFC tag unpowered and the battery latched on through sleep.
@@ -41,6 +67,29 @@ void PrepareCommon() {
 }
 
 }  // namespace
+
+boot_guard::Ledger NoteBootAttempt(boot_guard::ResetKind* reset) {
+    const boot_guard::ResetKind kind = ResetKindOf(esp_reset_reason());
+    const boot_guard::Ledger next = boot_guard::Ledger{g_boot_magic, g_boot_failures}.NoteAttempt(kind);
+    g_boot_magic = next.magic;
+    g_boot_failures = next.failures;
+    if (reset) *reset = kind;
+    return next;
+}
+
+void ClearBootLedger() {
+    g_boot_magic = boot_guard::kMagic;
+    g_boot_failures = 0;
+}
+
+void DeepSleepUntilEnter() {
+    PrepareCommon();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    esp_sleep_enable_ext1_wakeup_io(1ULL << kKeyEnter, ESP_EXT1_WAKEUP_ANY_LOW);
+    ESP_LOGI(kTag, "deep sleep; wake on Enter only");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_deep_sleep_start();
+}
 
 Retained& State() {
     if (g_retained.magic != kMagic) {

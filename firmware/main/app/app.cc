@@ -48,6 +48,8 @@ constexpr int64_t kRingAutoSilenceMs = 300000;
 constexpr int64_t kBlePairingTimeoutMs = 120000;
 constexpr int64_t kDeepSleepIdleMs = 180000;
 constexpr int64_t kBackgroundIdleMs = 2000;
+// A run that stays up this long no longer counts as a failed boot.
+constexpr int64_t kBootHealthyMs = 30 * 1000;
 constexpr uint64_t kSleepWakePeriodSecs = 600;
 constexpr uint64_t kSleepWakeMarginSecs = 15;
 constexpr uint64_t kUrgentPeriodSecs = 30;
@@ -211,6 +213,7 @@ struct State {
     bool never_synced = true;
     bool network_failed = false;
     bool urgent_synced = false;
+    bool boot_ledger_cleared = false;
     std::vector<uint8_t> edited_alarms;  // toggled while a sync ran
     std::vector<uint8_t> edited_todos;
     bool need_boot_ntp = false;
@@ -1114,6 +1117,7 @@ int64_t TimerWakeSecs() {
 }
 
 [[noreturn]] void GoToDeepSleep() {
+    power::ClearBootLedger();  // reaching sleep is a healthy run
     g.notice.reset();
     if (g.screen.kind != ScreenKind::Home) g.screen = Screen{ScreenKind::Home};
     const ui::HomeModel home = CurrentHome();
@@ -1158,6 +1162,11 @@ int64_t NextWaitMs() {
 bool Housekeeping() {
     bool redraw = false;
     const int64_t now_ms = NowMs();
+    if (!g.boot_ledger_cleared && now_ms >= kBootHealthyMs) {
+        power::ClearBootLedger();
+        g.boot_ledger_cleared = true;
+        ESP_LOGI(kTag, "boot ledger cleared: running normally");
+    }
     const DateTime previous = g.now;
     ReadClock();
     const bool minute_changed = g.have_clock && !previous.SameMinute(g.now);

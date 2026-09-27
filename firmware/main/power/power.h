@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "core/boot_guard.h"
+
 namespace power {
 
 enum class WakeCause { PowerOn, Enter, Down, RtcAlarm, Timer, ControlledRestart };
@@ -21,6 +23,15 @@ void EnableLightSleep();
 // Restarts through a short deep sleep (never esp_restart, see README).
 // The next boot reports WakeCause::ControlledRestart.
 [[noreturn]] void Restart();
+
+// Records this boot attempt in the retained boot ledger (core/boot_guard.h)
+// and returns the updated ledger. Call first thing in app_main.
+boot_guard::Ledger NoteBootAttempt(boot_guard::ResetKind* reset);
+// The boot path finished: this run no longer counts as a failed boot.
+void ClearBootLedger();
+
+// Deep sleep that only the Enter key ends (safe mode: no timer, no RTC alarm).
+[[noreturn]] void DeepSleepUntilEnter();
 
 // Survives deep sleep in RTC memory.
 struct Retained {

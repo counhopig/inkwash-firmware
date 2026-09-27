@@ -6,6 +6,7 @@ idf_component_register(
         "pcf8563.cc"
         "display.cc"
         "fonts.cc"
+        "core/boot_guard.cc"
         "core/codec.cc"
         "core/datetime.cc"
         "core/protocol.cc"
@@ -20,6 +21,7 @@ idf_component_register(
         "power/power.cc"
         "ui/screens.cc"
         "app/app.cc"
+        "app/safe_mode.cc"
     INCLUDE_DIRS "."
     REQUIRES
         driver
