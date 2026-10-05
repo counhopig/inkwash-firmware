@@ -1,4 +1,4 @@
-// PCF8563 real-time clock on I2C0 (rust-firmware/src/rtc.rs).
+// PCF8563 real-time clock on I2C0.
 #pragma once
 
 #include <cstdint>

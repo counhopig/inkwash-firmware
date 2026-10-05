@@ -5,19 +5,11 @@
 
 # ESP-IDF
 build/
+firmware/build-secure/
 managed_components/
 dependencies.lock
 sdkconfig
 sdkconfig.old
-
-# Rust build artifacts
-rust-firmware/target/
-rust-firmware/target-diagnostic/
-rust-firmware/target-secure/
-rust-firmware/.embuild/
-logic/target/
-tools/*/target/
-tools/*/*.png
 
 # Device backups and local build output
 backups/*.bin
@@ -36,6 +28,6 @@ __pycache__/
 .claude/
 
 # vscode - editor config is ignored, except the machine-independent
-# rust-analyzer settings (no absolute paths; see the file's header comment)
+# C++ project settings
 .vscode/*
 !.vscode/settings.json

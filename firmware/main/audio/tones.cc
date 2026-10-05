@@ -1,6 +1,8 @@
+#include "board_pins.h"
 #include "audio/tones.h"
 
 #include <cmath>
+#include <atomic>
 
 #include "board.h"
 #include "driver/gpio.h"
@@ -16,9 +18,8 @@ namespace {
 constexpr char kTag[] = "tones";
 constexpr uint16_t kCodecAddress = 0x18;
 constexpr uint32_t kSampleRate = 16000;
-constexpr gpio_num_t kPaEnable = GPIO_NUM_46;
 
-// Same tones as the Rust firmware.
+// Device alert tones.
 constexpr float kAlarmHz = 880.0f;
 constexpr float kAlarmBurstSecs = 0.05f;
 constexpr int kAlarmGapMs = 150;
@@ -36,6 +37,8 @@ i2c_master_dev_handle_t g_codec = nullptr;
 i2s_chan_handle_t g_tx = nullptr;
 QueueHandle_t g_queue = nullptr;
 bool g_awake = false;
+std::atomic<bool> g_playing{false};
+std::atomic<unsigned> g_pending{0};
 
 bool WriteReg(uint8_t reg, uint8_t value) {
     const uint8_t buf[2] = {reg, value};
@@ -46,7 +49,7 @@ bool ReadReg(uint8_t reg, uint8_t* value) {
     return i2c_master_transmit_receive(g_codec, &reg, 1, value, 1, 100) == ESP_OK;
 }
 
-// ES8311 bring-up, register for register as rust-firmware/src/audio.rs.
+// ES8311 register initialization.
 bool CodecInit() {
     uint8_t v = 0;
     bool ok = WriteReg(0x45, 0x00) && WriteReg(0x00, 0x1F);
@@ -90,14 +93,45 @@ void CodecStandby() {
     WriteReg(0x45, 0x01);
 }
 
+bool InitPlayback() {
+    gpio_set_level(board::pins::PaEnable, 0);
+    i2c_device_config_t dev = {};
+    dev.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev.device_address = kCodecAddress;
+    dev.scl_speed_hz = 400000;
+    if (!g_codec && i2c_master_bus_add_device(board::I2cBus(), &dev, &g_codec) != ESP_OK) return false;
+
+    i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    if (i2s_new_channel(&chan, &g_tx, nullptr) != ESP_OK) return false;
+    i2s_std_config_t std_cfg = {};
+    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate);
+    std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    std_cfg.gpio_cfg.mclk = board::pins::AudioMclk;
+    std_cfg.gpio_cfg.bclk = board::pins::AudioBclk;
+    std_cfg.gpio_cfg.ws = board::pins::AudioWs;
+    std_cfg.gpio_cfg.dout = board::pins::AudioOut;
+    std_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
+    if (i2s_channel_init_std_mode(g_tx, &std_cfg) != ESP_OK) {
+        i2s_del_channel(g_tx);
+        g_tx = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
 bool PlaySine(float hz, float secs, int16_t amplitude) {
+    if (!g_tx && !InitPlayback()) return false;
     if (!g_awake && !CodecInit()) {
         ESP_LOGW(kTag, "codec wake failed");
         return false;
     }
-    gpio_set_level(kPaEnable, 1);
+    gpio_set_level(board::pins::PaEnable, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
-    i2s_channel_enable(g_tx);
+    if (i2s_channel_enable(g_tx) != ESP_OK) {
+        gpio_set_level(board::pins::PaEnable, 0);
+        return false;
+    }
     constexpr int kChunk = 256;
     int16_t buf[kChunk * 2];
     const int total = static_cast<int>(kSampleRate * secs);
@@ -110,18 +144,27 @@ bool PlaySine(float hz, float secs, int16_t amplitude) {
             buf[i * 2 + 1] = s;
         }
         size_t written = 0;
-        i2s_channel_write(g_tx, buf, n * 4, &written, pdMS_TO_TICKS(5000));
+        if (i2s_channel_write(g_tx, buf, n * 4, &written, 500) != ESP_OK ||
+            written != static_cast<size_t>(n * 4)) {
+            i2s_channel_disable(g_tx);
+            gpio_set_level(board::pins::PaEnable, 0);
+            ESP_LOGW(kTag, "audio DMA write failed");
+            return false;
+        }
         frame += n;
     }
     vTaskDelay(pdMS_TO_TICKS(150));  // drain the DMA before the amplifier goes off
     i2s_channel_disable(g_tx);
-    gpio_set_level(kPaEnable, 0);
+    gpio_set_level(board::pins::PaEnable, 0);
     return true;
 }
 
 // Waits up to ms for a new command; returns true (and *cmd) when one came.
 bool WaitCommand(int ms, Command* cmd) {
-    return xQueueReceive(g_queue, cmd, ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(ms)) == pdTRUE;
+    if (xQueueReceive(g_queue, cmd, ms < 0 ? portMAX_DELAY : pdMS_TO_TICKS(ms)) != pdTRUE) return false;
+    g_playing.store(true);
+    g_pending.fetch_sub(1);
+    return true;
 }
 
 void Task(void*) {
@@ -130,6 +173,7 @@ void Task(void*) {
         Command next;
         if (mode == Command::Stop) {
             CodecStandby();
+            g_playing.store(false);
             WaitCommand(-1, &next);
             mode = next;
             continue;
@@ -161,42 +205,22 @@ void Task(void*) {
 }  // namespace
 
 bool Init() {
-    gpio_set_level(kPaEnable, 0);
-    i2c_device_config_t dev = {};
-    dev.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    dev.device_address = kCodecAddress;
-    dev.scl_speed_hz = 400000;
-    if (i2c_master_bus_add_device(board::I2cBus(), &dev, &g_codec) != ESP_OK) return false;
-
-    i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    if (i2s_new_channel(&chan, &g_tx, nullptr) != ESP_OK) return false;
-    i2s_std_config_t std_cfg = {};
-    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate);
-    std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-    std_cfg.gpio_cfg.mclk = GPIO_NUM_14;
-    std_cfg.gpio_cfg.bclk = GPIO_NUM_15;
-    std_cfg.gpio_cfg.ws = GPIO_NUM_38;
-    std_cfg.gpio_cfg.dout = GPIO_NUM_45;
-    std_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
-    if (i2s_channel_init_std_mode(g_tx, &std_cfg) != ESP_OK) return false;
-
-    if (!CodecInit()) {
-        ESP_LOGW(kTag, "ES8311 not responding; tones disabled");
+    g_queue = xQueueCreate(8, sizeof(Command));
+    if (!g_queue) return false;
+    if (xTaskCreate(Task, "tones", 4096, nullptr, 6, nullptr) != pdPASS) {
+        vQueueDelete(g_queue);
+        g_queue = nullptr;
         return false;
     }
-    CodecStandby();
-    g_queue = xQueueCreate(8, sizeof(Command));
-    xTaskCreate(Task, "tones", 4096, nullptr, 6, nullptr);
     return true;
 }
 
 namespace {
 void Send(Command cmd) {
     if (!g_queue) return;
-    if (xQueueSend(g_queue, &cmd, 0) != pdTRUE) {
-        xQueueReset(g_queue);
-        xQueueSend(g_queue, &cmd, 0);
-    }
+    g_pending.fetch_add(1);
+    // The tone task owns no application locks while consuming commands.
+    xQueueSend(g_queue, &cmd, portMAX_DELAY);
 }
 }  // namespace
 
@@ -207,5 +231,7 @@ void Start(Tone tone) {
 }
 
 void Stop() { Send(Command::Stop); }
+
+bool Busy() { return g_playing.load() || g_pending.load() != 0; }
 
 }  // namespace tones

@@ -1,5 +1,4 @@
-// Alarms, todos and inbox items: the same data the Rust firmware stores and
-// the server sends (see logic/src/{alarm_schedule,todo,inbox_item}.rs).
+// Alarm, todo and inbox models shared with the server contract.
 #pragma once
 
 #include <cstdint>

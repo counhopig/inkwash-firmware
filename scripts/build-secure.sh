@@ -27,7 +27,7 @@ printf '%s\n' \
     'CONFIG_SECURE_BOOT_ALLOW_ROM_BASIC=n' \
     > "$secure_defaults"
 
-export INKWASH_BUILD_PROFILE=secure
-export INKWASH_SECURE_BOOT_SIGNING_KEY="$key"
-export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;$secure_defaults"
-./scripts/build-rust.sh --release --locked
+export INKWASH_CPP_BUILD_DIR="${INKWASH_CPP_BUILD_DIR:-$PWD/firmware/build-secure}"
+mkdir -p "$INKWASH_CPP_BUILD_DIR"
+./scripts/build-cpp.sh -D "SDKCONFIG=$INKWASH_CPP_BUILD_DIR/sdkconfig" \
+    -D "SDKCONFIG_DEFAULTS=$PWD/firmware/sdkconfig.defaults;$secure_defaults"

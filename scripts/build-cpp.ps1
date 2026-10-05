@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 
 # Locate ESP-IDF without hardcoding an install path: honor $env:IDF_PATH
 # when set, else probe the conventional install locations and pick the
-# newest match. (Mirrors scripts/build-rust.sh; the Windows side is
+# newest match. (the Windows side is
 # unverified on a real toolchain.)
 $idfRoot = $null
 if ($env:IDF_PATH) {
@@ -62,13 +62,6 @@ if ($prepend.Count -gt 0) {
 
 . (Join-Path $idfRoot "export.ps1")
 
-if ($env:CARGO_HOME) {
-    $cargoBin = Join-Path $env:CARGO_HOME "bin"
-    if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) {
-        $env:Path = "$cargoBin;$env:Path"
-    }
-}
-
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $project = Join-Path $repo "firmware"
 if (-not (Test-Path (Join-Path $project "components\lvgl\lvgl.h"))) {
@@ -79,7 +72,7 @@ if (-not (Test-Path (Join-Path $project "components\lvgl\lvgl.h"))) {
 if (-not $BuildDir) {
     $BuildDir = if ($env:INKWASH_CPP_BUILD_DIR) { $env:INKWASH_CPP_BUILD_DIR } else { "C:\ikc" }
 }
-& idf.py -C $project -B $BuildDir build
+& idf.py -C $project -B $BuildDir -D CMAKE_EXPORT_COMPILE_COMMANDS=ON reconfigure build
 if ($LASTEXITCODE -ne 0) {
     throw "idf.py build failed with exit code $LASTEXITCODE"
 }

@@ -12,6 +12,7 @@ constexpr uint8_t kRegCtrl1 = 0x00;
 constexpr uint8_t kRegCtrl2 = 0x01;
 constexpr uint8_t kRegTime = 0x02;
 constexpr uint8_t kRegAlarm = 0x09;
+constexpr uint8_t kRegTimerControl = 0x0E;
 constexpr uint8_t kAlarmFlag = 0x08;
 constexpr uint8_t kAlarmIntEnable = 0x02;
 
@@ -35,7 +36,7 @@ bool Write(uint8_t reg, const uint8_t* data, size_t len) {
 bool UpdateCtrl2(uint8_t clear, uint8_t set) {
     uint8_t ctrl2 = 0;
     if (!Read(kRegCtrl2, &ctrl2, 1)) return false;
-    ctrl2 = static_cast<uint8_t>((ctrl2 & ~clear) | set);
+    ctrl2 = static_cast<uint8_t>(((ctrl2 & 0x1F) & ~clear) | set);
     return Write(kRegCtrl2, &ctrl2, 1);
 }
 
@@ -56,7 +57,9 @@ bool Init(i2c_master_bus_handle_t bus) {
         ESP_LOGE(kTag, "add device failed");
         return false;
     }
-    return true;
+    const uint8_t disabled = 0;
+    // Keep AF intact until the application has handled an alarm wake.
+    return Write(kRegTimerControl, &disabled, 1) && UpdateCtrl2(0x05, 0);
 }
 
 bool ReadTime(DateTime* out) {
@@ -105,7 +108,8 @@ bool SetAlarm(const schedule::AlarmRegs& regs) {
                       : static_cast<uint8_t>(0x80),
         regs.weekday >= 0 ? static_cast<uint8_t>(regs.weekday & 0x07) : static_cast<uint8_t>(0x80),
     };
-    return Write(kRegAlarm, payload, sizeof(payload)) && UpdateCtrl2(0, kAlarmIntEnable);
+    return UpdateCtrl2(kAlarmIntEnable, 0) && Write(kRegAlarm, payload, sizeof(payload)) &&
+           UpdateCtrl2(kAlarmFlag, kAlarmIntEnable);
 }
 
 bool ClearAlarm() {

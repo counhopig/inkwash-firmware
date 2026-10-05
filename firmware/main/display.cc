@@ -4,6 +4,7 @@
 #include <cstring>
 #include <vector>
 
+#include "core/refresh_policy.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -18,8 +19,6 @@ constexpr int kHeight = ZECTRIX_EPD_PANEL_HEIGHT;
 constexpr int kRowBytes = kWidth / 8;
 constexpr size_t kFrameBytes = ZECTRIX_EPD_1BPP_FRAME_BYTES;
 constexpr int kRenderRows = 40;
-constexpr int kMaxPartials = 20;
-constexpr int kMinPartialsBeforeBigFull = 5;
 
 zectrix_epd_handle_t g_epd = nullptr;
 lv_display_t* g_display = nullptr;
@@ -144,15 +143,16 @@ void AdoptPanelContent(uint8_t partial_refreshes) {
     }
 }
 
-void Update(Refresh mode) {
+bool Healthy() { return g_have_base; }
+
+bool Update(Refresh mode) {
     lv_timer_handler();
     lv_refr_now(g_display);
     int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
     const bool changed = ChangedArea(&x1, &y1, &x2, &y2);
-    if (mode != Refresh::Full && g_have_base && !changed) return;
-    const bool big = changed && (x2 - x1 + 1) * (y2 - y1 + 1) > kWidth * kHeight * 7 / 10;
-    const bool full = mode == Refresh::Full || !g_have_base || g_partials >= kMaxPartials ||
-                      (big && g_partials >= kMinPartialsBeforeBigFull);
+    const auto plan = refresh_policy::Choose(g_have_base, changed, mode == Refresh::Full, false);
+    if (plan == refresh_policy::Plan::None) return true;
+    bool full = plan == refresh_policy::Plan::Full;
     const int64_t start = esp_timer_get_time();
     esp_err_t err;
     if (full) {
@@ -161,10 +161,10 @@ void Update(Refresh mode) {
         err = RefreshPartial(x1, y1, x2, y2);
         if (err != ESP_OK) {
             ESP_LOGW(kTag, "partial refresh failed (0x%x); falling back to full", err);
+            full = true;
             err = RefreshFull();
-            if (err == ESP_OK) g_partials = 0;
         } else {
-            ++g_partials;
+            if (g_partials < 255) ++g_partials;
         }
     }
     if (err == ESP_OK) {
@@ -179,6 +179,7 @@ void Update(Refresh mode) {
     ESP_LOGI(kTag, "%s refresh (%d,%d)-(%d,%d) %s in %lld ms", full ? "full" : "partial", x1, y1,
              x2, y2, err == ESP_OK ? "ok" : "FAILED",
              static_cast<long long>((esp_timer_get_time() - start) / 1000));
+    return err == ESP_OK;
 }
 
 }  // namespace display

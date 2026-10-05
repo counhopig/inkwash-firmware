@@ -1,6 +1,4 @@
-// The Rust firmware's bitmap fonts as LVGL fonts (rust-firmware/src/
-// {canvas,font8x16,font5x7,font_cjk}.rs), so text renders pixel for pixel
-// the same:
+// Bitmap fonts exposed as LVGL fonts:
 //  - Prop(scale): 8x16 proportional ASCII plus 16x16 CJK, integer-scaled.
 //  - Small(): 5x7 ASCII plus 12x12 CJK.
 // Glyph tops sit at the label's y, like Canvas::draw_text_*.

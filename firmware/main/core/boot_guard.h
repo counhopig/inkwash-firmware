@@ -1,4 +1,4 @@
-// Boot-attempt ledger (logic/src/boot_guard.rs).
+// Boot-attempt ledger.
 //
 // A firmware that panics early reboots in a loop and drains the battery. The
 // ledger counts consecutive *failed* boots (panic, watchdog, brownout,

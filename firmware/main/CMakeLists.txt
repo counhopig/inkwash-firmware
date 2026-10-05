@@ -7,6 +7,9 @@ idf_component_register(
         "display.cc"
         "fonts.cc"
         "core/boot_guard.cc"
+        "core/sleep_trace.cc"
+        "core/power_policy.cc"
+        "core/refresh_policy.cc"
         "core/codec.cc"
         "core/datetime.cc"
         "core/protocol.cc"
@@ -21,6 +24,15 @@ idf_component_register(
         "power/power.cc"
         "ui/screens.cc"
         "app/app.cc"
+        "app/state.cc"
+        "app/view.cc"
+        "app/alarms.cc"
+        "app/reminders.cc"
+        "app/commands.cc"
+        "app/sync.cc"
+        "app/pairing.cc"
+        "app/input.cc"
+        "app/lifecycle.cc"
         "app/safe_mode.cc"
     INCLUDE_DIRS "."
     REQUIRES
@@ -44,9 +56,9 @@ idf_component_register(
         lvgl
         zectrix_epd
     EMBED_FILES
-        "../../rust-firmware/assets/hzk16.bin"
-        "../../rust-firmware/assets/hzk12.bin"
-        "../../rust-firmware/assets/cjk_index.bin"
+        "../assets/hzk16.bin"
+        "../assets/hzk12.bin"
+        "../assets/cjk_index.bin"
 )
 
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)
@@ -54,9 +66,13 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror -Wno-missi
 
 # The build time seeds the RTC after a power loss; the version is shown on
 # the About screen.
-string(TIMESTAMP INKWASH_BUILD_EPOCH "%s" UTC)
+if(DEFINED ENV{SOURCE_DATE_EPOCH} AND "$ENV{SOURCE_DATE_EPOCH}" MATCHES "^[0-9]+$")
+    set(INKWASH_BUILD_EPOCH "$ENV{SOURCE_DATE_EPOCH}")
+else()
+    string(TIMESTAMP INKWASH_BUILD_EPOCH "%s" UTC)
+endif()
 execute_process(
-    COMMAND git describe --always --dirty
+    COMMAND git describe --always --dirty --tags
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
     OUTPUT_VARIABLE INKWASH_GIT_REV
     OUTPUT_STRIP_TRAILING_WHITESPACE

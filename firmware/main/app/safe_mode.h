@@ -1,4 +1,4 @@
-// Minimum safe mode (rust-firmware/src/main.rs run_safe_mode): entered after
+// Minimum safe mode: entered after
 // kMaxBootFailures consecutive failed boots. Shows why, never touches stored
 // data, keeps the USB console answering, and does not bring up Wi-Fi, BLE,
 // audio or the RTC alarm path that may be what keeps crashing.

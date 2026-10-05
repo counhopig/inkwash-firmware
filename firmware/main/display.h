@@ -4,7 +4,7 @@
 // panel's 1 bpp frame. Update() compares that frame with what the panel
 // shows and partially refreshes the bounding box of the changed pixels, so a
 // screen can be rebuilt from scratch and still refresh only what changed. A
-// full refresh clears accumulated ghosting now and then.
+// full refresh establishes the baseline after a scene change or recovery.
 #pragma once
 
 #include <cstdint>
@@ -21,7 +21,10 @@ enum class Refresh { Auto, Full };
 
 // Renders pending LVGL changes and refreshes the panel. Blocks until the
 // panel refresh completes (~0.5 s partial, ~2-3 s full).
-void Update(Refresh mode = Refresh::Auto);
+bool Update(Refresh mode = Refresh::Auto);
+
+// False after a failed refresh; sleep must wait for a successful recovery.
+bool Healthy();
 
 // After a deep-sleep wake: renders the current LVGL screen and declares it to
 // be what the panel already shows, without refreshing (see

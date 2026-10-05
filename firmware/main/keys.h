@@ -1,4 +1,4 @@
-// Key events with the Rust firmware's timing (rust-firmware/src/button.rs):
+// Key events:
 // 20 ms polls, 4-sample debounce, long press after 1 s. A short press is
 // reported on release; a long press fires while held and its release is
 // reported separately.

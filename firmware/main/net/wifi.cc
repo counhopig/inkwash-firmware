@@ -1,6 +1,7 @@
 #include "net/wifi.h"
 
 #include <ctime>
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 
@@ -27,16 +28,22 @@ constexpr EventBits_t kFailed = BIT1;
 
 bool g_initialized = false;
 bool g_started = false;
+std::atomic<bool> g_connected{false};
 esp_netif_t* g_netif = nullptr;
 EventGroupHandle_t g_events = nullptr;
 
 void OnEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        g_connected.store(false);
         const auto* info = static_cast<wifi_event_sta_disconnected_t*>(data);
         ESP_LOGW(kTag, "disconnected (reason %d)", info ? info->reason : -1);
         xEventGroupSetBits(g_events, kFailed);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        g_connected.store(true);
         xEventGroupSetBits(g_events, kGotIp);
+    } else if ((base == WIFI_EVENT && id == WIFI_EVENT_STA_STOP) ||
+               (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP)) {
+        g_connected.store(false);
     }
 }
 
@@ -54,8 +61,8 @@ bool EnsureInit() {
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_set_mode(WIFI_MODE_STA);
     g_events = xEventGroupCreate();
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, OnEvent, nullptr);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, OnEvent, nullptr);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, OnEvent, nullptr);
+    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, OnEvent, nullptr);
     g_initialized = true;
     return true;
 }
@@ -82,6 +89,10 @@ bool WaitForIp(int64_t deadline_us) {
 
 bool UsedThisBoot() {
     return g_initialized;
+}
+
+bool IsConnected() {
+    return g_connected.load();
 }
 
 bool Connect(const store::WifiCreds& creds, std::string* error) {
@@ -120,6 +131,7 @@ bool Connect(const store::WifiCreds& creds, std::string* error) {
 }
 
 void Disconnect() {
+    g_connected.store(false);
     if (!g_started) return;
     esp_wifi_disconnect();
     esp_wifi_stop();

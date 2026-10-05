@@ -1,5 +1,4 @@
-// JSON for the model, byte-compatible with the Rust firmware's serde output
-// (NVS blobs) and with the server's sync payloads.
+// Model JSON compatible with existing NVS blobs and server sync payloads.
 #pragma once
 
 #include <string>

@@ -1,6 +1,8 @@
 #include "control/ble.h"
 
 #include <cstring>
+#include <atomic>
+#include <mutex>
 
 #include "esp_log.h"
 #include "esp_random.h"
@@ -27,12 +29,13 @@ const ble_uuid128_t kWriteUuid = BLE_UUID128_INIT(
 const ble_uuid128_t kNotifyUuid = BLE_UUID128_INIT(
     0xd4, 0xc7, 0xe2, 0xf8, 0xf2, 0x34, 0xb3, 0xa8, 0xd8, 0x48, 0x22, 0x5e, 0x52, 0x5e, 0xc2, 0xd2);
 
-bool g_active = false;
+std::atomic<bool> g_active{false};
 uint32_t g_passkey = 0;
-uint16_t g_conn = BLE_HS_CONN_HANDLE_NONE;
+std::atomic<uint16_t> g_conn{BLE_HS_CONN_HANDLE_NONE};
 uint16_t g_notify_handle = 0;
 std::string g_last_reply;
-std::function<void(const std::string&)> g_on_command;
+std::mutex g_reply_mutex;
+std::function<bool(const std::string&)> g_on_command;
 std::function<void(Event)> g_on_event;
 
 void Advertise();
@@ -47,12 +50,12 @@ int AccessWrite(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
         return BLE_ATT_ERR_UNLIKELY;
     }
     line.resize(copied);
-    if (g_on_command) g_on_command(line);
-    return 0;
+    return g_on_command && g_on_command(line) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
 int AccessNotify(uint16_t, uint16_t, ble_gatt_access_ctxt* ctxt, void*) {
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+    std::lock_guard<std::mutex> lock(g_reply_mutex);
     return os_mbuf_append(ctxt->om, g_last_reply.data(), g_last_reply.size()) == 0
                ? 0
                : BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -166,13 +169,16 @@ void HostTask(void*) {
 
 }  // namespace
 
-bool Start(uint32_t* passkey, std::function<void(const std::string&)> on_command,
+bool Start(uint32_t* passkey, std::function<bool(const std::string&)> on_command,
            std::function<void(Event)> on_event) {
     if (g_active) return false;
     g_on_command = std::move(on_command);
     g_on_event = std::move(on_event);
     g_passkey = esp_random() % 1000000;
-    g_last_reply.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_reply_mutex);
+        g_last_reply.clear();
+    }
     if (nimble_port_init() != ESP_OK) {
         ESP_LOGE(kTag, "NimBLE init failed");
         return false;
@@ -220,10 +226,14 @@ void Stop() {
 bool Active() { return g_active; }
 
 bool Notify(const std::string& json) {
-    g_last_reply = json;
-    if (g_conn == BLE_HS_CONN_HANDLE_NONE) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_reply_mutex);
+        g_last_reply = json;
+    }
+    const uint16_t connection = g_conn.load();
+    if (connection == BLE_HS_CONN_HANDLE_NONE) return false;
     os_mbuf* om = ble_hs_mbuf_from_flat(json.data(), json.size());
-    return om && ble_gatts_notify_custom(g_conn, g_notify_handle, om) == 0;
+    return om && ble_gatts_notify_custom(connection, g_notify_handle, om) == 0;
 }
 
 }  // namespace ble

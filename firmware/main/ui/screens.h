@@ -1,5 +1,4 @@
-// Every screen, drawn at the Rust firmware's coordinates
-// (rust-firmware/src/{home,screens,ui}.rs).
+// Device screens and their pixel layouts.
 #pragma once
 
 #include <string>
@@ -24,7 +23,7 @@ struct HomeModel {
     int todo_pending = 0;
     int todo_due_today = 0;
     int unread_inbox = 0;
-    bool wifi_configured = false;
+    bool wifi_connected = false;
     int battery_percent = -1;
     board::Charge charge;
 };
@@ -35,7 +34,7 @@ bool UnpackHome(const uint8_t* in, size_t len, HomeModel* model);
 
 HomeModel BuildHome(const std::vector<Alarm>& alarms, const std::vector<Todo>& todos,
                     const std::vector<InboxItem>& inbox, bool have_clock, const DateTime& now,
-                    bool wifi_configured, int battery_percent, board::Charge charge);
+                    bool wifi_connected, int battery_percent, board::Charge charge);
 
 void DrawHome(lv_obj_t* s, const HomeModel& m);
 void DrawList(lv_obj_t* s, const std::string& title, const std::vector<std::string>& items,

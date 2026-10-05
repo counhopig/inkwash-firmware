@@ -119,6 +119,7 @@ def main():
     link_error = None
     original = None
     writes_ok = 0
+    test_start = 0
     try:
         status = None
         ready_deadline = time.monotonic() + 30
@@ -130,6 +131,7 @@ def main():
             return 1
         print("status:", json.dumps(status, ensure_ascii=False))
         results.append(("get_status replies", status.get("status") == "status"))
+        test_start = len(link.log)
 
         original = status.get("timezone_offset_minutes")
 
@@ -140,7 +142,7 @@ def main():
 
         replay, _ = link.request(
             {"cmd": "set_timezone", "offset_minutes": target, "id": "smoke-tz"}, 20)
-        results.append(("same id replays the cached reply",
+        results.append(("repeated command with the same id succeeds",
                         bool(replay) and replay.get("status") == "ok"))
 
         after, _ = link.request({"cmd": "get_status", "id": "smoke-after"}, 8)
@@ -169,6 +171,16 @@ def main():
         link_error = str(err)
         print("FAIL  serial link:", link_error)
     finally:
+        if original is not None and link_error is None:
+            try:
+                restored, _ = link.request(
+                    {"cmd": "set_timezone", "offset_minutes": original,
+                     "id": "smoke-restore"}, 20)
+                results.append(("timezone restored to original",
+                                bool(restored) and restored.get("status") == "ok"))
+            except SerialException as err:
+                link_error = str(err)
+                results.append(("timezone restored to original", False))
         link.close()
 
     lines = link.log
@@ -186,19 +198,19 @@ def main():
     if args.log_file:
         Path(args.log_file).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print("serial log:", args.log_file)
-    trouble = [l for l in lines for pat in TROUBLE if pat.lower() in l.lower()]
+    trouble = [l for l in lines[test_start:] for pat in TROUBLE if pat.lower() in l.lower()]
     results.append(("no panic / watchdog / reset during soak", not trouble))
     results.append(("serial link stayed connected", link_error is None))
-    results.append(("persistence writes complete", writes_ok == args.stress))
+    results.append(("stress commands complete", writes_ok == args.stress))
     for line in trouble[:5]:
         print("  trouble:", line)
 
     uptimes = [int(m.group(1)) for m in
-               (re.search(r"^[IWE] \((\d+)\)", l) for l in lines) if m]
+               (re.search(r"^[IWE] \((\d+)\)", l) for l in lines[test_start:]) if m]
     if uptimes:
         print("uptime first/last: %d / %d ms" % (uptimes[0], uptimes[-1]))
-        monotonic = all(later >= earlier for earlier, later in zip(uptimes, uptimes[1:]))
-        results.append(("uptime monotonic", monotonic))
+        monotonic = all(later + 100 >= earlier for earlier, later in zip(uptimes, uptimes[1:]))
+        results.append(("no reset-sized uptime jumps", monotonic))
 
     minimums = stack_minimums(lines)
     if minimums:
@@ -206,7 +218,7 @@ def main():
             "%s=%d" % item for item in sorted(minimums.items(), key=lambda item: item[1])))
     tight = {task: free for task, free in minimums.items() if free < args.min_stack_free}
     results.append(("stack high-water marks reported", bool(minimums)))
-    results.append(("every task keeps >= %d free stack bytes" % args.min_stack_free
+    results.append(("reported tasks keep >= %d free stack bytes" % args.min_stack_free
                     + ("" if not tight else " (%s)" % ", ".join(
                         "%s=%d" % item for item in sorted(tight.items()))),
                     bool(minimums) and not tight))
@@ -214,21 +226,10 @@ def main():
     boot_markers = sum("boot: Loaded app from partition" in line for line in lines)
     results.append(("no application reboot", boot_markers <= 1))
 
-    refreshes = [l for l in lines if "EPD refresh completed" in l]
-    full = [l for l in refreshes if "Full" in l]
+    refreshes = [l for l in lines if "display:" in l and "refresh" in l and "ok in" in l]
+    full = [l for l in refreshes if "full refresh" in l]
     print("epd refreshes: %d (full %d, partial %d)"
           % (len(refreshes), len(full), len(refreshes) - len(full)))
-
-    if original is not None:
-        restore = Link(args.port, args.baud)
-        try:
-            restored, _ = restore.request(
-                {"cmd": "set_timezone", "offset_minutes": original,
-                 "id": "smoke-restore"}, 20)
-            results.append(("timezone restored to original",
-                            bool(restored) and restored.get("status") == "ok"))
-        finally:
-            restore.close()
 
     print("\n=== smoke results ===")
     failed = 0

@@ -6,6 +6,9 @@
 
 #include "cJSON.h"
 #include "core/boot_guard.h"
+#include "core/power_policy.h"
+#include "core/refresh_policy.h"
+#include "core/sleep_trace.h"
 #include "core/codec.h"
 #include "core/datetime.h"
 #include "core/protocol.h"
@@ -212,7 +215,64 @@ void TestBootGuard() {
     CHECK(l.Cleared().Recorded() && l.Cleared().failures == 0);
 }
 
+static void TestPowerAndRefreshPolicies() {
+    using power_policy::NextWakeSecs;
+    CHECK(NextWakeSecs(true, 0, -1) == 60);
+    CHECK(NextWakeSecs(true, 59, -1) == 1);
+    CHECK(NextWakeSecs(true, 86399, -1) == 1);
+    CHECK(NextWakeSecs(true, 86400, -1) == 60);
+    CHECK(NextWakeSecs(true, 15, 7) == 7);
+    CHECK(NextWakeSecs(false, 59, -1) == 60);
+    CHECK(power_policy::RetryPending(100, 160, 60));
+    CHECK(!power_policy::RetryPending(160, 160, 60));
+    CHECK(!power_policy::RetryPending(200, 160, 60));
+    CHECK(!power_policy::RetryPending(1, 160, 60));
+    power_policy::Work work;
+    CHECK(power_policy::CanSleep(work));
+    bool power_policy::Work::* gates[] = {
+        &power_policy::Work::usb, &power_policy::Work::network, &power_policy::Work::alarm,
+        &power_policy::Work::reminder, &power_policy::Work::pairing, &power_policy::Work::reply,
+        &power_policy::Work::audio, &power_policy::Work::display, &power_policy::Work::events,
+        &power_policy::Work::keys,
+    };
+    for (auto gate : gates) {
+        work = {};
+        work.*gate = true;
+        CHECK(!power_policy::CanSleep(work));
+    }
+    using refresh_policy::Plan;
+    CHECK(refresh_policy::Choose(false, false, false, false) == Plan::Full);
+    CHECK(refresh_policy::Choose(true, false, false, false) == Plan::None);
+    CHECK(refresh_policy::Choose(true, true, false, false) == Plan::Partial);
+    CHECK(refresh_policy::Choose(true, true, false, true) == Plan::Full);
+    CHECK(refresh_policy::Choose(true, false, true, false) == Plan::Full);
+}
+
 int main() {
+    sleep_trace::Ring trace = {};
+    CHECK(!sleep_trace::Valid(trace));
+    for (uint32_t i = 1; i <= 40; ++i) {
+        sleep_trace::Entry e = {};
+        e.kind = i % 2 ? sleep_trace::Kind::Sleep : sleep_trace::Kind::Boot;
+        e.utc_secs = 1700000000 + i;
+        sleep_trace::Append(&trace, e);
+    }
+    CHECK(trace.count == 16 && sleep_trace::Valid(trace));
+    CHECK(sleep_trace::At(trace, 0)->sequence == 25);
+    CHECK(sleep_trace::At(trace, 15)->sequence == 40);
+    CHECK(sleep_trace::At(trace, 16) == nullptr);
+    sleep_trace::SetBootTime(&trace, 1800000000);
+    CHECK(sleep_trace::At(trace, 15)->utc_secs == 1800000000);
+    trace.next = 100;
+    CHECK(!sleep_trace::Valid(trace));
+    sleep_trace::Entry e = {};
+    sleep_trace::Append(&trace, e);
+    CHECK(trace.count == 1 && sleep_trace::Valid(trace));
+    trace.entries[0].sequence = 99;
+    CHECK(!sleep_trace::Valid(trace));
+    sleep_trace::Append(&trace, e);
+    CHECK(trace.count == 1 && sleep_trace::Valid(trace));
+    TestPowerAndRefreshPolicies();
     TestDatetime();
     TestCodecMatchesSerde();
     TestSchedule();

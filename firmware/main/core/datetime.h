@@ -1,8 +1,5 @@
-// Calendar arithmetic, identical to logic/src/datetime.rs.
-//
-// The RTC keeps local time; "unix" values here are local wall-clock seconds
-// since 1970-01-01 00:00 of that same local calendar, exactly like the Rust
-// firmware's DateTime::to_unix.
+// Calendar arithmetic. The RTC keeps local time; "unix" values here are
+// local wall-clock seconds since 1970-01-01 00:00 of that local calendar.
 #pragma once
 
 #include <cstdint>

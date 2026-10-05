@@ -1,3 +1,4 @@
+#include "board_pins.h"
 #include "keys.h"
 
 #include "driver/gpio.h"
@@ -10,7 +11,7 @@ namespace {
 constexpr int kPollMs = 20;
 constexpr int kDebounceSamples = 4;
 constexpr int kLongPressPolls = 50;
-constexpr gpio_num_t kPins[3] = {GPIO_NUM_0, GPIO_NUM_39, GPIO_NUM_18};
+constexpr gpio_num_t kPins[3] = {board::pins::KeyEnter, board::pins::KeyUp, board::pins::KeyDown};
 constexpr board::Key kKeys[3] = {board::Key::Enter, board::Key::Up, board::Key::Down};
 
 std::function<void(Event)> g_on_event;
@@ -83,14 +84,15 @@ void Task(void*) {
 
 void Start(std::function<void(Event)> on_event) {
     g_on_event = std::move(on_event);
-    gpio_install_isr_service(0);
+    const esp_err_t installed = gpio_install_isr_service(0);
+    ESP_ERROR_CHECK(installed == ESP_ERR_INVALID_STATE ? ESP_OK : installed);
     for (gpio_num_t pin : kPins) {
         gpio_set_intr_type(pin, GPIO_INTR_LOW_LEVEL);
         gpio_intr_disable(pin);
         gpio_isr_handler_add(pin, OnEdge, reinterpret_cast<void*>(static_cast<intptr_t>(pin)));
     }
     // The task enables the interrupts once every key is up.
-    xTaskCreate(Task, "keys", 4096, nullptr, 10, &g_task);
+    configASSERT(xTaskCreate(Task, "keys", 4096, nullptr, 10, &g_task) == pdPASS);
 }
 
 }  // namespace keys

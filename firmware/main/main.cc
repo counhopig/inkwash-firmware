@@ -44,17 +44,19 @@ extern "C" void app_main() {
     board::Init();
     ReportPreviousCrash();
     if (ledger.Exhausted()) {
+        power::PrintSleepTrace();
         safe_mode::Run(ledger, reset);
     }
     const power::WakeCause wake = power::ReadWakeCause();
     if (!store::Init()) {
         ESP_LOGE("inkwash", "NVS unavailable; settings will not persist");
     }
-    pcf8563::Init(board::I2cBus());
+    if (!pcf8563::Init(board::I2cBus())) ESP_LOGE("inkwash", "RTC unavailable");
     if (!display::Init()) {
         ESP_LOGE("inkwash", "display unavailable");
+        power::DeepSleepUntilEnter();
     }
     fonts::Init();
-    tones::Init();
+    if (!tones::Init()) ESP_LOGW("inkwash", "audio worker unavailable");
     app::Run(wake);
 }

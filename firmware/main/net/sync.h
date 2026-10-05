@@ -1,4 +1,4 @@
-// Server sync (rust-firmware/src/{sync,sync_apply}.rs).
+// Server synchronization.
 #pragma once
 
 #include <cstdint>

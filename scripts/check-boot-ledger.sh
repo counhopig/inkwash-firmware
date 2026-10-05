@@ -3,7 +3,7 @@
 #
 # The boot ledger sits in `.rtc_noinit`, which the linker marks NOLOAD: the
 # section carries no contents, and the ELF -> image converters we flash with
-# (espflash, esptool) therefore leave it out of the loadable segments. That
+# (esptool) therefore leave it out of the loadable segments. That
 # matters, because the bootloader re-initializes RTC memory segments on every
 # reset that is not a deep-sleep wake (`esp_image_format.c: should_load()`). If
 # a converter ever started padding the noinit gap and covering the ledger
@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 mode=check
-elf="rust-firmware/target/xtensa-esp32s3-espidf/release/inkwash-note4"
+elf="${INKWASH_CPP_BUILD_DIR:-firmware/build}/inkwash.elf"
 if [ "${1:-}" = "--self-test" ]; then
     mode=self-test
 elif [ -n "${1:-}" ]; then
@@ -52,7 +52,7 @@ fi
 
 # esptool is the reference parser for the images both converters produce. It
 # lives in ESP-IDF's python environment, so honor $IDF_PATH and probe the
-# conventional install locations exactly like scripts/build-rust.sh does.
+# conventional ESP-IDF install locations.
 if [ -z "${IDF_PATH:-}" ]; then
     for candidate in "$HOME/esp/esp-idf" "$HOME"/esp/esp-idf-* \
         "$HOME"/.espressif/frameworks/esp-idf-*; do
@@ -172,10 +172,10 @@ if [ "$((start))" -ge "$((end))" ]; then
     echo "$elf has an empty .rtc_noinit: the boot ledger is not linked in" >&2
     exit 1
 fi
-# ESP32-S3 RTC slow memory. Anything else means the symbol reader could not be
+# ESP32-S3 RTC memory. Anything else means the symbol reader could not be
 # trusted, and a range outside the RTC window would make this gate vacuous.
 if [ "$((start))" -lt "$((0x50000000))" ] || [ "$((end))" -gt "$((0x50002000))" ]; then
-    echo "ledger range $start..$end is not inside ESP32-S3 RTC slow memory" >&2
+    echo "ledger range $start..$end is not inside ESP32-S3 RTC memory" >&2
     exit 1
 fi
 printf '==> boot ledger occupies %s..%s in %s\n' "$start" "$end" "$elf"
@@ -185,20 +185,6 @@ trap 'rm -rf "$tmp"' EXIT
 
 checked=0
 failures=0
-
-# espflash is the converter used by README.md and scripts/release.sh, so check
-# it first; esptool is what the Espressif build uses and stays the fallback.
-if command -v espflash >/dev/null 2>&1; then
-    espflash save-image --skip-update-check --chip esp32s3 "$elf" "$tmp/espflash.bin" >/dev/null 2>&1
-    checked=$((checked + 1))
-    echo "==> espflash image"
-    python3 -m esptool --chip esp32s3 image_info "$tmp/espflash.bin" > "$tmp/espflash.txt" 2>/dev/null
-    if ! decide "$start" "$end" "$tmp/espflash.txt"; then
-        failures=$((failures + 1))
-    fi
-else
-    echo "note: espflash not found; the flashing path was not checked" >&2
-fi
 
 python3 -m esptool --chip esp32s3 elf2image -o "$tmp/esptool.bin" "$elf" >/dev/null
 checked=$((checked + 1))

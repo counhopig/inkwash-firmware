@@ -69,7 +69,6 @@ struct Window {
     size_t first, last, selected;
 };
 
-// logic/src/list_window.rs
 Window ListWindow(size_t count, size_t selected) {
     if (count == 0) return {0, 0, 0};
     selected = std::min(selected, count - 1);
@@ -144,7 +143,7 @@ std::string FormatTodoRow(const Todo& t, bool have_now, const DateTime& now) {
 namespace {
 struct PackedHome {
     uint8_t version;
-    uint8_t have_clock, have_next_alarm, wifi_configured;
+    uint8_t have_clock, have_next_alarm, wifi_connected;
     uint16_t year;
     uint8_t month, day, weekday, hour, minute;
     int8_t battery_percent;
@@ -161,10 +160,10 @@ bool PackHome(const HomeModel& m, uint8_t* out, size_t len) {
         return false;
     }
     PackedHome p = {};
-    p.version = 1;
+    p.version = 2;
     p.have_clock = m.have_clock;
     p.have_next_alarm = m.have_next_alarm;
-    p.wifi_configured = m.wifi_configured;
+    p.wifi_connected = m.wifi_connected;
     p.year = m.clock.year;
     p.month = m.clock.month;
     p.day = m.clock.day;
@@ -189,12 +188,12 @@ bool UnpackHome(const uint8_t* in, size_t len, HomeModel* m) {
     PackedHome p;
     if (len < sizeof(p)) return false;
     std::memcpy(&p, in, sizeof(p));
-    if (p.version != 1) return false;
+    if (p.version != 2) return false;
     p.next_alarm_time[7] = p.next_alarm_date[7] = '\0';
     HomeModel h;
     h.have_clock = p.have_clock;
     h.have_next_alarm = p.have_next_alarm;
-    h.wifi_configured = p.wifi_configured;
+    h.wifi_connected = p.wifi_connected;
     h.clock.year = p.year;
     h.clock.month = p.month;
     h.clock.day = p.day;
@@ -217,11 +216,11 @@ bool UnpackHome(const uint8_t* in, size_t len, HomeModel* m) {
 
 HomeModel BuildHome(const std::vector<Alarm>& alarms, const std::vector<Todo>& todos,
                     const std::vector<InboxItem>& inbox, bool have_clock, const DateTime& now,
-                    bool wifi_configured, int battery_percent, board::Charge charge) {
+                    bool wifi_connected, int battery_percent, board::Charge charge) {
     HomeModel m;
     m.have_clock = have_clock;
     m.clock = now;
-    m.wifi_configured = wifi_configured;
+    m.wifi_connected = wifi_connected;
     m.battery_percent = battery_percent;
     m.charge = charge;
     if (have_clock) {
@@ -260,7 +259,7 @@ void DrawHome(lv_obj_t* s, const HomeModel& m) {
     const int battery_x = kWidth - (battery.width + 16);
     fonts::CreateIcon(s, battery, battery_x, 7);
     int cursor_x = battery_x;
-    if (m.wifi_configured) {
+    if (m.wifi_connected) {
         cursor_x -= kClusterGap + assets::kWifi.width;
         fonts::CreateIcon(s, assets::kWifi, cursor_x, 7 + battery.height - assets::kWifi.height);
     }
@@ -377,7 +376,7 @@ void DrawTodoList(lv_obj_t* s, const std::vector<Todo>& todos, size_t selected, 
 void DrawInboxList(lv_obj_t* s, const std::vector<InboxItem>& items, size_t selected) {
     std::vector<std::string> rows;
     for (const InboxItem& it : items) {
-        // "•" read, "○" unread, as the Rust firmware.
+        // "•" read, "○" unread.
         rows.push_back(fonts::TruncateProp((it.read ? "\xE2\x80\xA2 " : "\xE2\x97\x8B ") + it.title,
                                            kListTextMaxWidth));
     }

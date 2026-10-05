@@ -1,7 +1,5 @@
-// NVS persistence, compatible with the Rust firmware (rust-firmware/src/
-// {storage,alarms,todos,inbox,nvs_blob}.rs): same namespaces, keys, JSON
-// blob shapes and decimal-string scalars, so a device keeps its data when it
-// switches between the two firmwares.
+// NVS persistence preserves existing namespaces, keys, JSON blob shapes
+// and decimal-string scalars for compatibility with stored device data.
 #pragma once
 
 #include <cstdint>

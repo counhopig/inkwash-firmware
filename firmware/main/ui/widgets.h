@@ -1,4 +1,4 @@
-// Pixel-positioned primitives matching the Rust Canvas API, as LVGL objects.
+// Pixel-positioned LVGL primitives.
 #pragma once
 
 #include <string>

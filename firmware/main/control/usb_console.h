@@ -1,4 +1,4 @@
-// Control commands over USB Serial/JTAG (rust-firmware/src/usb_console.rs):
+// Control commands over USB Serial/JTAG:
 // the host sends ">>IW {json}\n", the device answers "<<IW {json}\n".
 #pragma once
 

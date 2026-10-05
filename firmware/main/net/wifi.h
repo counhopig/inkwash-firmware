@@ -8,6 +8,9 @@
 
 namespace wifi {
 
+// Associated with the access point and holding an IP address.
+bool IsConnected();
+
 // Connects and waits for DHCP (20 s budget). On failure *error says why.
 bool Connect(const store::WifiCreds& creds, std::string* error);
 

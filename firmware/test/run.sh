@@ -2,8 +2,9 @@
 # Builds and runs the host tests for firmware/main/core.
 set -euo pipefail
 cd "$(dirname "$0")"
-IDF="${IDF_PATH:-$HOME/esp/esp-idf-v5.5.5}"
+IDF="${IDF_PATH:-$HOME/esp/esp-idf}"
 out="$(mktemp -d)"
+trap 'rm -rf "$out"' EXIT
 gcc -c -O1 -I"$IDF/components/json/cJSON" "$IDF/components/json/cJSON/cJSON.c" -o "$out/cJSON.o"
 g++ -std=c++17 -Wall -Wextra -Werror -O1 -g \
     -I../main -I"$IDF/components/json/cJSON" \

@@ -1,5 +1,4 @@
-// Wake causes, deep sleep and automatic light sleep
-// (rust-firmware/src/power.rs, Slate's sleep_manager).
+// Wake causes, deep sleep and automatic light sleep.
 #pragma once
 
 #include <cstdint>
@@ -18,7 +17,10 @@ void EnableLightSleep();
 
 // Cuts the peripheral rails, arms the wake sources and enters deep sleep.
 // timer_secs < 0 arms no timer wake.
-[[noreturn]] void DeepSleep(int64_t timer_secs);
+[[noreturn]] void DeepSleep(int64_t timer_secs, uint64_t utc_secs = 0);
+
+// Print the retained sleep/reset history; zero time means unavailable.
+void PrintSleepTrace(uint64_t boot_utc_secs = 0);
 
 // Restarts through a short deep sleep (never esp_restart, see README).
 // The next boot reports WakeCause::ControlledRestart.
@@ -40,6 +42,7 @@ struct Retained {
     uint8_t partial_refreshes; // since the last full refresh
     uint8_t home_valid;        // the panel shows `home` (see ui::HomeSnapshot)
     uint8_t reserved;
+    uint64_t network_retry_utc; // offline backoff survives minute wakes
     uint8_t home[256];         // serialized Home model shown before sleep
 };
 Retained& State();

@@ -1,5 +1,4 @@
-// Sync request/response bodies (rust-firmware/src/sync.rs,
-// logic/src/sync_validate.rs).
+// Server sync request and response bodies.
 #pragma once
 
 #include <string>
@@ -32,7 +31,7 @@ std::string DecodeResponse(const char* body, size_t len, Response* out);
 std::string Validate(const Response& response);
 
 // The applied result, journaled before it is written so a reboot mid-apply
-// can finish the job (logic/src/app.rs SyncedData).
+// can finish applying the response.
 struct Applied {
     Response data;
     std::vector<uint8_t> uploaded_alarm_ids;

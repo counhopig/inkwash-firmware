@@ -1,6 +1,5 @@
-// USB/BLE control protocol, identical to logic/src/protocol.rs and
-// rust-firmware/src/control.rs: one JSON object per command with a "cmd"
-// tag, one JSON object per reply with a "status" tag, echoing "id".
+// USB/BLE protocol: one JSON command with a "cmd" tag and one JSON reply
+// with a "status" tag, echoing "id".
 #pragma once
 
 #include <cstdint>

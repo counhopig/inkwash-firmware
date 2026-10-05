@@ -1,6 +1,8 @@
+#include "board_pins.h"
 #include "board.h"
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -11,19 +13,6 @@ namespace {
 
 constexpr char kTag[] = "board";
 
-// Pinout (see the README hardware table).
-constexpr gpio_num_t kPowerLatch = GPIO_NUM_17;  // high keeps the battery switched on
-constexpr gpio_num_t kLed = GPIO_NUM_3;          // green LED, low = on
-constexpr gpio_num_t kAvdd = GPIO_NUM_42;        // audio + I2C pull-up rail
-constexpr gpio_num_t kPaEnable = GPIO_NUM_46;    // speaker amplifier
-constexpr gpio_num_t kNfcPower = GPIO_NUM_21;    // GT23SC6699 supply, unused
-constexpr gpio_num_t kKeyEnter = GPIO_NUM_0;
-constexpr gpio_num_t kKeyUp = GPIO_NUM_39;
-constexpr gpio_num_t kKeyDown = GPIO_NUM_18;
-constexpr gpio_num_t kChargeActive = GPIO_NUM_2;  // CHRG_L: low while charging
-constexpr gpio_num_t kChargeDone = GPIO_NUM_1;    // STDBY_H: high when full
-constexpr gpio_num_t kI2cSda = GPIO_NUM_47;
-constexpr gpio_num_t kI2cScl = GPIO_NUM_48;
 constexpr adc_channel_t kBatteryChannel = ADC_CHANNEL_3;  // GPIO4, VBAT / 2
 
 i2c_master_bus_handle_t g_i2c = nullptr;
@@ -44,6 +33,10 @@ void Output(gpio_num_t pin, int level) {
 }
 
 void Input(gpio_num_t pin, bool pull_up) {
+    if (rtc_gpio_is_valid_gpio(pin)) {
+        ESP_ERROR_CHECK(rtc_gpio_hold_dis(pin));
+        ESP_ERROR_CHECK(rtc_gpio_deinit(pin));
+    }
     gpio_config_t cfg = {};
     cfg.pin_bit_mask = 1ULL << pin;
     cfg.mode = GPIO_MODE_INPUT;
@@ -53,32 +46,34 @@ void Input(gpio_num_t pin, bool pull_up) {
 
 gpio_num_t KeyPin(Key key) {
     switch (key) {
-        case Key::Enter: return kKeyEnter;
-        case Key::Up: return kKeyUp;
-        case Key::Down: return kKeyDown;
+        case Key::Enter: return board::pins::KeyEnter;
+        case Key::Up: return board::pins::KeyUp;
+        case Key::Down: return board::pins::KeyDown;
     }
-    return kKeyEnter;
+    return board::pins::KeyEnter;
 }
 
 }  // namespace
 
 void Init() {
-    Output(kPowerLatch, 1);
-    Output(kLed, 1);
-    Output(kPaEnable, 0);
-    Output(kNfcPower, 0);
-    Output(kAvdd, 1);
+    Output(board::pins::PowerLatch, 1);
+    Output(board::pins::Led, 1);
+    Output(board::pins::PaEnable, 0);
+    Output(board::pins::NfcPower, 0);
+    Output(board::pins::Avdd, 1);
+    ESP_ERROR_CHECK(gpio_hold_en(board::pins::Avdd));
 
-    Input(kKeyEnter, true);
-    Input(kKeyUp, true);
-    Input(kKeyDown, true);
-    Input(kChargeActive, false);
-    Input(kChargeDone, false);
+    Input(board::pins::KeyEnter, true);
+    Input(board::pins::KeyUp, true);
+    Input(board::pins::KeyDown, true);
+    Input(board::pins::RtcInt, true);
+    Input(board::pins::ChargeActive, false);
+    Input(board::pins::ChargeDone, false);
 
     i2c_master_bus_config_t bus = {};
     bus.i2c_port = I2C_NUM_0;
-    bus.sda_io_num = kI2cSda;
-    bus.scl_io_num = kI2cScl;
+    bus.sda_io_num = board::pins::I2cSda;
+    bus.scl_io_num = board::pins::I2cScl;
     bus.clk_source = I2C_CLK_SRC_DEFAULT;
     bus.glitch_ignore_cnt = 7;
     bus.flags.enable_internal_pullup = false;
@@ -113,8 +108,8 @@ bool KeyDown(Key key) {
 
 Charge ReadCharge() {
     Charge charge;
-    const bool active = gpio_get_level(kChargeActive) == 0;
-    const bool done = gpio_get_level(kChargeDone) == 1;
+    const bool active = gpio_get_level(board::pins::ChargeActive) == 0;
+    const bool done = gpio_get_level(board::pins::ChargeDone) == 1;
     charge.power_present = active || done;
     charge.charging = active && !done;
     charge.full = done && !active;
@@ -122,7 +117,7 @@ Charge ReadCharge() {
 }
 
 void SetChargeLed(bool on) {
-    gpio_set_level(kLed, on ? 0 : 1);
+    gpio_set_level(board::pins::Led, on ? 0 : 1);
 }
 
 int BatteryPercent() {
@@ -140,7 +135,7 @@ int BatteryPercent() {
         sum_mv += mv;
     }
     const int vbat = sum_mv / kSamples * 2;
-    // Same curve as the Rust firmware (board.rs battery_percent_from_mv).
+    // Calibrated battery estimate for this board.
     const long long percent =
         (-static_cast<long long>(vbat) * vbat + 9016LL * vbat - 19189000LL) / 10000;
     return percent < 0 ? 0 : percent > 100 ? 100 : static_cast<int>(percent);

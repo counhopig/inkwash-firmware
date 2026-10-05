@@ -1,5 +1,4 @@
-// Alarm and todo scheduling rules, identical to logic/src/{alarm_schedule,
-// reminder_dedup,sanitize,sync_validate}.rs.
+// Alarm and todo scheduling rules.
 #pragma once
 
 #include <cstdint>
@@ -58,7 +57,7 @@ std::vector<const Todo*> DueHighImportanceTodos(const std::vector<Todo>& todos,
                                                 const DateTime& now);
 std::string ReminderDateKey(const DateTime& now);
 
-// Clamps stored data into range, like logic/src/sanitize.rs.
+// Clamps stored data into range.
 bool ValidDate(uint16_t year, uint8_t month, uint8_t day);
 void SanitizeAlarms(std::vector<Alarm>* alarms);
 void SanitizeTodos(std::vector<Todo>* todos);
