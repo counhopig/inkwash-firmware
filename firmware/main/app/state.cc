@@ -47,6 +47,9 @@ bool ReadClock() {
     if (pcf8563::ReadTime(&dt) && !dt.voltage_low) {
         g.now = dt;
         g.have_clock = true;
+        event_log::SetClock(g.now.ShiftedMinutes(-g.timezone).ToUnix(), g.clock_estimated);
+    } else {
+        event_log::SetClock(0, false);
     }
     return g.have_clock;
 }

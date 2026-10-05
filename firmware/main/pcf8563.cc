@@ -1,3 +1,4 @@
+#include "diagnostics/event_log.h"
 #include "pcf8563.h"
 
 #include "esp_log.h"
@@ -65,6 +66,7 @@ bool Init(i2c_master_bus_handle_t bus) {
 bool ReadTime(DateTime* out) {
     uint8_t buf[7] = {};
     if (!Read(kRegTime, buf, sizeof(buf))) {
+        event_log::Add("rtc_read_failed");
         ESP_LOGW(kTag, "read failed");
         return false;
     }
@@ -78,6 +80,7 @@ bool ReadTime(DateTime* out) {
     dt.month = FromBcd(buf[5] & 0x1F);
     dt.year = static_cast<uint16_t>(2000 + FromBcd(buf[6]));
     if (!Valid(dt)) {
+        event_log::Add("rtc_registers_invalid");
         ESP_LOGW(kTag, "invalid time registers");
         return false;
     }

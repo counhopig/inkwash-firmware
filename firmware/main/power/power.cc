@@ -6,6 +6,7 @@
 
 #include "driver/gpio.h"
 #include "core/sleep_trace.h"
+#include "diagnostics/event_log.h"
 #include "driver/rtc_io.h"
 #include "esp_attr.h"
 #include "esp_log.h"
@@ -20,7 +21,7 @@ namespace power {
 namespace {
 
 constexpr char kTag[] = "power";
-constexpr uint32_t kMagic = 0x494B5732;  // "IKW2"
+constexpr uint32_t kMagic = 0x494B5733;  // "IKW3"
 
 RTC_NOINIT_ATTR Retained g_retained;
 RTC_NOINIT_ATTR uint32_t g_controlled_restart;
@@ -39,6 +40,9 @@ void Trace(sleep_trace::Kind kind, int64_t timer_secs, uint64_t utc_secs, uint64
     e.timer_secs = timer_secs;
     e.wake_mask = mask;
     sleep_trace::Append(&g_sleep_trace, e);
+    event_log::Add("sleep kind=%u timer_s=%lld mask=%llu", unsigned(kind),
+                   static_cast<long long>(timer_secs), static_cast<unsigned long long>(mask));
+    if (!event_log::Flush()) ESP_LOGE(kTag, "event log flush failed before sleep");
 }
 
 boot_guard::ResetKind ResetKindOf(esp_reset_reason_t reason) {

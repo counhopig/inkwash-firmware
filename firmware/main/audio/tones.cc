@@ -1,3 +1,4 @@
+#include "diagnostics/event_log.h"
 #include "board_pins.h"
 #include "audio/tones.h"
 
@@ -123,6 +124,7 @@ bool InitPlayback() {
 bool PlaySine(float hz, float secs, int16_t amplitude) {
     if (!g_tx && !InitPlayback()) return false;
     if (!g_awake && !CodecInit()) {
+        event_log::Critical("audio_codec_wake_failed");
         ESP_LOGW(kTag, "codec wake failed");
         return false;
     }
@@ -148,6 +150,7 @@ bool PlaySine(float hz, float secs, int16_t amplitude) {
             written != static_cast<size_t>(n * 4)) {
             i2s_channel_disable(g_tx);
             gpio_set_level(board::pins::PaEnable, 0);
+            event_log::Critical("audio_dma_write_failed");
             ESP_LOGW(kTag, "audio DMA write failed");
             return false;
         }

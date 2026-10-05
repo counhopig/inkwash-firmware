@@ -8,6 +8,8 @@ idf_component_register(
         "fonts.cc"
         "core/boot_guard.cc"
         "core/sleep_trace.cc"
+        "core/event_journal.cc"
+        "diagnostics/event_log.cc"
         "core/power_policy.cc"
         "core/refresh_policy.cc"
         "core/codec.cc"
@@ -43,6 +45,7 @@ idf_component_register(
         esp_driver_gpio
         esp_driver_usb_serial_jtag
         esp_timer
+        esp_partition
         esp_pm
         esp_wifi
         esp_netif
@@ -82,5 +85,5 @@ if(NOT INKWASH_GIT_REV)
 endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     INKWASH_BUILD_EPOCH=${INKWASH_BUILD_EPOCH}ULL
-    INKWASH_VERSION="0.7.0"
+    INKWASH_VERSION="0.7.1"
     INKWASH_GIT_REV="${INKWASH_GIT_REV}")

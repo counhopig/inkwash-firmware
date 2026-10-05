@@ -50,6 +50,10 @@ void WriteNtpTime(uint64_t utc) {
     if (pcf8563::WriteTime(local)) {
         g.now = local;
         g.have_clock = true;
+        g.clock_estimated = false;
+        power::State().clock_estimated = 0;
+        event_log::SetClock(utc, false);
+        event_log::Critical("clock_ntp utc=%llu", static_cast<unsigned long long>(utc));
         store::SaveRtcAlignEpoch(local.ToUnix());
         g.programmed_valid = false;
         ESP_LOGI(kTag, "RTC set from NTP: %04u-%02u-%02u %02u:%02u", local.year, local.month,
@@ -93,6 +97,9 @@ void OnNetDone(const Event& e) {
     ESP_LOGI(kTag, "net job %d done in %lld ms: %s", static_cast<int>(job),
              static_cast<long long>(NowMs() - g.net_started_ms),
              e.result.ok ? "ok" : e.result.error.c_str());
+    event_log::Add("net_done job=%u ok=%u duration_ms=%lld", unsigned(job), unsigned(e.result.ok),
+                   static_cast<long long>(NowMs() - g.net_started_ms));
+    if (!e.result.ok) event_log::Flush();
     g.net_job = NetJob::None;
     const netsync::Result& r = e.result;
     if (job == NetJob::Sync || job == NetJob::UrgentPoll || job == NetJob::Ntp) {
@@ -100,6 +107,8 @@ void OnNetDone(const Event& e) {
         const uint64_t utc = g.now.ShiftedMinutes(-g.timezone).ToUnix();
         power::State().network_retry_utc = r.ok ? 0 :
             utc + std::max<uint16_t>(1, g.sync_interval) * 60ULL;
+        if (!r.ok) event_log::Add("net_retry utc=%llu",
+            static_cast<unsigned long long>(power::State().network_retry_utc));
     }
     switch (job) {
         case NetJob::Sync: {

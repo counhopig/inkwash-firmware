@@ -75,7 +75,7 @@ if [ ! -f "${IDF_PATH:-}/components/partition_table/gen_esp32part.py" ]; then
     exit 1
 fi
 python3 -c 'import hashlib,sys; sys.exit(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest() != sys.argv[2])' \
-    "$partitions" "5101832d2cdb397e86e74b407220c33dca1e318431f314eff2906155d326d4ea" || {
+    "$partitions" "b3a31833dfa23b985b89821768fdf4cf5d3b4e23c52a815c551c79e30fc4de74" || {
     echo "Refusing to flash: partition layout differs from the authorized Note 4 table." >&2
     exit 1
 }

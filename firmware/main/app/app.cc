@@ -6,10 +6,12 @@ QueueHandle_t g_events = nullptr;
 QueueHandle_t g_net = nullptr;
 TaskHandle_t g_net_task = nullptr;
 std::atomic<int> g_ble_link{-1};
+std::atomic<uint32_t> g_rejected_events{0};
 int64_t NowMs() { return esp_timer_get_time() / 1000; }
 
 bool Post(Event* e, TickType_t timeout) {
     if (xQueueSend(g_events, &e, timeout) == pdTRUE) return true;
+    g_rejected_events.fetch_add(1);
     delete e;
     return false;
 }
@@ -89,6 +91,8 @@ void Run(power::WakeCause wake) {
             event.ble_event = static_cast<ble::Event>(link);
             if (HandleEvent(event)) redraw = true;
         }
+        const uint32_t rejected = g_rejected_events.exchange(0);
+        if (rejected) event_log::Critical("event_queue_rejected count=%lu", static_cast<unsigned long>(rejected));
         if (Housekeeping()) redraw = true;
         if (redraw || !display::Healthy()) Render();
 

@@ -21,7 +21,7 @@ $flashArgs = Get-Content (Join-Path $BuildDir "flash_args") -Raw
 if ($flashArgs -notmatch '--flash_mode dio' -or $flashArgs -notmatch '--flash_freq 80m' -or $flashArgs -notmatch '--flash_size 16MB') {
     throw "Refusing to flash: build is not DIO / 80 MHz / 16 MB."
 }
-if ((Get-FileHash -Algorithm SHA256 $partitions).Hash -ne "5101832d2cdb397e86e74b407220c33dca1e318431f314eff2906155d326d4ea") {
+if ((Get-FileHash -Algorithm SHA256 $partitions).Hash -ne "b3a31833dfa23b985b89821768fdf4cf5d3b4e23c52a815c551c79e30fc4de74") {
     throw "Refusing to flash: partition layout differs from the authorized Note 4 table."
 }
 if (-not $env:IDF_PATH) { throw "Export the ESP-IDF environment first." }

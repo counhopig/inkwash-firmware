@@ -6,6 +6,9 @@
 
 #include "cJSON.h"
 #include "core/boot_guard.h"
+#include "core/event_journal.h"
+#include <vector>
+#include <limits>
 #include "core/power_policy.h"
 #include "core/refresh_policy.h"
 #include "core/sleep_trace.h"
@@ -248,7 +251,154 @@ static void TestPowerAndRefreshPolicies() {
     CHECK(refresh_policy::Choose(true, false, true, false) == Plan::Full);
 }
 
+
+class TestFlash : public event_journal::Flash {
+ public:
+    std::vector<uint8_t> data = std::vector<uint8_t>(8192, 0xff);
+    // Interrupt a programming operation after exactly this many bytes.
+    int write_budget = -1;
+    bool fail_read = false;
+    bool report_commit_error = false;
+    bool fail_erase = false;
+    size_t Size() const override { return data.size(); }
+    bool Read(size_t offset, void* out, size_t size) override {
+        if (fail_read || offset + size > data.size()) return false;
+        std::memcpy(out, data.data() + offset, size);
+        return true;
+    }
+    bool Write(size_t offset, const void* in, size_t size) override {
+        if (offset + size > data.size()) return false;
+        const auto* bytes = static_cast<const uint8_t*>(in);
+        for (size_t i = 0; i < size; ++i) {
+            if (write_budget == 0 || (data[offset+i] & bytes[i]) != bytes[i]) return false;
+            data[offset+i] &= bytes[i];
+            if (write_budget > 0) --write_budget;
+        }
+        return !(report_commit_error && size == 4);
+    }
+    bool Erase(size_t offset, size_t size) override {
+        if (fail_erase || offset % 4096 || size % 4096 || offset + size > data.size()) return false;
+        std::memset(data.data() + offset, 0xff, size);
+        return true;
+    }
+};
+
+static void TestEventJournal() {
+    using namespace event_journal;
+    Record record = {};
+    record.boot = 1;
+    record.utc_secs = 1700000000;
+    record.flags = kTimeValid;
+    std::strcpy(record.event, "test");
+    TestFlash flash;
+    Journal journal(flash);
+    CHECK(journal.Init());
+    CHECK(journal.Sequence() == 0);
+    CHECK(journal.Append(record));
+    Record read;
+    CHECK(journal.Read(0, &read) && Valid(read) && read.sequence == 1);
+    read.event[0] ^= 1;
+    CHECK(!Valid(read));
+    // Power-off and new process: no RAM metadata is retained.
+    Journal reboot(flash);
+    CHECK(reboot.Init() && reboot.Sequence() == 1 && reboot.Next() == 1);
+    for (int i = 0; i < 80; ++i) CHECK(reboot.Append(record));
+    Journal wrapped(flash);
+    CHECK(wrapped.Init() && wrapped.Sequence() == 81);
+    uint64_t previous = 0;
+    unsigned count = 0;
+    for (size_t i = 0; i < wrapped.Capacity(); ++i) {
+        CHECK(wrapped.Read((wrapped.Next() + i) % wrapped.Capacity(), &read));
+        if (!Valid(read)) continue;
+        CHECK(read.sequence > previous);
+        previous = read.sequence;
+        ++count;
+    }
+    CHECK(count == 49 && previous == 81);  // sector reclamation preserves 49 committed records
+    // Every possible byte boundary of a body/commit write may lose power.
+    for (int cut = 0; cut < 128; ++cut) {
+        TestFlash interrupted;
+        Journal first(interrupted);
+        CHECK(first.Init() && first.Append(record));
+        interrupted.write_budget = cut;
+        CHECK(!first.Append(record));
+        interrupted.write_budget = -1;
+        Journal recovered(interrupted);
+        CHECK(recovered.Init() && recovered.Sequence() == 1);
+        CHECK(recovered.Append(record));
+        Journal again(interrupted);
+        CHECK(again.Init() && again.Sequence() == 2);
+        CHECK(again.Read(0, &read) && Valid(read) && read.sequence == 1);
+    }
+    // Interrupted sector erase must not destroy the latest record in another sector.
+    for (size_t cut = 0; cut <= 4096; cut += 128) {
+        TestFlash erased;
+        Journal writer(erased);
+        CHECK(writer.Init());
+        for (int i = 0; i < 64; ++i) CHECK(writer.Append(record));
+        std::memset(erased.data.data(), 0xff, cut);
+        Journal recovered(erased);
+        CHECK(recovered.Init() && recovered.Sequence() == 64);
+        CHECK(recovered.Append(record));
+        CHECK(recovered.Read(0, &read) && Valid(read) && read.sequence == 65);
+    }
+    // A failed commit report may still leave a fully valid record on flash.
+    TestFlash uncertain;
+    Journal live(uncertain);
+    CHECK(live.Init() && live.Append(record));
+    uncertain.report_commit_error = true;
+    CHECK(!live.Append(record));
+    uncertain.report_commit_error = false;
+    CHECK(live.Append(record));
+    CHECK(live.Read(1, &read) && Valid(read) && read.sequence == 2);
+    CHECK(live.Read(2, &read) && Valid(read) && read.sequence == 3);
+    record.flags = kTimeEstimated;
+    CHECK(live.Append(record));
+    Journal provenance(uncertain);
+    CHECK(provenance.Init() && provenance.LastClockFlags() == kTimeEstimated);
+    record.flags = kTimeValid;
+    CHECK(provenance.Append(record));
+    Journal aligned(uncertain);
+    CHECK(aligned.Init() && aligned.LastClockFlags() == kTimeValid);
+    // Corrupt newest record: recover earlier history and skip the damaged tail.
+    TestFlash damaged;
+    Journal writer(damaged);
+    CHECK(writer.Init() && writer.Append(record) && writer.Append(record));
+    damaged.data[128 + 80] ^= 1;
+    Journal recovery(damaged);
+    CHECK(recovery.Init() && recovery.Sequence() == 1 && recovery.InvalidRecords() == 1);
+    CHECK(recovery.Append(record));
+    CHECK(recovery.Read(2, &read) && Valid(read) && read.sequence == 2);
+    damaged.fail_read = true;
+    CHECK(!recovery.Init() && !recovery.Append(record));
+    damaged.fail_read = false;
+    CHECK(recovery.Init());
+    damaged.fail_erase = true;
+    for (int i = 0; i < 29; ++i) CHECK(recovery.Append(record));
+    CHECK(!recovery.Append(record));
+    CHECK(recovery.Sequence() == 31);
+    protocol::Command command;
+    std::string error;
+    CHECK(protocol::Parse(R"({"cmd":"get_logs"})", &command, &error));
+    CHECK(command.cmd == protocol::Cmd::GetLogs && !command.log_resume);
+    CHECK(protocol::Parse(R"({"cmd":"get_logs","cursor":32,"anchor":12,"snapshot":"18446744073709551615"})", &command, &error));
+    CHECK(command.log_resume && command.log_cursor == 32 && command.log_snapshot == std::numeric_limits<uint64_t>::max());
+    for (const char* invalid : {
+        R"({"cmd":"get_logs","cursor":1})",
+        R"({"cmd":"get_logs","cursor":-1,"anchor":0,"snapshot":"1"})",
+        R"({"cmd":"get_logs","cursor":1.5,"anchor":0,"snapshot":"1"})",
+        R"({"cmd":"get_logs","cursor":8193,"anchor":0,"snapshot":"1"})",
+        R"({"cmd":"get_logs","cursor":0,"anchor":8192,"snapshot":"1"})",
+        R"({"cmd":"get_logs","cursor":0,"anchor":0,"snapshot":1})",
+        R"({"cmd":"get_logs","cursor":0,"anchor":0,"snapshot":"18446744073709551616"})",
+        R"({"cmd":"get_logs","cursor":0,"anchor":0,"snapshot":"-1"})"}) {
+        error.clear();
+        CHECK(!protocol::Parse(invalid, &command, &error));
+    }
+}
+
 int main() {
+    TestEventJournal();
     sleep_trace::Ring trace = {};
     CHECK(!sleep_trace::Valid(trace));
     for (uint32_t i = 1; i <= 40; ++i) {

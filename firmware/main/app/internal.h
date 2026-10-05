@@ -17,6 +17,7 @@
 #include "core/schedule.h"
 #include "core/power_policy.h"
 #include "display.h"
+#include "diagnostics/event_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "fonts.h"
@@ -110,6 +111,7 @@ struct Notice {
 };
 
 struct State {
+    bool clock_estimated = false;
     power::WakeCause wake = power::WakeCause::PowerOn;
     bool background = false;  // timer wake nobody has touched yet
 

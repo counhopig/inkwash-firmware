@@ -1,4 +1,5 @@
 #include "net/wifi.h"
+#include "diagnostics/event_log.h"
 
 #include <ctime>
 #include <atomic>
@@ -97,6 +98,7 @@ bool IsConnected() {
 
 bool Connect(const store::WifiCreds& creds, std::string* error) {
     if (!EnsureInit()) {
+        event_log::Critical("wifi_init_failed");
         *error = "Wi-Fi driver initialization failed";
         return false;
     }
@@ -109,19 +111,22 @@ bool Connect(const store::WifiCreds& creds, std::string* error) {
     cfg.sta.pmf_cfg.required = false;
     cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
     if (esp_wifi_set_config(WIFI_IF_STA, &cfg) != ESP_OK) {
+        event_log::Critical("wifi_config_failed");
         *error = "failed to set Wi-Fi station configuration";
         return false;
     }
     xEventGroupClearBits(g_events, kGotIp | kFailed);
     if (!g_started) {
         if (esp_wifi_start() != ESP_OK) {
-            *error = "failed to start Wi-Fi";
+            event_log::Critical("wifi_start_failed");
+        *error = "failed to start Wi-Fi";
             return false;
         }
         g_started = true;
     }
     esp_wifi_connect();
     if (!WaitForIp(esp_timer_get_time() + kConnectTimeoutMs * 1000LL)) {
+        event_log::Critical("wifi_connect_timeout");
         *error = "timed out waiting for Wi-Fi connection to '" + creds.ssid + "'";
         Disconnect();
         return false;
@@ -183,13 +188,17 @@ bool HttpsPost(const std::string& url, const std::string& token, const char* ext
     }
     bool ok = false;
     if (esp_http_client_open(client, static_cast<int>(request.size())) != ESP_OK) {
+        event_log::Critical("http_open_failed errno=%d", esp_http_client_get_errno(client));
         *error = "POST " + url + " failed to start";
     } else if (esp_http_client_write(client, request.data(), static_cast<int>(request.size())) !=
                static_cast<int>(request.size())) {
+        event_log::Critical("http_write_failed errno=%d", esp_http_client_get_errno(client));
         *error = "POST " + url + " body write failed";
     } else if (esp_http_client_fetch_headers(client) < 0) {
+        event_log::Critical("http_headers_failed errno=%d", esp_http_client_get_errno(client));
         *error = "POST " + url + " failed";
     } else if (const int status = esp_http_client_get_status_code(client); status != 200) {
+        event_log::Critical("http_status code=%d", status);
         *error = "HTTP " + std::to_string(status);
     } else {
         body->clear();
@@ -198,12 +207,14 @@ bool HttpsPost(const std::string& url, const std::string& token, const char* ext
         while (true) {
             const int n = esp_http_client_read(client, chunk, sizeof(chunk));
             if (n < 0) {
+                event_log::Critical("http_read_failed errno=%d", esp_http_client_get_errno(client));
                 *error = "HTTP response read failed";
                 ok = false;
                 break;
             }
             if (n == 0) break;
             if (body->size() + n > max_len) {
+                event_log::Critical("http_response_oversize bytes=%u limit=%u", unsigned(body->size() + n), unsigned(max_len));
                 *error = "sync response exceeded the device buffer";
                 ok = false;
                 break;

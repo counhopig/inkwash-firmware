@@ -7,6 +7,7 @@
 #include "control/usb_console.h"
 #include "core/protocol.h"
 #include "display.h"
+#include "diagnostics/event_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "fonts.h"
@@ -35,6 +36,8 @@ void OnLine(const std::string& line) {
     const std::string* id = cmd.has_id ? &cmd.id : nullptr;
     if (cmd.cmd == protocol::Cmd::GetStatus) {
         usb_console::Reply(protocol::ReplyStatus(protocol::Status{}, id));
+    } else if (cmd.cmd == protocol::Cmd::GetLogs) {
+        usb_console::Reply(event_log::Export(cmd));
     } else {
         usb_console::Reply(protocol::ReplyError("device is in safe mode (BOOT LOOP DETECTED); command rejected", id));
     }
@@ -43,6 +46,7 @@ void OnLine(const std::string& line) {
 }  // namespace
 
 void Run(const boot_guard::Ledger& ledger, boot_guard::ResetKind last_reset) {
+    event_log::Critical("safe_mode failures=%u reset=%u", unsigned(ledger.failures), unsigned(last_reset));
     char reason[96];
     std::snprintf(reason, sizeof(reason), "%u FAILED BOOTS IN A ROW, LAST: %s",
                   unsigned(ledger.failures), boot_guard::Label(last_reset));

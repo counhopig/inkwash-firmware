@@ -1,4 +1,5 @@
 #include "storage/store.h"
+#include "diagnostics/event_log.h"
 
 #include <cctype>
 #include <algorithm>
@@ -67,7 +68,10 @@ bool WriteStr(const char* ns, const char* key, const std::string& value) {
     if (!h) return false;
     const bool ok = nvs_set_str(h.get(), key, value.c_str()) == ESP_OK &&
                     nvs_commit(h.get()) == ESP_OK;
-    if (!ok) ESP_LOGE(kTag, "write %s/%s failed", ns, key);
+    if (!ok) {
+        event_log::Critical("nvs_write_failed namespace=%s key=%s", ns, key);
+        ESP_LOGE(kTag, "write %s/%s failed", ns, key);
+    }
     return ok;
 }
 
@@ -106,7 +110,10 @@ bool WriteBlob(const char* ns, const char* key, cJSON* json, size_t max) {
     if (!h) return false;
     const bool ok = nvs_set_blob(h.get(), key, text.data(), text.size()) == ESP_OK &&
                     nvs_commit(h.get()) == ESP_OK;
-    if (!ok) ESP_LOGE(kTag, "write %s/%s failed", ns, key);
+    if (!ok) {
+        event_log::Critical("nvs_write_failed namespace=%s key=%s", ns, key);
+        ESP_LOGE(kTag, "write %s/%s failed", ns, key);
+    }
     return ok;
 }
 

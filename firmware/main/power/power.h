@@ -41,7 +41,10 @@ struct Retained {
     uint8_t open_ble_pairing;  // restart into BLE pairing on a clean heap
     uint8_t partial_refreshes; // since the last full refresh
     uint8_t home_valid;        // the panel shows `home` (see ui::HomeSnapshot)
-    uint8_t reserved;
+    uint8_t clock_estimated;
+    uint64_t log_battery_utc;
+    uint8_t log_charge_state;
+    uint8_t log_power_valid;
     uint64_t network_retry_utc; // offline backoff survives minute wakes
     uint8_t home[256];         // serialized Home model shown before sleep
 };

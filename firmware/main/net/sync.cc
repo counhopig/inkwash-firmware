@@ -1,4 +1,5 @@
 #include "net/sync.h"
+#include "diagnostics/event_log.h"
 
 #include "cJSON.h"
 #include "core/sync_payload.h"
@@ -64,6 +65,7 @@ Result Run(const DateTime& now) {
     sync_payload::Applied applied;
     if (posted) {
         r.error = sync_payload::DecodeResponse(body.data(), body.size(), &applied.data);
+        if (!r.error.empty()) event_log::Critical("sync_response_decode_failed");
     }
     if (posted && r.error.empty()) {
         ESP_LOGI(kTag, "fetched %u alarms, %u todos, %u inbox",
@@ -83,6 +85,7 @@ Result Run(const DateTime& now) {
     applied.uploaded_alarm_ids = dirty_alarms;
     applied.uploaded_todo_ids = dirty_todos;
     if (!store::SaveSyncJournal(applied) || !Replay(applied) || !store::ClearSyncJournal()) {
+        event_log::Critical("sync_apply_store_failed");
         r.error = "failed to store the sync result";
         return r;
     }

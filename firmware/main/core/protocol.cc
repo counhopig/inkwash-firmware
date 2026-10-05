@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "cJSON.h"
 
@@ -100,6 +101,28 @@ bool Parse(const std::string& line, Command* out, std::string* error) {
         c.epoch_secs = static_cast<uint64_t>(n);
     } else if (cmd == "get_status") {
         c.cmd = Cmd::GetStatus;
+    } else if (cmd == "get_logs") {
+        c.cmd = Cmd::GetLogs;
+        const bool cursor = cJSON_GetObjectItemCaseSensitive(root, "cursor") != nullptr;
+        const bool anchor = cJSON_GetObjectItemCaseSensitive(root, "anchor") != nullptr;
+        const bool snapshot = cJSON_GetObjectItemCaseSensitive(root, "snapshot") != nullptr;
+        c.log_resume = cursor || anchor || snapshot;
+        if (c.log_resume) {
+            std::string text;
+            ok = Num(root, "cursor", 0, 8192, &n);
+            c.log_cursor = static_cast<uint32_t>(n);
+            ok = ok && Num(root, "anchor", 0, 8191, &n);
+            c.log_anchor = static_cast<uint32_t>(n);
+            ok = ok && Str(root, "snapshot", &text) && !text.empty() && text.size() <= 20;
+            for (char digit : text) {
+                if (digit < '0' || digit > '9' || c.log_snapshot >
+                    (std::numeric_limits<uint64_t>::max() - (digit - '0')) / 10) {
+                    ok = false;
+                    break;
+                }
+                c.log_snapshot = c.log_snapshot * 10 + (digit - '0');
+            }
+        }
     } else if (cmd == "clear_alarms") {
         c.cmd = Cmd::ClearAlarms;
     } else if (cmd == "set_timezone") {

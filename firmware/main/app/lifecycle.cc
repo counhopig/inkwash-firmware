@@ -1,4 +1,5 @@
 #include "app/internal.h"
+#include "esp_system.h"
 
 namespace app::detail {
 
@@ -89,6 +90,7 @@ bool Housekeeping() {
         redraw = true;
     }
     const int64_t now_ms = NowMs();
+    event_log::Poll();
     static int64_t last_stack_probe_ms = -30000;
     if (now_ms - last_stack_probe_ms >= 30000) {
         last_stack_probe_ms = now_ms;
@@ -146,6 +148,25 @@ bool Housekeeping() {
         if (CheckReminders()) redraw = true;
     }
     ScheduleSync();
+    auto& diagnostic = power::State();
+    const uint64_t utc = g.have_clock ? g.now.ShiftedMinutes(-g.timezone).ToUnix() : 0;
+    const auto charge = board::ReadCharge();
+    const uint8_t charge_state = unsigned(charge.power_present) | (unsigned(charge.charging) << 1) | (unsigned(charge.full) << 2);
+    const bool changed = !diagnostic.log_power_valid || charge_state != diagnostic.log_charge_state;
+    static int64_t last_sample_ms = -900000;
+    const bool due = g.have_clock ? (!diagnostic.log_battery_utc || utc < diagnostic.log_battery_utc ||
+                                    utc - diagnostic.log_battery_utc >= 900) : now_ms - last_sample_ms >= 900000;
+    if (changed || due) {
+        const int percent = board::BatteryPercent();
+        event_log::Add("power battery_pct=%d usb=%u charging=%u full=%u heap=%u", percent,
+                       unsigned(charge.power_present), unsigned(charge.charging), unsigned(charge.full),
+                       unsigned(esp_get_free_heap_size()));
+        if (percent >= 0 && percent <= 10) event_log::Critical("low_battery percent=%d", percent);
+        diagnostic.log_battery_utc = utc;
+        diagnostic.log_charge_state = charge_state;
+        diagnostic.log_power_valid = 1;
+        last_sample_ms = now_ms;
+    }
     board::SetChargeLed(board::ReadCharge().charging);
     return redraw;
 }
@@ -155,13 +176,18 @@ void Boot(power::WakeCause wake) {
     g.background = wake == power::WakeCause::Timer;
     g.last_activity_ms = NowMs();
     LoadConfig();
-    if (netsync::RecoverJournal()) ESP_LOGW(kTag, "recovered an interrupted sync apply");
+    if (netsync::RecoverJournal()) {
+        event_log::Critical("sync_journal_recovered");
+        ESP_LOGW(kTag, "recovered an interrupted sync apply");
+    }
     LoadData();
 
     DateTime dt;
     if (pcf8563::ReadTime(&dt)) {
         ESP_LOGI(kTag, "RTC %04u-%02u-%02u %02u:%02u:%02u vl=%d", dt.year, dt.month, dt.day,
                  dt.hour, dt.minute, dt.second, dt.voltage_low);
+        g.clock_estimated = dt.voltage_low || power::State().clock_estimated || event_log::LastClockEstimated();
+        if (dt.voltage_low) event_log::Critical("rtc_voltage_low");
         if (dt.voltage_low) {
             // The RTC lost power: start from the build time and ask NTP.
             const DateTime seeded = DateTime::FromUnix(INKWASH_BUILD_EPOCH).ShiftedMinutes(g.timezone);
@@ -172,6 +198,12 @@ void Boot(power::WakeCause wake) {
         g.now = dt;
         g.have_clock = !dt.voltage_low || pcf8563::ReadTime(&g.now);
     }
+    event_log::SetClock(g.have_clock ? g.now.ShiftedMinutes(-g.timezone).ToUnix() : 0, g.clock_estimated);
+    event_log::Add("clock utc=%llu quality=%s",
+                   static_cast<unsigned long long>(g.have_clock ? g.now.ShiftedMinutes(-g.timezone).ToUnix() : 0),
+                   g.have_clock ? (g.clock_estimated ? "estimated" : "rtc") : "unknown");
+    power::State().clock_estimated = g.clock_estimated;
+    event_log::Flush();
     SeedScheduler();
     power::PrintSleepTrace(g.have_clock ? g.now.ShiftedMinutes(-g.timezone).ToUnix() : 0);
 
@@ -217,6 +249,7 @@ bool HandleEvent(const Event& e) {
                      : e.key.kind == keys::Kind::LongPressed ? "hold"
                                                              : "release",
                      static_cast<int>(g.screen.kind));
+            event_log::Add("key key=%u action=%u screen=%u", unsigned(e.key.key), unsigned(e.key.kind), unsigned(g.screen.kind));
             g.last_activity_ms = NowMs();
             g.background = false;
             HandleKey(e.key);
@@ -225,6 +258,7 @@ bool HandleEvent(const Event& e) {
             HandleCommand(e.channel, e.line);
             return false;
         case Event::Kind::BleLink:
+            event_log::Add("ble_link event=%u", unsigned(e.ble_event));
             g.last_activity_ms = NowMs();
             if (e.ble_event == ble::Event::Connected || e.ble_event == ble::Event::Encrypted) {
                 g.ble_deadline_ms = NowMs() + kBlePairingTimeoutMs;
@@ -243,6 +277,16 @@ void LogSleepBlock() {
     const int64_t now = NowMs();
     if (now - last_ms < 30000) return;
     last_ms = now;
+    const uint32_t mask = (usb_console::HostConnected() ? 1u : 0u) |
+        (g.net_job != NetJob::None ? 2u : 0u) | (g.ringing ? 4u : 0u) |
+        (g.screen.kind == ScreenKind::Reminder ? 8u : 0u) |
+        (g.screen.kind == ScreenKind::BlePairing || ble::Active() ? 16u : 0u) |
+        (g.usb_reply.active || g.ble_reply.active ? 32u : 0u) |
+        (tones::Busy() ? 64u : 0u) | (!display::Healthy() ? 128u : 0u) |
+        (uxQueueMessagesWaiting(g_events) != 0 || g_ble_link.load() >= 0 ? 256u : 0u) |
+        (board::KeyDown(board::Key::Enter) || board::KeyDown(board::Key::Down) ||
+         board::KeyDown(board::Key::Up) ? 512u : 0u);
+    event_log::Add("sleep_held mask=0x%lx screen=%u", static_cast<unsigned long>(mask), unsigned(g.screen.kind));
     ESP_LOGI(kTag, "deep sleep held: usb=%d net=%d ring=%d screen=%d ble=%d replies=%d/%d",
              usb_console::HostConnected(), static_cast<int>(g.net_job), g.ringing,
              static_cast<int>(g.screen.kind), ble::Active(), g.usb_reply.active, g.ble_reply.active);

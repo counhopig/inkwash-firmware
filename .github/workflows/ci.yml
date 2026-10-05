@@ -25,6 +25,10 @@ jobs:
           version: v5.5.5
       - name: Core tests
         run: bash firmware/test/run.sh
+      - name: USB log exporter host tests
+        run: |
+          source "$IDF_PATH/export.sh"
+          python scripts/checks/test-export-logs.py
       - name: Build firmware
         run: ./scripts/build/build-cpp.sh
       - name: Check retained boot ledger

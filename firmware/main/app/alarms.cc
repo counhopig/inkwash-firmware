@@ -12,8 +12,11 @@ void ProgramRtcAlarm() {
     if (!want) {
         if (g.programmed_valid && g.programmed_none) return;
         if (pcf8563::ClearAlarm()) {
+            event_log::Add("rtc_alarm_clear");
             g.programmed_valid = true;
             g.programmed_none = true;
+        } else {
+            event_log::Critical("rtc_alarm_clear_failed");
         }
         return;
     }
@@ -23,11 +26,15 @@ void ProgramRtcAlarm() {
         return;
     }
     if (pcf8563::SetAlarm(regs)) {
+        event_log::Add("rtc_alarm id=%u hour=%u minute=%u day=%d weekday=%d",
+                       unsigned(next->id), unsigned(regs.hour), unsigned(regs.minute), regs.day, regs.weekday);
         g.programmed = regs;
         g.programmed_valid = true;
         g.programmed_none = false;
         ESP_LOGI(kTag, "RTC alarm programmed %02u:%02u day=%d weekday=%d", regs.hour, regs.minute,
                  regs.day, regs.weekday);
+    } else {
+        event_log::Critical("rtc_alarm_program_failed id=%u", unsigned(next->id));
     }
 }
 
@@ -45,10 +52,12 @@ void StartRinging() {
     g.fired_minute = g.now.ToUnix() / 60;
     g.screen = Screen{ScreenKind::AlarmRinging};
     tones::Start(tones::Tone::AlarmRing);
+    event_log::Critical("alarm_start");
 }
 
 void StopRinging() {
     if (!g.ringing) return;
+    event_log::Critical("alarm_stop timeout=%u", unsigned(NowMs() >= g.ring_deadline_ms));
     g.ringing = false;
     tones::Stop();
     g.screen = g.before_ring;
@@ -74,6 +83,7 @@ bool CheckRtcAlarm() {
                                   }),
                    g.alarms.end());
     if (g.alarms.size() != before) store::SaveAlarms(g.alarms);
+    event_log::Add("alarm_due id=%u", unsigned(id));
     ESP_LOGI(kTag, "alarm %u ringing", id);
     StartRinging();
     return true;

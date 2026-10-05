@@ -41,11 +41,13 @@ bool CheckReminders() {
     g.reminder_deadline_ms = NowMs() + kReminderTimeoutMs;
     g.screen = Screen{ScreenKind::Reminder};
     tones::Start(urgent ? tones::Tone::Siren : tones::Tone::TodoBeep);
+    event_log::Critical("reminder_start urgent=%u count=%u", unsigned(urgent), unsigned(lines.size()));
     return true;
 }
 
 void DismissReminder() {
     if (g.screen.kind != ScreenKind::Reminder) return;
+    event_log::Critical("reminder_stop timeout=%u", unsigned(NowMs() >= g.reminder_deadline_ms));
     tones::Stop();
     g.screen = g.before_reminder;
 }

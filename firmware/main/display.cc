@@ -1,4 +1,5 @@
 #include "display.h"
+#include "diagnostics/event_log.h"
 
 #include <algorithm>
 #include <cstring>
@@ -160,6 +161,7 @@ bool Update(Refresh mode) {
     } else {
         err = RefreshPartial(x1, y1, x2, y2);
         if (err != ESP_OK) {
+            event_log::Critical("display_partial_failed err=%d", int(err));
             ESP_LOGW(kTag, "partial refresh failed (0x%x); falling back to full", err);
             full = true;
             err = RefreshFull();
@@ -179,6 +181,7 @@ bool Update(Refresh mode) {
     ESP_LOGI(kTag, "%s refresh (%d,%d)-(%d,%d) %s in %lld ms", full ? "full" : "partial", x1, y1,
              x2, y2, err == ESP_OK ? "ok" : "FAILED",
              static_cast<long long>((esp_timer_get_time() - start) / 1000));
+    if (err != ESP_OK) event_log::Critical("display_refresh_failed err=%d", int(err));
     return err == ESP_OK;
 }
 

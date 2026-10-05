@@ -7,7 +7,7 @@
 
 namespace protocol {
 
-enum class Cmd : uint8_t { SetWifi, SetServer, SyncNow, SetRtc, GetStatus, ClearAlarms, SetTimezone };
+enum class Cmd : uint8_t { SetWifi, SetServer, SyncNow, SetRtc, GetStatus, ClearAlarms, SetTimezone, GetLogs };
 
 struct Command {
     Cmd cmd = Cmd::GetStatus;
@@ -17,6 +17,10 @@ struct Command {
     std::string url, token;      // SetServer
     uint64_t epoch_secs = 0;     // SetRtc
     int16_t offset_minutes = 0;  // SetTimezone
+    bool log_resume = false;
+    uint32_t log_cursor = 0;
+    uint32_t log_anchor = 0;
+    uint64_t log_snapshot = 0;
 };
 
 // Parses one command line (without the USB ">>IW " prefix). On failure

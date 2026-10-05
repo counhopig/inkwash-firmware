@@ -31,6 +31,7 @@ bool StartNet(NetJob job, const store::WifiCreds* creds) {
     }
     g.net_job = job;
     g.net_started_ms = NowMs();
+    event_log::Add("net_start job=%u", unsigned(job));
     ESP_LOGI(kTag, "net job %d started", static_cast<int>(job));
     return true;
 }
@@ -47,11 +48,17 @@ void HandleCommand(Channel ch, const std::string& line) {
     g.background = false;
     const std::string* id = c.has_id ? &c.id : nullptr;
     PendingReply& slot = Slot(ch);
-    if (slot.active) {
+    if (slot.active && c.cmd != protocol::Cmd::GetLogs) {
         SendReply(ch, protocol::ReplyBusy(id));
         return;
     }
+    if (c.cmd != protocol::Cmd::GetLogs && c.cmd != protocol::Cmd::GetStatus)
+        event_log::Add("command type=%u channel=%u", unsigned(c.cmd), unsigned(ch));
     switch (c.cmd) {
+        case protocol::Cmd::GetLogs:
+            SendReply(ch, ch == Channel::Usb ? event_log::Export(c) :
+                      protocol::ReplyError("Event logs require USB", id));
+            return;
         case protocol::Cmd::GetStatus: {
             protocol::Status s;
             s.wifi_configured = g.wifi_configured;
@@ -84,6 +91,10 @@ void HandleCommand(Channel ch, const std::string& line) {
             }
             g.now = local;
             g.have_clock = true;
+            g.clock_estimated = false;
+            power::State().clock_estimated = 0;
+            event_log::SetClock(c.epoch_secs, false);
+            event_log::Critical("clock_set utc=%llu", static_cast<unsigned long long>(c.epoch_secs));
             g.programmed_valid = false;
             g.last_full_boundary = Boundary(g.now.ToUnix(), std::max<uint16_t>(1, g.sync_interval) * 60ULL);
             g.last_urgent_boundary = Boundary(g.now.ToUnix(), kUrgentPeriodSecs);
