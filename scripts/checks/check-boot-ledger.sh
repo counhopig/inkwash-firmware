@@ -13,10 +13,10 @@
 # This gate converts the application ELF with the same converters used to flash
 # it and fails if any loadable segment overlaps `.rtc_noinit`.
 #
-# Usage: scripts/check-boot-ledger.sh [app-elf]
-#        scripts/check-boot-ledger.sh --self-test
+# Usage: scripts/checks/check-boot-ledger.sh [app-elf]
+#        scripts/checks/check-boot-ledger.sh --self-test
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 mode=check
 elf="${INKWASH_CPP_BUILD_DIR:-firmware/build}/inkwash.elf"

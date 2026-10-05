@@ -1,6 +1,6 @@
-# Builds the C++ firmware (firmware/) with ESP-IDF 5.5.
+# Builds the C++ firmware (firmware/) with ESP-IDF 5.5.5.
 #
-# Usage: .\scripts\build-cpp.ps1 [-BuildDir C:\ikc]
+# Usage: .\scripts\build\build-cpp.ps1 [-BuildDir C:\ikc]
 #
 # The build directory defaults to C:\ikc: ESP-IDF on Windows fails on long
 # object paths, and the checkout usually lives deep in a workspace.
@@ -12,8 +12,7 @@ $ErrorActionPreference = "Stop"
 
 # Locate ESP-IDF without hardcoding an install path: honor $env:IDF_PATH
 # when set, else probe the conventional install locations and pick the
-# newest match. (the Windows side is
-# unverified on a real toolchain.)
+# newest match.
 $idfRoot = $null
 if ($env:IDF_PATH) {
     $idfRoot = $env:IDF_PATH
@@ -62,7 +61,7 @@ if ($prepend.Count -gt 0) {
 
 . (Join-Path $idfRoot "export.ps1")
 
-$repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $project = Join-Path $repo "firmware"
 if (-not (Test-Path (Join-Path $project "components\lvgl\lvgl.h"))) {
     Write-Host "Fetching the LVGL submodule"
@@ -77,4 +76,4 @@ if ($LASTEXITCODE -ne 0) {
     throw "idf.py build failed with exit code $LASTEXITCODE"
 }
 Write-Host "Firmware image: $(Join-Path $BuildDir 'inkwash.bin')"
-Write-Host "Flash it with: .\scripts\flash-note4.ps1 -Port COMx -Cpp -Monitor"
+Write-Host "Flash it with: .\scripts\device\flash-note4.ps1 -Port COMx -BuildDir `"$BuildDir`" -Monitor"

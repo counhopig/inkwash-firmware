@@ -2,8 +2,8 @@
 """Sends Wi-Fi credentials to a Note 4 over the USB serial console.
 
 Usage:
-    python scripts/set-wifi.py --port COM5 --ssid MyNetwork
-    python scripts/set-wifi.py --port /dev/ttyACM0 --ssid MyNetwork --password secret
+    python scripts/device/set-wifi.py --port COM5 --ssid MyNetwork
+    python scripts/device/set-wifi.py --port /dev/ttyACM0 --ssid MyNetwork --password secret
 
 Without --password the script prompts for it, so it stays out of the shell
 history. The device tries the credentials first and stores them only if it

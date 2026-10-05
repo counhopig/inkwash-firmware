@@ -4,8 +4,8 @@
 .LSOverride
 
 # ESP-IDF
-build/
-firmware/build-secure/
+/build/
+/firmware/build/
 managed_components/
 dependencies.lock
 sdkconfig

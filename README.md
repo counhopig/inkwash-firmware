@@ -41,13 +41,13 @@ Install ESP-IDF **5.5.5**, including the ESP32-S3 toolchain, then initialize LVG
 
 ```sh
 git submodule update --init firmware/components/lvgl
-./scripts/build-cpp.sh
+./scripts/build/build-cpp.sh
 ```
 
 Set `IDF_PATH` for a nonstandard ESP-IDF installation. The default output is
 `firmware/build/`; `INKWASH_CPP_BUILD_DIR` selects another directory.
 
-On Windows, run `scripts\build-cpp.ps1` from PowerShell. It defaults to the
+On Windows, run `scripts\build\build-cpp.ps1` from PowerShell. It defaults to the
 short build path `C:\ikc`; use `-BuildDir` to select another path.
 
 ## Flash
@@ -60,14 +60,14 @@ Note 4C or another ESP32 board. Keep a full 16 MB backup before flashing.
 From an ESP-IDF shell:
 
 ```sh
-./scripts/flash-note4.sh --port /dev/cu.usbmodem101
+./scripts/device/flash-note4.sh --port /dev/cu.usbmodem101
 ```
 
 On Windows:
 
 ```powershell
-.\scripts\backup-flash.ps1 -Port COM5
-.\scripts\flash-note4.ps1 -Port COM5 -BuildDir C:\ikc
+.\scripts\device\backup-flash.ps1 -Port COM5
+.\scripts\device\flash-note4.ps1 -Port COM5 -BuildDir C:\ikc
 ```
 
 The wrappers verify chip, MAC and Flash capacity before writing. The partition
@@ -78,17 +78,28 @@ Boot and Flash encryption are disabled in the standard image.
 
 ```sh
 IDF_PATH=/path/to/esp-idf bash firmware/test/run.sh
-./scripts/check-boot-ledger.sh firmware/build/inkwash.elf
+./scripts/checks/check-boot-ledger.sh firmware/build/inkwash.elf
 ```
 
 CI runs the C++ core tests, builds the ESP32-S3 image and checks that loadable
 image segments exclude the retained boot ledger. Hardware acceptance covers
 USB, BLE, synchronization, alarm audio, button response and sleep/wake behavior.
 
-`scripts/capture-serial.py` records USB logs. Opening USB Serial/JTAG may reset
-the chip. `tools/generate_cjk_font.py` generates CJK font blobs; committed font
-assets are in `firmware/assets/`. `scripts/release.sh vX.Y.Z` builds, checks,
-packages and publishes a tagged GitHub release from a clean checkout.
+| Script | Purpose |
+| --- | --- |
+| `scripts/build/build-cpp.sh`, `scripts/build/build-cpp.ps1` | Build the C++ firmware |
+| `scripts/device/flash-note4.sh`, `scripts/device/flash-note4.ps1` | Verify board identity and flash the image |
+| `scripts/device/backup-flash.ps1` | Back up device Flash on Windows |
+| `scripts/checks/check-boot-ledger.sh` | Verify retained boot memory is outside image segments |
+| `scripts/checks/check-git-rev.sh` | Verify the embedded Git revision |
+| `scripts/device/capture-serial.py` | Record USB logs |
+| `scripts/checks/smoke-note4.py` | Exercise USB commands and observe stability |
+| `scripts/device/set-wifi.py` | Configure device Wi-Fi over USB |
+| `scripts/assets/generate_cjk_font.py` | Generate CJK bitmap assets with Pillow |
+| `scripts/release/release.sh vX.Y.Z` | Build, check, package and publish a tagged GitHub release from a clean checkout |
+
+Opening USB Serial/JTAG may reset the chip. Committed font assets are in
+`firmware/assets/`; normal builds do not require font generation.
 
 Startup logs include `SLEEPTRACE`: the latest 16 boot, deep-sleep and controlled
 restart events retained in RTC memory. Entries contain UTC time when available,
@@ -109,6 +120,13 @@ history; a power-on reset starts a new history. No Flash writes are used.
 | `firmware/main/audio/` | ES8311 and I2S tones |
 | `firmware/components/` | LVGL and e-paper driver |
 | `firmware/test/` | C++ host tests |
+| `firmware/assets/` | Embedded fonts and font license |
+| `scripts/` | Build, flash, validation and maintenance tools |
+
+`firmware/partitions.csv` is the authorized build and Flash partition layout.
+Flash scripts verify its checksum and the generated binary table.
+Local device backups belong in `backups/`, serial captures in `logs/`, and default
+build output in `firmware/build/`. These generated files are excluded from Git.
 
 ## License
 

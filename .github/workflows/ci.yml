@@ -26,11 +26,11 @@ jobs:
       - name: Core tests
         run: bash firmware/test/run.sh
       - name: Build firmware
-        run: ./scripts/build-cpp.sh
+        run: ./scripts/build/build-cpp.sh
       - name: Check retained boot ledger
-        run: ./scripts/check-boot-ledger.sh
+        run: ./scripts/checks/check-boot-ledger.sh
       - name: Check firmware revision
-        run: ./scripts/check-git-rev.sh
+        run: ./scripts/checks/check-git-rev.sh
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:

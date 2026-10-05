@@ -6,23 +6,22 @@ param(
     [string]$BuildDir
 )
 $ErrorActionPreference = "Stop"
-$repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $authorizedMac = "20:6E:F1:B4:7D:E4"
 if (-not $BuildDir) {
     $BuildDir = if ($env:INKWASH_CPP_BUILD_DIR) { $env:INKWASH_CPP_BUILD_DIR } else { "C:\ikc" }
 }
 $partitions = Join-Path $repo "firmware\partitions.csv"
-$originalTable = Join-Path $repo "rust-firmware\partitions.csv"
 foreach ($file in @("flash_args", "bootloader\bootloader.bin", "partition_table\partition-table.bin", "inkwash.bin")) {
     if (-not (Test-Path -LiteralPath (Join-Path $BuildDir $file) -PathType Leaf)) {
-        throw "Refusing to flash: $file not found (build with scripts\build-cpp.ps1)."
+        throw "Refusing to flash: $file not found (build with scripts\build\build-cpp.ps1)."
     }
 }
 $flashArgs = Get-Content (Join-Path $BuildDir "flash_args") -Raw
 if ($flashArgs -notmatch '--flash_mode dio' -or $flashArgs -notmatch '--flash_freq 80m' -or $flashArgs -notmatch '--flash_size 16MB') {
     throw "Refusing to flash: build is not DIO / 80 MHz / 16 MB."
 }
-if ((Get-FileHash -Algorithm SHA256 $partitions).Hash -ne (Get-FileHash -Algorithm SHA256 $originalTable).Hash) {
+if ((Get-FileHash -Algorithm SHA256 $partitions).Hash -ne "5101832d2cdb397e86e74b407220c33dca1e318431f314eff2906155d326d4ea") {
     throw "Refusing to flash: partition layout differs from the authorized Note 4 table."
 }
 if (-not $env:IDF_PATH) { throw "Export the ESP-IDF environment first." }

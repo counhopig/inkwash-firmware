@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
 if [ -z "${IDF_PATH:-}" ]; then
     for candidate in "$HOME/esp/esp-idf" "$HOME"/esp/esp-idf-*; do
         if [ -f "$candidate/export.sh" ]; then

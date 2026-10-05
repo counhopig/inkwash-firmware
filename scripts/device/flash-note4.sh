@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Flashes a Zectrix Note 4 only after proving the port holds that exact board.
 #
-# Usage: scripts/flash-note4.sh --port PORT [--build-dir DIR] [--monitor]
+# Usage: scripts/device/flash-note4.sh --port PORT [--build-dir DIR] [--monitor]
 #
 # A serial-port name is not an identity: another ESP32, or a Note 4C with a
 # different panel, may enumerate on the same name. Before writing anything this
@@ -10,7 +10,7 @@
 # 80 MHz with this repository's partition table.
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
 authorized_mac="20:6E:F1:B4:7D:E4"
 port="${INKWASH_NOTE4_PORT:-}"
 monitor=()
@@ -43,8 +43,7 @@ done
 
 partitions="$repo/firmware/partitions.csv"
 required=("$build_dir/inkwash.bin" "$build_dir/bootloader/bootloader.bin"
-          "$build_dir/partition_table/partition-table.bin" "$partitions"
-          "$repo/rust-firmware/partitions.csv")
+          "$build_dir/partition_table/partition-table.bin" "$partitions")
 
 if [ -z "$port" ]; then
     echo "Refusing to flash: name the port with --port or INKWASH_NOTE4_PORT." >&2
@@ -75,7 +74,8 @@ if [ ! -f "${IDF_PATH:-}/components/partition_table/gen_esp32part.py" ]; then
     echo "Refusing to flash: export the ESP-IDF environment first." >&2
     exit 1
 fi
-cmp "$partitions" "$repo/rust-firmware/partitions.csv" >/dev/null || {
+python3 -c 'import hashlib,sys; sys.exit(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest() != sys.argv[2])' \
+    "$partitions" "5101832d2cdb397e86e74b407220c33dca1e318431f314eff2906155d326d4ea" || {
     echo "Refusing to flash: partition layout differs from the authorized Note 4 table." >&2
     exit 1
 }

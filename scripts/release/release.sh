@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$repo"
-tag="${1:?Usage: scripts/release.sh vX.Y.Z}"
+tag="${1:?Usage: scripts/release/release.sh vX.Y.Z}"
 if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
     echo 'Invalid release tag.' >&2
     exit 1
@@ -21,11 +21,11 @@ if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1 ||
     exit 1
 fi
 export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-./scripts/build-cpp.sh
+./scripts/build/build-cpp.sh
 bash firmware/test/run.sh
 build_dir="${INKWASH_CPP_BUILD_DIR:-$repo/firmware/build}"
-./scripts/check-boot-ledger.sh "$build_dir/inkwash.elf"
-./scripts/check-git-rev.sh "$build_dir/inkwash.elf"
+./scripts/checks/check-boot-ledger.sh "$build_dir/inkwash.elf"
+./scripts/checks/check-git-rev.sh "$build_dir/inkwash.elf"
 for setting in 'CONFIG_IDF_TARGET="esp32s3"' 'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y' \
     'CONFIG_ESPTOOLPY_FLASHMODE_DIO=y' 'CONFIG_ESPTOOLPY_FLASHFREQ_80M=y' \
     '# CONFIG_SECURE_BOOT is not set' '# CONFIG_SECURE_FLASH_ENC_ENABLED is not set' \
