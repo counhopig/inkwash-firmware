@@ -1,5 +1,6 @@
 #include "control/usb_console.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "driver/usb_serial_jtag.h"
@@ -69,7 +70,9 @@ void Reply(const std::string& json) {
     size_t offset = 0;
     const int64_t deadline = esp_timer_get_time() + 1000000;
     while (offset < line.size() && esp_timer_get_time() < deadline) {
-        const int sent = usb_serial_jtag_write_bytes(line.data() + offset, line.size() - offset,
+        // A driver ring-buffer item must fit inside its 1024-byte TX buffer.
+        const size_t chunk = std::min<size_t>(512, line.size() - offset);
+        const int sent = usb_serial_jtag_write_bytes(line.data() + offset, chunk,
                                                     pdMS_TO_TICKS(100));
         if (sent > 0) offset += static_cast<size_t>(sent);
     }
