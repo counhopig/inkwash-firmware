@@ -21,6 +21,25 @@ through USB Serial/JTAG or BLE.
 The Wi-Fi icon indicates an active connection with an IP address. Network
 sessions end after their work completes, so the icon hides when Wi-Fi disconnects.
 
+## Configuration and synchronization
+
+Configure the clock, timezone, HTTPS server URL, token and Wi-Fi through
+`inkwash-desktop`. BLE pairing displays a passkey on the device and times out
+after two minutes. Synchronization is unavailable while BLE pairing is active.
+
+USB Wi-Fi configuration verifies the connection before saving credentials and
+returning a final success reply. BLE Wi-Fi configuration saves credentials,
+replies, then closes pairing. A successful BLE reply confirms that credentials
+were saved; connectivity is checked during the subsequent sync when both Wi-Fi
+and server settings are available.
+
+Synchronization uploads local alarm enable states, todo completion states and
+pending notification reads. Server results are validated and journaled in NVS
+before applying them; startup resumes an interrupted apply. Alarm and todo
+changes made while synchronization runs are retained for the next upload.
+Successful synchronization also attempts NTP alignment when the stored RTC
+alignment is missing or differs from the current clock by at least 24 hours.
+
 ## Power and display
 
 Home updates its clock at each RTC minute boundary while running on battery.
@@ -30,8 +49,9 @@ Enter, Down and the RTC alarm also wake the device. All three keys wake automati
 light sleep while the application is active.
 
 Clock updates use partial refreshes. Scene changes and recovery from a failed
-refresh establish a full baseline. Pending commands, network work, audio,
-pressed keys and display recovery prevent deep sleep. Audio and network hardware
+refresh establish a full baseline. USB activity, network work, ringing alarms,
+reminders, BLE pairing, pending replies, queued events, audio, pressed keys and
+display recovery prevent deep sleep. Audio and network hardware
 are initialized on demand; Wi-Fi disconnects at the end of each session. Failed
 background networking waits for the configured sync interval before retrying.
 
@@ -79,10 +99,13 @@ Boot and Flash encryption are disabled in the standard image.
 ```sh
 IDF_PATH=/path/to/esp-idf bash firmware/test/run.sh
 ./scripts/checks/check-boot-ledger.sh firmware/build/inkwash.elf
+./scripts/checks/check-boot-ledger.sh --self-test
+./scripts/checks/check-git-rev.sh firmware/build/inkwash.elf
 ```
 
-CI runs the C++ core tests, builds the ESP32-S3 image and checks that loadable
-image segments exclude the retained boot ledger. Hardware acceptance covers
+CI runs the C++ core tests, builds the ESP32-S3 image, checks that loadable
+image segments exclude the retained boot ledger, and verifies the embedded Git
+revision. Host tests cover hardware-free domain logic. Hardware acceptance covers
 USB, BLE, synchronization, alarm audio, button response and sleep/wake behavior.
 
 | Script | Purpose |
